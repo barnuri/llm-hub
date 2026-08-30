@@ -89,6 +89,15 @@ applied when no header is present). Fallback needs the request body buffered
 for replay; bodies over `LLM_HUB_MAX_REPLAY_BYTES` (default 2 MB) stream
 through with fallbacks disabled.
 
+Set the default chain any of three ways (per-request header always wins):
+
+- **UI** — the **Profiles** tab has a "Default fallbacks" editor: pick models
+  from the live list, reorder, save.
+- **API** — `POST /api/fallbacks` with
+  `{"fallbacks":["groq/llama-3.3-70b-versatile","openai/gpt-4o-mini"]}`.
+- **Env** — `LLM_HUB_DEFAULT_FALLBACKS=groq/llama-3.3-70b-versatile,openai/gpt-4o-mini`
+  in `.env`. The UI and API persist to the same variable.
+
 ## Environment reference
 
 | Variable | Default | Purpose |
