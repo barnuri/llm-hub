@@ -1,5 +1,9 @@
 {
   "devDependencies": {
     "playwright": "^1.62.1"
+  },
+  "scripts": {
+    "build:ui": "npm --prefix ui-src ci && npm --prefix ui-src run build",
+    "record-demo": "node scripts/record-demo.mjs"
   }
 }

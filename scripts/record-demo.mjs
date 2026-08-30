@@ -27,35 +27,36 @@ await page.goto(HUB_URL);
 await pause(1500);
 
 // Models: filter, then copy one id
-await page.fill("#model-search", "llama");
+const search = page.getByPlaceholder("Filter models…");
+await search.fill("llama");
 await pause(1200);
-await page.fill("#model-search", "");
+await search.fill("");
 await pause(600);
-const copyButtons = page.locator("[data-copy]");
+const copyButtons = page.getByRole("button", { name: "Copy", exact: true });
 if (await copyButtons.count()) { await copyButtons.first().click(); await pause(900); }
 
 // Stats
-await page.click('[data-tab="stats"]');
+await page.getByRole("tab", { name: "Stats" }).click();
 await pause(1500);
 
 // Usage
-await page.click('[data-tab="usage"]');
+await page.getByRole("tab", { name: "Usage" }).click();
 await pause(1500);
 
 // Profiles: open the add form, then cancel
-await page.click('[data-tab="profiles"]');
+await page.getByRole("tab", { name: "Profiles" }).click();
 await pause(1000);
-await page.click("#profile-add");
+await page.getByRole("button", { name: "Add profile" }).click();
 await pause(1400);
-await page.click("#modal-cancel");
+await page.getByRole("button", { name: "Cancel" }).click();
 await pause(600);
 
 // Keys
-await page.click('[data-tab="keys"]');
+await page.getByRole("tab", { name: "API keys" }).click();
 await pause(1200);
 
 // Setup: flip through targets
-await page.click('[data-tab="setup"]');
+await page.getByRole("tab", { name: "Setup" }).click();
 await pause(800);
 for (const target of ["openai-python", "langchain", "claude-code"]) {
   await page.selectOption("#setup-target", target);
