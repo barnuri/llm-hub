@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::consts::SERVICE_LABEL;
+use crate::consts::{SERVICE_BIND, SERVICE_LABEL, SERVICE_PORT};
 
 /// `llm-hub service install`: registers the hub as an always-on background
 /// service for the current user — launchd `LaunchAgent` on macOS, systemd user
@@ -44,6 +44,10 @@ pub fn render_launchd_plist(exe: &Path, cwd: &Path) -> String {
     <dict>
         <key>LLM_HUB_SERVICE</key>
         <string>1</string>
+        <key>LLM_HUB_PORT</key>
+        <string>{SERVICE_PORT}</string>
+        <key>LLM_HUB_BIND</key>
+        <string>{SERVICE_BIND}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -72,6 +76,8 @@ After=network.target
 ExecStart="{exe}"
 WorkingDirectory={cwd}
 Environment=LLM_HUB_SERVICE=1
+Environment=LLM_HUB_PORT={SERVICE_PORT}
+Environment=LLM_HUB_BIND={SERVICE_BIND}
 StandardOutput=append:{cwd}/logs/llm-hub.log
 StandardError=append:{cwd}/logs/llm-hub.log
 Restart=always
@@ -84,7 +90,7 @@ WantedBy=default.target
 }
 
 /// Task Scheduler XML has no environment element, so the action wraps the
-/// binary through `cmd /c set LLM_HUB_SERVICE=1&& <exe>`.
+/// binary through `cmd /c set` env pairs and `&& <exe>`.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn render_windows_task_xml(exe: &Path, cwd: &Path) -> String {
     let exe = xml_escape(exe);
@@ -110,7 +116,7 @@ pub fn render_windows_task_xml(exe: &Path, cwd: &Path) -> String {
   <Actions Context="Author">
     <Exec>
       <Command>cmd</Command>
-      <Arguments>/c set LLM_HUB_SERVICE=1&amp;&amp; "{exe}" >> "{cwd}\logs\llm-hub.log" 2&gt;&amp;1</Arguments>
+      <Arguments>/c set LLM_HUB_SERVICE=1&amp;&amp; set LLM_HUB_PORT={SERVICE_PORT}&amp;&amp; set LLM_HUB_BIND={SERVICE_BIND}&amp;&amp; "{exe}" >> "{cwd}\logs\llm-hub.log" 2&gt;&amp;1</Arguments>
       <WorkingDirectory>{cwd}</WorkingDirectory>
     </Exec>
   </Actions>
@@ -302,6 +308,8 @@ mod tests {
         assert!(out.contains("<string>/opt/bin/llm-hub</string>"));
         assert!(out.contains("<string>/srv/hub</string>"));
         assert!(out.contains("<key>LLM_HUB_SERVICE</key>"));
+        assert!(out.contains(&format!("<string>{SERVICE_PORT}</string>")));
+        assert!(out.contains(&format!("<string>{SERVICE_BIND}</string>")));
         assert!(out.contains("<key>RunAtLoad</key>"));
         assert!(out.contains("<key>KeepAlive</key>"));
         assert!(out.contains("<string>/srv/hub/logs/llm-hub.log</string>"));
@@ -314,6 +322,8 @@ mod tests {
         assert!(out.contains("ExecStart=\"/opt/bin/llm-hub\""));
         assert!(out.contains("WorkingDirectory=/srv/hub"));
         assert!(out.contains("Environment=LLM_HUB_SERVICE=1"));
+        assert!(out.contains(&format!("Environment=LLM_HUB_PORT={SERVICE_PORT}")));
+        assert!(out.contains(&format!("Environment=LLM_HUB_BIND={SERVICE_BIND}")));
         assert!(out.contains("Restart=always"));
         assert!(out.contains("StandardOutput=append:/srv/hub/logs/llm-hub.log"));
         assert!(out.contains("WantedBy=default.target"));
@@ -323,7 +333,9 @@ mod tests {
     fn windows_task_xml_runs_exe_in_cwd_with_restart_on_failure() {
         let out = render_windows_task_xml(Path::new("C:/hub/llm-hub.exe"), Path::new("C:/hub"));
 
-        assert!(out.contains("set LLM_HUB_SERVICE=1&amp;&amp; \"C:/hub/llm-hub.exe\""));
+        assert!(out.contains(&format!(
+            "set LLM_HUB_SERVICE=1&amp;&amp; set LLM_HUB_PORT={SERVICE_PORT}&amp;&amp; set LLM_HUB_BIND={SERVICE_BIND}&amp;&amp; \"C:/hub/llm-hub.exe\""
+        )));
         assert!(out.contains("<WorkingDirectory>C:/hub</WorkingDirectory>"));
         assert!(out.contains("<LogonTrigger>"));
         assert!(out.contains("<RestartOnFailure>"));

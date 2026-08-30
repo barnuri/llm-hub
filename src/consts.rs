@@ -26,6 +26,11 @@ pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_hours(24);
 pub const ENV_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 /// launchd `LaunchAgent` label (and plist file stem) on macOS.
 pub const SERVICE_LABEL: &str = "com.barnuri.llm-hub";
+/// Port baked into the service definitions as `LLM_HUB_PORT` — process env
+/// wins over `.env`, so installed services always serve here.
+pub const SERVICE_PORT: u16 = 8888;
+/// Bind address baked into the service definitions as `LLM_HUB_BIND`.
+pub const SERVICE_BIND: &str = "0.0.0.0";
 /// systemd user unit name on Linux / Task Scheduler task name on Windows.
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub const SERVICE_NAME: &str = "llm-hub";

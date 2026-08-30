@@ -136,8 +136,13 @@ Registers the hub as an always-on background service: a launchd LaunchAgent on
 macOS, a systemd user unit on Linux (run `loginctl enable-linger $USER` to
 start at boot without a login session), a Task Scheduler task on Windows. Run
 it from the directory containing your `.env` — that working directory is baked
-into the service definition. `llm-hub service uninstall` removes it,
-`llm-hub service status` checks it.
+into the service definition, so the service reads that `.env` for profiles,
+keys, and fallbacks. The definition also bakes in `LLM_HUB_PORT=8888` and
+`LLM_HUB_BIND=0.0.0.0`, which win over `.env` — an installed service always
+serves on `0.0.0.0:8888`, while foreground runs keep using `.env`. Logs land in
+`<that directory>/logs/llm-hub.log`. `llm-hub service uninstall` removes it,
+`llm-hub service status` checks it. Reinstall after updating to pick up
+definition changes.
 
 ## Updating
 
