@@ -27,7 +27,6 @@ Or grab a binary from [releases](https://github.com/barnuri/llm-hub/releases), o
 ```sh
 cd ~/somewhere
 cat > .env <<'ENV'
-LLM_HUB_PROFILES=openai,groq
 LLM_HUB_OPENAI_BASE_URL=https://api.openai.com/v1
 LLM_HUB_OPENAI_API_KEY=sk-...
 LLM_HUB_GROQ_BASE_URL=https://api.groq.com/openai/v1
@@ -82,7 +81,7 @@ through with fallbacks disabled.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LLM_HUB_PROFILES` | — | Comma list of profile names |
+| `LLM_HUB_PROFILES` | auto | Optional: profiles are discovered from `_BASE_URL` vars; set this to control order, subset, or dashed names |
 | `LLM_HUB_<NAME>_BASE_URL` | — | Upstream base URL (per profile, required) |
 | `LLM_HUB_<NAME>_API_KEY` | empty | Upstream key, injected on forward |
 | `LLM_HUB_<NAME>_HEADERS` | — | Extra headers, JSON object |

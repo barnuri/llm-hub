@@ -30,12 +30,13 @@ impl HubConfig {
                 .map(|v| v.trim().to_string())
         };
 
-        let profile_names: Vec<String> = get("PROFILES")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let profile_names = match get("PROFILES") {
+            Some(list) if !list.is_empty() => {
+                list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+            }
+            // No index var: discover profiles from LLM_HUB_<NAME>_BASE_URL keys.
+            _ => discover_profile_names(vars),
+        };
 
         let mut profiles = Vec::with_capacity(profile_names.len());
         for name in &profile_names {
@@ -142,6 +143,20 @@ fn parse_headers_json(upper: &str, raw: &str) -> Result<Vec<(String, String)>, S
     Ok(headers)
 }
 
+/// Profiles found by scanning for `LLM_HUB_<NAME>_BASE_URL` vars — the one
+/// key every profile must have. Names come back lowercased (env segments
+/// lose the original case/dashes); sorted for a stable order.
+fn discover_profile_names(vars: &HashMap<String, String>) -> Vec<String> {
+    let mut names: Vec<String> = vars
+        .keys()
+        .filter_map(|key| key.strip_prefix(PREFIX)?.strip_suffix("_BASE_URL"))
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_lowercase())
+        .collect();
+    names.sort();
+    names
+}
+
 /// Env-var segment for a profile name: uppercased, `-` mapped to `_`.
 pub fn env_name(profile: &str) -> String {
     profile.to_uppercase().replace('-', "_")
@@ -194,6 +209,26 @@ mod tests {
         assert_eq!(cfg.bind, DEFAULT_BIND);
         assert!(!cfg.persistent);
         assert_eq!(cfg.store_kind, "sqlite");
+    }
+
+    #[test]
+    fn discovers_profiles_without_index_var() {
+        let mut vars = base_vars();
+        vars.remove("LLM_HUB_PROFILES");
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        let mut names: Vec<&str> = cfg.profiles.iter().map(|p| p.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["groq", "openai"]);
+    }
+
+    #[test]
+    fn index_var_still_controls_selection_when_present() {
+        // groq has a BASE_URL but is not listed -> not loaded.
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_PROFILES".into(), "openai".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(cfg.profiles[0].name, "openai");
     }
 
     #[test]
