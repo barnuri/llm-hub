@@ -27,7 +27,8 @@ async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
     let mut command = Command::new(binary);
     command
         .current_dir(&dir)
-        .env("LLM_HUB_PORT", port.to_string());
+        .env("LLM_HUB_PORT", port.to_string())
+        .env("LLM_HUB_AUTO_UPDATE", "0");
     for (key, value) in vars {
         command.env(key, value);
     }

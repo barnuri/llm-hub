@@ -21,5 +21,11 @@ pub const HEADER_RETRY_ON: &str = "x-llm-hub-retry-on";
 pub const HEADER_SERVED_MODEL: &str = "x-llm-hub-model";
 pub const HEADER_ATTEMPTS: &str = "x-llm-hub-attempts";
 
+pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// launchd LaunchAgent label (and plist file stem) on macOS.
+pub const SERVICE_LABEL: &str = "com.barnuri.llm-hub";
+/// systemd user unit name on Linux / Task Scheduler task name on Windows.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+pub const SERVICE_NAME: &str = "llm-hub";
 pub const GITHUB_REPO: &str = "barnuri/llm-hub";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

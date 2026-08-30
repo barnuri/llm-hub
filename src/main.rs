@@ -7,6 +7,7 @@ mod services;
 mod utils;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::Router;
 use axum::middleware;
@@ -57,6 +58,24 @@ async fn main() {
         return;
     }
 
+    if std::env::args().nth(1).as_deref() == Some("service") {
+        let action = std::env::args().nth(2).unwrap_or_default();
+        let result = match action.as_str() {
+            "install" => services::service_manager::install(),
+            "uninstall" => services::service_manager::uninstall(),
+            "status" => services::service_manager::status(),
+            _ => {
+                eprintln!("usage: llm-hub service <install|uninstall|status>");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = result {
+            eprintln!("service {action} failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let vars = load_env_vars();
     let config = match HubConfig::from_map(&vars) {
         Ok(config) => config,
@@ -75,6 +94,7 @@ async fn main() {
     };
 
     let bind = format!("{}:{}", config.bind, config.port);
+    let auto_update = config.auto_update;
     let state = match AppState::new(config, store) {
         Ok(state) => state,
         Err(e) => {
@@ -84,7 +104,8 @@ async fn main() {
     };
 
     routes::models::spawn_background_refresh(state.clone());
-    services::update::spawn_update_check();
+    let restart_notify = Arc::new(tokio::sync::Notify::new());
+    services::update::spawn_auto_update(auto_update, restart_notify.clone());
 
     let protected = Router::new()
         .route("/v1/models", get(routes::models::list_models))
@@ -129,8 +150,11 @@ async fn main() {
     };
     tracing::info!("llm-hub v{VERSION} listening on http://{bind}");
     if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = restart_notify.notified() => {}
+            }
         })
         .await
     {

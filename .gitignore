@@ -5,10 +5,7 @@ target/
 .DS_Store
 .playwright-mcp/
 **/agent-spec
-
-
-# Added by cargo
-
 /target
 node_modules/
 docs/demo-video/
+llm-hub.db

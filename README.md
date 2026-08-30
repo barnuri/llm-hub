@@ -20,7 +20,19 @@ groq profile, `openai/gpt-4o` to OpenAI, `vllm/qwen-32b` to your local vLLM.
 curl -fsSL https://raw.githubusercontent.com/barnuri/llm-hub/main/scripts/install.sh | sh
 ```
 
-Or grab a binary from [releases](https://github.com/barnuri/llm-hub/releases), or build from source: `cargo build --release`.
+Or grab a binary from [releases](https://github.com/barnuri/llm-hub/releases), or install from source below.
+
+## Install from source
+
+```sh
+git clone https://github.com/barnuri/llm-hub && cd llm-hub
+cargo build --release   # binary at target/release/llm-hub
+```
+
+Or `cargo install --path .` — note that copy lives outside the repo tree, so it
+updates via release binaries unless you run the binary from the repo. Source
+installs are auto-detected by the updater, which runs `git pull` + rebuild
+instead of downloading a release.
 
 ## Quick start
 
@@ -96,18 +108,36 @@ through with fallbacks disabled.
 | `LLM_HUB_STORE` | `sqlite` | `sqlite` or `json` (when persistent) |
 | `LLM_HUB_STORE_PATH` | `llm-hub.db` | Store location |
 | `LLM_HUB_CONFIG_READONLY` | `false` | Block UI writes to `.env` |
+| `LLM_HUB_AUTO_UPDATE` | `true` | Apply updates automatically (startup + daily check); `false` = notice only |
 
 Profile names map to env segments uppercased with `-` → `_` (`my-proxy` →
 `LLM_HUB_MY_PROXY_BASE_URL`). See [.env.example](.env.example).
 
-## Updating
+## Run as a service
 
 ```sh
-llm-hub update
+cd ~/somewhere   # the directory with your .env
+llm-hub service install
 ```
 
-Checks GitHub releases, downloads the binary for your OS/arch, and swaps it
-atomically. The hub also logs a notice on startup when a newer version exists.
+Registers the hub as an always-on background service: a launchd LaunchAgent on
+macOS, a systemd user unit on Linux (run `loginctl enable-linger $USER` to
+start at boot without a login session), a Task Scheduler task on Windows. Run
+it from the directory containing your `.env` — that working directory is baked
+into the service definition. `llm-hub service uninstall` removes it,
+`llm-hub service status` checks it.
+
+## Updating
+
+Auto-update is on by default: the hub checks GitHub releases on startup and
+daily, downloads the binary for your OS/arch, and swaps it atomically. Source
+installs are updated via `git pull` + `cargo build --release` instead (the
+automatic pull is skipped while the checkout has uncommitted changes). Set
+`LLM_HUB_AUTO_UPDATE=false` to only log a notice when a newer version exists.
+
+```sh
+llm-hub update   # manual one-shot update, same logic
+```
 
 ## Docker
 

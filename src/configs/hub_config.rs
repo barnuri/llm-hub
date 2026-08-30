@@ -17,6 +17,7 @@ pub struct HubConfig {
     pub persistent: bool,
     pub store_kind: String,
     pub store_path: Option<String>,
+    pub auto_update: bool,
 }
 
 impl HubConfig {
@@ -74,6 +75,7 @@ impl HubConfig {
             persistent: get("PERSISTENT").is_some_and(|v| is_truthy(&v)),
             store_kind: get("STORE").unwrap_or_else(|| "sqlite".to_string()),
             store_path: get("STORE_PATH").filter(|v| !v.is_empty()),
+            auto_update: get("AUTO_UPDATE").is_none_or(|v| !is_falsy(&v)),
         })
     }
 
@@ -164,6 +166,11 @@ pub fn env_name(profile: &str) -> String {
 
 fn is_truthy(v: &str) -> bool {
     matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Opt-out flags default to true: only an explicit negative turns them off.
+fn is_falsy(v: &str) -> bool {
+    matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off")
 }
 
 /// Masks an api key for display: `sk-a...wxyz`. Short keys mask entirely.
@@ -264,6 +271,22 @@ mod tests {
         assert!(!groq.enabled);
         assert_eq!(groq.static_models, vec!["a", "b"]);
         assert_eq!(cfg.master_key.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn auto_update_defaults_on() {
+        let cfg = HubConfig::from_map(&base_vars()).unwrap();
+        assert!(cfg.auto_update);
+    }
+
+    #[test]
+    fn auto_update_parses_explicit_values() {
+        for (value, expected) in [("false", false), ("0", false), ("true", true)] {
+            let mut vars = base_vars();
+            vars.insert("LLM_HUB_AUTO_UPDATE".into(), value.into());
+            let cfg = HubConfig::from_map(&vars).unwrap();
+            assert_eq!(cfg.auto_update, expected, "LLM_HUB_AUTO_UPDATE={value}");
+        }
     }
 
     #[test]
