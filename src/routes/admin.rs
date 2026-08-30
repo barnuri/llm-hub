@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use axum::Json;
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{Path as UrlPath, Query, State};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::configs::{ProfileConfig, mask_key};
@@ -14,7 +15,7 @@ use crate::schemas::app_error::AppError;
 use crate::schemas::fallbacks_input::FallbacksInput;
 use crate::schemas::profile_input::ProfileInput;
 use crate::services::env_writer;
-use crate::services::store::{hash_key, now_ms};
+use crate::services::store::{StatsFilter, hash_key, now_ms};
 use crate::utils::hex::to_hex;
 use crate::utils::time::elapsed_ms;
 
@@ -184,9 +185,81 @@ pub async fn restart_server(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "ok": true, "restarting": true }))
 }
 
-pub async fn stats(State(state): State<AppState>) -> Json<Value> {
-    let snapshot = state.stats().snapshot();
-    Json(json!({ "profiles": snapshot.profiles, "models": snapshot.models }))
+#[derive(Debug, Deserialize, Default)]
+pub struct StatsQuery {
+    /// `live` (default), `1d`, `7d`, `30d`, or `all`.
+    #[serde(default)]
+    pub range: Option<String>,
+    pub profile: Option<String>,
+    pub model: Option<String>,
+}
+
+pub async fn stats(
+    State(state): State<AppState>,
+    Query(query): Query<StatsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let range = query.range.as_deref().unwrap_or("live");
+    let persistent = state.store().is_some();
+    let profile = query
+        .profile
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let model = query
+        .model
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let snapshot = if range == "live" || !persistent {
+        let mut snap = state.stats().snapshot(
+            if persistent && range != "live" {
+                "live"
+            } else {
+                range
+            },
+            persistent,
+        );
+        // Live registry cannot apply store filters; narrow client-side keys when asked.
+        if let Some(profile) = &profile {
+            snap.profiles.retain(|row| row.key == *profile);
+            snap.models
+                .retain(|row| row.key.starts_with(&format!("{profile}/")) || row.key == *profile);
+        }
+        if let Some(model) = &model {
+            snap.models.retain(|row| row.key == *model);
+        }
+        if range != "live" && !persistent {
+            snap.range = "live".into();
+            snap.filterable = false;
+        }
+        snap
+    } else {
+        let since_ms = match range {
+            "1d" => Some(now_ms().saturating_sub(86_400_000)),
+            "7d" => Some(now_ms().saturating_sub(7 * 86_400_000)),
+            "30d" => Some(now_ms().saturating_sub(30 * 86_400_000)),
+            "all" => None,
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "unknown stats range '{other}' (expected live, 1d, 7d, 30d, all)"
+                )));
+            }
+        };
+        let store = state.store().expect("persistent checked above");
+        store
+            .stats(&StatsFilter {
+                since_ms,
+                profile,
+                model,
+                range_label: range.to_string(),
+            })
+            .map_err(AppError::Internal)?
+    };
+
+    let body = serde_json::to_value(snapshot)
+        .map_err(|e| AppError::Internal(format!("serialize stats failed: {e}")))?;
+    Ok(Json(body))
 }
 
 pub async fn usage(State(state): State<AppState>) -> Result<Json<Value>, AppError> {

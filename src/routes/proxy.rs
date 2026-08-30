@@ -18,7 +18,7 @@ use crate::schemas::model_id::ModelId;
 use crate::services::anthropic;
 use crate::services::body_transform::BodyTransform;
 use crate::services::fallback::{RetryPolicy, fallback_chain, per_attempt_timeout_ms};
-use crate::services::stats::{RequestOutcome, scrape_usage};
+use crate::services::stats::{RequestOutcome, ScrapedUsage, scrape_usage};
 use crate::services::transforms::{self, RouteKind, TransformPlan};
 use crate::utils::headers::{filter_request_headers, filter_response_headers};
 
@@ -418,8 +418,11 @@ fn build_response(
         model_key: model_id.qualified(),
         status: status.as_u16(),
         latency_ms: 0,
+        ttft_ms: None,
         tokens_in: 0,
         tokens_out: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
     };
 
     let (summary_sender, summary_receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
@@ -430,19 +433,35 @@ fn build_response(
             transform,
             sender: Some(summary_sender),
             ended: false,
+            started,
+            ttft_ms: None,
         },
         pump,
     );
 
     tokio::spawn(async move {
         let summary = summary_receiver.await.unwrap_or_default();
-        let (tokens_in, tokens_out) = summary
-            .observed_usage
-            .unwrap_or_else(|| scrape_usage(&summary.tail));
+        let scraped = scrape_usage(&summary.tail);
+        let usage = match summary.observed_usage {
+            Some(observed) => ScrapedUsage {
+                tokens_in: observed.tokens_in,
+                tokens_out: observed.tokens_out,
+                cache_read_tokens: observed
+                    .cache_read_tokens
+                    .max(scraped.cache_read_tokens),
+                cache_write_tokens: observed
+                    .cache_write_tokens
+                    .max(scraped.cache_write_tokens),
+            },
+            None => scraped,
+        };
         let outcome = RequestOutcome {
             latency_ms: crate::utils::time::elapsed_ms(started),
-            tokens_in,
-            tokens_out,
+            ttft_ms: summary.ttft_ms,
+            tokens_in: usage.tokens_in,
+            tokens_out: usage.tokens_out,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
             ..outcome_seed
         };
         state_for_stats.stats().record(&outcome);
@@ -482,6 +501,9 @@ where
                     // The tail always holds the *upstream* bytes, so usage
                     // scraping keeps working when a transform is active but
                     // observed nothing itself.
+                    if state.ttft_ms.is_none() {
+                        state.ttft_ms = Some(crate::utils::time::elapsed_ms(state.started));
+                    }
                     append_tail(&mut state.tail, &bytes);
                     let Some(active) = state.transform.as_mut() else {
                         return Some((Ok(bytes), state));
@@ -514,6 +536,7 @@ where
                     .transform
                     .as_ref()
                     .and_then(BodyTransform::observed_usage),
+                ttft_ms: state.ttft_ms,
             });
         }
         state.transform = None;
@@ -531,15 +554,18 @@ struct StreamState<S> {
     transform: Option<BodyTransform>,
     sender: Option<tokio::sync::oneshot::Sender<StreamSummary>>,
     ended: bool,
+    started: Instant,
+    ttft_ms: Option<u64>,
 }
 
 /// What the finished body stream hands the stats task. `observed_usage` wins
 /// when a transform reported real numbers — the translated Anthropic body uses
-/// `input_tokens`/`output_tokens`, which `scrape_usage` cannot see.
+/// `input_tokens`/`output_tokens`, which older scrapers could not see.
 #[derive(Default)]
 struct StreamSummary {
     tail: Vec<u8>,
-    observed_usage: Option<(u64, u64)>,
+    observed_usage: Option<ScrapedUsage>,
+    ttft_ms: Option<u64>,
 }
 
 /// True when the upstream answered with an SSE body.
@@ -609,15 +635,21 @@ async fn build_anthropic_response(
     };
 
     // Usage is scraped from the OpenAI-shaped body, before translation — the
-    // Anthropic `input_tokens`/`output_tokens` names are invisible to it.
-    let (tokens_in, tokens_out) = scrape_usage(&raw);
+    // Anthropic `input_tokens`/`output_tokens` names are also handled now, but
+    // the upstream shape remains the primary source.
+    let usage = scrape_usage(&raw);
+    let latency_ms = crate::utils::time::elapsed_ms(started);
     let outcome = RequestOutcome {
         profile: model_id.profile.clone(),
         model_key: model_id.qualified(),
         status: status.as_u16(),
-        latency_ms: crate::utils::time::elapsed_ms(started),
-        tokens_in,
-        tokens_out,
+        latency_ms,
+        // Buffered replies have no first-token event; treat full latency as TTFT.
+        ttft_ms: Some(latency_ms),
+        tokens_in: usage.tokens_in,
+        tokens_out: usage.tokens_out,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
     };
     let state_for_stats = state.clone();
     tokio::spawn(async move {
@@ -657,13 +689,17 @@ async fn read_upstream_capped(upstream: reqwest::Response, cap: usize) -> (Vec<u
 }
 
 fn record_failure(state: &AppState, model_id: &ModelId, status: u16, started: Instant) {
+    let latency_ms = crate::utils::time::elapsed_ms(started);
     let outcome = RequestOutcome {
         profile: model_id.profile.clone(),
         model_key: model_id.qualified(),
         status: if status == 0 { 599 } else { status },
-        latency_ms: crate::utils::time::elapsed_ms(started),
+        latency_ms,
+        ttft_ms: None,
         tokens_in: 0,
         tokens_out: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
     };
     state.stats().record(&outcome);
     if let Some(store) = state.store() {

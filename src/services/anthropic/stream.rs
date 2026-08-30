@@ -51,7 +51,7 @@ pub struct AnthropicStream {
     /// client as `tool_use`.
     saw_tool_use: bool,
     /// `None` until the upstream reports usage at all.
-    usage: Option<(u64, u64)>,
+    usage: Option<crate::services::stats::ScrapedUsage>,
 }
 
 /// Where the translated message is in its lifecycle. Every transition is
@@ -151,7 +151,7 @@ impl AnthropicStream {
     /// Token counts scraped from the upstream chunks, for stats. `None` when
     /// the upstream never sent a `usage` object.
     #[must_use]
-    pub fn observed_usage(&self) -> Option<(u64, u64)> {
+    pub fn observed_usage(&self) -> Option<crate::services::stats::ScrapedUsage> {
         self.usage
     }
 
@@ -214,7 +214,17 @@ impl AnthropicStream {
             return;
         };
         let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-        self.usage = Some((field("prompt_tokens"), field("completion_tokens")));
+        let cached_details = usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        self.usage = Some(crate::services::stats::ScrapedUsage {
+            tokens_in: field("prompt_tokens"),
+            tokens_out: field("completion_tokens"),
+            cache_read_tokens: cached_details.max(field("cache_read_input_tokens")),
+            cache_write_tokens: field("cache_creation_input_tokens"),
+        });
     }
 
     fn handle_text(&mut self, delta: &Value, out: &mut String) {
@@ -369,7 +379,8 @@ impl AnthropicStream {
             return;
         }
         self.close_block(out);
-        let (input_tokens, output_tokens) = self.usage.unwrap_or((0, 0));
+        let usage = self.usage.unwrap_or_default();
+        let (input_tokens, output_tokens) = (usage.tokens_in, usage.tokens_out);
         let stop_reason = reconcile_tool_use(self.stop_reason, self.saw_tool_use);
         out.push_str(&format_event(
             "message_delta",
@@ -709,9 +720,11 @@ mod tests {
     #[test]
     fn observed_usage_is_reported_for_stats() {
         let (stream, _) = run(&[TEXT_A]);
-        assert_eq!(stream.observed_usage(), None);
+        assert!(stream.observed_usage().is_none());
         let (stream, _) = run(&[TEXT_A, USAGE, "[DONE]"]);
-        assert_eq!(stream.observed_usage(), Some((5, 6)));
+        let usage = stream.observed_usage().expect("usage chunk should be absorbed");
+        assert_eq!(usage.tokens_in, 5);
+        assert_eq!(usage.tokens_out, 6);
     }
 
     #[test]

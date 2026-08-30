@@ -7,8 +7,11 @@ pub struct UsageRow {
     pub profile: String,
     pub status: u16,
     pub latency_ms: u64,
+    pub ttft_ms: Option<u64>,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 // UsageRow needs Deserialize only for the JSON store file.
@@ -21,8 +24,14 @@ impl<'de> Deserialize<'de> for UsageRow {
             profile: String,
             status: u16,
             latency_ms: u64,
+            #[serde(default)]
+            ttft_ms: Option<u64>,
             tokens_in: u64,
             tokens_out: u64,
+            #[serde(default)]
+            cache_read_tokens: u64,
+            #[serde(default)]
+            cache_write_tokens: u64,
         }
         let raw = Raw::deserialize(d)?;
         Ok(UsageRow {
@@ -31,8 +40,11 @@ impl<'de> Deserialize<'de> for UsageRow {
             profile: raw.profile,
             status: raw.status,
             latency_ms: raw.latency_ms,
+            ttft_ms: raw.ttft_ms,
             tokens_in: raw.tokens_in,
             tokens_out: raw.tokens_out,
+            cache_read_tokens: raw.cache_read_tokens,
+            cache_write_tokens: raw.cache_write_tokens,
         })
     }
 }

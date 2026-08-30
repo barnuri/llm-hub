@@ -29,14 +29,42 @@ export interface StatsEntry {
   readonly errors: number;
   readonly tokens_in: number;
   readonly tokens_out: number;
+  readonly cache_read_tokens: number;
+  readonly cache_write_tokens: number;
   readonly p50_ms: number;
   readonly p95_ms: number;
+  readonly ttft_p50_ms: number;
+  readonly ttft_p95_ms: number;
+  readonly tokens_per_sec_p50: number;
+  readonly tokens_per_sec_avg: number;
+}
+
+export interface StatsOverview {
+  readonly requests: number;
+  readonly errors: number;
+  readonly tokens_in: number;
+  readonly tokens_out: number;
+  readonly cache_read_tokens: number;
+  readonly cache_write_tokens: number;
+  readonly cache_hit_rate_pct: number;
+  readonly p50_ms: number;
+  readonly p95_ms: number;
+  readonly ttft_p50_ms: number;
+  readonly ttft_p95_ms: number;
+  readonly tokens_per_sec_p50: number;
+  readonly tokens_per_sec_avg: number;
 }
 
 export interface StatsSnapshot {
+  readonly range: string;
+  readonly persistent: boolean;
+  readonly filterable: boolean;
+  readonly overview: StatsOverview;
   readonly profiles: readonly StatsEntry[];
   readonly models: readonly StatsEntry[];
 }
+
+export type StatsRange = "live" | "1d" | "7d" | "30d" | "all";
 
 export interface UsageRow {
   readonly ts_ms: number;
@@ -44,8 +72,11 @@ export interface UsageRow {
   readonly profile: string;
   readonly status: number;
   readonly latency_ms: number;
+  readonly ttft_ms: number | null;
   readonly tokens_in: number;
   readonly tokens_out: number;
+  readonly cache_read_tokens: number;
+  readonly cache_write_tokens: number;
 }
 
 export interface UsageReport {

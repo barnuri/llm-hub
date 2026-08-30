@@ -77,7 +77,7 @@ impl BodyTransform {
     /// `None` means "fall back to scraping the tail", which is what the
     /// untransformed path does.
     #[must_use]
-    pub fn observed_usage(&self) -> Option<(u64, u64)> {
+    pub fn observed_usage(&self) -> Option<crate::services::stats::ScrapedUsage> {
         match self {
             Self::AnthropicStream(stream) => stream.observed_usage(),
             // Neither of these touches the usage object, so the raw upstream

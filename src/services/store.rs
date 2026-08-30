@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::services::stats::RequestOutcome;
+use crate::services::stats::{RequestOutcome, StatsSnapshot, snapshot_from_outcomes};
 
 const DEFAULT_SQLITE_PATH: &str = "llm-hub.db";
 const DEFAULT_JSON_PATH: &str = "llm-hub-stats.json";
@@ -42,6 +42,17 @@ struct Totals {
     errors: u64,
     tokens_in: u64,
     tokens_out: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+}
+
+/// Optional filters for store-backed stats aggregation.
+#[derive(Debug, Clone, Default)]
+pub struct StatsFilter {
+    pub since_ms: Option<u64>,
+    pub profile: Option<String>,
+    pub model: Option<String>,
+    pub range_label: String,
 }
 
 impl Store {
@@ -68,7 +79,10 @@ impl Store {
                 status INTEGER NOT NULL,
                 latency_ms INTEGER NOT NULL,
                 tokens_in INTEGER NOT NULL,
-                tokens_out INTEGER NOT NULL
+                tokens_out INTEGER NOT NULL,
+                ttft_ms INTEGER,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts_ms);
             CREATE TABLE IF NOT EXISTS api_keys (
@@ -80,6 +94,7 @@ impl Store {
             );",
         )
         .map_err(|e| format!("sqlite schema init failed: {e}"))?;
+        migrate_requests_columns(&conn)?;
         Ok(Store::Sqlite(Mutex::new(conn)))
     }
 
@@ -102,16 +117,21 @@ impl Store {
             profile: outcome.profile.clone(),
             status: outcome.status,
             latency_ms: outcome.latency_ms,
+            ttft_ms: outcome.ttft_ms,
             tokens_in: outcome.tokens_in,
             tokens_out: outcome.tokens_out,
+            cache_read_tokens: outcome.cache_read_tokens,
+            cache_write_tokens: outcome.cache_write_tokens,
         };
         match self {
             Store::Sqlite(conn) => {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
                 guard
                     .execute(
-                        "INSERT INTO requests (ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        "INSERT INTO requests (
+                            ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
+                            ttft_ms, cache_read_tokens, cache_write_tokens
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                         rusqlite::params![
                             db_i64(row.ts_ms),
                             row.model,
@@ -119,7 +139,10 @@ impl Store {
                             i64::from(row.status),
                             db_i64(row.latency_ms),
                             db_i64(row.tokens_in),
-                            db_i64(row.tokens_out)
+                            db_i64(row.tokens_out),
+                            row.ttft_ms.map(db_i64),
+                            db_i64(row.cache_read_tokens),
+                            db_i64(row.cache_write_tokens)
                         ],
                     )
                     .map_err(|e| e.to_string())?;
@@ -133,6 +156,8 @@ impl Store {
                 }
                 guard.state.totals.tokens_in += row.tokens_in;
                 guard.state.totals.tokens_out += row.tokens_out;
+                guard.state.totals.cache_read_tokens += row.cache_read_tokens;
+                guard.state.totals.cache_write_tokens += row.cache_write_tokens;
                 guard.state.recent.push(row);
                 let overflow = guard.state.recent.len().saturating_sub(USAGE_RECENT_LIMIT);
                 if overflow > 0 {
@@ -166,23 +191,14 @@ impl Store {
                     .map_err(|e| e.to_string())?;
                 let mut stmt = guard
                     .prepare(
-                        "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out
+                        "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
+                                ttft_ms, cache_read_tokens, cache_write_tokens
                          FROM requests ORDER BY id DESC LIMIT ?1",
                     )
                     .map_err(|e| e.to_string())?;
                 let limit = i64::try_from(USAGE_RECENT_LIMIT).unwrap_or(i64::MAX);
                 let recent = stmt
-                    .query_map([limit], |r| {
-                        Ok(UsageRow {
-                            ts_ms: db_u64(r.get::<_, i64>(0)?),
-                            model: r.get(1)?,
-                            profile: r.get(2)?,
-                            status: u16::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
-                            latency_ms: db_u64(r.get::<_, i64>(4)?),
-                            tokens_in: db_u64(r.get::<_, i64>(5)?),
-                            tokens_out: db_u64(r.get::<_, i64>(6)?),
-                        })
-                    })
+                    .query_map([limit], map_usage_row)
                     .map_err(|e| e.to_string())?
                     .filter_map(Result::ok)
                     .collect();
@@ -204,6 +220,96 @@ impl Store {
                     total_tokens_out: totals.tokens_out,
                     recent: guard.state.recent.iter().rev().cloned().collect(),
                 })
+            }
+        }
+    }
+
+    /// Aggregate filtered request history into the same shape as live stats.
+    pub fn stats(&self, filter: &StatsFilter) -> Result<StatsSnapshot, String> {
+        let outcomes = self.filtered_outcomes(filter)?;
+        Ok(snapshot_from_outcomes(
+            &outcomes,
+            &filter.range_label,
+            true,
+        ))
+    }
+
+    fn filtered_outcomes(&self, filter: &StatsFilter) -> Result<Vec<RequestOutcome>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut sql = String::from(
+                    "SELECT model, profile, status, latency_ms, tokens_in, tokens_out,
+                            ttft_ms, cache_read_tokens, cache_write_tokens
+                     FROM requests WHERE 1=1",
+                );
+                let mut params: Vec<rusqlite::types::Value> = Vec::new();
+                if let Some(since) = filter.since_ms {
+                    sql.push_str(" AND ts_ms >= ?");
+                    params.push(rusqlite::types::Value::Integer(db_i64(since)));
+                }
+                if let Some(profile) = &filter.profile {
+                    sql.push_str(" AND profile = ?");
+                    params.push(rusqlite::types::Value::Text(profile.clone()));
+                }
+                if let Some(model) = &filter.model {
+                    sql.push_str(" AND model = ?");
+                    params.push(rusqlite::types::Value::Text(model.clone()));
+                }
+                let mut stmt = guard.prepare(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(params), |r| {
+                        Ok(RequestOutcome {
+                            model_key: r.get(0)?,
+                            profile: r.get(1)?,
+                            status: u16::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                            latency_ms: db_u64(r.get::<_, i64>(3)?),
+                            tokens_in: db_u64(r.get::<_, i64>(4)?),
+                            tokens_out: db_u64(r.get::<_, i64>(5)?),
+                            ttft_ms: r
+                                .get::<_, Option<i64>>(6)?
+                                .map(db_u64),
+                            cache_read_tokens: db_u64(r.get::<_, i64>(7).unwrap_or(0)),
+                            cache_write_tokens: db_u64(r.get::<_, i64>(8).unwrap_or(0)),
+                        })
+                    })
+                    .map_err(|e| e.to_string())?
+                    .filter_map(Result::ok)
+                    .collect();
+                Ok(rows)
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                let rows = guard
+                    .state
+                    .recent
+                    .iter()
+                    .filter(|row| {
+                        filter
+                            .since_ms
+                            .is_none_or(|since| row.ts_ms >= since)
+                            && filter
+                                .profile
+                                .as_ref()
+                                .is_none_or(|profile| row.profile == *profile)
+                            && filter
+                                .model
+                                .as_ref()
+                                .is_none_or(|model| row.model == *model)
+                    })
+                    .map(|row| RequestOutcome {
+                        profile: row.profile.clone(),
+                        model_key: row.model.clone(),
+                        status: row.status,
+                        latency_ms: row.latency_ms,
+                        ttft_ms: row.ttft_ms,
+                        tokens_in: row.tokens_in,
+                        tokens_out: row.tokens_out,
+                        cache_read_tokens: row.cache_read_tokens,
+                        cache_write_tokens: row.cache_write_tokens,
+                    })
+                    .collect();
+                Ok(rows)
             }
         }
     }
@@ -313,6 +419,53 @@ fn db_u64(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
 }
 
+fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
+    let existing = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(requests)")
+            .map_err(|e| e.to_string())?;
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        names
+    };
+    let add = |name: &str, ddl: &str| -> Result<(), String> {
+        if existing.iter().any(|col| col == name) {
+            return Ok(());
+        }
+        conn.execute(ddl, [])
+            .map_err(|e| format!("sqlite migrate add {name}: {e}"))?;
+        Ok(())
+    };
+    add("ttft_ms", "ALTER TABLE requests ADD COLUMN ttft_ms INTEGER")?;
+    add(
+        "cache_read_tokens",
+        "ALTER TABLE requests ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add(
+        "cache_write_tokens",
+        "ALTER TABLE requests ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
+
+fn map_usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRow> {
+    Ok(UsageRow {
+        ts_ms: db_u64(r.get::<_, i64>(0)?),
+        model: r.get(1)?,
+        profile: r.get(2)?,
+        status: u16::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
+        latency_ms: db_u64(r.get::<_, i64>(4)?),
+        tokens_in: db_u64(r.get::<_, i64>(5)?),
+        tokens_out: db_u64(r.get::<_, i64>(6)?),
+        ttft_ms: r.get::<_, Option<i64>>(7)?.map(db_u64),
+        cache_read_tokens: db_u64(r.get::<_, i64>(8).unwrap_or(0)),
+        cache_write_tokens: db_u64(r.get::<_, i64>(9).unwrap_or(0)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,8 +476,11 @@ mod tests {
             model_key: "openai/gpt-4o".into(),
             status: 200,
             latency_ms: 42,
+            ttft_ms: Some(12),
             tokens_in: 5,
             tokens_out: 7,
+            cache_read_tokens: 3,
+            cache_write_tokens: 1,
         }
     }
 
@@ -338,6 +494,31 @@ mod tests {
         assert_eq!(usage.total_requests, 1);
         assert_eq!(usage.recent.len(), 1);
         assert_eq!(usage.recent[0].tokens_out, 7);
+        assert_eq!(usage.recent[0].cache_read_tokens, 3);
+        assert_eq!(usage.recent[0].ttft_ms, Some(12));
+    }
+
+    #[test]
+    fn sqlite_stats_filter_by_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        store.record(&sample_outcome()).unwrap();
+        let mut other = sample_outcome();
+        other.profile = "anthropic".into();
+        other.model_key = "anthropic/claude".into();
+        store.record(&other).unwrap();
+        let snap = store
+            .stats(&StatsFilter {
+                since_ms: None,
+                profile: Some("openai".into()),
+                model: None,
+                range_label: "all".into(),
+            })
+            .unwrap();
+        assert_eq!(snap.overview.requests, 1);
+        assert_eq!(snap.profiles[0].key, "openai");
+        assert!(snap.overview.tokens_per_sec_avg > 0.0);
     }
 
     #[test]
@@ -371,6 +552,7 @@ mod tests {
         let store = Store::open("json", Some(path_str)).unwrap();
         let usage = store.usage().unwrap();
         assert_eq!(usage.total_requests, 1);
+        assert_eq!(usage.recent[0].cache_write_tokens, 1);
     }
 
     #[test]
