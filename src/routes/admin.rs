@@ -9,9 +9,10 @@ use serde_json::{Value, json};
 use crate::configs::{HubConfig, ProfileConfig, mask_key};
 use crate::consts::{ENV_FILE, VERSION};
 use crate::dependencies::state::AppState;
+use crate::schemas::api_key_record::ApiKeyRecord;
 use crate::schemas::app_error::AppError;
 use crate::services::env_writer;
-use crate::services::store::{ApiKeyRecord, hash_key, now_ms};
+use crate::services::store::{hash_key, now_ms};
 
 #[derive(Deserialize)]
 pub struct ProfileInput {
