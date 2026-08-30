@@ -96,6 +96,7 @@ through with fallbacks disabled.
 | `LLM_HUB_PROFILES` | auto | Optional: profiles are discovered from `_BASE_URL` vars; set this to control order, subset, or dashed names |
 | `LLM_HUB_<NAME>_BASE_URL` | — | Upstream base URL (per profile, required) |
 | `LLM_HUB_<NAME>_API_KEY` | empty | Upstream key, injected on forward |
+| `LLM_HUB_<NAME>_DISPLAY_NAME` | — | Optional UI label; routing id stays `<NAME>` |
 | `LLM_HUB_<NAME>_HEADERS` | — | Extra headers, JSON object |
 | `LLM_HUB_<NAME>_TIMEOUT_MS` | none | Per-attempt timeout for this profile |
 | `LLM_HUB_<NAME>_ENABLED` | `true` | Disable without deleting |

@@ -1,5 +1,9 @@
 export interface ProfileRow {
   readonly name: string;
+  /** Optional UI label; falls back to `name` when absent. */
+  readonly display_name: string | null;
+  /** Server-resolved label (`display_name` or `name`). */
+  readonly label: string;
   readonly base_url: string;
   readonly api_key_masked: string;
   readonly headers: Record<string, string>;

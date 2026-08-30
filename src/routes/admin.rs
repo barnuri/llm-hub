@@ -17,6 +17,7 @@ use crate::services::store::{hash_key, now_ms};
 #[derive(Deserialize)]
 pub struct ProfileInput {
     pub name: String,
+    pub display_name: Option<String>,
     pub base_url: String,
     /// Omitted or empty on update => keep the existing key (write-only field).
     pub api_key: Option<String>,
@@ -35,6 +36,8 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
         .map(|p| {
             json!({
                 "name": p.name,
+                "display_name": p.display_name,
+                "label": p.label(),
                 "base_url": p.base_url,
                 "api_key_masked": mask_key(&p.api_key),
                 "headers": p.extra_headers.iter().cloned().collect::<HashMap<_, _>>(),
@@ -73,8 +76,13 @@ pub async fn upsert_profile(
         Some(key) => key,
         None => existing.map(|p| p.api_key.clone()).unwrap_or_default(),
     };
+    let display_name = input
+        .display_name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let profile = ProfileConfig {
         name: input.name.trim().to_string(),
+        display_name,
         base_url: input.base_url.trim().trim_end_matches('/').to_string(),
         api_key,
         extra_headers: input.headers.unwrap_or_default().into_iter().collect(),

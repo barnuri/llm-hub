@@ -123,7 +123,7 @@ export function App() {
                 return (
                   <li key={profile.name}>
                     <span className={`led ${led}`}></span>
-                    {profile.name}
+                    {profile.label}
                   </li>
                 );
               })}

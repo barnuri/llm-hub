@@ -13,6 +13,7 @@ interface ProfilesScreenProps {
 interface FormState {
   readonly existing: ProfileRow | null;
   name: string;
+  displayName: string;
   baseUrl: string;
   apiKey: string;
   models: string;
@@ -25,12 +26,21 @@ export function ProfilesScreen({ meta, onChanged, onToast }: ProfilesScreenProps
   const readonly = meta?.readonly ?? false;
 
   const openAdd = () =>
-    setForm({ existing: null, name: "", baseUrl: "", apiKey: "", models: "", enabled: true });
+    setForm({
+      existing: null,
+      name: "",
+      displayName: "",
+      baseUrl: "",
+      apiKey: "",
+      models: "",
+      enabled: true,
+    });
 
   const openEdit = (profile: ProfileRow) =>
     setForm({
       existing: profile,
       name: profile.name,
+      displayName: profile.display_name ?? "",
       baseUrl: profile.base_url,
       apiKey: "",
       models: profile.models.join(","),
@@ -46,6 +56,7 @@ export function ProfilesScreen({ meta, onChanged, onToast }: ProfilesScreenProps
         method: "POST",
         body: JSON.stringify({
           name: form.name.trim(),
+          display_name: form.displayName.trim() || null,
           base_url: form.baseUrl.trim(),
           api_key: form.apiKey || undefined,
           models: form.models.split(",").map((s) => s.trim()).filter(Boolean),
@@ -104,6 +115,7 @@ export function ProfilesScreen({ meta, onChanged, onToast }: ProfilesScreenProps
         <thead>
           <tr>
             <th>Name</th>
+            <th>Label</th>
             <th>Base URL</th>
             <th>Key</th>
             <th>Enabled</th>
@@ -114,6 +126,7 @@ export function ProfilesScreen({ meta, onChanged, onToast }: ProfilesScreenProps
           {(meta?.profiles ?? []).map((profile) => (
             <tr key={profile.name}>
               <td className="mono">{profile.name}</td>
+              <td>{profile.label}</td>
               <td className="mono">{profile.base_url}</td>
               <td className="mono">{profile.api_key_masked || "—"}</td>
               <td>{profile.enabled ? "yes" : "no"}</td>
@@ -148,6 +161,16 @@ export function ProfilesScreen({ meta, onChanged, onToast }: ProfilesScreenProps
               value={form.name}
               readOnly={form.existing !== null}
               onChange={(event) => setForm({ ...form, name: event.target.value })}
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="f-display">Display name (optional UI label)</label>
+            <input
+              id="f-display"
+              className="input"
+              placeholder={form.name.trim() || "same as name"}
+              value={form.displayName}
+              onChange={(event) => setForm({ ...form, displayName: event.target.value })}
             />
           </div>
           <div className="field">

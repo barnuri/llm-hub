@@ -20,6 +20,14 @@ pub fn upsert_profile(
 
     let mut new_vars: Vec<(String, String)> =
         vec![(format!("{upper}_BASE_URL"), profile.base_url.clone())];
+    if let Some(label) = profile
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        new_vars.push((format!("{upper}_DISPLAY_NAME"), label.to_string()));
+    }
     if !profile.api_key.is_empty() {
         new_vars.push((format!("{upper}_API_KEY"), profile.api_key.clone()));
     }
@@ -105,6 +113,7 @@ mod tests {
     fn sample_profile() -> ProfileConfig {
         ProfileConfig {
             name: "groq".into(),
+            display_name: Some("Groq Cloud".into()),
             base_url: "https://api.groq.com/openai/v1".into(),
             api_key: "gsk-12345".into(),
             extra_headers: vec![],
@@ -130,6 +139,7 @@ mod tests {
         assert!(content.starts_with("# my comment\n"), "comment preserved");
         assert!(content.contains("LLM_HUB_PROFILES=openai,groq"));
         assert!(content.contains("LLM_HUB_GROQ_BASE_URL=https://api.groq.com/openai/v1"));
+        assert!(content.contains("LLM_HUB_GROQ_DISPLAY_NAME=Groq Cloud"));
         assert!(content.contains("LLM_HUB_GROQ_API_KEY=gsk-12345"));
 
         // update: change key, ensure no duplicate lines

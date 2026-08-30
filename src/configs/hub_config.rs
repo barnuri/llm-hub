@@ -112,8 +112,11 @@ impl HubConfig {
             ),
         };
 
+        let display_name = get("DISPLAY_NAME").filter(|v| !v.is_empty());
+
         Ok(ProfileConfig {
             name: name.to_string(),
+            display_name,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: get("API_KEY").unwrap_or_default(),
             extra_headers,
@@ -260,6 +263,7 @@ mod tests {
         vars.insert("LLM_HUB_GROQ_TIMEOUT_MS".into(), "30000".into());
         vars.insert("LLM_HUB_GROQ_ENABLED".into(), "false".into());
         vars.insert("LLM_HUB_GROQ_MODELS".into(), "a, b".into());
+        vars.insert("LLM_HUB_GROQ_DISPLAY_NAME".into(), "Groq Cloud".into());
         vars.insert("LLM_HUB_MASTER_KEY".into(), "secret".into());
         let cfg = HubConfig::from_map(&vars).unwrap();
         let groq = cfg.profile("groq").unwrap();
@@ -270,7 +274,10 @@ mod tests {
         assert_eq!(groq.timeout_ms, Some(30000));
         assert!(!groq.enabled);
         assert_eq!(groq.static_models, vec!["a", "b"]);
+        assert_eq!(groq.display_name.as_deref(), Some("Groq Cloud"));
+        assert_eq!(groq.label(), "Groq Cloud");
         assert_eq!(cfg.master_key.as_deref(), Some("secret"));
+        assert_eq!(cfg.profile("openai").unwrap().label(), "openai");
     }
 
     #[test]
