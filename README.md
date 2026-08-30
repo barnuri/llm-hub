@@ -92,7 +92,9 @@ through with fallbacks disabled.
 Set the default chain any of three ways (per-request header always wins):
 
 - **UI** — the **Profiles** tab has a "Default fallbacks" editor: pick models
-  from the live list, reorder, save.
+  from the live list, reorder, save. For the per-request header, the **Setup**
+  tab has an optional fallback picker that bakes `X-LLM-Hub-Fallbacks` into
+  every generated client snippet.
 - **API** — `POST /api/fallbacks` with
   `{"fallbacks":["groq/llama-3.3-70b-versatile","openai/gpt-4o-mini"]}`.
 - **Env** — `LLM_HUB_DEFAULT_FALLBACKS=groq/llama-3.3-70b-versatile,openai/gpt-4o-mini`
