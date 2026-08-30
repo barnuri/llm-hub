@@ -142,7 +142,9 @@ keys, and fallbacks. The definition also bakes in `LLM_HUB_PORT=8888` and
 serves on `0.0.0.0:8888`, while foreground runs keep using `.env`. Logs land in
 `<that directory>/logs/llm-hub.log`. `llm-hub service uninstall` removes it,
 `llm-hub service status` checks it. Reinstall after updating to pick up
-definition changes.
+definition changes. On macOS, install also adds the binary to the Application
+Firewall allow list (sudo may prompt) — without it, macOS silently drops LAN
+connections to unsigned background binaries on every port.
 
 ## Updating
 

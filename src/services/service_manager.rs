@@ -164,8 +164,33 @@ mod platform {
         let domain = format!("gui/{}", uid()?);
         let plist_arg = plist.display().to_string();
         run("launchctl", &["bootstrap", &domain, &plist_arg])?;
+        allow_through_firewall(exe);
         println!("service {SERVICE_LABEL} installed and running");
         Ok(())
+    }
+
+    /// The macOS Application Firewall blocks inbound connections to unsigned
+    /// background binaries per-app (any port), so a LAN bind needs the binary
+    /// on its allow list. Best-effort: install still succeeds if this fails —
+    /// sudo prompts in the terminal, and on failure we print the manual fix.
+    fn allow_through_firewall(exe: &Path) {
+        const FIREWALL: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
+        let enabled = std::process::Command::new(FIREWALL)
+            .arg("--getglobalstate")
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("enabled"));
+        if !enabled {
+            return;
+        }
+        let exe_arg = exe.display().to_string();
+        println!("macOS firewall is on — allowing {exe_arg} (sudo may prompt)");
+        let allowed = run("sudo", &[FIREWALL, "--add", &exe_arg])
+            .and_then(|()| run("sudo", &[FIREWALL, "--unblockapp", &exe_arg]));
+        if let Err(e) = allowed {
+            println!("could not update the firewall ({e}); run manually:");
+            println!("  sudo {FIREWALL} --add \"{exe_arg}\"");
+            println!("  sudo {FIREWALL} --unblockapp \"{exe_arg}\"");
+        }
     }
 
     pub fn uninstall() -> Result<(), String> {
