@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct UsageRow {
     pub ts_ms: u64,
     pub model: String,

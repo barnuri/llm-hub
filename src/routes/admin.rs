@@ -3,29 +3,19 @@ use std::path::Path;
 
 use axum::Json;
 use axum::extract::{Path as UrlPath, State};
-use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::configs::{HubConfig, ProfileConfig, mask_key};
+use crate::configs::{ProfileConfig, mask_key};
 use crate::consts::{ENV_FILE, VERSION};
 use crate::dependencies::state::AppState;
+use crate::schemas::api_key_input::ApiKeyInput;
 use crate::schemas::api_key_record::ApiKeyRecord;
 use crate::schemas::app_error::AppError;
+use crate::schemas::profile_input::ProfileInput;
 use crate::services::env_writer;
 use crate::services::store::{hash_key, now_ms};
-
-#[derive(Deserialize)]
-pub struct ProfileInput {
-    pub name: String,
-    pub display_name: Option<String>,
-    pub base_url: String,
-    /// Omitted or empty on update => keep the existing key (write-only field).
-    pub api_key: Option<String>,
-    pub headers: Option<HashMap<String, String>>,
-    pub timeout_ms: Option<u64>,
-    pub enabled: Option<bool>,
-    pub models: Option<Vec<String>>,
-}
+use crate::utils::hex::to_hex;
+use crate::utils::time::elapsed_ms;
 
 pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
     let config = state.config();
@@ -65,13 +55,14 @@ pub async fn upsert_profile(
     if config.config_readonly {
         return Err(AppError::ReadOnly);
     }
-    if input.name.contains('/') || input.name.trim().is_empty() {
+    let name = input.name.trim().to_string();
+    if name.contains('/') || name.is_empty() {
         return Err(AppError::BadRequest(
             "profile name must be non-empty and contain no '/'".into(),
         ));
     }
 
-    let existing = config.profile(&input.name);
+    let existing = config.profile(&name);
     let api_key = match input.api_key.filter(|k| !k.is_empty()) {
         Some(key) => key,
         None => existing.map(|p| p.api_key.clone()).unwrap_or_default(),
@@ -81,7 +72,7 @@ pub async fn upsert_profile(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let profile = ProfileConfig {
-        name: input.name.trim().to_string(),
+        name,
         display_name,
         base_url: input.base_url.trim().trim_end_matches('/').to_string(),
         api_key,
@@ -156,7 +147,7 @@ pub async fn test_profile(
             Ok(Json(json!({
                 "ok": healthy,
                 "status": response.status().as_u16(),
-                "latency_ms": started.elapsed().as_millis() as u64,
+                "latency_ms": elapsed_ms(started),
             })))
         }
         Ok(Err(e)) => {
@@ -182,15 +173,12 @@ pub async fn usage(State(state): State<AppState>) -> Result<Json<Value>, AppErro
         ));
     };
     let report = store.usage().map_err(AppError::Internal)?;
-    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
+    let body = serde_json::to_value(report)
+        .map_err(|e| AppError::Internal(format!("serialize usage report failed: {e}")))?;
+    Ok(Json(body))
 }
 
 // --- hub api keys ---
-
-#[derive(Deserialize)]
-pub struct ApiKeyInput {
-    pub name: String,
-}
 
 pub async fn list_api_keys(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let Some(store) = state.store() else {
@@ -246,12 +234,11 @@ pub async fn delete_api_key(
 
 fn generate_key() -> String {
     let bytes: [u8; 24] = rand::random();
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("sk-hub-{hex}")
+    format!("sk-hub-{}", to_hex(&bytes))
 }
 
 fn reload_config(state: &AppState) -> Result<(), AppError> {
-    let vars = crate::load_env_vars();
-    let config = HubConfig::from_map(&vars).map_err(AppError::Internal)?;
-    state.swap_config(config).map_err(AppError::Internal)
+    crate::services::config_reload::reload(state)
+        .map(|_| ())
+        .map_err(AppError::Internal)
 }

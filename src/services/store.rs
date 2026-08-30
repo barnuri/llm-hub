@@ -15,26 +15,28 @@ const DEFAULT_SQLITE_PATH: &str = "llm-hub.db";
 const DEFAULT_JSON_PATH: &str = "llm-hub-stats.json";
 const USAGE_RECENT_LIMIT: usize = 200;
 
-/// Durable store behind LLM_HUB_PERSISTENT=true. Sqlite keeps a full request
+/// Durable store behind `LLM_HUB_PERSISTENT=true`. Sqlite keeps a full request
 /// log; Json keeps a rolling recent window flushed on every write batch.
+#[derive(Debug)]
 pub enum Store {
     Sqlite(Mutex<Connection>),
     Json(Mutex<JsonStore>),
 }
 
+#[derive(Debug)]
 pub struct JsonStore {
     path: PathBuf,
     state: JsonState,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct JsonState {
     totals: Totals,
     recent: Vec<UsageRow>,
     api_keys: Vec<ApiKeyRecord>,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct Totals {
     requests: u64,
     errors: u64,
@@ -47,7 +49,7 @@ impl Store {
     pub fn open(kind: &str, path: Option<&str>) -> Result<Store, String> {
         match kind {
             "sqlite" => Self::open_sqlite(path.unwrap_or(DEFAULT_SQLITE_PATH)),
-            "json" => Self::open_json(path.unwrap_or(DEFAULT_JSON_PATH)),
+            "json" => Ok(Self::open_json(path.unwrap_or(DEFAULT_JSON_PATH))),
             other => Err(format!(
                 "unknown LLM_HUB_STORE: {other} (expected sqlite or json)"
             )),
@@ -81,16 +83,16 @@ impl Store {
         Ok(Store::Sqlite(Mutex::new(conn)))
     }
 
-    fn open_json(path: &str) -> Result<Store, String> {
+    fn open_json(path: &str) -> Store {
         let path_buf = PathBuf::from(path);
         let state = match std::fs::read(&path_buf) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(_) => JsonState::default(),
         };
-        Ok(Store::Json(Mutex::new(JsonStore {
+        Store::Json(Mutex::new(JsonStore {
             path: path_buf,
             state,
-        })))
+        }))
     }
 
     pub fn record(&self, outcome: &RequestOutcome) -> Result<(), String> {
@@ -110,7 +112,15 @@ impl Store {
                     .execute(
                         "INSERT INTO requests (ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        rusqlite::params![row.ts_ms as i64, row.model, row.profile, row.status as i64, row.latency_ms as i64, row.tokens_in as i64, row.tokens_out as i64],
+                        rusqlite::params![
+                            db_i64(row.ts_ms),
+                            row.model,
+                            row.profile,
+                            i64::from(row.status),
+                            db_i64(row.latency_ms),
+                            db_i64(row.tokens_in),
+                            db_i64(row.tokens_out)
+                        ],
                     )
                     .map_err(|e| e.to_string())?;
                 Ok(())
@@ -146,10 +156,10 @@ impl Store {
                         [],
                         |r| {
                             Ok((
-                                r.get::<_, i64>(0)? as u64,
-                                r.get::<_, i64>(1)? as u64,
-                                r.get::<_, i64>(2)? as u64,
-                                r.get::<_, i64>(3)? as u64,
+                                db_u64(r.get::<_, i64>(0)?),
+                                db_u64(r.get::<_, i64>(1)?),
+                                db_u64(r.get::<_, i64>(2)?),
+                                db_u64(r.get::<_, i64>(3)?),
                             ))
                         },
                     )
@@ -160,16 +170,17 @@ impl Store {
                          FROM requests ORDER BY id DESC LIMIT ?1",
                     )
                     .map_err(|e| e.to_string())?;
+                let limit = i64::try_from(USAGE_RECENT_LIMIT).unwrap_or(i64::MAX);
                 let recent = stmt
-                    .query_map([USAGE_RECENT_LIMIT as i64], |r| {
+                    .query_map([limit], |r| {
                         Ok(UsageRow {
-                            ts_ms: r.get::<_, i64>(0)? as u64,
+                            ts_ms: db_u64(r.get::<_, i64>(0)?),
                             model: r.get(1)?,
                             profile: r.get(2)?,
-                            status: r.get::<_, i64>(3)? as u16,
-                            latency_ms: r.get::<_, i64>(4)? as u64,
-                            tokens_in: r.get::<_, i64>(5)? as u64,
-                            tokens_out: r.get::<_, i64>(6)? as u64,
+                            status: u16::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
+                            latency_ms: db_u64(r.get::<_, i64>(4)?),
+                            tokens_in: db_u64(r.get::<_, i64>(5)?),
+                            tokens_out: db_u64(r.get::<_, i64>(6)?),
                         })
                     })
                     .map_err(|e| e.to_string())?
@@ -211,7 +222,7 @@ impl Store {
                             key_hash: r.get(1)?,
                             masked: r.get(2)?,
                             enabled: r.get::<_, i64>(3)? != 0,
-                            created_ms: r.get::<_, i64>(4)? as u64,
+                            created_ms: db_u64(r.get::<_, i64>(4)?),
                         })
                     })
                     .map_err(|e| e.to_string())?
@@ -233,7 +244,13 @@ impl Store {
                 guard
                     .execute(
                         "INSERT INTO api_keys (name, key_hash, masked, enabled, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        rusqlite::params![record.name, record.key_hash, record.masked, record.enabled as i64, record.created_ms as i64],
+                        rusqlite::params![
+                            record.name,
+                            record.key_hash,
+                            record.masked,
+                            i64::from(record.enabled),
+                            db_i64(record.created_ms)
+                        ],
                     )
                     .map_err(|e| format!("insert api key failed (duplicate name?): {e}"))?;
                 Ok(())
@@ -277,17 +294,24 @@ impl JsonStore {
 }
 
 pub fn hash_key(key: &str) -> String {
-    Sha256::digest(key.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    crate::utils::hex::to_hex(&Sha256::digest(key.as_bytes()))
 }
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+/// SQLite stores only `i64`; values here are counters/timestamps, so clamping
+/// at the type bounds is the correct lossy edge behavior.
+fn db_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+fn db_u64(v: i64) -> u64 {
+    u64::try_from(v).unwrap_or(0)
 }
 
 #[cfg(test)]

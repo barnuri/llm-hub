@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ApiKeyRecord {
     pub name: String,
     /// SHA-256 hex of the key — the key itself is never stored.

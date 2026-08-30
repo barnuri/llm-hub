@@ -104,6 +104,10 @@ impl AppState {
         self.0.model_cache.store(Arc::new(Some(Arc::new(cached))));
     }
 
+    pub fn clear_model_cache(&self) {
+        self.0.model_cache.store(Arc::new(None));
+    }
+
     pub fn set_upstream_health(&self, profile: &str, healthy: bool) {
         self.0.upstream_health.insert(profile.to_string(), healthy);
     }

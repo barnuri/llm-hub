@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod config_reload;
 pub mod env_writer;
 pub mod fallback;
 pub mod service_manager;

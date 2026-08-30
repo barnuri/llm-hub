@@ -338,7 +338,7 @@ fn build_response(
         let tail_bytes = tail_receiver.await.unwrap_or_default();
         let (tokens_in, tokens_out) = scrape_usage(&tail_bytes);
         let outcome = RequestOutcome {
-            latency_ms: started.elapsed().as_millis() as u64,
+            latency_ms: crate::utils::time::elapsed_ms(started),
             tokens_in,
             tokens_out,
             ..outcome_seed
@@ -358,10 +358,9 @@ fn build_response(
     builder
         .body(Body::from_stream(observed))
         .unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::empty())
-                .expect("static fallback response is valid")
+            let mut fallback = Response::new(Body::empty());
+            *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            fallback
         })
 }
 
@@ -370,7 +369,7 @@ fn record_failure(state: &AppState, model_id: &ModelId, status: u16, started: In
         profile: model_id.profile.clone(),
         model_key: model_id.qualified(),
         status: if status == 0 { 599 } else { status },
-        latency_ms: started.elapsed().as_millis() as u64,
+        latency_ms: crate::utils::time::elapsed_ms(started),
         tokens_in: 0,
         tokens_out: 0,
     };

@@ -1,3 +1,7 @@
+#![deny(clippy::all)]
+#![warn(clippy::pedantic)]
+#![deny(rust_2018_idioms)]
+
 mod configs;
 mod consts;
 mod dependencies;
@@ -19,7 +23,8 @@ use crate::dependencies::state::AppState;
 use crate::services::store::Store;
 
 /// Env-file pairs merged with process env (process env wins). Reads via
-/// from_path_iter so reloads never mutate global process state.
+/// `from_path_iter` so reloads never mutate global process state.
+#[must_use]
 pub fn load_env_vars() -> HashMap<String, String> {
     let mut vars: HashMap<String, String> = HashMap::new();
     if let Ok(iter) = dotenvy::from_path_iter(ENV_FILE) {
@@ -42,37 +47,7 @@ async fn main() {
         )
         .init();
 
-    match std::env::args().nth(1).as_deref() {
-        Some("--version") | Some("-V") | Some("version") => {
-            println!("llm-hub v{VERSION}");
-            return;
-        }
-        _ => {}
-    }
-
-    if std::env::args().nth(1).as_deref() == Some("update") {
-        if let Err(e) = services::update::self_update().await {
-            eprintln!("update failed: {e}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    if std::env::args().nth(1).as_deref() == Some("service") {
-        let action = std::env::args().nth(2).unwrap_or_default();
-        let result = match action.as_str() {
-            "install" => services::service_manager::install(),
-            "uninstall" => services::service_manager::uninstall(),
-            "status" => services::service_manager::status(),
-            _ => {
-                eprintln!("usage: llm-hub service <install|uninstall|status>");
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = result {
-            eprintln!("service {action} failed: {e}");
-            std::process::exit(1);
-        }
+    if run_cli_command().await {
         return;
     }
 
@@ -106,7 +81,77 @@ async fn main() {
     routes::models::spawn_background_refresh(state.clone());
     let restart_notify = Arc::new(tokio::sync::Notify::new());
     services::update::spawn_auto_update(auto_update, restart_notify.clone());
+    services::config_reload::spawn_env_watcher(state.clone(), restart_notify.clone());
 
+    let app = build_router(state);
+
+    let listener = match tokio::net::TcpListener::bind(&bind).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("cannot bind {bind}: {e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!("llm-hub v{VERSION} listening on http://{bind}");
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                () = wait_for_ctrl_c() => {}
+                () = restart_notify.notified() => {}
+            }
+        })
+        .await
+    {
+        eprintln!("server error: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn wait_for_ctrl_c() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Handles `--version`, `update`, and `service` invocations.
+/// Returns true when a CLI command was handled and the process should exit.
+async fn run_cli_command() -> bool {
+    match std::env::args().nth(1).as_deref() {
+        Some("--version" | "-V" | "version") => {
+            println!("llm-hub v{VERSION}");
+            true
+        }
+        Some("update") => {
+            if let Err(e) = services::update::self_update().await {
+                eprintln!("update failed: {e}");
+                std::process::exit(1);
+            }
+            true
+        }
+        Some("service") => {
+            run_service_command();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn run_service_command() {
+    let action = std::env::args().nth(2).unwrap_or_default();
+    let result = match action.as_str() {
+        "install" => services::service_manager::install(),
+        "uninstall" => services::service_manager::uninstall(),
+        "status" => services::service_manager::status(),
+        _ => {
+            eprintln!("usage: llm-hub service <install|uninstall|status>");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = result {
+        eprintln!("service {action} failed: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/v1/models", get(routes::models::list_models))
         .route("/v1/models/{*id}", get(routes::proxy::get_model_by_id))
@@ -135,32 +180,11 @@ async fn main() {
             services::auth::require_master_key,
         ));
 
-    let app = Router::new()
+    Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .merge(protected)
         .fallback(routes::ui::serve)
-        .with_state(state);
-
-    let listener = match tokio::net::TcpListener::bind(&bind).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            eprintln!("cannot bind {bind}: {e}");
-            std::process::exit(1);
-        }
-    };
-    tracing::info!("llm-hub v{VERSION} listening on http://{bind}");
-    if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = restart_notify.notified() => {}
-            }
-        })
-        .await
-    {
-        eprintln!("server error: {e}");
-        std::process::exit(1);
-    }
+        .with_state(state)
 }
 
 fn open_store(config: &HubConfig) -> Result<Option<Store>, String> {

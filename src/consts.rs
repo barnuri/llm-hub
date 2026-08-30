@@ -22,6 +22,8 @@ pub const HEADER_SERVED_MODEL: &str = "x-llm-hub-model";
 pub const HEADER_ATTEMPTS: &str = "x-llm-hub-attempts";
 
 pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often the running process re-reads `.env` for external edits.
+pub const ENV_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 /// launchd LaunchAgent label (and plist file stem) on macOS.
 pub const SERVICE_LABEL: &str = "com.barnuri.llm-hub";
 /// systemd user unit name on Linux / Task Scheduler task name on Windows.
