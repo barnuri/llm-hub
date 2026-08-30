@@ -163,6 +163,12 @@ mod platform {
         println!("wrote {}", plist.display());
         let domain = format!("gui/{}", uid()?);
         let plist_arg = plist.display().to_string();
+        // Reinstall-safe: unload any previous registration first (ignore
+        // "not loaded"), so rerunning install applies the fresh definition.
+        let target = format!("{domain}/{SERVICE_LABEL}");
+        if run("launchctl", &["bootout", &target]).is_err() {
+            println!("note: service was not previously loaded");
+        }
         run("launchctl", &["bootstrap", &domain, &plist_arg])?;
         allow_through_firewall(exe);
         println!("service {SERVICE_LABEL} installed and running");
@@ -244,6 +250,9 @@ mod platform {
         println!("wrote {}", unit.display());
         run("systemctl", &["--user", "daemon-reload"])?;
         run("systemctl", &["--user", "enable", "--now", SERVICE_NAME])?;
+        // enable --now is a no-op when already running — restart so a
+        // reinstall always picks up the rewritten unit.
+        run("systemctl", &["--user", "restart", SERVICE_NAME])?;
         println!(
             "hint: run `loginctl enable-linger $USER` so the service starts at boot without a login session"
         );
