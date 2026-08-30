@@ -1,0 +1,248 @@
+use std::collections::HashMap;
+use std::path::Path;
+
+use axum::Json;
+use axum::extract::{Path as UrlPath, State};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::configs::{HubConfig, ProfileConfig, mask_key};
+use crate::consts::{ENV_FILE, VERSION};
+use crate::dependencies::state::AppState;
+use crate::schemas::app_error::AppError;
+use crate::services::env_writer;
+use crate::services::store::{ApiKeyRecord, hash_key, now_ms};
+
+#[derive(Deserialize)]
+pub struct ProfileInput {
+    pub name: String,
+    pub base_url: String,
+    /// Omitted or empty on update => keep the existing key (write-only field).
+    pub api_key: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub timeout_ms: Option<u64>,
+    pub enabled: Option<bool>,
+    pub models: Option<Vec<String>>,
+}
+
+pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
+    let config = state.config();
+    let health = state.upstream_health();
+    let profiles: Vec<Value> = config
+        .profiles
+        .iter()
+        .map(|p| {
+            json!({
+                "name": p.name,
+                "base_url": p.base_url,
+                "api_key_masked": mask_key(&p.api_key),
+                "headers": p.extra_headers.iter().cloned().collect::<HashMap<_, _>>(),
+                "timeout_ms": p.timeout_ms,
+                "enabled": p.enabled,
+                "models": p.static_models,
+                "healthy": health.get(&p.name).copied(),
+            })
+        })
+        .collect();
+    Json(json!({
+        "profiles": profiles,
+        "readonly": config.config_readonly,
+        "persistent": config.persistent,
+        "auth_enabled": config.master_key.is_some() || !state.api_key_hashes().is_empty(),
+        "version": VERSION,
+    }))
+}
+
+pub async fn upsert_profile(
+    State(state): State<AppState>,
+    Json(input): Json<ProfileInput>,
+) -> Result<Json<Value>, AppError> {
+    let config = state.config();
+    if config.config_readonly {
+        return Err(AppError::ReadOnly);
+    }
+    if input.name.contains('/') || input.name.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "profile name must be non-empty and contain no '/'".into(),
+        ));
+    }
+
+    let existing = config.profile(&input.name);
+    let api_key = match input.api_key.filter(|k| !k.is_empty()) {
+        Some(key) => key,
+        None => existing.map(|p| p.api_key.clone()).unwrap_or_default(),
+    };
+    let profile = ProfileConfig {
+        name: input.name.trim().to_string(),
+        base_url: input.base_url.trim().trim_end_matches('/').to_string(),
+        api_key,
+        extra_headers: input.headers.unwrap_or_default().into_iter().collect(),
+        timeout_ms: input.timeout_ms,
+        enabled: input.enabled.unwrap_or(true),
+        static_models: input.models.unwrap_or_default(),
+    };
+    if !profile.base_url.starts_with("http://") && !profile.base_url.starts_with("https://") {
+        return Err(AppError::BadRequest(
+            "base_url must start with http:// or https://".into(),
+        ));
+    }
+
+    let mut names: Vec<String> = config.profiles.iter().map(|p| p.name.clone()).collect();
+    if !names.contains(&profile.name) {
+        names.push(profile.name.clone());
+    }
+    env_writer::upsert_profile(Path::new(ENV_FILE), &profile, &names)
+        .map_err(AppError::Internal)?;
+    reload_config(&state)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn delete_profile(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let config = state.config();
+    if config.config_readonly {
+        return Err(AppError::ReadOnly);
+    }
+    if config.profile(&name).is_none() {
+        return Err(AppError::NotFound(format!("no such profile: {name}")));
+    }
+    let remaining: Vec<String> = config
+        .profiles
+        .iter()
+        .map(|p| p.name.clone())
+        .filter(|n| *n != name)
+        .collect();
+    env_writer::remove_profile(Path::new(ENV_FILE), &name, &remaining)
+        .map_err(AppError::Internal)?;
+    reload_config(&state)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn test_profile(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let config = state.config();
+    let profile = config
+        .profile(&name)
+        .ok_or_else(|| AppError::NotFound(format!("no such profile: {name}")))?;
+    let client = state
+        .client(&name)
+        .ok_or_else(|| AppError::Internal("no client".into()))?;
+
+    let mut request = client.get(format!("{}/models", profile.base_url));
+    if !profile.api_key.is_empty() {
+        request = request.bearer_auth(&profile.api_key);
+    }
+    for (header_name, value) in &profile.extra_headers {
+        request = request.header(header_name, value);
+    }
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(crate::consts::MODELS_FANOUT_TIMEOUT, request.send()).await {
+        Ok(Ok(response)) => {
+            let healthy = response.status().is_success();
+            state.set_upstream_health(&name, healthy);
+            Ok(Json(json!({
+                "ok": healthy,
+                "status": response.status().as_u16(),
+                "latency_ms": started.elapsed().as_millis() as u64,
+            })))
+        }
+        Ok(Err(e)) => {
+            state.set_upstream_health(&name, false);
+            Ok(Json(json!({ "ok": false, "error": e.to_string() })))
+        }
+        Err(_) => {
+            state.set_upstream_health(&name, false);
+            Ok(Json(json!({ "ok": false, "error": "timeout" })))
+        }
+    }
+}
+
+pub async fn stats(State(state): State<AppState>) -> Json<Value> {
+    let snapshot = state.stats().snapshot();
+    Json(json!({ "profiles": snapshot.profiles, "models": snapshot.models }))
+}
+
+pub async fn usage(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let Some(store) = state.store() else {
+        return Err(AppError::BadRequest(
+            "persistence is off — set LLM_HUB_PERSISTENT=true to keep usage history".into(),
+        ));
+    };
+    let report = store.usage().map_err(AppError::Internal)?;
+    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
+}
+
+// --- hub api keys ---
+
+#[derive(Deserialize)]
+pub struct ApiKeyInput {
+    pub name: String,
+}
+
+pub async fn list_api_keys(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let Some(store) = state.store() else {
+        return Ok(Json(json!({ "persistent": false, "keys": [] })));
+    };
+    let keys = store.list_api_keys().map_err(AppError::Internal)?;
+    let rows: Vec<Value> = keys
+        .iter()
+        .map(|k| json!({ "name": k.name, "masked": k.masked, "enabled": k.enabled, "created_ms": k.created_ms }))
+        .collect();
+    Ok(Json(json!({ "persistent": true, "keys": rows })))
+}
+
+/// Creates a key and returns it ONCE — only the hash is stored.
+pub async fn create_api_key(
+    State(state): State<AppState>,
+    Json(input): Json<ApiKeyInput>,
+) -> Result<Json<Value>, AppError> {
+    let Some(store) = state.store() else {
+        return Err(AppError::BadRequest(
+            "persistence is off — set LLM_HUB_PERSISTENT=true to manage api keys".into(),
+        ));
+    };
+    if input.name.trim().is_empty() {
+        return Err(AppError::BadRequest("key name must not be empty".into()));
+    }
+    let key = generate_key();
+    let record = ApiKeyRecord {
+        name: input.name.trim().to_string(),
+        key_hash: hash_key(&key),
+        masked: mask_key(&key),
+        enabled: true,
+        created_ms: now_ms(),
+    };
+    store
+        .insert_api_key(&record)
+        .map_err(AppError::BadRequest)?;
+    state.refresh_api_key_hashes();
+    Ok(Json(json!({ "name": record.name, "key": key })))
+}
+
+pub async fn delete_api_key(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let Some(store) = state.store() else {
+        return Err(AppError::BadRequest("persistence is off".into()));
+    };
+    store.delete_api_key(&name).map_err(AppError::Internal)?;
+    state.refresh_api_key_hashes();
+    Ok(Json(json!({ "ok": true })))
+}
+
+fn generate_key() -> String {
+    let bytes: [u8; 24] = rand::random();
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sk-hub-{hex}")
+}
+
+fn reload_config(state: &AppState) -> Result<(), AppError> {
+    let vars = crate::load_env_vars();
+    let config = HubConfig::from_map(&vars).map_err(AppError::Internal)?;
+    state.swap_config(config).map_err(AppError::Internal)
+}

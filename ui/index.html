@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-hub</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230b0f1a'/%3E%3Cpath d='M8 3l4.3 2.5v5L8 13 3.7 10.5v-5z' fill='none' stroke='%2322c55e' stroke-width='1.4'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="brand-mark">◆</span> llm-hub <span id="version" class="version"></span></div>
+  <div class="topbar-right">
+    <span id="auth-badge" class="badge" hidden></span>
+    <span id="persist-badge" class="badge" hidden></span>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="sidebar">
+    <div class="nav-tabs" role="tablist">
+      <button class="nav-tab active" data-tab="models" role="tab">Models</button>
+      <button class="nav-tab" data-tab="stats" role="tab">Stats</button>
+      <button class="nav-tab" data-tab="usage" role="tab">Usage</button>
+      <button class="nav-tab" data-tab="profiles" role="tab">Profiles</button>
+      <button class="nav-tab" data-tab="keys" role="tab">API keys</button>
+      <button class="nav-tab" data-tab="setup" role="tab">Setup</button>
+    </div>
+    <div class="ports">
+      <div class="ports-title">Upstreams</div>
+      <ul id="port-list" class="port-list"></ul>
+    </div>
+  </nav>
+
+  <main class="content">
+    <section id="tab-models" class="tab active">
+      <div class="toolbar">
+        <input id="model-search" class="input search" type="search" placeholder="Filter models…" aria-label="Filter models">
+        <span id="model-count" class="dim"></span>
+      </div>
+      <table class="table">
+        <thead><tr><th>Model id</th><th>Profile</th><th></th></tr></thead>
+        <tbody id="model-rows"></tbody>
+      </table>
+    </section>
+
+    <section id="tab-stats" class="tab">
+      <p class="note" id="stats-note">Live counters since process start. Enable <code>LLM_HUB_PERSISTENT=true</code> for durable history.</p>
+      <h2>By profile</h2>
+      <table class="table">
+        <thead><tr><th>Profile</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">p50 ms</th><th class="num">p95 ms</th><th class="num">Tokens in</th><th class="num">Tokens out</th></tr></thead>
+        <tbody id="stats-profile-rows"></tbody>
+      </table>
+      <h2>By model</h2>
+      <table class="table">
+        <thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">p50 ms</th><th class="num">p95 ms</th><th class="num">Tokens in</th><th class="num">Tokens out</th></tr></thead>
+        <tbody id="stats-model-rows"></tbody>
+      </table>
+    </section>
+
+    <section id="tab-usage" class="tab">
+      <div id="usage-totals" class="stat-tiles"></div>
+      <table class="table">
+        <thead><tr><th>Time</th><th>Model</th><th class="num">Status</th><th class="num">Latency ms</th><th class="num">In</th><th class="num">Out</th></tr></thead>
+        <tbody id="usage-rows"></tbody>
+      </table>
+      <p class="note" id="usage-note" hidden>Persistence is off. Set <code>LLM_HUB_PERSISTENT=true</code> to record usage history.</p>
+    </section>
+
+    <section id="tab-profiles" class="tab">
+      <div class="toolbar">
+        <button id="profile-add" class="btn primary">Add profile</button>
+        <span id="readonly-note" class="dim" hidden>read-only mode — edits disabled</span>
+      </div>
+      <table class="table">
+        <thead><tr><th>Name</th><th>Base URL</th><th>Key</th><th>Enabled</th><th></th></tr></thead>
+        <tbody id="profile-rows"></tbody>
+      </table>
+    </section>
+
+    <section id="tab-keys" class="tab">
+      <div class="toolbar">
+        <button id="key-add" class="btn primary">Create key</button>
+      </div>
+      <p class="note" id="keys-note" hidden>Persistence is off. Set <code>LLM_HUB_PERSISTENT=true</code> to manage hub API keys.</p>
+      <table class="table">
+        <thead><tr><th>Name</th><th>Key</th><th>Created</th><th></th></tr></thead>
+        <tbody id="key-rows"></tbody>
+      </table>
+    </section>
+
+    <section id="tab-setup" class="tab">
+      <div class="toolbar">
+        <label class="dim" for="setup-target">Tool</label>
+        <select id="setup-target" class="input"></select>
+        <label class="dim" for="setup-model">Model</label>
+        <select id="setup-model" class="input"></select>
+      </div>
+      <p class="note" id="setup-auth-note"></p>
+      <pre class="snippet"><code id="setup-snippet"></code></pre>
+      <button id="setup-copy" class="btn">Copy snippet</button>
+    </section>
+  </main>
+</div>
+
+<div id="modal-backdrop" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h3 id="modal-title"></h3>
+    <div id="modal-body"></div>
+    <div class="modal-actions">
+      <button id="modal-cancel" class="btn">Cancel</button>
+      <button id="modal-confirm" class="btn primary">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>

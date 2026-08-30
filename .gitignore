@@ -1,0 +1,14 @@
+target/
+.env
+.env.*
+!.env.example
+.DS_Store
+.playwright-mcp/
+**/agent-spec
+
+
+# Added by cargo
+
+/target
+node_modules/
+docs/demo-video/
