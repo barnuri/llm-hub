@@ -1,11 +1,16 @@
+pub mod anthropic;
 pub mod auth;
+pub mod body_transform;
 pub mod config_reload;
 pub mod env_writer;
 pub mod fallback;
 pub mod restart;
 pub mod service_manager;
 pub mod source_install;
+pub mod sse;
 pub mod stats;
 pub mod store;
+pub mod tool_names;
+pub mod transforms;
 pub mod update;
 pub mod upstream;

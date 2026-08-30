@@ -113,6 +113,7 @@ mod tests {
             store_kind: "sqlite".into(),
             store_path: None,
             auto_update: false,
+            stream_role_inject: true,
         }
     }
 

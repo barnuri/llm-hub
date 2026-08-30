@@ -15,7 +15,7 @@ pub enum AppError {
 }
 
 impl AppError {
-    fn status(&self) -> StatusCode {
+    pub(crate) fn status(&self) -> StatusCode {
         match self {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -39,7 +39,7 @@ impl AppError {
         }
     }
 
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         match self {
             AppError::BadRequest(m)
             | AppError::NotFound(m)

@@ -20,6 +20,30 @@ pub const HEADER_TIMEOUT_MS: &str = "x-llm-hub-timeout-ms";
 pub const HEADER_RETRY_ON: &str = "x-llm-hub-retry-on";
 pub const HEADER_SERVED_MODEL: &str = "x-llm-hub-model";
 pub const HEADER_ATTEMPTS: &str = "x-llm-hub-attempts";
+pub const HEADER_SYSTEM_PROMPT_MODE: &str = "x-llm-hub-system-prompt-mode";
+pub const HEADER_REASONING_STRIP: &str = "x-llm-hub-reasoning-strip";
+/// Response-side diagnostic: which request transforms actually fired.
+pub const HEADER_TRANSFORMS: &str = "x-llm-hub-transforms";
+
+/// Cap for `x-llm-hub-system-prompt-mode: truncate`, in CHARACTERS (not bytes
+/// — see the UTF-8 note in transforms.rs).
+pub const SYSTEM_PROMPT_MAX_CHARS: usize = 1000;
+
+/// `OpenAI` and Bedrock Converse both reject function names over 64 bytes, so
+/// this one is a BYTE limit — unlike `SYSTEM_PROMPT_MAX_CHARS`, it is what the
+/// provider actually enforces.
+pub const MAX_TOOL_NAME_LEN: usize = 64;
+/// Hex characters of the name digest appended to a truncated tool name.
+pub const TOOL_NAME_HASH_LEN: usize = 8;
+/// `MAX_TOOL_NAME_LEN` - `TOOL_NAME_HASH_LEN` - 1 (the `_` separator).
+pub const TOOL_NAME_PREFIX_LEN: usize = MAX_TOOL_NAME_LEN - TOOL_NAME_HASH_LEN - 1;
+
+/// Every Anthropic Messages request lands on the upstream's chat-completions
+/// endpoint regardless of the client-facing path.
+pub const ANTHROPIC_UPSTREAM_PATH: &str = "/v1/chat/completions";
+pub const ANTHROPIC_MESSAGE_ID_PREFIX: &str = "msg_";
+/// Ceiling for a transform that must buffer a whole (non-SSE) body.
+pub const MAX_TRANSFORM_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_hours(24);
 /// How often the running process re-reads `.env` for external edits.

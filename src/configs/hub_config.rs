@@ -5,6 +5,10 @@ use crate::consts::{DEFAULT_BIND, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_PORT};
 
 const PREFIX: &str = "LLM_HUB_";
 
+// Env-driven feature flags: each one is an independent opt-in/opt-out switch
+// read straight from a `LLM_HUB_*` var, so collapsing them into enums would
+// only move the same booleans one indirection away.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct HubConfig {
     pub profiles: Vec<ProfileConfig>,
@@ -18,6 +22,10 @@ pub struct HubConfig {
     pub store_kind: String,
     pub store_path: Option<String>,
     pub auto_update: bool,
+    /// Inject `role:"assistant"` into the first streamed delta when the
+    /// upstream omits it. Opt-out (`LLM_HUB_STREAM_ROLE=false`): the clients
+    /// this repairs cannot set a request header, so it defaults on.
+    pub stream_role_inject: bool,
 }
 
 impl HubConfig {
@@ -78,6 +86,7 @@ impl HubConfig {
             store_kind: get("STORE").unwrap_or_else(|| "sqlite".to_string()),
             store_path: get("STORE_PATH").filter(|v| !v.is_empty()),
             auto_update: get("AUTO_UPDATE").is_none_or(|v| !is_falsy(&v)),
+            stream_role_inject: get("STREAM_ROLE").is_none_or(|v| !is_falsy(&v)),
         })
     }
 
@@ -298,6 +307,24 @@ mod tests {
             vars.insert("LLM_HUB_AUTO_UPDATE".into(), value.into());
             let cfg = HubConfig::from_map(&vars).unwrap();
             assert_eq!(cfg.auto_update, expected, "LLM_HUB_AUTO_UPDATE={value}");
+        }
+    }
+
+    #[test]
+    fn stream_role_defaults_on_and_parses_explicit_values() {
+        assert!(
+            HubConfig::from_map(&base_vars())
+                .unwrap()
+                .stream_role_inject
+        );
+        for (value, expected) in [("false", false), ("off", false), ("true", true)] {
+            let mut vars = base_vars();
+            vars.insert("LLM_HUB_STREAM_ROLE".into(), value.into());
+            let cfg = HubConfig::from_map(&vars).unwrap();
+            assert_eq!(
+                cfg.stream_role_inject, expected,
+                "LLM_HUB_STREAM_ROLE={value}"
+            );
         }
     }
 

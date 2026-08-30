@@ -191,6 +191,7 @@ fn run_service_command() {
 
 fn build_router(state: AppState) -> Router {
     let protected = Router::new()
+        .route("/v1/messages", post(routes::anthropic::messages))
         .route("/v1/models", get(routes::models::list_models))
         .route("/v1/models/{*id}", get(routes::proxy::get_model_by_id))
         .route("/v1/{*path}", any(routes::proxy::proxy))

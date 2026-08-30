@@ -63,6 +63,61 @@ require one. The **Setup** tab in the UI generates ready snippets for Claude
 Code, Codex CLI, Cursor, Continue, aider, OpenAI SDKs, Claude Agent SDK,
 LangChain, and LiteLLM.
 
+## Anthropic Messages endpoint
+
+`POST /v1/messages` speaks the Anthropic Messages API on the front and OpenAI
+chat-completions to whichever profile you route to, so an Anthropic SDK can
+target any upstream the hub knows about.
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8410
+export ANTHROPIC_API_KEY=dummy   # ignored while auth is off
+curl localhost:8410/v1/messages \
+  -H 'content-type: application/json' \
+  -d '{"model":"groq/llama-3.3-70b-versatile","max_tokens":256,
+       "system":"be terse","messages":[{"role":"user","content":"hi"}]}'
+```
+
+The model id is the usual `<profile>/<model>`, and every `X-LLM-Hub-*` control
+header works here exactly as it does on `/v1/chat/completions` — fallback
+chains, `X-LLM-Hub-Retry-On`, `X-LLM-Hub-Timeout-Ms`, and the
+`X-LLM-Hub-Model` / `X-LLM-Hub-Attempts` response headers. The translated
+message body also reports the model actually served, so a request that fell
+over to a fallback says so in `model`. Tool names longer than 64 characters —
+routine once MCP servers are in play — are aliased on the way upstream and
+restored on the way back (see [request transforms](#request-transforms)), so an
+Anthropic client keeps using its own names.
+
+`"stream": true` works: the upstream's OpenAI SSE stream is translated frame by
+frame into the Anthropic event sequence (`message_start`, `content_block_start` /
+`_delta` / `_stop` for text and for streamed `tool_use` with `input_json_delta`,
+`message_delta`, `message_stop`). Nothing is buffered beyond the frame being
+assembled, and the stream is left well-formed even if the upstream is cut
+mid-flight. Two deviations worth knowing:
+
+- Content blocks are **serialized**: OpenAI may interleave `tool_calls` indices,
+  Anthropic's protocol cannot, so opening a block closes the previous one.
+- `message_start` reports zero tokens and `message_delta` carries the real
+  counts — OpenAI only reports usage in a chunk that arrives after the one
+  carrying `finish_reason`, so the terminal events are flushed on `[DONE]` (or
+  at end of stream) rather than earlier.
+
+Current limits:
+
+- `POST /v1/messages/count_tokens` is not implemented.
+- Content that OpenAI chat-completions cannot represent is dropped rather than
+  faked: `thinking` / `redacted_thinking` blocks, the `thinking` parameter,
+  `top_k`, and Anthropic server tools (`web_search_*`, `computer_*`). An image
+  block whose `source.type` is neither `base64` nor `url` is a 400.
+- `stop_reason` is never `stop_sequence`, and `stop_sequence` is always `null`:
+  the OpenAI wire format never reports which stop string matched. A message that
+  carries a `tool_use` block always reports `tool_use`, even when the upstream
+  reported `finish_reason: "stop"` alongside its tool calls (llama.cpp, vLLM in
+  some configs, and several gateways do) — Anthropic clients drive their agent
+  loop off that field, not off the block list.
+- Request bodies over `LLM_HUB_MAX_REPLAY_BYTES` are a 400 here rather than an
+  unbuffered passthrough — translation needs the whole document.
+
 ## Fallbacks
 
 Send an ordered chain; the hub retries the next model only on connect errors,
@@ -100,6 +155,50 @@ Set the default chain any of three ways (per-request header always wins):
 - **Env** — `LLM_HUB_DEFAULT_FALLBACKS=groq/llama-3.3-70b-versatile,openai/gpt-4o-mini`
   in `.env`. The UI and API persist to the same variable.
 
+## Request transforms
+
+Two opt-in request headers reshape the body on its way upstream, for the times
+the client cannot. Both apply to `/v1/chat/completions` and to `/v1/messages`
+alike — the Anthropic body is translated first, so one implementation covers
+both — and both run once, before the fallback chain, so every attempt sends
+byte-identical bytes.
+
+| Header | Direction | Values | Effect |
+|---|---|---|---|
+| `X-LLM-Hub-System-Prompt-Mode` | request | `none` \| `truncate` \| `drop` | Trims or drops the system prompt. `truncate` caps each `system`/`developer` message at 1000 characters (`system` on the Anthropic route); `drop` removes them, unless that would leave no messages at all. |
+| `X-LLM-Hub-Reasoning-Strip` | request | `true` \| `1` \| `yes` \| `on` | Removes `reasoning`, `reasoning_effort` and `thinking` from the request — for upstreams that 400 on parameters they do not model. |
+| `X-LLM-Hub-Transforms` | response | e.g. `system-prompt=truncate, tool-names=3, reasoning-strip` | Diagnostic: which transforms actually fired. Omitted when none did. |
+
+An unrecognized value — or an absent header — leaves the request untouched, with
+no error and no warning. Nothing here is inferred from the model name or the
+profile: a transform that fired for the primary but not for a fallback would
+make `X-LLM-Hub-Attempts` describe two different requests.
+
+Two more repairs are always on, because the clients they fix cannot ask for
+them.
+
+**Streamed first-delta role.** When a streamed first `choices[0].delta` arrives
+without a `role`, the hub inserts `role: "assistant"` (the OpenAI spec requires
+it; some local servers omit it, which breaks clients that rebuild the message
+from deltas alone). An existing role is never overwritten, only the first delta
+is touched, and the rewriter stops framing the stream the moment it is done.
+Set `LLM_HUB_STREAM_ROLE=false` to disable it.
+
+**Tool-name truncation.** OpenAI-compatible upstreams reject a function name
+over 64 characters with a 400, and MCP tools blow past that routinely — a tool
+reached through a server prefix is named `mcp__<server>__<tool>`. Any longer
+name is replaced on the way upstream with `<first 55 chars>_<8 hex of its
+sha256>`, and the original is put back in the response — in the OpenAI
+`tool_calls[].function.name`, in the Anthropic route's `tool_use` blocks, and
+frame by frame in a stream. `tools[]`, `tool_choice`, and `tool_calls[]` on prior assistant
+messages are all rewritten, so a forced tool choice keeps naming a tool the
+request still declares. The alias is a pure function of the name: it is the
+same on every turn of a conversation and on every attempt in a fallback chain,
+and nothing is stored between requests. Names of 64 characters or fewer — and
+aliases echoed back by the client — are passed through untouched, so
+`X-LLM-Hub-Transforms` only reports `tool-names=N` when something was actually
+renamed.
+
 ## Environment reference
 
 | Variable | Default | Purpose |
@@ -120,6 +219,7 @@ Set the default chain any of three ways (per-request header always wins):
 | `LLM_HUB_STORE` | `sqlite` | `sqlite` or `json` (when persistent) |
 | `LLM_HUB_STORE_PATH` | `llm-hub.db` | Store location |
 | `LLM_HUB_CONFIG_READONLY` | `false` | Block UI writes to `.env` |
+| `LLM_HUB_STREAM_ROLE` | `true` | Inject `role:"assistant"` into the first streamed delta when the upstream omits it |
 | `LLM_HUB_AUTO_UPDATE` | `true` | Apply updates automatically (startup + daily check); `false` = notice only |
 
 Profile names map to env segments uppercased with `-` → `_` (`my-proxy` →
