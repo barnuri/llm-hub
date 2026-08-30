@@ -26,7 +26,7 @@ impl Default for RetryPolicy {
 
 impl RetryPolicy {
     /// `X-LLM-Hub-Retry-On: 429,503` replaces the default set entirely —
-    /// an explicit override wins, including over NEVER_RETRY.
+    /// an explicit override wins, including over `NEVER_RETRY`.
     pub fn from_headers(headers: &HeaderMap) -> RetryPolicy {
         let Some(raw) = header_str(headers, HEADER_RETRY_ON) else {
             return RetryPolicy::default();
@@ -69,6 +69,28 @@ pub fn fallback_chain(headers: &HeaderMap, default_chain: &[String]) -> Vec<Stri
         .collect()
 }
 
+/// Validates and normalizes (trims) a default fallback chain before
+/// persisting. Entries are stored comma-joined in the env file, so commas
+/// inside an entry are rejected; profiles are deliberately not checked for
+/// existence (a chain may reference a temporarily disabled profile).
+///
+/// # Errors
+/// Fails when an entry is empty after trimming or contains a comma.
+pub fn validate_chain(chain: &[String]) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::with_capacity(chain.len());
+    for entry in chain {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return Err("fallback entries must not be empty".to_string());
+        }
+        if trimmed.contains(',') {
+            return Err(format!("fallback entry may not contain ',': {trimmed}"));
+        }
+        normalized.push(trimmed.to_string());
+    }
+    Ok(normalized)
+}
+
 pub fn per_attempt_timeout_ms(headers: &HeaderMap) -> Option<u64> {
     header_str(headers, HEADER_TIMEOUT_MS)?.trim().parse().ok()
 }
@@ -77,7 +99,7 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 #[cfg(test)]
@@ -122,6 +144,24 @@ mod tests {
             fallback_chain(&headers, &default_chain),
             vec!["groq/llama-3.3-70b", "openai/gpt-4o-mini"]
         );
+    }
+
+    #[test]
+    fn validate_chain_accepts_and_normalizes_entries() {
+        assert_eq!(validate_chain(&[]), Ok(vec![]));
+        assert_eq!(
+            validate_chain(&[" groq/llama-3.3-70b ".into(), "openai/gpt-4o".into()]),
+            Ok(vec![
+                "groq/llama-3.3-70b".to_string(),
+                "openai/gpt-4o".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn validate_chain_rejects_empty_and_comma_entries() {
+        assert!(validate_chain(&["  ".into()]).is_err());
+        assert!(validate_chain(&["a/x,b/y".into()]).is_err());
     }
 
     #[test]

@@ -3,13 +3,15 @@ use std::path::Path;
 use crate::consts::SERVICE_LABEL;
 
 /// `llm-hub service install`: registers the hub as an always-on background
-/// service for the current user — launchd LaunchAgent on macOS, systemd user
+/// service for the current user — launchd `LaunchAgent` on macOS, systemd user
 /// unit on Linux, Task Scheduler task on Windows. The definition captures the
 /// current executable path and working directory (so `.env` is found) and
-/// sets LLM_HUB_SERVICE=1 so auto-update knows a supervisor will restart us.
+/// sets `LLM_HUB_SERVICE=1` so auto-update knows a supervisor will restart us.
 pub fn install() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(cwd.join("logs"))
+        .map_err(|e| format!("cannot create logs dir: {e}"))?;
     platform::install(&exe, &cwd)
 }
 
@@ -48,9 +50,9 @@ pub fn render_launchd_plist(exe: &Path, cwd: &Path) -> String {
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>{cwd}/llm-hub.log</string>
+    <string>{cwd}/logs/llm-hub.log</string>
     <key>StandardErrorPath</key>
-    <string>{cwd}/llm-hub.log</string>
+    <string>{cwd}/logs/llm-hub.log</string>
 </dict>
 </plist>
 "#
@@ -70,6 +72,8 @@ After=network.target
 ExecStart="{exe}"
 WorkingDirectory={cwd}
 Environment=LLM_HUB_SERVICE=1
+StandardOutput=append:{cwd}/logs/llm-hub.log
+StandardError=append:{cwd}/logs/llm-hub.log
 Restart=always
 RestartSec=2
 
@@ -106,7 +110,7 @@ pub fn render_windows_task_xml(exe: &Path, cwd: &Path) -> String {
   <Actions Context="Author">
     <Exec>
       <Command>cmd</Command>
-      <Arguments>/c set LLM_HUB_SERVICE=1&amp;&amp; "{exe}"</Arguments>
+      <Arguments>/c set LLM_HUB_SERVICE=1&amp;&amp; "{exe}" >> "{cwd}\logs\llm-hub.log" 2&gt;&amp;1</Arguments>
       <WorkingDirectory>{cwd}</WorkingDirectory>
     </Exec>
   </Actions>
@@ -300,6 +304,7 @@ mod tests {
         assert!(out.contains("<key>LLM_HUB_SERVICE</key>"));
         assert!(out.contains("<key>RunAtLoad</key>"));
         assert!(out.contains("<key>KeepAlive</key>"));
+        assert!(out.contains("<string>/srv/hub/logs/llm-hub.log</string>"));
     }
 
     #[test]
@@ -310,6 +315,7 @@ mod tests {
         assert!(out.contains("WorkingDirectory=/srv/hub"));
         assert!(out.contains("Environment=LLM_HUB_SERVICE=1"));
         assert!(out.contains("Restart=always"));
+        assert!(out.contains("StandardOutput=append:/srv/hub/logs/llm-hub.log"));
         assert!(out.contains("WantedBy=default.target"));
     }
 
@@ -321,6 +327,7 @@ mod tests {
         assert!(out.contains("<WorkingDirectory>C:/hub</WorkingDirectory>"));
         assert!(out.contains("<LogonTrigger>"));
         assert!(out.contains("<RestartOnFailure>"));
+        assert!(out.contains(r#">> "C:/hub\logs\llm-hub.log" 2&gt;&amp;1"#));
     }
 
     #[test]

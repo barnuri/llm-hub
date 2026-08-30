@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::configs::{ProfileConfig, env_name};
 
@@ -58,6 +59,14 @@ pub fn upsert_profile(
     write_atomic(path, &lines)
 }
 
+/// Persists the default fallback chain (`LLM_HUB_DEFAULT_FALLBACKS`),
+/// comma-joined. An empty chain clears the value.
+pub fn set_default_fallbacks(path: &Path, chain: &[String]) -> Result<(), String> {
+    let mut lines = read_lines(path)?;
+    set_var(&mut lines, "DEFAULT_FALLBACKS", &chain.join(","));
+    write_atomic(path, &lines)
+}
+
 pub fn remove_profile(
     path: &Path,
     name: &str,
@@ -96,11 +105,17 @@ fn set_var(lines: &mut Vec<String>, key: &str, value: &str) {
 }
 
 fn write_atomic(path: &Path, lines: &[String]) -> Result<(), String> {
+    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(".env.tmp-{}", std::process::id()));
+    // pid + per-process counter so concurrent writers never share a temp file.
+    let tmp = dir.join(format!(
+        ".env.tmp-{}-{}",
+        std::process::id(),
+        WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let content = lines.join("\n") + "\n";
     std::fs::write(&tmp, content).map_err(|e| format!("write temp env failed: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("atomic rename failed: {e}"))
@@ -149,6 +164,26 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content.matches("LLM_HUB_GROQ_API_KEY=").count(), 1);
         assert!(content.contains("gsk-99999"));
+    }
+
+    #[test]
+    fn set_default_fallbacks_creates_updates_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+
+        let chain = vec!["groq/llama".to_string(), "openai/gpt-4o".to_string()];
+        set_default_fallbacks(&path, &chain).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("LLM_HUB_DEFAULT_FALLBACKS=groq/llama,openai/gpt-4o"));
+
+        set_default_fallbacks(&path, &["a/b".to_string()]).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.matches("LLM_HUB_DEFAULT_FALLBACKS=").count(), 1);
+        assert!(content.contains("LLM_HUB_DEFAULT_FALLBACKS=a/b"));
+
+        set_default_fallbacks(&path, &[]).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("LLM_HUB_DEFAULT_FALLBACKS=\n"));
     }
 
     #[test]

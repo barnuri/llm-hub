@@ -32,9 +32,11 @@ impl HubConfig {
         };
 
         let profile_names = match get("PROFILES") {
-            Some(list) if !list.is_empty() => {
-                list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-            }
+            Some(list) if !list.is_empty() => list
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
             // No index var: discover profiles from LLM_HUB_<NAME>_BASE_URL keys.
             _ => discover_profile_names(vars),
         };
@@ -156,9 +158,9 @@ fn discover_profile_names(vars: &HashMap<String, String>) -> Vec<String> {
         .keys()
         .filter_map(|key| key.strip_prefix(PREFIX)?.strip_suffix("_BASE_URL"))
         .filter(|segment| !segment.is_empty())
-        .map(|segment| segment.to_lowercase())
+        .map(str::to_lowercase)
         .collect();
-    names.sort();
+    names.sort_unstable();
     names
 }
 
@@ -181,10 +183,13 @@ pub fn mask_key(key: &str) -> String {
     if key.is_empty() {
         return String::new();
     }
-    if key.len() <= 8 {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 8 {
         return "***".to_string();
     }
-    format!("{}...{}", &key[..4], &key[key.len() - 4..])
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}...{tail}")
 }
 
 #[cfg(test)]
@@ -227,7 +232,7 @@ mod tests {
         vars.remove("LLM_HUB_PROFILES");
         let cfg = HubConfig::from_map(&vars).unwrap();
         let mut names: Vec<&str> = cfg.profiles.iter().map(|p| p.name.as_str()).collect();
-        names.sort();
+        names.sort_unstable();
         assert_eq!(names, vec!["groq", "openai"]);
     }
 

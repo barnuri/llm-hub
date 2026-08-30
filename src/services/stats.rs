@@ -34,7 +34,7 @@ pub struct StatsSnapshot {
 }
 
 /// In-memory, lock-free-on-read stats. Model keys come from caller input, so
-/// the map is capped: past STATS_MAX_MODEL_KEYS new names bucket into "other".
+/// the map is capped: past `STATS_MAX_MODEL_KEYS` new names bucket into "other".
 #[derive(Default)]
 pub struct StatsRegistry {
     by_profile: DashMap<String, EntryStats>,
@@ -103,10 +103,9 @@ fn snapshot_map(map: &DashMap<String, EntryStats>) -> Vec<EntrySnapshot> {
         .map(|entry| {
             let stats = entry.value();
             let (p50_ms, p95_ms) = match stats.latency_ms.lock() {
-                Ok(guard) => guard
-                    .as_ref()
-                    .map(|h| (h.value_at_quantile(0.5), h.value_at_quantile(0.95)))
-                    .unwrap_or((0, 0)),
+                Ok(guard) => guard.as_ref().map_or((0, 0), |h| {
+                    (h.value_at_quantile(0.5), h.value_at_quantile(0.95))
+                }),
                 Err(_) => (0, 0),
             };
             EntrySnapshot {

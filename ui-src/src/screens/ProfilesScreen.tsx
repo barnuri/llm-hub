@@ -1,11 +1,13 @@
 import { useState } from "react";
 
+import { FallbacksEditor } from "../components/FallbacksEditor";
 import { Modal } from "../components/Modal";
 import { api } from "../lib/api";
 import type { HubMeta, ProfileRow } from "../lib/types";
 
 interface ProfilesScreenProps {
   readonly meta: HubMeta | null;
+  readonly models: readonly string[];
   readonly onChanged: () => void;
   readonly onToast: (message: string, isError?: boolean) => void;
 }
@@ -20,7 +22,7 @@ interface FormState {
   enabled: boolean;
 }
 
-export function ProfilesScreen({ meta, onChanged, onToast }: ProfilesScreenProps) {
+export function ProfilesScreen({ meta, models, onChanged, onToast }: ProfilesScreenProps) {
   const [form, setForm] = useState<FormState | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const readonly = meta?.readonly ?? false;
@@ -145,6 +147,15 @@ export function ProfilesScreen({ meta, onChanged, onToast }: ProfilesScreenProps
           ))}
         </tbody>
       </table>
+
+      <FallbacksEditor
+        key={(meta?.default_fallbacks ?? []).join(",")}
+        chain={meta?.default_fallbacks ?? []}
+        models={models}
+        readonly={readonly}
+        onSaved={onChanged}
+        onToast={onToast}
+      />
 
       {form ? (
         <Modal

@@ -11,6 +11,7 @@ use crate::dependencies::state::AppState;
 use crate::schemas::api_key_input::ApiKeyInput;
 use crate::schemas::api_key_record::ApiKeyRecord;
 use crate::schemas::app_error::AppError;
+use crate::schemas::fallbacks_input::FallbacksInput;
 use crate::schemas::profile_input::ProfileInput;
 use crate::services::env_writer;
 use crate::services::store::{hash_key, now_ms};
@@ -40,6 +41,7 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
         .collect();
     Json(json!({
         "profiles": profiles,
+        "default_fallbacks": config.default_fallbacks,
         "readonly": config.config_readonly,
         "persistent": config.persistent,
         "auth_enabled": config.master_key.is_some() || !state.api_key_hashes().is_empty(),
@@ -93,6 +95,20 @@ pub async fn upsert_profile(
     }
     env_writer::upsert_profile(Path::new(ENV_FILE), &profile, &names)
         .map_err(AppError::Internal)?;
+    reload_config(&state)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn set_default_fallbacks(
+    State(state): State<AppState>,
+    Json(input): Json<FallbacksInput>,
+) -> Result<Json<Value>, AppError> {
+    if state.config().config_readonly {
+        return Err(AppError::ReadOnly);
+    }
+    let chain = crate::services::fallback::validate_chain(&input.fallbacks)
+        .map_err(AppError::BadRequest)?;
+    env_writer::set_default_fallbacks(Path::new(ENV_FILE), &chain).map_err(AppError::Internal)?;
     reload_config(&state)?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -159,6 +175,13 @@ pub async fn test_profile(
             Ok(Json(json!({ "ok": false, "error": "timeout" })))
         }
     }
+}
+
+/// Triggers a graceful restart: supervised installs are restarted by their
+/// supervisor; standalone runs respawn themselves after the server drains.
+pub async fn restart_server(State(state): State<AppState>) -> Json<Value> {
+    crate::services::restart::request_restart(state.restart_notify());
+    Json(json!({ "ok": true, "restarting": true }))
 }
 
 pub async fn stats(State(state): State<AppState>) -> Json<Value> {

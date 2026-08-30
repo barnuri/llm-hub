@@ -1,15 +1,33 @@
 import { useMemo, useState } from "react";
 
+import { setQueryParam, useRoute } from "../lib/router";
+import type { ProfileRow } from "../lib/types";
+
 interface ModelsScreenProps {
   readonly models: readonly string[];
+  readonly profiles: readonly ProfileRow[];
   readonly onCopy: (id: string) => void;
 }
 
-export function ModelsScreen({ models, onCopy }: ModelsScreenProps) {
+export function ModelsScreen({ models, profiles, onCopy }: ModelsScreenProps) {
   const [query, setQuery] = useState("");
+  const route = useRoute();
+  const activeProfile = route.query.get("profile") ?? "";
+
+  const profileNames = useMemo(() => {
+    const prefixes = new Set(models.map((id) => id.split("/")[0] ?? ""));
+    prefixes.delete("");
+    return [...prefixes].sort();
+  }, [models]);
+
+  const labelFor = (name: string) => profiles.find((p) => p.name === name)?.label ?? name;
+
   const filtered = useMemo(
-    () => models.filter((id) => id.toLowerCase().includes(query.toLowerCase())),
-    [models, query],
+    () =>
+      models
+        .filter((id) => activeProfile === "" || id.startsWith(`${activeProfile}/`))
+        .filter((id) => id.toLowerCase().includes(query.toLowerCase())),
+    [models, query, activeProfile],
   );
 
   return (
@@ -25,6 +43,28 @@ export function ModelsScreen({ models, onCopy }: ModelsScreenProps) {
         />
         <span className="dim">{filtered.length} models</span>
       </div>
+      {profileNames.length > 1 ? (
+        <div className="toolbar chips" role="group" aria-label="Filter by profile">
+          <button
+            type="button"
+            className={activeProfile === "" ? "chip active" : "chip"}
+            onClick={() => setQueryParam("profile", null)}
+          >
+            All
+          </button>
+          {profileNames.map((name) => (
+            <button
+              key={name}
+              type="button"
+              className={activeProfile === name ? "chip active" : "chip"}
+              aria-pressed={activeProfile === name}
+              onClick={() => setQueryParam("profile", activeProfile === name ? null : name)}
+            >
+              {labelFor(name)}
+            </button>
+          ))}
+        </div>
+      ) : null}
       <table className="table">
         <thead>
           <tr>
@@ -41,7 +81,7 @@ export function ModelsScreen({ models, onCopy }: ModelsScreenProps) {
                 <td>
                   <span className="model-id">
                     <span className="model-profile-part">{profile}/</span>
-                    {id.slice(profile.length + 1)}
+                    {id.slice((profile ?? "").length + 1)}
                   </span>
                 </td>
                 <td className="mono">{profile}</td>

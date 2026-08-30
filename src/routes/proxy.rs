@@ -19,11 +19,10 @@ use crate::utils::headers::{filter_request_headers, filter_response_headers};
 /// Catch-all /v1/* passthrough with header-driven fallbacks.
 pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Response, AppError> {
     let (parts, body) = req.into_parts();
-    let path_and_query = parts
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| parts.uri.path().to_string());
+    let path_and_query = parts.uri.path_and_query().map_or_else(
+        || parts.uri.path().to_string(),
+        |pq| pq.as_str().to_string(),
+    );
 
     let content_type = header_value(&parts.headers, "content-type");
     if content_type.starts_with("multipart/") {
@@ -112,7 +111,7 @@ async fn attempt_loop(
     };
 
     let primary_id = parse_model_or_400(&config, &primary)?;
-    inject_stream_usage(json_body.as_mut());
+    inject_stream_usage(&mut json_body);
 
     let mut chain: Vec<ModelId> = vec![primary_id];
     for fallback in fallback_chain(headers, &config.default_fallbacks) {
@@ -210,8 +209,8 @@ fn parse_model_or_400(config: &crate::configs::HubConfig, raw: &str) -> Result<M
 }
 
 /// Q3 decision: ask upstreams for the usage chunk on streams so token stats
-/// work, unless the caller already set stream_options themselves.
-fn inject_stream_usage(json_body: Option<&mut Value>) {
+/// work, unless the caller already set `stream_options` themselves.
+fn inject_stream_usage(json_body: &mut Option<Value>) {
     let Some(Value::Object(obj)) = json_body else {
         return;
     };
@@ -317,19 +316,16 @@ fn build_response(
     let observed = futures_util::stream::unfold(
         (upstream.bytes_stream(), Vec::new(), Some(tail_sender)),
         |(mut inner, mut tail, mut sender)| async move {
-            match inner.next().await {
-                Some(chunk) => {
-                    if let Ok(bytes) = &chunk {
-                        append_tail(&mut tail, bytes);
-                    }
-                    Some((chunk, (inner, tail, sender)))
+            if let Some(chunk) = inner.next().await {
+                if let Ok(bytes) = &chunk {
+                    append_tail(&mut tail, bytes);
                 }
-                None => {
-                    if let Some(s) = sender.take() {
-                        let _ = s.send(tail);
-                    }
-                    None
+                Some((chunk, (inner, tail, sender)))
+            } else {
+                if let Some(s) = sender.take() {
+                    let _ = s.send(tail);
                 }
+                None
             }
         },
     );

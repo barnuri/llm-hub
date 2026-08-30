@@ -2,6 +2,7 @@ pub mod auth;
 pub mod config_reload;
 pub mod env_writer;
 pub mod fallback;
+pub mod restart;
 pub mod service_manager;
 pub mod source_install;
 pub mod stats;

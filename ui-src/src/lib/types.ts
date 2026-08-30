@@ -15,6 +15,8 @@ export interface ProfileRow {
 
 export interface HubMeta {
   readonly profiles: readonly ProfileRow[];
+  /** Default fallback chain of model ids, tried in order on failure. */
+  readonly default_fallbacks: readonly string[];
   readonly readonly: boolean;
   readonly persistent: boolean;
   readonly auth_enabled: boolean;

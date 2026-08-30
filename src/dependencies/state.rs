@@ -25,6 +25,8 @@ struct Inner {
     model_cache: ArcSwap<Option<Arc<CachedModels>>>,
     /// profile name -> reachable, updated on every models fan-out.
     upstream_health: DashMap<String, bool>,
+    /// Fired to trigger graceful shutdown (auto-update, env watcher, /api/restart).
+    restart_notify: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -41,6 +43,7 @@ impl AppState {
             api_key_hashes: ArcSwap::from_pointee(HashSet::new()),
             model_cache: ArcSwap::from_pointee(None),
             upstream_health: DashMap::new(),
+            restart_notify: Arc::new(tokio::sync::Notify::new()),
         }));
         state.refresh_api_key_hashes();
         Ok(state)
@@ -106,6 +109,10 @@ impl AppState {
 
     pub fn clear_model_cache(&self) {
         self.0.model_cache.store(Arc::new(None));
+    }
+
+    pub fn restart_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.0.restart_notify.clone()
     }
 
     pub fn set_upstream_health(&self, profile: &str, healthy: bool) {

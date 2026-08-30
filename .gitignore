@@ -9,3 +9,5 @@ target/
 node_modules/
 docs/demo-video/
 llm-hub.db
+logs/
+llm-hub.log

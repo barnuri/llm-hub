@@ -11,7 +11,6 @@ mod services;
 mod utils;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use axum::Router;
 use axum::middleware;
@@ -40,12 +39,7 @@ pub fn load_env_vars() -> HashMap<String, String> {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("llm_hub=info")),
-        )
-        .init();
+    let _tracing_guard = init_tracing();
 
     if run_cli_command().await {
         return;
@@ -79,7 +73,7 @@ async fn main() {
     };
 
     routes::models::spawn_background_refresh(state.clone());
-    let restart_notify = Arc::new(tokio::sync::Notify::new());
+    let restart_notify = state.restart_notify();
     services::update::spawn_auto_update(auto_update, restart_notify.clone());
     services::config_reload::spawn_env_watcher(state.clone(), restart_notify.clone());
 
@@ -105,7 +99,51 @@ async fn main() {
         eprintln!("server error: {e}");
         std::process::exit(1);
     }
+
+    match services::restart::respawn_if_requested() {
+        Ok(true) => tracing::info!("respawned llm-hub after restart request"),
+        Ok(false) => {}
+        Err(e) => eprintln!("restart respawn failed: {e}"),
+    }
 }
+
+/// Console logging always; plus a `./logs/llm-hub.log` file sink when not
+/// supervised (supervised runs already get that file via the service's
+/// stdout/stderr redirect — a second writer would interleave with it).
+/// The returned guard must live for the whole process so buffered lines flush.
+fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("llm_hub=info"));
+    let console = tracing_subscriber::fmt::layer();
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(console);
+
+    if !services::restart::is_supervised() {
+        if let Err(e) = std::fs::create_dir_all(LOGS_DIR) {
+            registry.init();
+            tracing::warn!("cannot create {LOGS_DIR} dir, file logging disabled: {e}");
+            return None;
+        }
+        let appender = tracing_appender::rolling::never(LOGS_DIR, "llm-hub.log");
+        let (file_writer, guard) = tracing_appender::non_blocking(appender);
+        registry
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(file_writer),
+            )
+            .init();
+        return Some(guard);
+    }
+    registry.init();
+    None
+}
+
+const LOGS_DIR: &str = "logs";
 
 async fn wait_for_ctrl_c() {
     let _ = tokio::signal::ctrl_c().await;
@@ -168,6 +206,8 @@ fn build_router(state: AppState) -> Router {
             "/api/profiles/{name}/test",
             post(routes::admin::test_profile),
         )
+        .route("/api/fallbacks", post(routes::admin::set_default_fallbacks))
+        .route("/api/restart", post(routes::admin::restart_server))
         .route("/api/stats", get(routes::admin::stats))
         .route("/api/usage", get(routes::admin::usage))
         .route(

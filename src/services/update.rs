@@ -68,7 +68,7 @@ pub async fn self_update() -> Result<UpdateOutcome, String> {
     Ok(UpdateOutcome::Applied)
 }
 
-/// Checks at startup and every UPDATE_CHECK_INTERVAL. With auto-update
+/// Checks at startup and every `UPDATE_CHECK_INTERVAL`. With auto-update
 /// enabled it applies new releases; otherwise it only logs that one exists.
 /// Never blocks serving.
 pub fn spawn_auto_update(auto_update_enabled: bool, restart_notify: Arc<tokio::sync::Notify>) {
@@ -162,7 +162,7 @@ async fn check_source_update(
 }
 
 fn notify_or_log_restart(restart_notify: &tokio::sync::Notify, what: &str) {
-    if std::env::var("LLM_HUB_SERVICE").as_deref() == Ok("1") {
+    if crate::services::restart::is_supervised() {
         tracing::info!("{what} — restarting so the service loads it");
         restart_notify.notify_one();
         return;

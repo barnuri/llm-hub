@@ -300,11 +300,10 @@ pub fn hash_key(key: &str) -> String {
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// SQLite stores only `i64`; values here are counters/timestamps, so clamping
+/// `SQLite` stores only `i64`; values here are counters/timestamps, so clamping
 /// at the type bounds is the correct lossy edge behavior.
 fn db_i64(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)

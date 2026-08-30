@@ -1,6 +1,7 @@
 pub mod api_key_input;
 pub mod api_key_record;
 pub mod app_error;
+pub mod fallbacks_input;
 pub mod model_id;
 pub mod profile_input;
 pub mod usage_report;
