@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[allow(clippy::struct_field_names)] // intentional USD-per-1M suffix on every rate field
 pub struct TokenRates {
     pub input_per_1m: f64,
     pub output_per_1m: f64,
@@ -138,7 +139,7 @@ mod tests {
     #[test]
     fn parse_model_prices_list() {
         let map = parse_model_prices("glm:0.1/0.2, other:1/2/0.1/1.5").unwrap();
-        assert_eq!(map["glm"].input_per_1m, 0.1);
-        assert_eq!(map["other"].cache_write_per_1m, 1.5);
+        assert!((map["glm"].input_per_1m - 0.1).abs() < f64::EPSILON);
+        assert!((map["other"].cache_write_per_1m - 1.5).abs() < f64::EPSILON);
     }
 }

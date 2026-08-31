@@ -88,8 +88,10 @@ fn env_file_hash(path: &Path) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
-    use crate::configs::ProfileConfig;
+    use crate::configs::{ProfileConfig, TokenRates};
 
     fn sample(bind: &str, port: u16) -> HubConfig {
         HubConfig {
@@ -102,8 +104,8 @@ mod tests {
                 timeout_ms: None,
                 enabled: true,
                 static_models: vec![],
-                pricing: Default::default(),
-                model_prices: Default::default(),
+                pricing: TokenRates::default(),
+                model_prices: HashMap::default(),
             }],
             master_key: None,
             default_fallbacks: vec![],
@@ -116,7 +118,7 @@ mod tests {
             store_path: None,
             auto_update: false,
             stream_role_inject: true,
-            pricing: Default::default(),
+            pricing: TokenRates::default(),
         }
     }
 

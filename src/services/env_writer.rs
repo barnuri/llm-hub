@@ -123,7 +123,10 @@ fn write_atomic(path: &Path, lines: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::configs::TokenRates;
 
     fn sample_profile() -> ProfileConfig {
         ProfileConfig {
@@ -135,8 +138,8 @@ mod tests {
             timeout_ms: None,
             enabled: true,
             static_models: vec![],
-            pricing: Default::default(),
-            model_prices: Default::default(),
+            pricing: TokenRates::default(),
+            model_prices: HashMap::default(),
         }
     }
 

@@ -184,6 +184,7 @@ fn record_entry(entry: &EntryStats, outcome: &RequestOutcome) {
     if let Some(tps) = tokens_per_sec(outcome)
         && let Ok(mut guard) = entry.tokens_per_sec_x100.lock()
     {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let centi = (tps * 100.0).round().clamp(1.0, 1_000_000_000.0) as u64;
         let histogram = guard.get_or_insert_with(new_tps_histogram);
         let _ = histogram.record(centi);
@@ -200,6 +201,7 @@ fn record_entry(entry: &EntryStats, outcome: &RequestOutcome) {
 ///
 /// Streaming: wall time after the first token. Non-stream: full request latency.
 #[must_use]
+#[allow(clippy::cast_precision_loss)] // throughput estimate; exact integer math not needed
 pub fn tokens_per_sec(outcome: &RequestOutcome) -> Option<f64> {
     if outcome.tokens_out == 0 || outcome.latency_ms == 0 {
         return None;
@@ -255,6 +257,7 @@ fn entry_snapshot(key: &str, stats: &EntryStats) -> EntrySnapshot {
     }
 }
 
+#[allow(clippy::cast_precision_loss)] // cache-hit % display; mantissa loss is fine
 fn overview_from_entry(stats: &EntryStats) -> OverviewSnapshot {
     let snap = entry_snapshot("overview", stats);
     let cache_hit_rate_pct = if snap.tokens_in == 0 {
@@ -289,6 +292,7 @@ fn latency_percentiles(lock: &Mutex<Option<Histogram<u64>>>) -> (u64, u64) {
     }
 }
 
+#[allow(clippy::cast_precision_loss)] // display averages from histogram centi-units
 fn tps_summary(stats: &EntryStats) -> (f64, f64) {
     let p50 = match stats.tokens_per_sec_x100.lock() {
         Ok(guard) => guard

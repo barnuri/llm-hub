@@ -154,6 +154,7 @@ pub fn apply_costs(snapshot: &mut StatsSnapshot, book: &PricingBook) {
     };
 }
 
+#[allow(clippy::cast_precision_loss)] // token counts → USD; mantissa loss is fine for estimates
 pub fn estimate_with_rates(
     rates: TokenRates,
     tokens_in: u64,
