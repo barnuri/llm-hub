@@ -37,6 +37,7 @@ export interface StatsEntry {
   readonly ttft_p95_ms: number;
   readonly tokens_per_sec_p50: number;
   readonly tokens_per_sec_avg: number;
+  readonly cost_usd: number;
 }
 
 export interface StatsOverview {
@@ -53,6 +54,12 @@ export interface StatsOverview {
   readonly ttft_p95_ms: number;
   readonly tokens_per_sec_p50: number;
   readonly tokens_per_sec_avg: number;
+  readonly cost_usd: number;
+}
+
+export interface StatsPricing {
+  readonly configured: boolean;
+  readonly note: string;
 }
 
 export interface StatsSnapshot {
@@ -62,6 +69,7 @@ export interface StatsSnapshot {
   readonly overview: StatsOverview;
   readonly profiles: readonly StatsEntry[];
   readonly models: readonly StatsEntry[];
+  readonly pricing: StatsPricing;
 }
 
 export type StatsRange = "live" | "1d" | "7d" | "30d" | "all";

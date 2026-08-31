@@ -102,6 +102,8 @@ mod tests {
                 timeout_ms: None,
                 enabled: true,
                 static_models: vec![],
+                pricing: Default::default(),
+                model_prices: Default::default(),
             }],
             master_key: None,
             default_fallbacks: vec![],
@@ -114,6 +116,7 @@ mod tests {
             store_path: None,
             auto_update: false,
             stream_role_inject: true,
+            pricing: Default::default(),
         }
     }
 

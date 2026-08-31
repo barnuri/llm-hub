@@ -40,3 +40,19 @@ export function formatPct(value: number): string {
   return `${formatNumber(value, 1)}%`;
 }
 
+export function formatUsd(value: number): string {
+  if (!Number.isFinite(value) || value === 0) {
+    return "$0.00";
+  }
+  if (value > 0 && value < 0.01) {
+    return `$${value.toLocaleString(undefined, {
+      minimumFractionDigits: 4,
+      maximumFractionDigits: 6,
+    })}`;
+  }
+  return `$${value.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+

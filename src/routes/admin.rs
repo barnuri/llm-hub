@@ -83,6 +83,8 @@ pub async fn upsert_profile(
         timeout_ms: input.timeout_ms,
         enabled: input.enabled.unwrap_or(true),
         static_models: input.models.unwrap_or_default(),
+        pricing: existing.map(|p| p.pricing).unwrap_or_default(),
+        model_prices: existing.map(|p| p.model_prices.clone()).unwrap_or_default(),
     };
     if !profile.base_url.starts_with("http://") && !profile.base_url.starts_with("https://") {
         return Err(AppError::BadRequest(
@@ -211,7 +213,7 @@ pub async fn stats(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let snapshot = if range == "live" || !persistent {
+    let mut snapshot = if range == "live" || !persistent {
         let mut snap = state.stats().snapshot(
             if persistent && range != "live" {
                 "live"
@@ -256,6 +258,9 @@ pub async fn stats(
             })
             .map_err(AppError::Internal)?
     };
+
+    let book = crate::services::pricing::PricingBook::from_hub(&state.config());
+    crate::services::pricing::apply_costs(&mut snapshot, &book);
 
     let body = serde_json::to_value(snapshot)
         .map_err(|e| AppError::Internal(format!("serialize stats failed: {e}")))?;

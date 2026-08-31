@@ -26,6 +26,8 @@ pub struct HubConfig {
     /// upstream omits it. Opt-out (`LLM_HUB_STREAM_ROLE=false`): the clients
     /// this repairs cannot set a request header, so it defaults on.
     pub stream_role_inject: bool,
+    /// Global USD/1M token defaults when a profile/model has no rates.
+    pub pricing: crate::configs::TokenRates,
 }
 
 impl HubConfig {
@@ -74,6 +76,25 @@ impl HubConfig {
             None => DEFAULT_PORT,
         };
 
+        let pricing = crate::configs::TokenRates {
+            input_per_1m: crate::configs::token_rates::parse_optional_f64(
+                get("INPUT_USD_PER_1M"),
+                "LLM_HUB_INPUT_USD_PER_1M",
+            )?,
+            output_per_1m: crate::configs::token_rates::parse_optional_f64(
+                get("OUTPUT_USD_PER_1M"),
+                "LLM_HUB_OUTPUT_USD_PER_1M",
+            )?,
+            cache_read_per_1m: crate::configs::token_rates::parse_optional_f64(
+                get("CACHE_READ_USD_PER_1M"),
+                "LLM_HUB_CACHE_READ_USD_PER_1M",
+            )?,
+            cache_write_per_1m: crate::configs::token_rates::parse_optional_f64(
+                get("CACHE_WRITE_USD_PER_1M"),
+                "LLM_HUB_CACHE_WRITE_USD_PER_1M",
+            )?,
+        };
+
         Ok(HubConfig {
             profiles,
             master_key,
@@ -87,6 +108,7 @@ impl HubConfig {
             store_path: get("STORE_PATH").filter(|v| !v.is_empty()),
             auto_update: get("AUTO_UPDATE").is_none_or(|v| !is_falsy(&v)),
             stream_role_inject: get("STREAM_ROLE").is_none_or(|v| !is_falsy(&v)),
+            pricing,
         })
     }
 
@@ -124,6 +146,8 @@ impl HubConfig {
         };
 
         let display_name = get("DISPLAY_NAME").filter(|v| !v.is_empty());
+        let (pricing, model_prices) =
+            crate::configs::token_rates::profile_rates_from_env(name, &get)?;
 
         Ok(ProfileConfig {
             name: name.to_string(),
@@ -139,6 +163,8 @@ impl HubConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            pricing,
+            model_prices,
         })
     }
 }

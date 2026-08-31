@@ -38,6 +38,7 @@ pub struct EntrySnapshot {
     pub ttft_p95_ms: u64,
     pub tokens_per_sec_p50: f64,
     pub tokens_per_sec_avg: f64,
+    pub cost_usd: f64,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -55,6 +56,7 @@ pub struct OverviewSnapshot {
     pub ttft_p95_ms: u64,
     pub tokens_per_sec_p50: f64,
     pub tokens_per_sec_avg: f64,
+    pub cost_usd: f64,
 }
 
 #[derive(Serialize)]
@@ -65,6 +67,8 @@ pub struct StatsSnapshot {
     pub overview: OverviewSnapshot,
     pub profiles: Vec<EntrySnapshot>,
     pub models: Vec<EntrySnapshot>,
+    #[serde(default)]
+    pub pricing: crate::services::pricing::PricingMeta,
 }
 
 /// Token counts scraped from an upstream usage object.
@@ -122,6 +126,7 @@ impl StatsRegistry {
             overview,
             profiles,
             models,
+            pricing: crate::services::pricing::PricingMeta::default(),
         }
     }
 }
@@ -246,6 +251,7 @@ fn entry_snapshot(key: &str, stats: &EntryStats) -> EntrySnapshot {
         ttft_p95_ms,
         tokens_per_sec_p50,
         tokens_per_sec_avg,
+        cost_usd: 0.0,
     }
 }
 
@@ -270,6 +276,7 @@ fn overview_from_entry(stats: &EntryStats) -> OverviewSnapshot {
         ttft_p95_ms: snap.ttft_p95_ms,
         tokens_per_sec_p50: snap.tokens_per_sec_p50,
         tokens_per_sec_avg: snap.tokens_per_sec_avg,
+        cost_usd: 0.0,
     }
 }
 

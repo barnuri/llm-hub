@@ -1,5 +1,5 @@
 import type { StatsEntry } from "../lib/types";
-import { formatMs, formatNumber, formatTps } from "../lib/format";
+import { formatMs, formatNumber, formatTps, formatUsd } from "../lib/format";
 
 interface StatsTableProps {
   readonly label: string;
@@ -17,6 +17,9 @@ export function StatsTable({ label, rows }: StatsTableProps) {
               <th>{label}</th>
               <th className="num" title="How many times this was called">
                 Requests
+              </th>
+              <th className="num" title="Estimated USD for tokens in this row">
+                Cost
               </th>
               <th className="num" title="Calls that failed (HTTP 400+)">
                 Errors
@@ -44,7 +47,7 @@ export function StatsTable({ label, rows }: StatsTableProps) {
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td colSpan={9} className="dim">
+                <td colSpan={10} className="dim">
                   No requests in this filter window yet.
                 </td>
               </tr>
@@ -53,6 +56,7 @@ export function StatsTable({ label, rows }: StatsTableProps) {
                 <tr key={entry.key}>
                   <td className="mono">{entry.key}</td>
                   <td className="num">{formatNumber(entry.requests)}</td>
+                  <td className="num">{formatUsd(entry.cost_usd)}</td>
                   <td className="num">{formatNumber(entry.errors)}</td>
                   <td className="num">{formatMs(entry.ttft_p50_ms)}</td>
                   <td className="num">{formatTps(entry.tokens_per_sec_p50)}</td>

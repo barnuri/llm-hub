@@ -211,6 +211,12 @@ renamed.
 | `LLM_HUB_<NAME>_TIMEOUT_MS` | none | Per-attempt timeout for this profile |
 | `LLM_HUB_<NAME>_ENABLED` | `true` | Disable without deleting |
 | `LLM_HUB_<NAME>_MODELS` | — | Static model list when upstream lacks `/v1/models` |
+| `LLM_HUB_<NAME>_INPUT_USD_PER_1M` | `0` | Estimated input token price for stats cost |
+| `LLM_HUB_<NAME>_OUTPUT_USD_PER_1M` | `0` | Estimated output token price for stats cost |
+| `LLM_HUB_<NAME>_CACHE_READ_USD_PER_1M` | 10% of input | Optional cache-hit price |
+| `LLM_HUB_<NAME>_CACHE_WRITE_USD_PER_1M` | = input | Optional cache-write price |
+| `LLM_HUB_<NAME>_MODEL_PRICES` | — | Per-model overrides: `model:in/out[,cache_read[/cache_write]]` |
+| `LLM_HUB_INPUT_USD_PER_1M` / `OUTPUT_…` | `0` | Global default rates when a profile has none |
 | `LLM_HUB_BIND` / `LLM_HUB_PORT` | `127.0.0.1` / `8410` | Listen address |
 | `LLM_HUB_MASTER_KEY` | unset | Require this key on `/v1/*` and `/api/*`; unset = no auth |
 | `LLM_HUB_DEFAULT_FALLBACKS` | — | Default fallback chain |

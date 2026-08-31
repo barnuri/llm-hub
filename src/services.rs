@@ -4,6 +4,7 @@ pub mod body_transform;
 pub mod config_reload;
 pub mod env_writer;
 pub mod fallback;
+pub mod pricing;
 pub mod restart;
 pub mod service_manager;
 pub mod source_install;

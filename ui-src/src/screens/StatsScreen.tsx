@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { StatsTable } from "../components/StatsTable";
 import { api } from "../lib/api";
-import { formatMs, formatNumber, formatPct, formatTps } from "../lib/format";
+import { formatMs, formatNumber, formatPct, formatTps, formatUsd } from "../lib/format";
 import type { StatsOverview, StatsRange, StatsSnapshot } from "../lib/types";
 
 interface StatsScreenProps {
@@ -44,6 +44,10 @@ const METRIC_HELP: ReadonlyArray<{ readonly title: string; readonly body: string
     title: "Tokens in / out",
     body: "Tokens in = size of your prompt. Tokens out = size of the model’s answer. Billing and speed usually track these.",
   },
+  {
+    title: "Cost (USD)",
+    body: "Estimated spend from token counts × your rates (USD per 1M tokens). Cache hits usually cost less than fresh input. Local/unknown models stay $0 unless you set prices.",
+  },
 ];
 
 function emptyOverview(): StatsOverview {
@@ -61,6 +65,7 @@ function emptyOverview(): StatsOverview {
     ttft_p95_ms: 0,
     tokens_per_sec_p50: 0,
     tokens_per_sec_avg: 0,
+    cost_usd: 0,
   };
 }
 
@@ -191,6 +196,8 @@ export function StatsScreen({ onError }: StatsScreenProps) {
         <p className="note">Day filters need persistence — fell back to live counters.</p>
       ) : null}
 
+      {snapshot?.pricing?.note ? <p className="note">{snapshot.pricing.note}</p> : null}
+
       <div className="stat-tiles stat-tiles-hero">
         <MetricTile
           accent="cyan"
@@ -203,6 +210,11 @@ export function StatsScreen({ onError }: StatsScreenProps) {
           label="Tokens / sec (p50)"
           value={formatTps(overview.tokens_per_sec_p50)}
           hint="Streaming speed after the reply starts. Higher = faster answers."
+        />
+        <MetricTile
+          label="Est. cost"
+          value={formatUsd(overview.cost_usd)}
+          hint="Estimated USD for tokens in this filter window."
         />
         <MetricTile
           label="Cache hit rate"

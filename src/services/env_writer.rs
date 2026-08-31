@@ -135,6 +135,8 @@ mod tests {
             timeout_ms: None,
             enabled: true,
             static_models: vec![],
+            pricing: Default::default(),
+            model_prices: Default::default(),
         }
     }
 
