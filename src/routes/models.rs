@@ -189,13 +189,10 @@ mod tests {
     }
 
     #[test]
-    fn static_claude_sonnet__advertises_1m() {
+    fn static_claude_sonnet__no_tokens_means_no_1m_suffix() {
         let models = static_models(&profile("llmgw", &["bedrock/anthropic.claude-sonnet-5"]));
-        assert_eq!(
-            models[0]["id"],
-            "llmgw/bedrock/anthropic.claude-sonnet-5[1m]"
-        );
-        assert_eq!(models[0]["max_input_tokens"], CONTEXT_TOKENS_1M);
+        assert_eq!(models[0]["id"], "llmgw/bedrock/anthropic.claude-sonnet-5");
+        assert!(models[0].get("max_input_tokens").is_none());
     }
 }
 

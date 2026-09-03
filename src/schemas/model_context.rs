@@ -35,13 +35,11 @@ pub fn max_input_tokens_from_item(item: &Value) -> Option<u64> {
 
 /// Window Claude Code should assume for this hub id.
 ///
-/// Prefer upstream metadata; fall back to name heuristics only when the
-/// upstream omits token counts (static model lists, dumb proxies).
-pub fn inferred_max_input_tokens(model_id: &str, upstream_tokens: Option<u64>) -> Option<u64> {
-    if let Some(tokens) = upstream_tokens.filter(|t| *t > 0) {
-        return Some(tokens);
-    }
-    looks_like_claude_1m(model_id).then_some(CONTEXT_TOKENS_1M)
+/// Uses upstream `/v1/models` metadata only — no name guessing. The same
+/// model family (e.g. Sonnet 5) can be listed at 200k and 1M as separate
+/// upstream entries.
+pub fn inferred_max_input_tokens(_model_id: &str, upstream_tokens: Option<u64>) -> Option<u64> {
+    upstream_tokens.filter(|t| *t > 0)
 }
 
 /// Hub `/v1/models` id Claude Code should see. Models with a 1M+ window get
@@ -57,18 +55,6 @@ pub fn advertised_model_id(qualified: &str, upstream_tokens: Option<u64>) -> Str
 fn should_advertise_1m(model_id: &str, upstream_tokens: Option<u64>) -> bool {
     inferred_max_input_tokens(model_id, upstream_tokens)
         .is_some_and(|tokens| tokens >= CONTEXT_TOKENS_1M)
-}
-
-fn looks_like_claude_1m(model_id: &str) -> bool {
-    let id = model_id.to_ascii_lowercase();
-    if has_1m_suffix(&id) {
-        return true;
-    }
-    id.contains("claude-opus")
-        || id.contains("claude-sonnet-5")
-        || id.contains("claude-sonnet-4-6")
-        || id.contains("claude-sonnet-4.6")
-        || id.contains("claude-fable")
 }
 
 #[cfg(test)]
@@ -97,42 +83,46 @@ mod tests {
     }
 
     #[test]
-    fn claude_opus_family__is_1m() {
+    fn upstream_1m__advertises_suffix() {
         assert_eq!(
-            inferred_max_input_tokens("llmgw/bedrock/anthropic.claude-opus-5", None),
-            Some(CONTEXT_TOKENS_1M)
+            advertised_model_id("llmgw/bedrock/anthropic.claude-opus-5", Some(1_000_000)),
+            "llmgw/bedrock/anthropic.claude-opus-5[1m]"
         );
         assert_eq!(
-            advertised_model_id("llmgw/bedrock/anthropic.claude-opus-5", None),
-            "llmgw/bedrock/anthropic.claude-opus-5[1m]"
+            advertised_model_id("llmgw/bedrock/anthropic.claude-sonnet-5", Some(1_000_000)),
+            "llmgw/bedrock/anthropic.claude-sonnet-5[1m]"
         );
     }
 
     #[test]
-    fn upstream_tokens__take_priority_over_name_heuristics() {
+    fn upstream_200k__does_not_advertise_1m_even_for_sonnet_5_name() {
         assert_eq!(
-            inferred_max_input_tokens("llmgw/bedrock/anthropic.claude-opus-5", Some(1_000_000)),
-            Some(1_000_000)
+            advertised_model_id("llmgw/bedrock/anthropic.claude-sonnet-5", Some(200_000)),
+            "llmgw/bedrock/anthropic.claude-sonnet-5"
         );
         assert_eq!(
-            advertised_model_id("llmgw/bedrock/anthropic.claude-opus-5", Some(1_000_000),),
-            "llmgw/bedrock/anthropic.claude-opus-5[1m]"
-        );
-    }
-
-    #[test]
-    fn upstream_200k__does_not_advertise_1m_even_for_opus_name() {
-        assert_eq!(
-            advertised_model_id("llmgw/bedrock/anthropic.claude-opus-5", Some(200_000),),
+            advertised_model_id("llmgw/bedrock/anthropic.claude-opus-5", Some(200_000)),
             "llmgw/bedrock/anthropic.claude-opus-5"
         );
     }
 
     #[test]
-    fn claude_sonnet_5_family__is_1m() {
+    fn missing_upstream_tokens__does_not_advertise_1m() {
         assert_eq!(
-            inferred_max_input_tokens("llmgw/bedrock/anthropic.claude-sonnet-5", None),
-            Some(CONTEXT_TOKENS_1M)
+            advertised_model_id("llmgw/bedrock/anthropic.claude-sonnet-5", None),
+            "llmgw/bedrock/anthropic.claude-sonnet-5"
+        );
+        assert_eq!(
+            inferred_max_input_tokens("llmgw/bedrock/anthropic.claude-opus-5", None),
+            None
+        );
+    }
+
+    #[test]
+    fn upstream_tokens__passed_through() {
+        assert_eq!(
+            inferred_max_input_tokens("llmgw/bedrock/anthropic.claude-opus-5", Some(1_000_000)),
+            Some(1_000_000)
         );
     }
 
@@ -157,10 +147,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_haiku_id__no_inferred_window() {
+    fn claude_haiku_upstream_200k__no_1m_suffix() {
         assert_eq!(
-            inferred_max_input_tokens("llmgw/anthropic.claude-haiku-4-5", None),
-            None
+            inferred_max_input_tokens("llmgw/anthropic.claude-haiku-4-5", Some(200_000)),
+            Some(200_000)
+        );
+        assert_eq!(
+            advertised_model_id("llmgw/anthropic.claude-haiku-4-5", Some(200_000)),
+            "llmgw/anthropic.claude-haiku-4-5"
         );
     }
 }
