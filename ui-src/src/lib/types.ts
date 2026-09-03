@@ -70,6 +70,19 @@ export interface StatsSnapshot {
   readonly profiles: readonly StatsEntry[];
   readonly models: readonly StatsEntry[];
   readonly pricing: StatsPricing;
+  readonly series_bucket?: string;
+  readonly series?: readonly SeriesPoint[];
+}
+
+export interface SeriesPoint {
+  readonly ts_ms: number;
+  readonly key: string;
+  readonly requests: number;
+  readonly tokens_in: number;
+  readonly tokens_out: number;
+  readonly cache_read_tokens: number;
+  readonly cache_write_tokens: number;
+  readonly cost_usd: number;
 }
 
 export type StatsRange = "live" | "1d" | "7d" | "30d" | "all";
@@ -85,6 +98,7 @@ export interface UsageRow {
   readonly tokens_out: number;
   readonly cache_read_tokens: number;
   readonly cache_write_tokens: number;
+  readonly cost_usd: number;
 }
 
 export interface UsageReport {
@@ -94,6 +108,14 @@ export interface UsageReport {
   readonly total_tokens_out: number;
   readonly recent: readonly UsageRow[];
 }
+
+export interface ErrorsReport {
+  readonly range: string;
+  readonly total_errors: number;
+  readonly recent: readonly UsageRow[];
+}
+
+export type ErrorsRange = "1d" | "7d" | "30d" | "all";
 
 export interface ApiKeyRow {
   readonly name: string;

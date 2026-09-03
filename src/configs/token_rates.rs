@@ -103,8 +103,10 @@ pub fn profile_rates_from_env(
     get: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(TokenRates, HashMap<String, TokenRates>), String> {
     let upper = profile.to_uppercase().replace('-', "_");
-    let input =
-        parse_optional_f64(get("INPUT_USD_PER_1M"), &format!("LLM_HUB_{upper}_INPUT_USD_PER_1M"))?;
+    let input = parse_optional_f64(
+        get("INPUT_USD_PER_1M"),
+        &format!("LLM_HUB_{upper}_INPUT_USD_PER_1M"),
+    )?;
     let output = parse_optional_f64(
         get("OUTPUT_USD_PER_1M"),
         &format!("LLM_HUB_{upper}_OUTPUT_USD_PER_1M"),

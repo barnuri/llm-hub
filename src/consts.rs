@@ -60,3 +60,8 @@ pub const SERVICE_BIND: &str = "0.0.0.0";
 pub const SERVICE_NAME: &str = "llm-hub";
 pub const GITHUB_REPO: &str = "barnuri/llm-hub";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Claude Code's `[1m]` suffix / native long-context window size.
+pub const CONTEXT_TOKENS_1M: u64 = 1_000_000;
+/// Suffix Claude Code appends to treat a gateway model id as 1M context.
+pub const CONTEXT_1M_SUFFIX: &str = "[1m]";

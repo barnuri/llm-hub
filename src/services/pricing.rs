@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::configs::{HubConfig, TokenRates};
+use crate::schemas::usage_report::UsageReport;
 use crate::services::stats::StatsSnapshot;
 
 const PER_MILLION: f64 = 1_000_000.0;
@@ -139,6 +140,15 @@ pub fn apply_costs(snapshot: &mut StatsSnapshot, book: &PricingBook) {
         }
     }
     snapshot.overview.cost_usd = snapshot.models.iter().map(|row| row.cost_usd).sum();
+    for point in &mut snapshot.series {
+        point.cost_usd = book.estimate(
+            &point.key,
+            point.tokens_in,
+            point.tokens_out,
+            point.cache_read_tokens,
+            point.cache_write_tokens,
+        );
+    }
     snapshot.pricing = PricingMeta {
         configured: book.is_configured() || snapshot.overview.cost_usd > 0.0,
         note: if book.is_configured() {
@@ -152,6 +162,19 @@ pub fn apply_costs(snapshot: &mut StatsSnapshot, book: &PricingBook) {
                 .into()
         },
     };
+}
+
+/// Attach estimated `cost_usd` to each usage log row. Local / unknown models stay `$0`.
+pub fn apply_usage_costs(report: &mut UsageReport, book: &PricingBook) {
+    for row in &mut report.recent {
+        row.cost_usd = book.estimate(
+            &row.model,
+            row.tokens_in,
+            row.tokens_out,
+            row.cache_read_tokens,
+            row.cache_write_tokens,
+        );
+    }
 }
 
 #[allow(clippy::cast_precision_loss)] // token counts → USD; mantissa loss is fine for estimates
@@ -303,5 +326,53 @@ mod tests {
         let rates = book.rates_for("llmgw/bedrock/claude-sonnet-5");
         assert!((rates.input_per_1m - 3.0).abs() < f64::EPSILON);
         assert!((rates.output_per_1m - 15.0).abs() < f64::EPSILON);
+    }
+
+    fn sample_usage_row(
+        model: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+    ) -> crate::schemas::usage_row::UsageRow {
+        crate::schemas::usage_row::UsageRow {
+            ts_ms: 0,
+            model: model.into(),
+            profile: "test".into(),
+            status: 200,
+            latency_ms: 1,
+            ttft_ms: None,
+            tokens_in,
+            tokens_out,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: 0.0,
+        }
+    }
+
+    #[test]
+    fn apply_usage_costs__cloud_model_nonzero() {
+        let book = PricingBook::default();
+        let mut report = UsageReport {
+            total_requests: 1,
+            total_errors: 0,
+            total_tokens_in: 1_000_000,
+            total_tokens_out: 0,
+            recent: vec![sample_usage_row("openai/gpt-4o", 1_000_000, 0)],
+        };
+        apply_usage_costs(&mut report, &book);
+        assert!(report.recent[0].cost_usd > 0.0);
+    }
+
+    #[test]
+    fn apply_usage_costs__local_model_zero() {
+        let book = PricingBook::default();
+        let mut report = UsageReport {
+            total_requests: 1,
+            total_errors: 0,
+            total_tokens_in: 1_000_000,
+            total_tokens_out: 0,
+            recent: vec![sample_usage_row("vllm/qwen-32b", 1_000_000, 0)],
+        };
+        apply_usage_costs(&mut report, &book);
+        assert_eq!(report.recent[0].cost_usd, 0.0);
     }
 }

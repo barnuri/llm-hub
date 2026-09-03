@@ -417,6 +417,7 @@ fn build_response(
         profile: model_id.profile.clone(),
         model_key: model_id.qualified(),
         status: status.as_u16(),
+        ts_ms: 0,
         latency_ms: 0,
         ttft_ms: None,
         tokens_in: 0,
@@ -446,12 +447,8 @@ fn build_response(
             Some(observed) => ScrapedUsage {
                 tokens_in: observed.tokens_in,
                 tokens_out: observed.tokens_out,
-                cache_read_tokens: observed
-                    .cache_read_tokens
-                    .max(scraped.cache_read_tokens),
-                cache_write_tokens: observed
-                    .cache_write_tokens
-                    .max(scraped.cache_write_tokens),
+                cache_read_tokens: observed.cache_read_tokens.max(scraped.cache_read_tokens),
+                cache_write_tokens: observed.cache_write_tokens.max(scraped.cache_write_tokens),
             },
             None => scraped,
         };
@@ -643,6 +640,7 @@ async fn build_anthropic_response(
         profile: model_id.profile.clone(),
         model_key: model_id.qualified(),
         status: status.as_u16(),
+        ts_ms: 0,
         latency_ms,
         // Buffered replies have no first-token event; treat full latency as TTFT.
         ttft_ms: Some(latency_ms),
@@ -694,6 +692,7 @@ fn record_failure(state: &AppState, model_id: &ModelId, status: u16, started: In
         profile: model_id.profile.clone(),
         model_key: model_id.qualified(),
         status: if status == 0 { 599 } else { status },
+        ts_ms: 0,
         latency_ms,
         ttft_ms: None,
         tokens_in: 0,

@@ -722,7 +722,9 @@ mod tests {
         let (stream, _) = run(&[TEXT_A]);
         assert!(stream.observed_usage().is_none());
         let (stream, _) = run(&[TEXT_A, USAGE, "[DONE]"]);
-        let usage = stream.observed_usage().expect("usage chunk should be absorbed");
+        let usage = stream
+            .observed_usage()
+            .expect("usage chunk should be absorbed");
         assert_eq!(usage.tokens_in, 5);
         assert_eq!(usage.tokens_out, 6);
     }

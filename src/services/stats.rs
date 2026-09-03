@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -69,6 +70,23 @@ pub struct StatsSnapshot {
     pub models: Vec<EntrySnapshot>,
     #[serde(default)]
     pub pricing: crate::services::pricing::PricingMeta,
+    /// `hour` for `1d`, `day` for `7d`, empty when the window has no series.
+    #[serde(default)]
+    pub series_bucket: String,
+    #[serde(default)]
+    pub series: Vec<SeriesPoint>,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct SeriesPoint {
+    pub ts_ms: u64,
+    pub key: String,
+    pub requests: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_usd: f64,
 }
 
 /// Token counts scraped from an upstream usage object.
@@ -90,10 +108,14 @@ pub struct StatsRegistry {
     overall: EntryStats,
 }
 
+pub const SERIES_HOUR_MS: u64 = 3_600_000;
+pub const SERIES_DAY_MS: u64 = 86_400_000;
+
 pub struct RequestOutcome {
     pub profile: String,
     pub model_key: String,
     pub status: u16,
+    pub ts_ms: u64,
     pub latency_ms: u64,
     /// Time until first upstream byte. `None` for buffered/non-stream replies.
     pub ttft_ms: Option<u64>,
@@ -127,6 +149,8 @@ impl StatsRegistry {
             profiles,
             models,
             pricing: crate::services::pricing::PricingMeta::default(),
+            series_bucket: String::new(),
+            series: Vec::new(),
         }
     }
 }
@@ -142,6 +166,74 @@ pub fn snapshot_from_outcomes(
         registry.record(outcome);
     }
     registry.snapshot(range, persistent)
+}
+
+#[must_use]
+pub fn series_bucket_for_range(range: &str) -> Option<(&'static str, u64)> {
+    match range {
+        "1d" => Some(("hour", SERIES_HOUR_MS)),
+        "7d" => Some(("day", SERIES_DAY_MS)),
+        _ => None,
+    }
+}
+
+/// Bucket outcomes by hour or day and model. Emits a full grid (zeros included)
+/// so line charts do not skip empty intervals.
+#[must_use]
+pub fn series_from_outcomes(
+    outcomes: &[RequestOutcome],
+    bucket_ms: u64,
+    since_ms: u64,
+    until_ms: u64,
+) -> Vec<SeriesPoint> {
+    if bucket_ms == 0 {
+        return Vec::new();
+    }
+    let models: BTreeSet<String> = outcomes.iter().map(|row| row.model_key.clone()).collect();
+    if models.is_empty() {
+        return Vec::new();
+    }
+    let start = floor_bucket(since_ms, bucket_ms);
+    let end = floor_bucket(until_ms.max(since_ms), bucket_ms);
+    let mut totals: HashMap<(u64, String), SeriesPoint> = HashMap::new();
+    let mut ts = start;
+    while ts <= end {
+        for key in &models {
+            totals.insert(
+                (ts, key.clone()),
+                SeriesPoint {
+                    ts_ms: ts,
+                    key: key.clone(),
+                    ..SeriesPoint::default()
+                },
+            );
+        }
+        ts = ts.saturating_add(bucket_ms);
+        if ts == 0 {
+            break;
+        }
+    }
+    for outcome in outcomes {
+        if outcome.ts_ms < since_ms || outcome.ts_ms > until_ms {
+            continue;
+        }
+        let bucket = floor_bucket(outcome.ts_ms, bucket_ms);
+        let Some(point) = totals.get_mut(&(bucket, outcome.model_key.clone())) else {
+            continue;
+        };
+        point.requests += 1;
+        point.tokens_in += outcome.tokens_in;
+        point.tokens_out += outcome.tokens_out;
+        point.cache_read_tokens += outcome.cache_read_tokens;
+        point.cache_write_tokens += outcome.cache_write_tokens;
+    }
+    let mut series: Vec<SeriesPoint> = totals.into_values().collect();
+    series.sort_by(|left, right| left.ts_ms.cmp(&right.ts_ms).then(left.key.cmp(&right.key)));
+    series
+}
+
+fn floor_bucket(ts_ms: u64, bucket_ms: u64) -> u64 {
+    (ts_ms / bucket_ms) * bucket_ms
 }
 
 fn record_into(map: &DashMap<String, EntryStats>, key: &str, outcome: &RequestOutcome, cap: usize) {
@@ -191,9 +283,7 @@ fn record_entry(entry: &EntryStats, outcome: &RequestOutcome) {
         entry
             .tokens_per_sec_sum_x100
             .fetch_add(centi, Ordering::Relaxed);
-        entry
-            .tokens_per_sec_samples
-            .fetch_add(1, Ordering::Relaxed);
+        entry.tokens_per_sec_samples.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -366,6 +456,7 @@ mod tests {
             profile: profile.into(),
             model_key: model.into(),
             status,
+            ts_ms: 0,
             latency_ms: 100,
             ttft_ms: Some(40),
             tokens_in: 10,
@@ -373,6 +464,35 @@ mod tests {
             cache_read_tokens: 4,
             cache_write_tokens: 0,
         }
+    }
+
+    #[test]
+    fn series_from_outcomes__same_hour_sums_requests() {
+        let hour = SERIES_HOUR_MS;
+        let mut first = outcome("openai", "openai/gpt-4o", 200);
+        first.ts_ms = hour + 10;
+        first.tokens_in = 3;
+        let mut second = outcome("openai", "openai/gpt-4o", 200);
+        second.ts_ms = hour + 20;
+        second.tokens_in = 7;
+        let series = series_from_outcomes(&[first, second], hour, hour, hour + hour - 1);
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].requests, 2);
+        assert_eq!(series[0].tokens_in, 10);
+        assert_eq!(series[0].ts_ms, hour);
+    }
+
+    #[test]
+    fn series_from_outcomes__empty_hour_is_zero() {
+        let hour = SERIES_HOUR_MS;
+        let mut row = outcome("vllm", "vllm/qwen", 200);
+        row.ts_ms = hour * 2 + 1;
+        let series = series_from_outcomes(&[row], hour, hour, hour * 2 + 1);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].ts_ms, hour);
+        assert_eq!(series[0].requests, 0);
+        assert_eq!(series[1].ts_ms, hour * 2);
+        assert_eq!(series[1].requests, 1);
     }
 
     #[test]

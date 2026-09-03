@@ -26,15 +26,16 @@ export function snippetFor(
     "claude-code": `# Claude Code — route through llm-hub via env:
 export ANTHROPIC_BASE_URL=${base}
 export ANTHROPIC_AUTH_TOKEN=${key}
-export ANTHROPIC_MODEL=${model}${
+export ANTHROPIC_MODEL=${model}
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1${
       fb
         ? `
 export ANTHROPIC_CUSTOM_HEADERS="${FALLBACKS_HEADER}: ${chain}"`
         : ""
     }
 claude
-# note: works when the selected upstream is Anthropic-compatible;
-# for OpenAI-only upstreams use an adapter profile.`,
+# /model lists hub models with context from upstream (1M Claude ids end in [1m]).`,
     codex: `# ~/.codex/config.toml
 model = "${model}"
 model_provider = "llm-hub"

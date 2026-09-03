@@ -12,6 +12,8 @@ pub struct UsageRow {
     pub tokens_out: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// Estimated USD at read time. Not persisted; old JSON store files load as `$0`.
+    pub cost_usd: f64,
 }
 
 // UsageRow needs Deserialize only for the JSON store file.
@@ -32,6 +34,8 @@ impl<'de> Deserialize<'de> for UsageRow {
             cache_read_tokens: u64,
             #[serde(default)]
             cache_write_tokens: u64,
+            #[serde(default)]
+            cost_usd: f64,
         }
         let raw = Raw::deserialize(d)?;
         Ok(UsageRow {
@@ -45,6 +49,7 @@ impl<'de> Deserialize<'de> for UsageRow {
             tokens_out: raw.tokens_out,
             cache_read_tokens: raw.cache_read_tokens,
             cache_write_tokens: raw.cache_write_tokens,
+            cost_usd: raw.cost_usd,
         })
     }
 }

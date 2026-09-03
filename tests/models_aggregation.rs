@@ -68,7 +68,10 @@ async fn aggregates_partially_when_one_upstream_is_down() {
     let alive_b = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/models"))
-        .respond_with(models_response(&["gpt-4o"]))
+        .respond_with(models_response(&[
+            "gpt-4o",
+            "bedrock/anthropic.claude-opus-5",
+        ]))
         .mount(&alive_a)
         .await;
     Mock::given(method("GET"))
@@ -105,6 +108,17 @@ async fn aggregates_partially_when_one_upstream_is_down() {
         .collect();
 
     assert!(ids.contains(&"a/gpt-4o"));
+    assert!(
+        ids.contains(&"a/bedrock/anthropic.claude-opus-5[1m]"),
+        "1M Claude families are advertised with [1m] so Claude Code assumes 1M"
+    );
+    let opus = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "a/bedrock/anthropic.claude-opus-5[1m]")
+        .unwrap();
+    assert_eq!(opus["max_input_tokens"], 1_000_000);
     assert!(
         ids.contains(&"b/meta-llama/Llama-4-Scout"),
         "slash-containing upstream id keeps full path"

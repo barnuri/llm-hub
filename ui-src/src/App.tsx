@@ -10,12 +10,14 @@ import { ModelsScreen } from "./screens/ModelsScreen";
 import { ProfilesScreen } from "./screens/ProfilesScreen";
 import { SetupScreen } from "./screens/SetupScreen";
 import { StatsScreen } from "./screens/StatsScreen";
+import { ErrorsScreen } from "./screens/ErrorsScreen";
 import { UsageScreen } from "./screens/UsageScreen";
 
 const TABS: ReadonlyArray<readonly [string, string]> = [
+  ["overview", "Overview"],
+  ["errors", "Errors"],
   ["models", "Models"],
   ["stats", "Stats"],
-  ["usage", "Usage"],
   ["profiles", "Profiles"],
   ["keys", "API keys"],
   ["setup", "Setup"],
@@ -28,7 +30,8 @@ interface ModelsResponse {
 export function App() {
   const route = useRoute();
   const routeTab = route.path.split("/")[0] ?? "";
-  const tab = TABS.some(([id]) => id === routeTab) ? routeTab : "models";
+  const normalizedTab = routeTab === "usage" ? "overview" : routeTab;
+  const tab = TABS.some(([id]) => id === normalizedTab) ? normalizedTab : "overview";
   const [meta, setMeta] = useState<HubMeta | null>(null);
   const [models, setModels] = useState<readonly string[]>([]);
   const [toasts, setToasts] = useState<readonly ToastItem[]>([]);
@@ -172,7 +175,8 @@ export function App() {
             <ModelsScreen models={models} profiles={meta?.profiles ?? []} onCopy={copy} />
           ) : null}
           {tab === "stats" ? <StatsScreen onError={(message) => toast(message, true)} /> : null}
-          {tab === "usage" ? <UsageScreen /> : null}
+          {tab === "overview" ? <UsageScreen /> : null}
+          {tab === "errors" ? <ErrorsScreen /> : null}
           {tab === "profiles" ? (
             <ProfilesScreen meta={meta} models={models} onChanged={loadAll} onToast={toast} />
           ) : null}

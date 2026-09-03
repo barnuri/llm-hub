@@ -211,6 +211,7 @@ fn build_router(state: AppState) -> Router {
         .route("/api/restart", post(routes::admin::restart_server))
         .route("/api/stats", get(routes::admin::stats))
         .route("/api/usage", get(routes::admin::usage))
+        .route("/api/errors", get(routes::admin::errors))
         .route(
             "/api/keys",
             get(routes::admin::list_api_keys).post(routes::admin::create_api_key),

@@ -12,8 +12,10 @@ use crate::dependencies::state::AppState;
 use crate::schemas::api_key_input::ApiKeyInput;
 use crate::schemas::api_key_record::ApiKeyRecord;
 use crate::schemas::app_error::AppError;
+use crate::schemas::errors_report::ErrorsReport;
 use crate::schemas::fallbacks_input::FallbacksInput;
 use crate::schemas::profile_input::ProfileInput;
+use crate::schemas::usage_report::UsageReport;
 use crate::services::env_writer;
 use crate::services::store::{StatsFilter, hash_key, now_ms};
 use crate::utils::hex::to_hex;
@@ -273,9 +275,58 @@ pub async fn usage(State(state): State<AppState>) -> Result<Json<Value>, AppErro
             "persistence is off — set LLM_HUB_PERSISTENT=true to keep usage history".into(),
         ));
     };
-    let report = store.usage().map_err(AppError::Internal)?;
+    let mut report = store.usage().map_err(AppError::Internal)?;
+    let book = crate::services::pricing::PricingBook::from_hub(&state.config());
+    crate::services::pricing::apply_usage_costs(&mut report, &book);
     let body = serde_json::to_value(report)
         .map_err(|e| AppError::Internal(format!("serialize usage report failed: {e}")))?;
+    Ok(Json(body))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ErrorsQuery {
+    /// `1d`, `7d` (default), `30d`, or `all`.
+    #[serde(default)]
+    pub range: Option<String>,
+}
+
+pub async fn errors(
+    State(state): State<AppState>,
+    Query(query): Query<ErrorsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let Some(store) = state.store() else {
+        return Err(AppError::BadRequest(
+            "persistence is off — set LLM_HUB_PERSISTENT=true to keep usage history".into(),
+        ));
+    };
+    let range = query.range.as_deref().unwrap_or("7d");
+    let since_ms = match range {
+        "1d" => Some(now_ms().saturating_sub(86_400_000)),
+        "7d" => Some(now_ms().saturating_sub(7 * 86_400_000)),
+        "30d" => Some(now_ms().saturating_sub(30 * 86_400_000)),
+        "all" => None,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unknown errors range '{other}' (expected 1d, 7d, 30d, all)"
+            )));
+        }
+    };
+    let (total_errors, recent) = store.errors(since_ms).map_err(AppError::Internal)?;
+    let mut priced = UsageReport {
+        total_requests: total_errors,
+        total_errors,
+        total_tokens_in: 0,
+        total_tokens_out: 0,
+        recent,
+    };
+    let book = crate::services::pricing::PricingBook::from_hub(&state.config());
+    crate::services::pricing::apply_usage_costs(&mut priced, &book);
+    let body = serde_json::to_value(ErrorsReport {
+        range: range.to_string(),
+        total_errors,
+        recent: priced.recent,
+    })
+    .map_err(|e| AppError::Internal(format!("serialize errors report failed: {e}")))?;
     Ok(Json(body))
 }
 

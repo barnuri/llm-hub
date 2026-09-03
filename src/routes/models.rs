@@ -6,6 +6,9 @@ use serde_json::{Value, json};
 use crate::configs::ProfileConfig;
 use crate::consts::{MODELS_CACHE_TTL, MODELS_FANOUT_TIMEOUT};
 use crate::dependencies::state::AppState;
+use crate::schemas::model_context::{
+    advertised_model_id, inferred_max_input_tokens, max_input_tokens_from_item,
+};
 
 pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
     if let Some(cached) = state.model_cache()
@@ -85,9 +88,13 @@ async fn fetch_profile_models(
 fn rewrite_model(profile: &ProfileConfig, item: &Value) -> Value {
     let mut model = item.clone();
     let raw_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+    let upstream_tokens = max_input_tokens_from_item(item);
+    let qualified = format!("{}/{}", profile.name, raw_id);
+    let advertised = advertised_model_id(&qualified, upstream_tokens);
     if let Some(obj) = model.as_object_mut() {
-        obj.insert("id".into(), json!(format!("{}/{}", profile.name, raw_id)));
+        obj.insert("id".into(), json!(advertised.clone()));
         obj.insert("owned_by".into(), json!(profile.name));
+        annotate_context(obj, &advertised, upstream_tokens);
     }
     model
 }
@@ -97,13 +104,99 @@ fn static_models(profile: &ProfileConfig) -> Vec<Value> {
         .static_models
         .iter()
         .map(|id| {
-            json!({
-                "id": format!("{}/{}", profile.name, id),
+            let qualified = format!("{}/{}", profile.name, id);
+            let advertised = advertised_model_id(&qualified, None);
+            let mut model = json!({
+                "id": advertised.clone(),
                 "object": "model",
                 "owned_by": profile.name,
-            })
+            });
+            if let Some(obj) = model.as_object_mut() {
+                annotate_context(obj, &advertised, None);
+            }
+            model
         })
         .collect()
+}
+
+fn annotate_context(
+    obj: &mut serde_json::Map<String, Value>,
+    advertised_id: &str,
+    upstream_tokens: Option<u64>,
+) {
+    let Some(tokens) = inferred_max_input_tokens(advertised_id, upstream_tokens) else {
+        return;
+    };
+    obj.insert("max_input_tokens".into(), json!(tokens));
+    obj.insert("context_length".into(), json!(tokens));
+    obj.insert("context_window".into(), json!(tokens));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::configs::{ProfileConfig, TokenRates};
+    use crate::consts::CONTEXT_TOKENS_1M;
+    use std::collections::HashMap;
+
+    fn profile(name: &str, static_ids: &[&str]) -> ProfileConfig {
+        ProfileConfig {
+            name: name.to_string(),
+            display_name: None,
+            base_url: String::new(),
+            api_key: String::new(),
+            extra_headers: Vec::new(),
+            timeout_ms: None,
+            enabled: true,
+            static_models: static_ids.iter().map(|id| (*id).to_string()).collect(),
+            pricing: TokenRates::default(),
+            model_prices: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn rewrite_claude_opus__advertises_1m_id_and_tokens() {
+        let item = json!({
+            "id": "bedrock/anthropic.claude-opus-5",
+            "object": "model",
+            "max_input_tokens": CONTEXT_TOKENS_1M,
+            "context_length": CONTEXT_TOKENS_1M,
+        });
+        let out = rewrite_model(&profile("llmgw", &[]), &item);
+        assert_eq!(out["id"], "llmgw/bedrock/anthropic.claude-opus-5[1m]");
+        assert_eq!(out["max_input_tokens"], CONTEXT_TOKENS_1M);
+        assert_eq!(out["context_window"], CONTEXT_TOKENS_1M);
+    }
+
+    #[test]
+    fn rewrite_claude_opus_200k_upstream__keeps_plain_id() {
+        let item = json!({
+            "id": "bedrock/anthropic.claude-opus-5",
+            "object": "model",
+            "max_input_tokens": 200_000,
+        });
+        let out = rewrite_model(&profile("llmgw", &[]), &item);
+        assert_eq!(out["id"], "llmgw/bedrock/anthropic.claude-opus-5");
+        assert_eq!(out["max_input_tokens"], 200_000);
+    }
+
+    #[test]
+    fn rewrite_local_model__keeps_plain_id() {
+        let item = json!({"id": "meta/muse-glimmer", "object": "model"});
+        let out = rewrite_model(&profile("llama_swap", &[]), &item);
+        assert_eq!(out["id"], "llama_swap/meta/muse-glimmer");
+        assert!(out.get("max_input_tokens").is_none());
+    }
+
+    #[test]
+    fn static_claude_sonnet__advertises_1m() {
+        let models = static_models(&profile("llmgw", &["bedrock/anthropic.claude-sonnet-5"]));
+        assert_eq!(
+            models[0]["id"],
+            "llmgw/bedrock/anthropic.claude-sonnet-5[1m]"
+        );
+        assert_eq!(models[0]["max_input_tokens"], CONTEXT_TOKENS_1M);
+    }
 }
 
 /// Spawned from main: keeps the cache warm so client startups never fan out.
