@@ -221,10 +221,26 @@ fn translate_tools(tools: &[Value]) -> Vec<Value> {
         if let Some(description) = obj.get("description") {
             function.insert("description".into(), description.clone());
         }
-        function.insert("parameters".into(), schema.clone());
+        function.insert("parameters".into(), normalize_tool_parameters(schema));
         out.push(json!({ "type": "function", "function": Value::Object(function) }));
     }
     out
+}
+
+/// Fills in the JSON-Schema fields an Anthropic `input_schema` may omit.
+///
+/// Anthropic and `OpenAI` both accept a bare `{"type": "object"}`, but stricter
+/// `OpenAI`-compatible servers (LM Studio) reject a `parameters` object without
+/// `properties`. Only the top level is normalized — nested schemas are the
+/// caller's shape and are copied through untouched.
+fn normalize_tool_parameters(schema: &Value) -> Value {
+    let Some(fields) = schema.as_object() else {
+        return json!({ "type": "object", "properties": {} });
+    };
+    let mut parameters = fields.clone();
+    parameters.entry("type").or_insert_with(|| json!("object"));
+    parameters.entry("properties").or_insert_with(|| json!({}));
+    Value::Object(parameters)
 }
 
 fn translate_tool_choice(choice: &Value) -> Option<Value> {
@@ -473,6 +489,45 @@ mod tests {
         }));
         assert_eq!(out["tools"].as_array().unwrap().len(), 1);
         assert_eq!(out["tools"][0]["function"]["name"], "keep");
+    }
+
+    #[test]
+    fn tool_schema_without_properties__gets_empty_properties() {
+        let out = translate(&json!({
+            "messages": [],
+            "tools": [{"name": "no_args", "input_schema": {"type": "object"}}]
+        }));
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn tool_schema_without_type__keeps_existing_properties() {
+        let out = translate(&json!({
+            "messages": [],
+            "tools": [{
+                "name": "typeless",
+                "input_schema": {"properties": {"q": {"type": "string"}}, "required": ["q"]}
+            }]
+        }));
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"],
+            json!({"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]})
+        );
+    }
+
+    #[test]
+    fn non_object_tool_schema__becomes_empty_object_schema() {
+        let out = translate(&json!({
+            "messages": [],
+            "tools": [{"name": "broken", "input_schema": "nonsense"}]
+        }));
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
     }
 
     #[test]
