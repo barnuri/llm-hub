@@ -7,16 +7,20 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::configs::{ProfileConfig, mask_key};
-use crate::consts::{ENV_FILE, VERSION};
+use crate::consts::{DEFAULT_INSIGHTS_MIN_REQUESTS, DEFAULT_INSIGHTS_RANGE, ENV_FILE, VERSION};
 use crate::dependencies::state::AppState;
 use crate::schemas::api_key_input::ApiKeyInput;
 use crate::schemas::api_key_record::ApiKeyRecord;
 use crate::schemas::app_error::AppError;
 use crate::schemas::errors_report::ErrorsReport;
 use crate::schemas::fallbacks_input::FallbacksInput;
+use crate::schemas::insights::insights_report::InsightsReport;
+use crate::schemas::insights::pick_by::PickBy;
 use crate::schemas::profile_input::ProfileInput;
 use crate::schemas::usage_report::UsageReport;
 use crate::services::env_writer;
+use crate::services::insights;
+use crate::services::stats::RequestOutcome;
 use crate::services::store::{StatsFilter, hash_key, now_ms};
 use crate::utils::hex::to_hex;
 use crate::utils::time::elapsed_ms;
@@ -393,4 +397,123 @@ fn reload_config(state: &AppState) -> Result<(), AppError> {
     crate::services::config_reload::reload(state)
         .map(|_| ())
         .map_err(AppError::Internal)
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct InsightsQuery {
+    /// `1d`, `7d` (default), `30d`, or `all`.
+    #[serde(default)]
+    pub range: Option<String>,
+    pub profile: Option<String>,
+    pub min_requests: Option<u64>,
+    /// Criterion for `/api/insights/pick`; `overall` when omitted.
+    pub by: Option<PickBy>,
+}
+
+/// Per-model speed, stability, health and category leaders.
+pub async fn insights(
+    State(state): State<AppState>,
+    Query(query): Query<InsightsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let report = insights_report(&state, &query)?;
+    serde_json::to_value(report)
+        .map(Json)
+        .map_err(|e| AppError::Internal(format!("serialize insights failed: {e}")))
+}
+
+/// The best ranked model for `by`, so scripts can choose a model from stats.
+pub async fn insights_pick(
+    State(state): State<AppState>,
+    Query(query): Query<InsightsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let report = insights_report(&state, &query)?;
+    let by = query.by.unwrap_or_default();
+    let Some(picked) = insights::pick(&report, by) else {
+        return Err(AppError::NotFound(format!(
+            "no ranked model: none has {} or more calls in {} without a failure streak",
+            report.min_requests, report.range
+        )));
+    };
+    serde_json::to_value(picked)
+        .map(Json)
+        .map_err(|e| AppError::Internal(format!("serialize pick failed: {e}")))
+}
+
+/// Full insights for agents: plain-language summary, every pick, per-model
+/// metrics and failure reasons in one JSON document.
+pub async fn insights_agent_report(
+    State(state): State<AppState>,
+    Query(query): Query<InsightsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let window = insights_window(&state, &query)?;
+    let report = insights::build_agent_report(
+        &window.outcomes,
+        &window.range,
+        window.profile,
+        window.min_requests,
+        now_ms(),
+    );
+    serde_json::to_value(report)
+        .map(Json)
+        .map_err(|e| AppError::Internal(format!("serialize agent report failed: {e}")))
+}
+
+struct InsightsWindow {
+    outcomes: Vec<RequestOutcome>,
+    range: String,
+    profile: Option<String>,
+    min_requests: u64,
+}
+
+fn insights_report(state: &AppState, query: &InsightsQuery) -> Result<InsightsReport, AppError> {
+    let window = insights_window(state, query)?;
+    Ok(insights::build_report(
+        &window.outcomes,
+        &window.range,
+        window.min_requests,
+        now_ms(),
+    ))
+}
+
+fn insights_window(state: &AppState, query: &InsightsQuery) -> Result<InsightsWindow, AppError> {
+    let Some(store) = state.store() else {
+        return Err(AppError::BadRequest(
+            "persistence is off — set LLM_HUB_PERSISTENT=true to keep usage history".into(),
+        ));
+    };
+    let range = query.range.as_deref().unwrap_or(DEFAULT_INSIGHTS_RANGE);
+    let since_ms = match range {
+        "1d" => Some(now_ms().saturating_sub(86_400_000)),
+        "7d" => Some(now_ms().saturating_sub(7 * 86_400_000)),
+        "30d" => Some(now_ms().saturating_sub(30 * 86_400_000)),
+        "all" => None,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unknown insights range '{other}' (expected 1d, 7d, 30d, all)"
+            )));
+        }
+    };
+    let profile = query
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let outcomes = store
+        .filtered_outcomes(&StatsFilter {
+            since_ms,
+            profile: profile.clone(),
+            model: None,
+            range_label: range.to_string(),
+        })
+        .map_err(AppError::Internal)?;
+    Ok(InsightsWindow {
+        outcomes,
+        range: range.to_string(),
+        profile,
+        min_requests: query
+            .min_requests
+            .unwrap_or(DEFAULT_INSIGHTS_MIN_REQUESTS)
+            .max(1),
+    })
 }

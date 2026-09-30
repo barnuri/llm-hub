@@ -7,7 +7,7 @@ import {
   rankModels,
 } from "../components/UsageModelChart";
 import { api } from "../lib/api";
-import { formatNumber, formatTime, formatUsd } from "../lib/format";
+import { formatDateTime, formatNumber, formatUsd } from "../lib/format";
 import { navigate } from "../lib/router";
 import type { SeriesPoint, StatsSnapshot, UsageReport } from "../lib/types";
 
@@ -251,7 +251,7 @@ export function UsageScreen() {
               Next
             </button>
           </div>
-          <div className="table-scroll usage-table-scroll">
+          <div className="table-scroll">
             <table className="table">
               <thead>
                 <tr>
@@ -274,7 +274,7 @@ export function UsageScreen() {
                 ) : (
                   pageRows.map((row) => (
                     <tr key={`${row.ts_ms}-${row.model}-${row.status}-${row.latency_ms}`}>
-                      <td className="mono">{formatTime(row.ts_ms)}</td>
+                      <td className="mono">{formatDateTime(row.ts_ms)}</td>
                       <td className="mono">{row.model}</td>
                       <td className="num">{row.status}</td>
                       <td className="num">{row.latency_ms}</td>

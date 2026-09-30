@@ -155,6 +155,26 @@ Set the default chain any of three ways (per-request header always wins):
 - **Env** — `LLM_HUB_DEFAULT_FALLBACKS=groq/llama-3.3-70b-versatile,openai/gpt-4o-mini`
   in `.env`. The UI and API persist to the same variable.
 
+## Model insights
+
+With `LLM_HUB_PERSISTENT=true`, the **Insights** tab ranks models by what
+actually happened through the hub: success rate, current failure streak,
+time to first token, output speed, prompt-reading speed, cache hits, and the
+most common failure reasons. Overall score = 60% reliability + 40% speed,
+where speed is relative to the best ranked model. A model is ranked once it
+has `min_requests` calls in the window (default 5) and its newest 3 calls did
+not all fail. The scores measure speed and failed calls, not answer quality.
+
+```sh
+curl 'localhost:8410/api/insights?range=7d&min_requests=5'
+curl 'localhost:8410/api/insights/pick?by=overall&profile=llama_swap'
+```
+
+`range` is `1d`, `7d` (default), `30d` or `all`. `by` is `overall`,
+`stability`, `speed`, `ttft`, `decode` or `prefill`. `pick` returns the winner
+plus runners-up and answers 404 when no model is ranked yet, so scripts can
+fall back to a fixed model.
+
 ## Request transforms
 
 Two opt-in request headers reshape the body on its way upstream, for the times

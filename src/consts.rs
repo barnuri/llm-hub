@@ -20,6 +20,12 @@ pub const ERROR_REASON_MAX_CHARS: usize = 500;
 /// Statuses at or above this are failures in stats, the store, and the log.
 pub const ERROR_STATUS_MIN: u16 = 400;
 
+/// A model needs this many calls in the window before insights rank it.
+pub const DEFAULT_INSIGHTS_MIN_REQUESTS: u64 = 5;
+
+/// Window `/api/insights` uses when `range` is omitted.
+pub const DEFAULT_INSIGHTS_RANGE: &str = "7d";
+
 /// How long an SSE response may produce no upstream bytes before the hub sends
 /// a keepalive comment. A slow local model answers the request headers in
 /// milliseconds and then goes silent for the whole prefill (measured: 113s on a

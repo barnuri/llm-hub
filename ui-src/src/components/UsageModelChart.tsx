@@ -5,7 +5,7 @@ import type { SeriesPoint, StatsEntry } from "../lib/types";
 
 export const DEFAULT_VISIBLE_MODELS = 4;
 const VIEW_WIDTH = 640;
-const VIEW_HEIGHT = 168;
+const VIEW_HEIGHT = 200;
 const PAD = { top: 12, right: 46, bottom: 26, left: 38 } as const;
 const INNER_WIDTH = VIEW_WIDTH - PAD.left - PAD.right;
 const INNER_HEIGHT = VIEW_HEIGHT - PAD.top - PAD.bottom;
@@ -310,27 +310,29 @@ export function UsageTrendChart({
           )}
         </div>
       </div>
-      <table className="sr-only">
-        <caption>{title} model requests and cost</caption>
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>Model</th>
-            <th>Requests</th>
-            <th>Cost</th>
-          </tr>
-        </thead>
-        <tbody>
-          {series.map((point) => (
-            <tr key={`${point.ts_ms}-${point.key}`}>
-              <td>{formatBucket(point.ts_ms, bucket)}</td>
-              <td>{point.key}</td>
-              <td>{formatNumber(point.requests)}</td>
-              <td>{formatUsd(point.cost_usd)}</td>
+      <div className="sr-only">
+        <table>
+          <caption>{title} model requests and cost</caption>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Model</th>
+              <th>Requests</th>
+              <th>Cost</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {series.map((point) => (
+              <tr key={`${point.ts_ms}-${point.key}`}>
+                <td>{formatBucket(point.ts_ms, bucket)}</td>
+                <td>{point.key}</td>
+                <td>{formatNumber(point.requests)}</td>
+                <td>{formatUsd(point.cost_usd)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }

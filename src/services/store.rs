@@ -309,13 +309,14 @@ impl Store {
         Ok(snapshot)
     }
 
-    fn filtered_outcomes(&self, filter: &StatsFilter) -> Result<Vec<RequestOutcome>, String> {
+    /// Request outcomes matching `filter`, oldest first.
+    pub fn filtered_outcomes(&self, filter: &StatsFilter) -> Result<Vec<RequestOutcome>, String> {
         match self {
             Store::Sqlite(conn) => {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
                 let mut sql = String::from(
                     "SELECT model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms
+                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error
                      FROM requests WHERE 1=1",
                 );
                 let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -331,6 +332,7 @@ impl Store {
                     sql.push_str(" AND model = ?");
                     params.push(rusqlite::types::Value::Text(model.clone()));
                 }
+                sql.push_str(" ORDER BY id");
                 let mut stmt = guard.prepare(&sql).map_err(|e| e.to_string())?;
                 let rows = stmt
                     .query_map(rusqlite::params_from_iter(params), |r| {
@@ -345,7 +347,7 @@ impl Store {
                             cache_read_tokens: db_u64(r.get::<_, i64>(7).unwrap_or(0)),
                             cache_write_tokens: db_u64(r.get::<_, i64>(8).unwrap_or(0)),
                             ts_ms: db_u64(r.get::<_, i64>(9).unwrap_or(0)),
-                            error: None,
+                            error: r.get::<_, Option<String>>(10).unwrap_or(None),
                         })
                     })
                     .map_err(|e| e.to_string())?

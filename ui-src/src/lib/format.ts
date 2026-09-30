@@ -2,6 +2,15 @@ export function formatTime(tsMs: number): string {
   return new Date(tsMs).toLocaleTimeString();
 }
 
+/** Time only for today, otherwise short date plus time, so older rows are not ambiguous. */
+export function formatDateTime(tsMs: number): string {
+  const date = new Date(tsMs);
+  if (date.toDateString() === new Date().toDateString()) {
+    return date.toLocaleTimeString();
+  }
+  return `${date.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${date.toLocaleTimeString()}`;
+}
+
 export function formatDate(tsMs: number): string {
   return new Date(tsMs).toLocaleDateString();
 }

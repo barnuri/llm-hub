@@ -129,3 +129,57 @@ export interface KeysResponse {
   readonly persistent: boolean;
   readonly keys: readonly ApiKeyRow[];
 }
+
+export type ModelHealth = "healthy" | "degraded" | "failing" | "insufficient_data";
+
+export type InsightsRange = "1d" | "7d" | "30d" | "all";
+
+export interface ModelInsight {
+  readonly model: string;
+  readonly profile: string;
+  readonly requests: number;
+  readonly errors: number;
+  readonly success_rate_pct: number;
+  readonly consecutive_failures: number;
+  readonly health: ModelHealth;
+  readonly ttft_p50_ms: number | null;
+  readonly ttft_p95_ms: number | null;
+  readonly latency_p50_ms: number | null;
+  readonly decode_tokens_per_sec_p50: number | null;
+  readonly prefill_tokens_per_sec_p50: number | null;
+  readonly cache_hit_rate_pct: number;
+  readonly tokens_in: number;
+  readonly tokens_out: number;
+  readonly top_errors: ReadonlyArray<{ readonly reason: string; readonly count: number }>;
+  readonly last_success_ms: number | null;
+  readonly last_error_ms: number | null;
+  readonly ranked: boolean;
+  readonly stability_score: number | null;
+  readonly speed_score: number | null;
+  readonly overall_score: number | null;
+}
+
+export interface InsightLeaders {
+  readonly best_overall: string | null;
+  readonly most_stable: string | null;
+  readonly fastest_first_token: string | null;
+  readonly fastest_decode: string | null;
+  readonly fastest_prefill: string | null;
+  readonly most_used: string | null;
+}
+
+export interface InsightsReport {
+  readonly range: string;
+  readonly min_requests: number;
+  readonly generated_ms: number;
+  readonly leaders: InsightLeaders;
+  readonly models: readonly ModelInsight[];
+}
+
+export interface ModelPick {
+  readonly by: string;
+  readonly model: string;
+  readonly value: number;
+  readonly reason: string;
+  readonly alternatives: ReadonlyArray<{ readonly model: string; readonly value: number }>;
+}

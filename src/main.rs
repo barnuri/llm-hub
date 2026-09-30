@@ -212,6 +212,12 @@ fn build_router(state: AppState) -> Router {
         .route("/api/stats", get(routes::admin::stats))
         .route("/api/usage", get(routes::admin::usage))
         .route("/api/errors", get(routes::admin::errors))
+        .route("/api/insights", get(routes::admin::insights))
+        .route("/api/insights/pick", get(routes::admin::insights_pick))
+        .route(
+            "/api/insights/report",
+            get(routes::admin::insights_agent_report),
+        )
         .route(
             "/api/keys",
             get(routes::admin::list_api_keys).post(routes::admin::create_api_key),

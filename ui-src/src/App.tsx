@@ -11,10 +11,12 @@ import { ProfilesScreen } from "./screens/ProfilesScreen";
 import { SetupScreen } from "./screens/SetupScreen";
 import { StatsScreen } from "./screens/StatsScreen";
 import { ErrorsScreen } from "./screens/ErrorsScreen";
+import { InsightsScreen } from "./screens/InsightsScreen";
 import { UsageScreen } from "./screens/UsageScreen";
 
 const TABS: ReadonlyArray<readonly [string, string]> = [
   ["overview", "Overview"],
+  ["insights", "Insights"],
   ["errors", "Errors"],
   ["models", "Models"],
   ["stats", "Stats"],
@@ -177,6 +179,7 @@ export function App() {
           {tab === "stats" ? <StatsScreen onError={(message) => toast(message, true)} /> : null}
           {tab === "overview" ? <UsageScreen /> : null}
           {tab === "errors" ? <ErrorsScreen /> : null}
+          {tab === "insights" ? <InsightsScreen onCopy={copy} /> : null}
           {tab === "profiles" ? (
             <ProfilesScreen meta={meta} models={models} onChanged={loadAll} onToast={toast} />
           ) : null}
