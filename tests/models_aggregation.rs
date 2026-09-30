@@ -57,7 +57,14 @@ async fn wait_ready(base: &str) {
 fn models_response(ids: &[&str]) -> ResponseTemplate {
     let data: Vec<serde_json::Value> = ids
         .iter()
-        .map(|id| serde_json::json!({"id": id, "object": "model", "owned_by": "upstream"}))
+        .map(|id| {
+            let mut model =
+                serde_json::json!({"id": id, "object": "model", "owned_by": "upstream"});
+            if *id == "bedrock/anthropic.claude-opus-5" {
+                model["max_input_tokens"] = serde_json::json!(1_000_000);
+            }
+            model
+        })
         .collect();
     ResponseTemplate::new(200).set_body_json(serde_json::json!({"object": "list", "data": data}))
 }
@@ -82,7 +89,7 @@ async fn aggregates_partially_when_one_upstream_is_down() {
 
     let dead_port = free_port();
     let (hub, base) = start_hub(HashMap::from([
-        ("LLM_HUB_PROFILES".into(), "a,b,dead".into()),
+        ("LLM_HUB_PROFILES".into(), "a,b,dead,disabled".into()),
         ("LLM_HUB_A_BASE_URL".into(), alive_a.uri()),
         ("LLM_HUB_B_BASE_URL".into(), alive_b.uri()),
         (
@@ -90,6 +97,9 @@ async fn aggregates_partially_when_one_upstream_is_down() {
             format!("http://127.0.0.1:{dead_port}"),
         ),
         ("LLM_HUB_DEAD_MODELS".into(), "static-x".into()),
+        ("LLM_HUB_DISABLED_BASE_URL".into(), alive_b.uri()),
+        ("LLM_HUB_DISABLED_ENABLED".into(), "false".into()),
+        ("LLM_HUB_DISABLED_MODELS".into(), "hidden".into()),
     ]))
     .await;
 
@@ -126,6 +136,10 @@ async fn aggregates_partially_when_one_upstream_is_down() {
     assert!(
         ids.contains(&"dead/static-x"),
         "dead upstream degrades to its static list"
+    );
+    assert!(
+        !ids.contains(&"disabled/hidden"),
+        "disabled profiles must not appear in the models API"
     );
     drop(hub);
 }

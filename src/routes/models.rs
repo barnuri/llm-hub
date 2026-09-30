@@ -11,12 +11,16 @@ use crate::schemas::model_context::{
 };
 
 pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
-    if let Some(cached) = state.model_cache()
+    let mut payload = if let Some(cached) = state.model_cache()
         && cached.fetched_at.elapsed() < MODELS_CACHE_TTL
     {
-        return Json(cached.payload.clone());
-    }
-    Json(refresh_models(&state).await)
+        cached.payload.clone()
+    } else {
+        refresh_models(&state).await
+    };
+    let config = state.config();
+    filter_enabled_models(&mut payload, &config.profiles);
+    Json(payload)
 }
 
 /// Fans out to every enabled upstream, rewrites ids to `<profile>/<id>`,
@@ -119,6 +123,21 @@ fn static_models(profile: &ProfileConfig) -> Vec<Value> {
         .collect()
 }
 
+fn filter_enabled_models(payload: &mut Value, profiles: &[ProfileConfig]) {
+    let Some(models) = payload.get_mut("data").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    models.retain(|model| {
+        let Some(owner) = model.get("owned_by").and_then(Value::as_str) else {
+            return false;
+        };
+        profiles
+            .iter()
+            .any(|profile| profile.enabled && profile.name == owner)
+    });
+}
+
 fn annotate_context(
     obj: &mut serde_json::Map<String, Value>,
     advertised_id: &str,
@@ -193,6 +212,32 @@ mod tests {
         let models = static_models(&profile("llmgw", &["bedrock/anthropic.claude-sonnet-5"]));
         assert_eq!(models[0]["id"], "llmgw/bedrock/anthropic.claude-sonnet-5");
         assert!(models[0].get("max_input_tokens").is_none());
+    }
+
+    #[test]
+    fn disabled_profile_models__only_enabled_profiles_remain() {
+        let enabled = profile("enabled", &[]);
+        let mut disabled = profile("disabled", &[]);
+        disabled.enabled = false;
+        let profiles = vec![enabled, disabled];
+        let mut payload = json!({
+            "object": "list",
+            "data": [
+                {"id": "enabled/model", "owned_by": "enabled"},
+                {"id": "disabled/model", "owned_by": "disabled"},
+                {"id": "unknown/model"}
+            ]
+        });
+
+        filter_enabled_models(&mut payload, &profiles);
+
+        assert_eq!(
+            payload,
+            json!({
+                "object": "list",
+                "data": [{"id": "enabled/model", "owned_by": "enabled"}]
+            })
+        );
     }
 }
 
