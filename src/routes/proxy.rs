@@ -1077,8 +1077,14 @@ mod tests {
             "request (69657 tokens) exceeds the available context size (65536 tokens)"
         );
         assert_eq!(error_reason(400, br#"{"error":"bad model"}"#), "bad model");
-        assert_eq!(error_reason(500, b"  upstream exploded \n"), "upstream exploded");
-        assert_eq!(error_reason(404, b""), "HTTP 404 with empty body from upstream");
+        assert_eq!(
+            error_reason(500, b"  upstream exploded \n"),
+            "upstream exploded"
+        );
+        assert_eq!(
+            error_reason(404, b""),
+            "HTTP 404 with empty body from upstream"
+        );
         assert_eq!(
             error_reason(400, "x".repeat(2000).as_bytes()).len(),
             ERROR_REASON_MAX_CHARS
