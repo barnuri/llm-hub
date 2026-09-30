@@ -2,19 +2,26 @@
 //! "which model should I use" picks built on top of them.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+
+use serde_json::Value;
 
 use crate::consts::ERROR_STATUS_MIN;
 use crate::schemas::insights::agent_report::AgentReport;
 use crate::schemas::insights::error_count::ErrorCount;
 use crate::schemas::insights::failure_reason::FailureReason;
+use crate::schemas::insights::harness_insight::HarnessInsight;
 use crate::schemas::insights::insight_leaders::InsightLeaders;
 use crate::schemas::insights::insights_report::InsightsReport;
+use crate::schemas::insights::model_catalog_entry::ModelCatalogEntry;
 use crate::schemas::insights::model_health::ModelHealth;
 use crate::schemas::insights::model_insight::ModelInsight;
 use crate::schemas::insights::model_pick::ModelPick;
 use crate::schemas::insights::pick_by::PickBy;
 use crate::schemas::insights::pick_candidate::PickCandidate;
+use crate::schemas::insights::use_case_pick::UseCasePick;
+use crate::schemas::model_context::{max_input_tokens_from_item, strip_1m_suffix};
+use crate::services::harness::classify;
 use crate::services::stats::{RequestOutcome, tokens_per_sec};
 use crate::utils::time::utc_iso8601;
 
@@ -30,6 +37,10 @@ const PERCENT: f64 = 100.0;
 const MEDIAN: f64 = 0.5;
 const P95: f64 = 0.95;
 const AGENT_FAILURE_REASONS: usize = 10;
+/// A harness needs this many calls on a model before it can be its best harness.
+const HARNESS_MIN_CALLS: u64 = 3;
+/// Probes and scripts, not agent harnesses: never offered as a model's best harness.
+const NON_AGENT_CLIENTS: [&str; 3] = ["curl", "python", "unknown"];
 const MS_PER_SECOND: f64 = 1000.0;
 const SCORING: &str = "overall = 0.6 x reliability (success %) + 0.4 x speed; speed = half output tok/s \
 relative to the fastest ranked model + half the fastest first-token p50 relative to this model's";
@@ -42,9 +53,13 @@ so switching models costs a reload.",
 ];
 
 /// Builds the insights report from outcomes in chronological order.
+///
+/// `catalog` adds context window and declared use cases, and lists models that
+/// had no calls in the window so readers still see them.
 #[must_use]
 pub fn build_report(
     outcomes: &[RequestOutcome],
+    catalog: &HashMap<String, ModelCatalogEntry>,
     range: &str,
     min_requests: u64,
     generated_ms: u64,
@@ -60,15 +75,79 @@ pub fn build_report(
         .into_values()
         .map(|calls| model_insight(&calls, min_requests))
         .collect();
+    for id in catalog.keys() {
+        if !models.iter().any(|model| model.model == *id) {
+            models.push(unused_model(id));
+        }
+    }
+    for model in &mut models {
+        if let Some(entry) = catalog.get(&model.model) {
+            model.context_window = entry.context_window;
+            model.use_cases.clone_from(&entry.use_cases);
+            model.summary.clone_from(&entry.summary);
+        }
+    }
     score_ranked(&mut models);
     models.sort_by(report_order);
+    let all_calls: Vec<&RequestOutcome> = outcomes.iter().collect();
     InsightsReport {
         range: range.to_string(),
         min_requests,
         generated_ms,
         leaders: leaders(&models),
+        best_for: best_for(&models),
+        harnesses: harness_insights(&all_calls),
         models,
     }
+}
+
+/// Context window, use cases and summary per hub model id, read from a
+/// `/v1/models` payload. llama-swap rows carry the registry's `use_cases` and
+/// `summary` in `meta.llamaswap`.
+#[must_use]
+pub fn catalog_from_models(payload: &Value) -> HashMap<String, ModelCatalogEntry> {
+    let Some(items) = payload.get("data").and_then(Value::as_array) else {
+        return HashMap::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let id = item.get("id").and_then(Value::as_str)?;
+            let meta = item.get("meta").and_then(|meta| meta.get("llamaswap"));
+            let use_cases = meta
+                .and_then(|meta| meta.get("use_cases"))
+                .map(string_list)
+                .unwrap_or_default();
+            let summary = meta
+                .and_then(|meta| meta.get("summary"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string);
+            let entry = ModelCatalogEntry {
+                context_window: max_input_tokens_from_item(item),
+                use_cases,
+                summary,
+            };
+            Some((strip_1m_suffix(id).to_string(), entry))
+        })
+        .collect()
+}
+
+fn string_list(value: &Value) -> Vec<String> {
+    let raw: Vec<String> = match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        Value::String(text) => text.split(',').map(str::to_string).collect(),
+        _ => Vec::new(),
+    };
+    raw.into_iter()
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 /// The best ranked model for `by`, with runners-up; `None` when nothing is ranked.
@@ -112,12 +191,13 @@ pub fn pick(report: &InsightsReport, by: PickBy) -> Option<ModelPick> {
 #[must_use]
 pub fn build_agent_report(
     outcomes: &[RequestOutcome],
+    catalog: &HashMap<String, ModelCatalogEntry>,
     range: &str,
     profile: Option<String>,
     min_requests: u64,
     generated_ms: u64,
 ) -> AgentReport {
-    let report = build_report(outcomes, range, min_requests, generated_ms);
+    let report = build_report(outcomes, catalog, range, min_requests, generated_ms);
     let picks: Vec<ModelPick> = PickBy::ALL
         .into_iter()
         .filter_map(|by| pick(&report, by))
@@ -132,6 +212,8 @@ pub fn build_agent_report(
         summary: summary(&report, &picks),
         picks,
         leaders: report.leaders,
+        best_for: report.best_for,
+        harnesses: report.harnesses,
         failure_reasons: failure_reasons(outcomes),
         models: report.models,
     }
@@ -162,6 +244,22 @@ Lower min_requests or widen the range.",
     }
     for picked in picks.iter().filter(|picked| picked.by != PickBy::Overall) {
         lines.push(format!("{}: {}.", criterion_label(picked.by), picked.model));
+    }
+    for use_case_pick in &report.best_for {
+        let basis = if use_case_pick.ranked {
+            "from call stats"
+        } else {
+            "declared only, too few calls to rank"
+        };
+        lines.push(format!(
+            "Best for {}: {} ({basis}).",
+            use_case_pick.use_case, use_case_pick.model
+        ));
+    }
+    for model in report.models.iter().filter(|model| model.requests > 0) {
+        if let Some(harness) = &model.best_harness {
+            lines.push(format!("{} works best in {harness}.", model.model));
+        }
     }
     for model in &report.models {
         let reason = model.top_errors.first().map_or_else(String::new, |error| {
@@ -305,9 +403,13 @@ fn model_insight(calls: &[&RequestOutcome], min_requests: u64) -> ModelInsight {
         min_requests,
     );
     let first = calls.first().copied();
+    let by_harness = harness_insights(calls);
     ModelInsight {
         model: first.map(|call| call.model_key.clone()).unwrap_or_default(),
         profile: first.map(|call| call.profile.clone()).unwrap_or_default(),
+        context_window: None,
+        use_cases: Vec::new(),
+        summary: None,
         requests,
         errors,
         success_rate_pct,
@@ -332,7 +434,149 @@ fn model_insight(calls: &[&RequestOutcome], min_requests: u64) -> ModelInsight {
         stability_score: None,
         speed_score: None,
         overall_score: None,
+        best_harness: best_harness(&by_harness),
+        by_harness,
     }
+}
+
+/// A catalog model with no calls in the window.
+fn unused_model(id: &str) -> ModelInsight {
+    ModelInsight {
+        model: id.to_string(),
+        profile: id.split('/').next().unwrap_or_default().to_string(),
+        context_window: None,
+        use_cases: Vec::new(),
+        summary: None,
+        requests: 0,
+        errors: 0,
+        success_rate_pct: 0.0,
+        consecutive_failures: 0,
+        health: ModelHealth::InsufficientData,
+        ttft_p50_ms: None,
+        ttft_p95_ms: None,
+        latency_p50_ms: None,
+        decode_tokens_per_sec_p50: None,
+        prefill_tokens_per_sec_p50: None,
+        cache_hit_rate_pct: 0.0,
+        tokens_in: 0,
+        tokens_out: 0,
+        top_errors: Vec::new(),
+        last_success_ms: None,
+        last_error_ms: None,
+        ranked: false,
+        stability_score: None,
+        speed_score: None,
+        overall_score: None,
+        by_harness: Vec::new(),
+        best_harness: None,
+    }
+}
+
+/// Success rate and speed per client harness, busiest harness first.
+fn harness_insights(calls: &[&RequestOutcome]) -> Vec<HarnessInsight> {
+    let mut groups: HashMap<String, Vec<&RequestOutcome>> = HashMap::new();
+    for call in calls {
+        groups
+            .entry(classify(call.client.as_deref()))
+            .or_default()
+            .push(call);
+    }
+    let mut insights: Vec<HarnessInsight> = groups
+        .into_iter()
+        .map(|(harness, group)| {
+            let successes: Vec<&RequestOutcome> = group
+                .iter()
+                .copied()
+                .filter(|call| is_success(call))
+                .collect();
+            let ttfts: Vec<f64> = successes
+                .iter()
+                .filter_map(|call| call.ttft_ms)
+                .map(to_f64)
+                .collect();
+            let decode: Vec<f64> = successes
+                .iter()
+                .filter_map(|call| tokens_per_sec(call))
+                .collect();
+            HarnessInsight {
+                harness,
+                requests: group.len() as u64,
+                success_rate_pct: ratio_pct(successes.len() as u64, group.len() as u64),
+                ttft_p50_ms: percentile(&ttfts, MEDIAN).map(round_ms),
+                decode_tokens_per_sec_p50: percentile(&decode, MEDIAN),
+            }
+        })
+        .collect();
+    insights.sort_by(|a, b| {
+        b.requests
+            .cmp(&a.requests)
+            .then_with(|| a.harness.cmp(&b.harness))
+    });
+    insights
+}
+
+/// Highest success rate among agent harnesses with enough calls; lower TTFT
+/// then more calls break ties.
+fn best_harness(by_harness: &[HarnessInsight]) -> Option<String> {
+    by_harness
+        .iter()
+        .filter(|entry| entry.requests >= HARNESS_MIN_CALLS)
+        .filter(|entry| !NON_AGENT_CLIENTS.contains(&entry.harness.as_str()))
+        .max_by(|a, b| {
+            compare_f64(a.success_rate_pct, b.success_rate_pct)
+                .then_with(|| {
+                    b.ttft_p50_ms
+                        .unwrap_or(u64::MAX)
+                        .cmp(&a.ttft_p50_ms.unwrap_or(u64::MAX))
+                })
+                .then_with(|| a.requests.cmp(&b.requests))
+        })
+        .map(|entry| entry.harness.clone())
+}
+
+/// One pick per declared use case: the best ranked model tagged with it, or,
+/// when none is ranked yet, the tagged model with the most calls.
+fn best_for(models: &[ModelInsight]) -> Vec<UseCasePick> {
+    let use_cases: BTreeSet<&str> = models
+        .iter()
+        .flat_map(|model| model.use_cases.iter().map(String::as_str))
+        .collect();
+    use_cases
+        .into_iter()
+        .filter_map(|use_case| {
+            let tagged: Vec<&ModelInsight> = models
+                .iter()
+                .filter(|model| model.use_cases.iter().any(|tag| tag == use_case))
+                .collect();
+            let best_ranked = tagged.iter().filter(|model| model.ranked).max_by(|a, b| {
+                compare_f64(
+                    a.overall_score.unwrap_or(0.0),
+                    b.overall_score.unwrap_or(0.0),
+                )
+            });
+            let (winner, ranked) = match best_ranked {
+                Some(model) => (*model, true),
+                None => (*tagged.iter().max_by_key(|model| model.requests)?, false),
+            };
+            let reason = if ranked {
+                format!(
+                    "highest overall score ({:.1}) among models declared for {use_case}",
+                    winner.overall_score.unwrap_or(0.0)
+                )
+            } else {
+                format!(
+                    "declared for {use_case} in the model registry; no tagged model has enough calls to rank"
+                )
+            };
+            Some(UseCasePick {
+                use_case: use_case.to_string(),
+                model: winner.model.clone(),
+                ranked,
+                reason,
+                candidates: tagged.iter().map(|model| model.model.clone()).collect(),
+            })
+        })
+        .collect()
 }
 
 fn health(
@@ -535,6 +779,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             error: (status >= ERROR_STATUS_MIN).then(|| format!("boom {status}")),
+            client: None,
         }
     }
 
@@ -563,7 +808,7 @@ mod tests {
         cached.cache_read_tokens = 500;
         let outcomes = timed(vec![ok("p/a", 1000, 2000), cached, fail("p/a")]);
 
-        let report = build_report(&outcomes, "7d", 1, NOW_MS);
+        let report = build_report(&outcomes, &HashMap::new(), "7d", 1, NOW_MS);
         let a = insight(&report, "p/a");
 
         assert_eq!((a.requests, a.errors), (3, 1));
@@ -593,7 +838,7 @@ mod tests {
             fail("p/a"),
         ]);
 
-        let report = build_report(&outcomes, "7d", 1, NOW_MS);
+        let report = build_report(&outcomes, &HashMap::new(), "7d", 1, NOW_MS);
         let a = insight(&report, "p/a");
 
         assert_eq!(a.health, ModelHealth::Failing);
@@ -611,7 +856,7 @@ mod tests {
             ok("p/a", 100, 200),
         ]);
 
-        let report = build_report(&outcomes, "7d", 1, NOW_MS);
+        let report = build_report(&outcomes, &HashMap::new(), "7d", 1, NOW_MS);
         let a = insight(&report, "p/a");
 
         assert_eq!(a.health, ModelHealth::Degraded);
@@ -620,7 +865,13 @@ mod tests {
 
     #[test]
     fn below_min_requests__insufficient_data_and_unranked() {
-        let report = build_report(&timed(vec![ok("p/a", 100, 200)]), "7d", 5, NOW_MS);
+        let report = build_report(
+            &timed(vec![ok("p/a", 100, 200)]),
+            &HashMap::new(),
+            "7d",
+            5,
+            NOW_MS,
+        );
         let a = insight(&report, "p/a");
 
         assert_eq!(a.health, ModelHealth::InsufficientData);
@@ -638,7 +889,7 @@ mod tests {
             ok("p/flaky", 100, 1100),
         ]);
 
-        let report = build_report(&outcomes, "7d", 2, NOW_MS);
+        let report = build_report(&outcomes, &HashMap::new(), "7d", 2, NOW_MS);
 
         let fast = insight(&report, "p/fast");
         assert_eq!(fast.speed_score, Some(100.0));
@@ -665,7 +916,7 @@ mod tests {
             ok("p/b", 100, 1000),
             ok("p/c", 200, 1000),
         ]);
-        let report = build_report(&outcomes, "1d", 1, NOW_MS);
+        let report = build_report(&outcomes, &HashMap::new(), "1d", 1, NOW_MS);
 
         let picked = pick(&report, PickBy::Ttft).unwrap();
 
@@ -683,7 +934,7 @@ mod tests {
     #[test]
     fn pick_without_ranked_models__none() {
         let outcomes = timed(vec![fail("p/a"), fail("p/a"), fail("p/a")]);
-        let report = build_report(&outcomes, "7d", 1, NOW_MS);
+        let report = build_report(&outcomes, &HashMap::new(), "7d", 1, NOW_MS);
 
         assert_eq!(pick(&report, PickBy::Overall), None);
     }
@@ -700,7 +951,14 @@ mod tests {
         ]);
         outcomes[3].error = None;
 
-        let report = build_agent_report(&outcomes, "7d", Some("p".into()), 2, 1_790_792_466_123);
+        let report = build_agent_report(
+            &outcomes,
+            &HashMap::new(),
+            "7d",
+            Some("p".into()),
+            2,
+            1_790_792_466_123,
+        );
 
         assert_eq!(report.generated_at, "2026-09-30T18:21:06.123Z");
         assert_eq!(report.picks.len(), PickBy::ALL.len());
@@ -730,10 +988,134 @@ mod tests {
 
     #[test]
     fn agent_report_without_ranked_models__says_why() {
-        let report = build_agent_report(&timed(vec![ok("p/a", 100, 200)]), "1d", None, 5, 0);
+        let report = build_agent_report(
+            &timed(vec![ok("p/a", 100, 200)]),
+            &HashMap::new(),
+            "1d",
+            None,
+            5,
+            0,
+        );
 
         assert!(report.picks.is_empty());
         assert!(report.summary[0].starts_with("No model has 5 or more calls in 1d"));
+    }
+
+    fn from(client: &str, mut outcome: RequestOutcome) -> RequestOutcome {
+        outcome.client = Some(client.to_string());
+        outcome
+    }
+
+    fn catalog(entries: &[(&str, u64, &[&str])]) -> HashMap<String, ModelCatalogEntry> {
+        entries
+            .iter()
+            .map(|(id, ctx, uses)| {
+                let entry = ModelCatalogEntry {
+                    context_window: Some(*ctx),
+                    use_cases: uses.iter().map(ToString::to_string).collect(),
+                    summary: Some(format!("{id} summary")),
+                };
+                (id.to_string(), entry)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn catalog_from_models__reads_context_use_cases_and_strips_1m() {
+        let payload = serde_json::json!({"data": [
+            {"id": "llama_swap/qwen", "max_input_tokens": 262_144,
+             "meta": {"llamaswap": {"use_cases": ["Coding", " planning "], "summary": "good coder"}}},
+            {"id": "llmgw/opus[1m]", "max_input_tokens": 1_000_000},
+            {"id": "llama_swap/small", "meta": {"llamaswap": {"use_cases": "fast, general"}}}
+        ]});
+
+        let parsed = catalog_from_models(&payload);
+
+        let qwen = &parsed["llama_swap/qwen"];
+        assert_eq!(qwen.context_window, Some(262_144));
+        assert_eq!(qwen.use_cases, vec!["coding", "planning"]);
+        assert_eq!(qwen.summary.as_deref(), Some("good coder"));
+        assert_eq!(parsed["llmgw/opus"].context_window, Some(1_000_000));
+        assert_eq!(
+            parsed["llama_swap/small"].use_cases,
+            vec!["fast", "general"]
+        );
+    }
+
+    #[test]
+    fn catalog__fills_fields_and_lists_unused_models() {
+        let outcomes = timed(vec![ok("p/a", 100, 200)]);
+        let known = catalog(&[
+            ("p/a", 131_072, &["coding"]),
+            ("p/idle", 32_768, &["general"]),
+        ]);
+
+        let report = build_report(&outcomes, &known, "7d", 1, NOW_MS);
+
+        let a = insight(&report, "p/a");
+        assert_eq!(a.context_window, Some(131_072));
+        assert_eq!(a.use_cases, vec!["coding"]);
+        let idle = insight(&report, "p/idle");
+        assert_eq!(
+            (idle.requests, idle.health),
+            (0, ModelHealth::InsufficientData)
+        );
+        assert_eq!(idle.context_window, Some(32_768));
+    }
+
+    #[test]
+    fn best_harness__most_reliable_agent_harness_with_enough_calls() {
+        let outcomes = timed(vec![
+            from("claude-cli/2.1 (external, cli)", ok("p/a", 300, 1000)),
+            from("claude-cli/2.1 (external, cli)", ok("p/a", 300, 1000)),
+            from("claude-cli/2.1 (external, cli)", fail("p/a")),
+            from("OpenAI/JS 5 [x-initiator]", ok("p/a", 500, 1000)),
+            from("OpenAI/JS 5 [x-initiator]", ok("p/a", 500, 1000)),
+            from("OpenAI/JS 5 [x-initiator]", ok("p/a", 500, 1000)),
+            from("curl/8", ok("p/a", 10, 20)),
+            from("curl/8", ok("p/a", 10, 20)),
+            from("curl/8", ok("p/a", 10, 20)),
+        ]);
+
+        let report = build_report(&outcomes, &HashMap::new(), "7d", 1, NOW_MS);
+        let a = insight(&report, "p/a");
+
+        assert_eq!(a.best_harness.as_deref(), Some("copilot-cli"));
+        let claude = a
+            .by_harness
+            .iter()
+            .find(|h| h.harness == "claude-code")
+            .unwrap();
+        assert!((claude.success_rate_pct - 66.7).abs() < 1e-9);
+        assert_eq!(report.harnesses.len(), 3);
+    }
+
+    #[test]
+    fn best_for__ranked_tagged_model_wins_else_declared_fallback() {
+        let outcomes = timed(vec![
+            ok("p/fast", 100, 1100),
+            ok("p/fast", 100, 1100),
+            ok("p/slow", 400, 4400),
+            ok("p/slow", 400, 4400),
+        ]);
+        let known = catalog(&[
+            ("p/fast", 1, &["coding"]),
+            ("p/slow", 1, &["coding", "planning"]),
+            ("p/idle", 1, &["vision"]),
+        ]);
+
+        let report = build_report(&outcomes, &known, "7d", 2, NOW_MS);
+        let by_use: HashMap<&str, &UseCasePick> = report
+            .best_for
+            .iter()
+            .map(|pick| (pick.use_case.as_str(), pick))
+            .collect();
+
+        assert_eq!(by_use["coding"].model, "p/fast");
+        assert!(by_use["coding"].ranked);
+        assert_eq!(by_use["planning"].model, "p/slow");
+        assert_eq!(by_use["vision"].model, "p/idle");
+        assert!(!by_use["vision"].ranked);
     }
 
     #[test]

@@ -134,9 +134,28 @@ export type ModelHealth = "healthy" | "degraded" | "failing" | "insufficient_dat
 
 export type InsightsRange = "1d" | "7d" | "30d" | "all";
 
+export interface HarnessInsight {
+  readonly harness: string;
+  readonly requests: number;
+  readonly success_rate_pct: number;
+  readonly ttft_p50_ms: number | null;
+  readonly decode_tokens_per_sec_p50: number | null;
+}
+
+export interface UseCasePick {
+  readonly use_case: string;
+  readonly model: string;
+  readonly ranked: boolean;
+  readonly reason: string;
+  readonly candidates: readonly string[];
+}
+
 export interface ModelInsight {
   readonly model: string;
   readonly profile: string;
+  readonly context_window: number | null;
+  readonly use_cases: readonly string[];
+  readonly summary: string | null;
   readonly requests: number;
   readonly errors: number;
   readonly success_rate_pct: number;
@@ -157,6 +176,8 @@ export interface ModelInsight {
   readonly stability_score: number | null;
   readonly speed_score: number | null;
   readonly overall_score: number | null;
+  readonly by_harness: readonly HarnessInsight[];
+  readonly best_harness: string | null;
 }
 
 export interface InsightLeaders {
@@ -173,6 +194,8 @@ export interface InsightsReport {
   readonly min_requests: number;
   readonly generated_ms: number;
   readonly leaders: InsightLeaders;
+  readonly best_for: readonly UseCasePick[];
+  readonly harnesses: readonly HarnessInsight[];
   readonly models: readonly ModelInsight[];
 }
 

@@ -3,7 +3,15 @@ import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { formatMs, formatNumber, formatPct, formatTps } from "../lib/format";
 import { navigate, useRoute } from "../lib/router";
-import type { InsightsRange, InsightsReport, ModelHealth, ModelInsight, ModelPick } from "../lib/types";
+import type {
+  HarnessInsight,
+  InsightsRange,
+  InsightsReport,
+  ModelHealth,
+  ModelInsight,
+  ModelPick,
+  UseCasePick,
+} from "../lib/types";
 
 interface InsightsScreenProps {
   readonly onCopy: (text: string) => void;
@@ -46,6 +54,16 @@ function shortName(model: string | null): string {
   }
   const slash = model.indexOf("/");
   return slash >= 0 ? model.slice(slash + 1) : model;
+}
+
+function formatContext(tokens: number | null): string {
+  if (!tokens) {
+    return "—";
+  }
+  if (tokens >= 1_000_000) {
+    return `${formatNumber(tokens / 1_000_000, 1)}M`;
+  }
+  return `${formatNumber(Math.round(tokens / 1024))}k`;
 }
 
 function queryString(range: InsightsRange, minCalls: number): string {
@@ -181,6 +199,8 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
 
       {report ? <Leaders report={report} /> : null}
 
+      {report && report.best_for.length > 0 ? <BestFor picks={report.best_for} /> : null}
+
       {ranked.length > 0 ? (
         <>
           <h3>Ranking</h3>
@@ -208,7 +228,9 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
               <thead>
                 <tr>
                   <th>Model</th>
+                  <th>Good for</th>
                   <th>Health</th>
+                  <th className="num">Context</th>
                   <th className="num">Calls</th>
                   <th className="num">Success</th>
                   <th className="num">First token p50</th>
@@ -216,6 +238,7 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
                   <th className="num">Output speed</th>
                   <th className="num">Prompt reading</th>
                   <th className="num">Cache hit</th>
+                  <th>Best harness</th>
                   <th>Most common error</th>
                 </tr>
               </thead>
@@ -228,7 +251,62 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
           </div>
         </>
       ) : null}
+
+      {report && report.harnesses.length > 0 ? <Harnesses harnesses={report.harnesses} /> : null}
     </section>
+  );
+}
+
+function BestFor({ picks }: { readonly picks: readonly UseCasePick[] }) {
+  return (
+    <>
+      <h3>Best model for each job</h3>
+      <p className="dim">
+        Use cases come from the model registry; the pick is the best-ranked model declared for each one.
+      </p>
+      <div className="stat-tiles">
+        {picks.map((pick) => (
+          <div key={pick.use_case} className="stat-tile" title={pick.reason}>
+            <div className="label">Best for {pick.use_case}</div>
+            <div className="insights-leader mono">{shortName(pick.model)}</div>
+            <div className="hint">{pick.ranked ? "Ranked from calls" : "Declared only, not enough calls yet"}</div>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function Harnesses({ harnesses }: { readonly harnesses: readonly HarnessInsight[] }) {
+  return (
+    <>
+      <h3>By harness</h3>
+      <p className="dim">Which client sent the calls, told apart by its User-Agent and headers.</p>
+      <div className="table-scroll">
+        <table className="table insights-harness-table">
+          <thead>
+            <tr>
+              <th>Harness</th>
+              <th className="num">Calls</th>
+              <th className="num">Success</th>
+              <th className="num">First token p50</th>
+              <th className="num">Output speed</th>
+            </tr>
+          </thead>
+          <tbody>
+            {harnesses.map((harness) => (
+              <tr key={harness.harness}>
+                <td className="mono">{harness.harness}</td>
+                <td className="num">{formatNumber(harness.requests)}</td>
+                <td className="num">{formatPct(harness.success_rate_pct)}</td>
+                <td className="num nowrap">{formatMs(harness.ttft_p50_ms ?? 0)}</td>
+                <td className="num nowrap">{formatTps(harness.decode_tokens_per_sec_p50 ?? 0)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
   );
 }
 
@@ -298,12 +376,24 @@ function DetailRow({ model }: { readonly model: ModelInsight }) {
   const topError = model.top_errors[0];
   return (
     <tr>
-      <td className="mono nowrap" title={model.model}>
+      <td className="mono nowrap" title={model.summary ?? model.model}>
         {shortName(model.model)}
+      </td>
+      <td className="nowrap">
+        {model.use_cases.length > 0 ? (
+          model.use_cases.map((useCase) => (
+            <span key={useCase} className="insights-use">
+              {useCase}
+            </span>
+          ))
+        ) : (
+          <span className="dim">—</span>
+        )}
       </td>
       <td>
         <HealthPill health={model.health} />
       </td>
+      <td className="num">{formatContext(model.context_window)}</td>
       <td className="num">{formatNumber(model.requests)}</td>
       <td className="num">{formatPct(model.success_rate_pct)}</td>
       <td className="num nowrap">{formatMs(model.ttft_p50_ms ?? 0)}</td>
@@ -311,6 +401,7 @@ function DetailRow({ model }: { readonly model: ModelInsight }) {
       <td className="num nowrap">{formatTps(model.decode_tokens_per_sec_p50 ?? 0)}</td>
       <td className="num nowrap">{formatTps(model.prefill_tokens_per_sec_p50 ?? 0)}</td>
       <td className="num">{formatPct(model.cache_hit_rate_pct)}</td>
+      <td className="mono nowrap">{model.best_harness ?? <span className="dim">—</span>}</td>
       <td className="error-reason" title={topError?.reason}>
         {topError ? `${topError.reason} (×${topError.count})` : <span className="dim">None</span>}
       </td>

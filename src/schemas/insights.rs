@@ -1,10 +1,13 @@
 pub mod agent_report;
 pub mod error_count;
 pub mod failure_reason;
+pub mod harness_insight;
 pub mod insight_leaders;
 pub mod insights_report;
+pub mod model_catalog_entry;
 pub mod model_health;
 pub mod model_insight;
 pub mod model_pick;
 pub mod pick_by;
 pub mod pick_candidate;
+pub mod use_case_pick;

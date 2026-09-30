@@ -15,6 +15,7 @@ use crate::schemas::app_error::AppError;
 use crate::schemas::errors_report::ErrorsReport;
 use crate::schemas::fallbacks_input::FallbacksInput;
 use crate::schemas::insights::insights_report::InsightsReport;
+use crate::schemas::insights::model_catalog_entry::ModelCatalogEntry;
 use crate::schemas::insights::pick_by::PickBy;
 use crate::schemas::profile_input::ProfileInput;
 use crate::schemas::usage_report::UsageReport;
@@ -415,7 +416,7 @@ pub async fn insights(
     State(state): State<AppState>,
     Query(query): Query<InsightsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let report = insights_report(&state, &query)?;
+    let report = insights_report(&state, &query).await?;
     serde_json::to_value(report)
         .map(Json)
         .map_err(|e| AppError::Internal(format!("serialize insights failed: {e}")))
@@ -426,7 +427,7 @@ pub async fn insights_pick(
     State(state): State<AppState>,
     Query(query): Query<InsightsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let report = insights_report(&state, &query)?;
+    let report = insights_report(&state, &query).await?;
     let by = query.by.unwrap_or_default();
     let Some(picked) = insights::pick(&report, by) else {
         return Err(AppError::NotFound(format!(
@@ -445,9 +446,10 @@ pub async fn insights_agent_report(
     State(state): State<AppState>,
     Query(query): Query<InsightsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let window = insights_window(&state, &query)?;
+    let window = insights_window(&state, &query).await?;
     let report = insights::build_agent_report(
         &window.outcomes,
+        &window.catalog,
         &window.range,
         window.profile,
         window.min_requests,
@@ -460,22 +462,30 @@ pub async fn insights_agent_report(
 
 struct InsightsWindow {
     outcomes: Vec<RequestOutcome>,
+    catalog: HashMap<String, ModelCatalogEntry>,
     range: String,
     profile: Option<String>,
     min_requests: u64,
 }
 
-fn insights_report(state: &AppState, query: &InsightsQuery) -> Result<InsightsReport, AppError> {
-    let window = insights_window(state, query)?;
+async fn insights_report(
+    state: &AppState,
+    query: &InsightsQuery,
+) -> Result<InsightsReport, AppError> {
+    let window = insights_window(state, query).await?;
     Ok(insights::build_report(
         &window.outcomes,
+        &window.catalog,
         &window.range,
         window.min_requests,
         now_ms(),
     ))
 }
 
-fn insights_window(state: &AppState, query: &InsightsQuery) -> Result<InsightsWindow, AppError> {
+async fn insights_window(
+    state: &AppState,
+    query: &InsightsQuery,
+) -> Result<InsightsWindow, AppError> {
     let Some(store) = state.store() else {
         return Err(AppError::BadRequest(
             "persistence is off — set LLM_HUB_PERSISTENT=true to keep usage history".into(),
@@ -507,8 +517,10 @@ fn insights_window(state: &AppState, query: &InsightsQuery) -> Result<InsightsWi
             range_label: range.to_string(),
         })
         .map_err(AppError::Internal)?;
+    let catalog = insights_catalog(state, profile.as_deref()).await;
     Ok(InsightsWindow {
         outcomes,
+        catalog,
         range: range.to_string(),
         profile,
         min_requests: query
@@ -516,4 +528,28 @@ fn insights_window(state: &AppState, query: &InsightsQuery) -> Result<InsightsWi
             .unwrap_or(DEFAULT_INSIGHTS_MIN_REQUESTS)
             .max(1),
     })
+}
+
+/// Enabled models from the hub's model list (cached, refreshed when cold),
+/// narrowed to `profile` when one is given.
+async fn insights_catalog(
+    state: &AppState,
+    profile: Option<&str>,
+) -> HashMap<String, ModelCatalogEntry> {
+    let payload = match state.model_cache() {
+        Some(cached) => cached.payload.clone(),
+        None => crate::routes::models::refresh_models(state).await,
+    };
+    let config = state.config();
+    insights::catalog_from_models(&payload)
+        .into_iter()
+        .filter(|(id, _)| {
+            let model_profile = id.split('/').next().unwrap_or_default();
+            let enabled = config
+                .profiles
+                .iter()
+                .any(|p| p.enabled && p.name == model_profile);
+            enabled && profile.is_none_or(|wanted| wanted == model_profile)
+        })
+        .collect()
 }

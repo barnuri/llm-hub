@@ -125,6 +125,7 @@ impl Store {
             cache_write_tokens: outcome.cache_write_tokens,
             cost_usd: 0.0,
             error: outcome.error.clone(),
+            client: outcome.client.clone(),
         };
         match self {
             Store::Sqlite(conn) => {
@@ -133,8 +134,8 @@ impl Store {
                     .execute(
                         "INSERT INTO requests (
                             ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, error
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                         rusqlite::params![
                             db_i64(row.ts_ms),
                             row.model,
@@ -146,7 +147,8 @@ impl Store {
                             row.ttft_ms.map(db_i64),
                             db_i64(row.cache_read_tokens),
                             db_i64(row.cache_write_tokens),
-                            row.error
+                            row.error,
+                            row.client
                         ],
                     )
                     .map_err(|e| e.to_string())?;
@@ -196,7 +198,7 @@ impl Store {
                 let mut stmt = guard
                     .prepare(
                         "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                                ttft_ms, cache_read_tokens, cache_write_tokens, error
+                                ttft_ms, cache_read_tokens, cache_write_tokens, error, client
                          FROM requests ORDER BY id DESC LIMIT ?1",
                     )
                     .map_err(|e| e.to_string())?;
@@ -247,7 +249,7 @@ impl Store {
                     .map_err(|e| e.to_string())?;
                 let mut list_sql = format!(
                     "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, error
+                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client
                      FROM requests WHERE status >= {ERROR_STATUS_MIN}"
                 );
                 if since_ms.is_some() {
@@ -316,7 +318,7 @@ impl Store {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
                 let mut sql = String::from(
                     "SELECT model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error
+                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error, client
                      FROM requests WHERE 1=1",
                 );
                 let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -348,6 +350,7 @@ impl Store {
                             cache_write_tokens: db_u64(r.get::<_, i64>(8).unwrap_or(0)),
                             ts_ms: db_u64(r.get::<_, i64>(9).unwrap_or(0)),
                             error: r.get::<_, Option<String>>(10).unwrap_or(None),
+                            client: r.get::<_, Option<String>>(11).unwrap_or(None),
                         })
                     })
                     .map_err(|e| e.to_string())?
@@ -384,6 +387,7 @@ impl Store {
                         cache_write_tokens: row.cache_write_tokens,
                         ts_ms: row.ts_ms,
                         error: row.error.clone(),
+                        client: row.client.clone(),
                     })
                     .collect();
                 Ok(rows)
@@ -526,6 +530,7 @@ fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE requests ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0",
     )?;
     add("error", "ALTER TABLE requests ADD COLUMN error TEXT")?;
+    add("client", "ALTER TABLE requests ADD COLUMN client TEXT")?;
     Ok(())
 }
 
@@ -543,6 +548,7 @@ fn map_usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRow> {
         cache_write_tokens: db_u64(r.get::<_, i64>(9).unwrap_or(0)),
         cost_usd: 0.0,
         error: r.get::<_, Option<String>>(10).unwrap_or(None),
+        client: r.get::<_, Option<String>>(11).unwrap_or(None),
     })
 }
 
@@ -563,6 +569,7 @@ mod tests {
             cache_write_tokens: 1,
             ts_ms: 0,
             error: None,
+            client: None,
         }
     }
 

@@ -1,9 +1,11 @@
 use serde::Serialize;
 
 use super::failure_reason::FailureReason;
+use super::harness_insight::HarnessInsight;
 use super::insight_leaders::InsightLeaders;
 use super::model_insight::ModelInsight;
 use super::model_pick::ModelPick;
+use super::use_case_pick::UseCasePick;
 
 /// Self-contained insights for an agent choosing a model: plain-language
 /// findings first, then every pick, per-model metrics and failure reasons.
@@ -18,6 +20,8 @@ pub struct AgentReport {
     pub summary: Vec<String>,
     pub picks: Vec<ModelPick>,
     pub leaders: InsightLeaders,
+    pub best_for: Vec<UseCasePick>,
+    pub harnesses: Vec<HarnessInsight>,
     pub failure_reasons: Vec<FailureReason>,
     pub models: Vec<ModelInsight>,
 }

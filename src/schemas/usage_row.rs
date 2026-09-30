@@ -16,6 +16,8 @@ pub struct UsageRow {
     pub cost_usd: f64,
     /// Failure reason captured for `status >= 400` rows.
     pub error: Option<String>,
+    /// Caller signature: User-Agent plus harness markers.
+    pub client: Option<String>,
 }
 
 // UsageRow needs Deserialize only for the JSON store file.
@@ -40,6 +42,8 @@ impl<'de> Deserialize<'de> for UsageRow {
             cost_usd: f64,
             #[serde(default)]
             error: Option<String>,
+            #[serde(default)]
+            client: Option<String>,
         }
         let raw = Raw::deserialize(d)?;
         Ok(UsageRow {
@@ -55,6 +59,7 @@ impl<'de> Deserialize<'de> for UsageRow {
             cache_write_tokens: raw.cache_write_tokens,
             cost_usd: raw.cost_usd,
             error: raw.error,
+            client: raw.client,
         })
     }
 }

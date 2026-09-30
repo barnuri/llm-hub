@@ -125,6 +125,8 @@ pub struct RequestOutcome {
     pub cache_write_tokens: u64,
     /// Short upstream/hub failure reason for `status >= 400`; `None` on success.
     pub error: Option<String>,
+    /// Caller signature (see `services::harness::client_signature`).
+    pub client: Option<String>,
 }
 
 impl StatsRegistry {
@@ -466,6 +468,7 @@ mod tests {
             cache_read_tokens: 4,
             cache_write_tokens: 0,
             error: None,
+            client: None,
         }
     }
 

@@ -19,6 +19,7 @@ use crate::schemas::model_id::ModelId;
 use crate::services::anthropic;
 use crate::services::body_transform::BodyTransform;
 use crate::services::fallback::{RetryPolicy, fallback_chain, per_attempt_timeout_ms};
+use crate::services::harness::client_signature;
 use crate::services::stats::{RequestOutcome, ScrapedUsage, scrape_usage};
 use crate::services::transforms::{self, RouteKind, TransformPlan};
 use crate::utils::headers::{filter_request_headers, filter_response_headers};
@@ -157,6 +158,7 @@ pub(crate) async fn attempt_loop(
         }
     }
 
+    let client = client_signature(headers);
     let retry_policy = RetryPolicy::from_headers(headers);
     let attempt_timeout = per_attempt_timeout_ms(headers).map(Duration::from_millis);
 
@@ -193,6 +195,7 @@ pub(crate) async fn attempt_loop(
                         started,
                         route,
                         &plan,
+                        client,
                     )
                     .await);
                 }
@@ -202,11 +205,12 @@ pub(crate) async fn attempt_loop(
                     status,
                     started,
                     format!("HTTP {status}; retried on the next fallback"),
+                    client.clone(),
                 );
             }
             Err(reason) => {
                 attempts_trail.push(format!("{}={reason}", model_id.qualified()));
-                record_failure(state, model_id, 0, started, reason);
+                record_failure(state, model_id, 0, started, reason, client.clone());
                 if index == last_index {
                     return Err(AppError::UpstreamUnavailable(format!(
                         "all attempts failed: {}",
@@ -232,13 +236,23 @@ async fn deliver(
     started: Instant,
     route: RouteKind,
     plan: &TransformPlan,
+    client: Option<String>,
 ) -> Response {
     let is_sse = is_event_stream(&response);
     // The Anthropic non-stream translation is the one body the hub buffers in
     // full; everything else streams through a `BodyTransform` (or, in the
     // common case, through nothing at all).
     let mut out = if route == RouteKind::Anthropic && !is_sse {
-        build_anthropic_response(state, response, model_id, attempts_trail, started, plan).await
+        build_anthropic_response(
+            state,
+            response,
+            model_id,
+            attempts_trail,
+            started,
+            plan,
+            client,
+        )
+        .await
     } else {
         let transform = transforms::response_transform(route, plan, &model_id.qualified(), is_sse);
         build_response(
@@ -248,6 +262,7 @@ async fn deliver(
             attempts_trail,
             started,
             transform,
+            client,
         )
     };
     if let Some(applied) = plan.header_value() {
@@ -280,7 +295,13 @@ async fn attempt_single(
     .await
     .map_err(AppError::UpstreamUnavailable)?;
     Ok(build_response(
-        state, response, model_id, &trail, started, None,
+        state,
+        response,
+        model_id,
+        &trail,
+        started,
+        None,
+        client_signature(headers),
     ))
 }
 
@@ -398,6 +419,7 @@ fn build_response(
     attempts_trail: &[String],
     started: Instant,
     transform: Option<BodyTransform>,
+    client: Option<String>,
 ) -> Response {
     let status = upstream.status();
     // Read before `bytes_stream()` consumes the response. A comment frame
@@ -437,6 +459,7 @@ fn build_response(
         cache_read_tokens: 0,
         cache_write_tokens: 0,
         error: None,
+        client,
     };
 
     let (summary_sender, summary_receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
@@ -667,6 +690,7 @@ async fn build_anthropic_response(
     attempts_trail: &[String],
     started: Instant,
     plan: &TransformPlan,
+    client: Option<String>,
 ) -> Response {
     let upstream_status = upstream.status();
     let mut response_headers = filter_response_headers(&headermap_from_reqwest(upstream.headers()));
@@ -735,6 +759,7 @@ async fn build_anthropic_response(
                 error_reason(status.as_u16(), &raw)
             }
         }),
+        client,
     };
     log_failure(&outcome);
     let state_for_stats = state.clone();
@@ -780,6 +805,7 @@ fn record_failure(
     status: u16,
     started: Instant,
     reason: String,
+    client: Option<String>,
 ) {
     let latency_ms = crate::utils::time::elapsed_ms(started);
     let outcome = RequestOutcome {
@@ -794,6 +820,7 @@ fn record_failure(
         cache_read_tokens: 0,
         cache_write_tokens: 0,
         error: Some(reason),
+        client,
     };
     log_failure(&outcome);
     state.stats().record(&outcome);
@@ -855,6 +882,7 @@ async fn passthrough_oversized(
         &[model_id.qualified()],
         started,
         None,
+        client_signature(headers),
     ))
 }
 

@@ -444,6 +444,11 @@ button.stat-tile-link:focus-visible { outline: 2px solid var(--accent); outline-
 .insights-bar-part.speed, .insights-swatch.speed { background: var(--cyan); }
 .insights-score { text-align: right; font-weight: 600; }
 .insights-rank-row .insights-health { justify-self: start; }
+.insights-use {
+  display: inline-block; font-size: 11px; padding: 0 7px; margin-right: 4px; border-radius: 10px;
+  border: 1px solid #0e7490; color: var(--cyan);
+}
+.insights-harness-table { max-width: 760px; }
 .insights-legend { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
 .insights-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-left: 10px; }
 .insights-swatch:first-child { margin-left: 0; }
