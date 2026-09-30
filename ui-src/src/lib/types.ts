@@ -99,6 +99,7 @@ export interface UsageRow {
   readonly cache_read_tokens: number;
   readonly cache_write_tokens: number;
   readonly cost_usd: number;
+  readonly error?: string | null;
 }
 
 export interface UsageReport {

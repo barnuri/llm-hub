@@ -9,8 +9,9 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::consts::{
-    ANTHROPIC_UPSTREAM_PATH, HEADER_ATTEMPTS, HEADER_SERVED_MODEL, HEADER_TRANSFORMS,
-    MAX_TRANSFORM_BUFFER_BYTES, SSE_KEEPALIVE_FRAME, USAGE_SCRAPE_TAIL_BYTES,
+    ANTHROPIC_UPSTREAM_PATH, ERROR_REASON_MAX_CHARS, ERROR_STATUS_MIN, HEADER_ATTEMPTS,
+    HEADER_SERVED_MODEL, HEADER_TRANSFORMS, MAX_TRANSFORM_BUFFER_BYTES, SSE_KEEPALIVE_FRAME,
+    USAGE_SCRAPE_TAIL_BYTES,
 };
 use crate::dependencies::state::AppState;
 use crate::schemas::app_error::AppError;
@@ -195,11 +196,17 @@ pub(crate) async fn attempt_loop(
                     )
                     .await);
                 }
-                record_failure(state, model_id, status, started);
+                record_failure(
+                    state,
+                    model_id,
+                    status,
+                    started,
+                    format!("HTTP {status}; retried on the next fallback"),
+                );
             }
             Err(reason) => {
                 attempts_trail.push(format!("{}={reason}", model_id.qualified()));
-                record_failure(state, model_id, 0, started);
+                record_failure(state, model_id, 0, started, reason);
                 if index == last_index {
                     return Err(AppError::UpstreamUnavailable(format!(
                         "all attempts failed: {}",
@@ -429,6 +436,7 @@ fn build_response(
         tokens_out: 0,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        error: None,
     };
 
     let (summary_sender, summary_receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
@@ -465,8 +473,11 @@ fn build_response(
             tokens_out: usage.tokens_out,
             cache_read_tokens: usage.cache_read_tokens,
             cache_write_tokens: usage.cache_write_tokens,
+            error: (outcome_seed.status >= ERROR_STATUS_MIN)
+                .then(|| error_reason(&summary.tail)),
             ..outcome_seed
         };
+        log_failure(&outcome);
         state_for_stats.stats().record(&outcome);
         if let Some(store) = state_for_stats.store()
             && let Err(e) = store.record(&outcome)
@@ -605,6 +616,25 @@ struct StreamState<S> {
     keepalive: Option<Duration>,
 }
 
+/// Clients such as Copilot CLI and Claude Code close the connection as soon as
+/// they read the final SSE frame, so the body can be dropped before `pump`
+/// sees upstream EOF. Hand the stats task what was observed so far instead of
+/// letting the sender drop — which recorded 0 tokens and no TTFT.
+impl<S> Drop for StreamState<S> {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(StreamSummary {
+                tail: std::mem::take(&mut self.tail),
+                observed_usage: self
+                    .transform
+                    .as_ref()
+                    .and_then(BodyTransform::observed_usage),
+                ttft_ms: self.ttft_ms,
+            });
+        }
+    }
+}
+
 /// What the finished body stream hands the stats task. `observed_usage` wins
 /// when a transform reported real numbers — the translated Anthropic body uses
 /// `input_tokens`/`output_tokens`, which older scrapers could not see.
@@ -698,7 +728,15 @@ async fn build_anthropic_response(
         tokens_out: usage.tokens_out,
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        error: (status.as_u16() >= ERROR_STATUS_MIN).then(|| {
+            if overflowed {
+                "upstream response too large to translate".to_string()
+            } else {
+                error_reason(&raw)
+            }
+        }),
     };
+    log_failure(&outcome);
     let state_for_stats = state.clone();
     tokio::spawn(async move {
         state_for_stats.stats().record(&outcome);
@@ -736,7 +774,13 @@ async fn read_upstream_capped(upstream: reqwest::Response, cap: usize) -> (Vec<u
     (buffered, false)
 }
 
-fn record_failure(state: &AppState, model_id: &ModelId, status: u16, started: Instant) {
+fn record_failure(
+    state: &AppState,
+    model_id: &ModelId,
+    status: u16,
+    started: Instant,
+    reason: String,
+) {
     let latency_ms = crate::utils::time::elapsed_ms(started);
     let outcome = RequestOutcome {
         profile: model_id.profile.clone(),
@@ -749,7 +793,9 @@ fn record_failure(state: &AppState, model_id: &ModelId, status: u16, started: In
         tokens_out: 0,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        error: Some(reason),
     };
+    log_failure(&outcome);
     state.stats().record(&outcome);
     if let Some(store) = state.store() {
         let _ = store.record(&outcome);
@@ -837,6 +883,44 @@ fn extract_model_prefix(buffered: &Bytes) -> Option<String> {
     let start = after.find('"')? + 1;
     let end = after[start..].find('"')? + start;
     Some(after[start..end].to_string())
+}
+
+/// Short, human-readable reason for a failed upstream body: the JSON
+/// `error.message` / `message` / `detail` when present, else the raw text.
+fn error_reason(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let trimmed = text.trim();
+    let from_json = serde_json::from_str::<Value>(trimmed).ok().and_then(|v| {
+        let error = v.get("error");
+        error
+            .and_then(|e| e.get("message"))
+            .or(error)
+            .or_else(|| v.get("message"))
+            .or_else(|| v.get("detail"))
+            .and_then(|m| match m {
+                Value::String(s) => Some(s.clone()),
+                Value::Null => None,
+                other => Some(other.to_string()),
+            })
+    });
+    let reason = from_json.unwrap_or_else(|| trimmed.to_string());
+    let reason = if reason.is_empty() {
+        "empty upstream error body".to_string()
+    } else {
+        reason
+    };
+    reason.chars().take(ERROR_REASON_MAX_CHARS).collect()
+}
+
+fn log_failure(outcome: &RequestOutcome) {
+    if let Some(reason) = &outcome.error {
+        tracing::warn!(
+            model = %outcome.model_key,
+            status = outcome.status,
+            latency_ms = outcome.latency_ms,
+            "request failed: {reason}"
+        );
+    }
 }
 
 fn append_tail(tail: &mut Vec<u8>, bytes: &Bytes) {
@@ -961,6 +1045,42 @@ mod tests {
         // separate them.
         let first = chunks.iter().position(|c| c == "data: one\n\n").unwrap();
         assert_eq!(chunks[first + 1], "data: two\n\n", "{chunks:?}");
+    }
+
+    #[tokio::test]
+    async fn client_closing_before_upstream_eof_still_reports_usage_and_ttft() {
+        let usage_frame = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":34}}\n\ndata: [DONE]\n\n";
+        // The upstream never reaches EOF while the client is reading.
+        let upstream = stream::iter(vec![Ok(Bytes::from(usage_frame))])
+            .chain(stream::pending())
+            .boxed();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let state = state_for(upstream, None, Some(sender));
+
+        let (first, state) = pump(state).await.unwrap();
+        assert_eq!(first.unwrap(), Bytes::from(usage_frame));
+        drop(state);
+
+        let summary = receiver.await.expect("summary must be sent on drop");
+        assert!(summary.ttft_ms.is_some());
+        let usage = scrape_usage(&summary.tail);
+        assert_eq!((usage.tokens_in, usage.tokens_out), (1200, 34));
+    }
+
+    #[test]
+    fn error_reason_prefers_the_json_message() {
+        let body = br#"{"error":{"code":400,"message":"request (69657 tokens) exceeds the available context size (65536 tokens)","type":"exceed_context_size_error"}}"#;
+        assert_eq!(
+            error_reason(body),
+            "request (69657 tokens) exceeds the available context size (65536 tokens)"
+        );
+        assert_eq!(error_reason(br#"{"error":"bad model"}"#), "bad model");
+        assert_eq!(error_reason(b"  upstream exploded \n"), "upstream exploded");
+        assert_eq!(error_reason(b""), "empty upstream error body");
+        assert_eq!(
+            error_reason("x".repeat(2000).as_bytes()).len(),
+            ERROR_REASON_MAX_CHARS
+        );
     }
 
     #[tokio::test]

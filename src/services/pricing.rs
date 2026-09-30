@@ -345,6 +345,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             cost_usd: 0.0,
+            error: None,
         }
     }
 

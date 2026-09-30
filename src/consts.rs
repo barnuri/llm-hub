@@ -14,6 +14,12 @@ pub const STATS_OVERFLOW_KEY: &str = "other";
 /// Rolling tail kept per response for scraping the `usage` object.
 pub const USAGE_SCRAPE_TAIL_BYTES: usize = 64 * 1024;
 
+/// Failed requests are stored with at most this much of the upstream reason.
+pub const ERROR_REASON_MAX_CHARS: usize = 500;
+
+/// Statuses at or above this are failures in stats, the store, and the log.
+pub const ERROR_STATUS_MIN: u16 = 400;
+
 /// How long an SSE response may produce no upstream bytes before the hub sends
 /// a keepalive comment. A slow local model answers the request headers in
 /// milliseconds and then goes silent for the whole prefill (measured: 113s on a

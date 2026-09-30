@@ -21,16 +21,22 @@ pub fn has_1m_suffix(raw: &str) -> bool {
     strip_1m_suffix(raw) != raw.trim()
 }
 
-/// Read a context window from an upstream `/v1/models` entry.
+/// Read a context window from an upstream `/v1/models` entry. llama-swap
+/// has no top-level field for it; its per-model `metadata:` config block is
+/// surfaced as `meta.llamaswap`, so that is checked as a fallback.
 pub fn max_input_tokens_from_item(item: &Value) -> Option<u64> {
-    for key in ["max_input_tokens", "context_length", "context_window"] {
-        if let Some(tokens) = item.get(key).and_then(Value::as_u64)
-            && tokens > 0
-        {
-            return Some(tokens);
-        }
-    }
-    None
+    context_tokens_in(item).or_else(|| {
+        item.get("meta")
+            .and_then(|meta| meta.get("llamaswap"))
+            .and_then(context_tokens_in)
+    })
+}
+
+fn context_tokens_in(obj: &Value) -> Option<u64> {
+    ["max_input_tokens", "context_length", "context_window"]
+        .into_iter()
+        .filter_map(|key| obj.get(key).and_then(Value::as_u64))
+        .find(|tokens| *tokens > 0)
 }
 
 /// Window Claude Code should assume for this hub id.
@@ -60,6 +66,24 @@ fn should_advertise_1m(model_id: &str, upstream_tokens: Option<u64>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llama_swap_metadata__context_length_read() {
+        let item = serde_json::json!({
+            "id": "qwen3.6-35b",
+            "meta": { "llamaswap": { "context_length": 262_144, "type": "model" } }
+        });
+        assert_eq!(max_input_tokens_from_item(&item), Some(262_144));
+    }
+
+    #[test]
+    fn top_level_context__wins_over_llama_swap_metadata() {
+        let item = serde_json::json!({
+            "context_length": 131_072,
+            "meta": { "llamaswap": { "context_length": 262_144 } }
+        });
+        assert_eq!(max_input_tokens_from_item(&item), Some(131_072));
+    }
 
     #[test]
     fn trailing_1m_suffix__stripped() {

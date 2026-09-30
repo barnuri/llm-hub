@@ -183,6 +183,7 @@ button.stat-tile-link:focus-visible { outline: 2px solid var(--accent); outline-
 }
 .usage-kpis { margin-bottom: 0; }
 .usage-table-scroll { max-height: 240px; overflow: auto; }
+.error-reason { min-width: 280px; max-width: 560px; white-space: normal; overflow-wrap: anywhere; font-size: 12px; }
 .usage-period h2 { margin-top: 0; }
 .usage-period .dim { margin: 0 0 10px; }
 .usage-records {

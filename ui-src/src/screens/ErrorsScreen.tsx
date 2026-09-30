@@ -114,12 +114,13 @@ export function ErrorsScreen() {
               <th className="num">In</th>
               <th className="num">Out</th>
               <th className="num">Cost</th>
+              <th>Reason</th>
             </tr>
           </thead>
           <tbody>
             {pageRows.length === 0 ? (
               <tr>
-                <td colSpan={7} className="dim">
+                <td colSpan={8} className="dim">
                   No errors in this window.
                 </td>
               </tr>
@@ -133,6 +134,9 @@ export function ErrorsScreen() {
                   <td className="num">{row.tokens_in}</td>
                   <td className="num">{row.tokens_out}</td>
                   <td className="num">{formatUsd(row.cost_usd)}</td>
+                  <td className="mono error-reason" title={row.error ?? undefined}>
+                    {row.error ?? <span className="dim">not recorded</span>}
+                  </td>
                 </tr>
               ))
             )}

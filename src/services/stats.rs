@@ -123,6 +123,8 @@ pub struct RequestOutcome {
     pub tokens_out: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// Short upstream/hub failure reason for `status >= 400`; `None` on success.
+    pub error: Option<String>,
 }
 
 impl StatsRegistry {
@@ -463,6 +465,7 @@ mod tests {
             tokens_out: 20,
             cache_read_tokens: 4,
             cache_write_tokens: 0,
+            error: None,
         }
     }
 

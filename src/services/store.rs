@@ -9,12 +9,12 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::consts::ERROR_STATUS_MIN;
 use crate::services::stats::{RequestOutcome, StatsSnapshot, snapshot_from_outcomes};
 
 const DEFAULT_SQLITE_PATH: &str = "llm-hub.db";
 const DEFAULT_JSON_PATH: &str = "llm-hub-stats.json";
 const USAGE_RECENT_LIMIT: usize = 200;
-const ERROR_STATUS_MIN: u16 = 400;
 
 /// Durable store behind `LLM_HUB_PERSISTENT=true`. Sqlite keeps a full request
 /// log; Json keeps a rolling recent window flushed on every write batch.
@@ -124,6 +124,7 @@ impl Store {
             cache_read_tokens: outcome.cache_read_tokens,
             cache_write_tokens: outcome.cache_write_tokens,
             cost_usd: 0.0,
+            error: outcome.error.clone(),
         };
         match self {
             Store::Sqlite(conn) => {
@@ -132,8 +133,8 @@ impl Store {
                     .execute(
                         "INSERT INTO requests (
                             ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            ttft_ms, cache_read_tokens, cache_write_tokens, error
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                         rusqlite::params![
                             db_i64(row.ts_ms),
                             row.model,
@@ -144,7 +145,8 @@ impl Store {
                             db_i64(row.tokens_out),
                             row.ttft_ms.map(db_i64),
                             db_i64(row.cache_read_tokens),
-                            db_i64(row.cache_write_tokens)
+                            db_i64(row.cache_write_tokens),
+                            row.error
                         ],
                     )
                     .map_err(|e| e.to_string())?;
@@ -194,7 +196,7 @@ impl Store {
                 let mut stmt = guard
                     .prepare(
                         "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                                ttft_ms, cache_read_tokens, cache_write_tokens
+                                ttft_ms, cache_read_tokens, cache_write_tokens, error
                          FROM requests ORDER BY id DESC LIMIT ?1",
                     )
                     .map_err(|e| e.to_string())?;
@@ -245,7 +247,7 @@ impl Store {
                     .map_err(|e| e.to_string())?;
                 let mut list_sql = format!(
                     "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens
+                            ttft_ms, cache_read_tokens, cache_write_tokens, error
                      FROM requests WHERE status >= {ERROR_STATUS_MIN}"
                 );
                 if since_ms.is_some() {
@@ -343,6 +345,7 @@ impl Store {
                             cache_read_tokens: db_u64(r.get::<_, i64>(7).unwrap_or(0)),
                             cache_write_tokens: db_u64(r.get::<_, i64>(8).unwrap_or(0)),
                             ts_ms: db_u64(r.get::<_, i64>(9).unwrap_or(0)),
+                            error: None,
                         })
                     })
                     .map_err(|e| e.to_string())?
@@ -378,6 +381,7 @@ impl Store {
                         cache_read_tokens: row.cache_read_tokens,
                         cache_write_tokens: row.cache_write_tokens,
                         ts_ms: row.ts_ms,
+                        error: row.error.clone(),
                     })
                     .collect();
                 Ok(rows)
@@ -519,6 +523,7 @@ fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
         "cache_write_tokens",
         "ALTER TABLE requests ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0",
     )?;
+    add("error", "ALTER TABLE requests ADD COLUMN error TEXT")?;
     Ok(())
 }
 
@@ -535,6 +540,7 @@ fn map_usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRow> {
         cache_read_tokens: db_u64(r.get::<_, i64>(8).unwrap_or(0)),
         cache_write_tokens: db_u64(r.get::<_, i64>(9).unwrap_or(0)),
         cost_usd: 0.0,
+        error: r.get::<_, Option<String>>(10).unwrap_or(None),
     })
 }
 
@@ -554,6 +560,7 @@ mod tests {
             cache_read_tokens: 3,
             cache_write_tokens: 1,
             ts_ms: 0,
+            error: None,
         }
     }
 
@@ -569,6 +576,23 @@ mod tests {
         assert_eq!(usage.recent[0].tokens_out, 7);
         assert_eq!(usage.recent[0].cache_read_tokens, 3);
         assert_eq!(usage.recent[0].ttft_ms, Some(12));
+    }
+
+    #[test]
+    fn sqlite_errors__keep_the_failure_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let mut failed = sample_outcome();
+        failed.status = 400;
+        failed.error = Some("exceeds the available context size".into());
+        store.record(&failed).unwrap();
+        let (total, recent) = store.errors(None).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(
+            recent[0].error.as_deref(),
+            Some("exceeds the available context size")
+        );
     }
 
     #[test]
