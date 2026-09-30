@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::consts::{
     ANTHROPIC_UPSTREAM_PATH, HEADER_ATTEMPTS, HEADER_SERVED_MODEL, HEADER_TRANSFORMS,
-    MAX_TRANSFORM_BUFFER_BYTES, USAGE_SCRAPE_TAIL_BYTES,
+    MAX_TRANSFORM_BUFFER_BYTES, SSE_KEEPALIVE_FRAME, USAGE_SCRAPE_TAIL_BYTES,
 };
 use crate::dependencies::state::AppState;
 use crate::schemas::app_error::AppError;
@@ -393,6 +393,11 @@ fn build_response(
     transform: Option<BodyTransform>,
 ) -> Response {
     let status = upstream.status();
+    // Read before `bytes_stream()` consumes the response. A comment frame
+    // injected into a JSON body would corrupt it, so this is SSE-only.
+    let keepalive = is_event_stream(&upstream)
+        .then(|| state.config().sse_keepalive)
+        .flatten();
     let mut response_headers = filter_response_headers(&headermap_from_reqwest(upstream.headers()));
     if transform.is_some() {
         // The body is rewritten, so the upstream's encoding no longer
@@ -436,6 +441,7 @@ fn build_response(
             ended: false,
             started,
             ttft_ms: None,
+            keepalive,
         },
         pump,
     );
@@ -493,8 +499,16 @@ where
 {
     loop {
         if !state.ended {
-            match state.inner.next().await {
-                Some(Ok(bytes)) => {
+            match next_chunk(&mut state.inner, state.keepalive).await {
+                // Nothing from upstream for a whole interval. The frame goes
+                // out ahead of the transform and without touching `tail` or
+                // `ttft_ms`: it is the hub's own byte, not the upstream's, and
+                // must not show up in usage scraping or latency stats.
+                NextChunk::Idle => {
+                    let ping = Bytes::from_static(SSE_KEEPALIVE_FRAME.as_bytes());
+                    return Some((Ok(ping), state));
+                }
+                NextChunk::Chunk(Ok(bytes)) => {
                     // The tail always holds the *upstream* bytes, so usage
                     // scraping keeps working when a transform is active but
                     // observed nothing itself.
@@ -516,12 +530,14 @@ where
                 // A mid-stream read error is unrecoverable either way; with a
                 // transform active the client is still owed a well-formed tail,
                 // so the error ends the stream instead of being forwarded.
-                Some(Err(e)) if state.transform.is_none() => return Some((Err(e), state)),
-                Some(Err(e)) => {
+                NextChunk::Chunk(Err(e)) if state.transform.is_none() => {
+                    return Some((Err(e), state));
+                }
+                NextChunk::Chunk(Err(e)) => {
                     tracing::warn!("upstream stream error, closing translated stream: {e}");
                     state.ended = true;
                 }
-                None => state.ended = true,
+                NextChunk::End => state.ended = true,
             }
         }
 
@@ -544,6 +560,37 @@ where
     }
 }
 
+/// What one poll of the upstream body produced.
+enum NextChunk {
+    /// The keepalive interval elapsed with the upstream still silent.
+    Idle,
+    Chunk(reqwest::Result<Bytes>),
+    End,
+}
+
+/// Awaits the next upstream chunk, giving up after `keepalive` so the caller
+/// can send a comment frame and come back.
+///
+/// Cancelling the `next()` future on timeout loses nothing: `Stream::poll_next`
+/// only yields an item by returning `Ready`, so a future dropped while `Pending`
+/// has consumed nothing. Without `keepalive` this is a plain `next().await`.
+async fn next_chunk<S>(inner: &mut S, keepalive: Option<Duration>) -> NextChunk
+where
+    S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    let Some(interval) = keepalive else {
+        return match inner.next().await {
+            Some(item) => NextChunk::Chunk(item),
+            None => NextChunk::End,
+        };
+    };
+    match tokio::time::timeout(interval, inner.next()).await {
+        Err(_elapsed) => NextChunk::Idle,
+        Ok(Some(item)) => NextChunk::Chunk(item),
+        Ok(None) => NextChunk::End,
+    }
+}
+
 /// The per-response state the body stream carries while it drains.
 struct StreamState<S> {
     inner: S,
@@ -553,6 +600,9 @@ struct StreamState<S> {
     ended: bool,
     started: Instant,
     ttft_ms: Option<u64>,
+    /// Idle gap after which a keepalive comment goes out. `None` on every
+    /// non-SSE body and whenever the knob is off — see `pump`.
+    keepalive: Option<Duration>,
 }
 
 /// What the finished body stream hands the stats task. `observed_usage` wins
@@ -837,4 +887,136 @@ fn headermap_from_reqwest(headers: &reqwest::header::HeaderMap) -> HeaderMap {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures_util::stream::{self, BoxStream, StreamExt as _};
+
+    use super::*;
+
+    const KEEPALIVE: Duration = Duration::from_millis(25);
+    /// Comfortably longer than `KEEPALIVE`, so the idle branch fires at least
+    /// twice without the test depending on exact scheduler timing.
+    const SILENCE_MS: u64 = 120;
+
+    type TestStream = BoxStream<'static, reqwest::Result<Bytes>>;
+
+    /// Upstream that sleeps `delay_ms` before handing over each payload, which
+    /// is what gives `pump` a real idle gap to react to.
+    fn slow_stream(steps: Vec<(u64, &'static str)>) -> TestStream {
+        stream::unfold(steps.into_iter(), |mut steps| async move {
+            let (delay_ms, payload) = steps.next()?;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            Some((Ok(Bytes::from_static(payload.as_bytes())), steps))
+        })
+        .boxed()
+    }
+
+    fn state_for(
+        inner: TestStream,
+        keepalive: Option<Duration>,
+        sender: Option<tokio::sync::oneshot::Sender<StreamSummary>>,
+    ) -> StreamState<TestStream> {
+        StreamState {
+            inner,
+            tail: Vec::new(),
+            transform: None,
+            sender,
+            ended: false,
+            started: Instant::now(),
+            ttft_ms: None,
+            keepalive,
+        }
+    }
+
+    /// Drives the body stream to exhaustion, returning every chunk as text.
+    async fn drain(mut state: StreamState<TestStream>) -> Vec<String> {
+        let mut chunks = Vec::new();
+        while let Some((item, next)) = pump(state).await {
+            chunks.push(String::from_utf8(item.unwrap().to_vec()).unwrap());
+            state = next;
+        }
+        chunks
+    }
+
+    fn ping_count(chunks: &[String]) -> usize {
+        chunks.iter().filter(|c| *c == SSE_KEEPALIVE_FRAME).count()
+    }
+
+    #[tokio::test]
+    async fn pings_while_the_upstream_is_silent_then_stops_once_bytes_flow() {
+        let upstream = slow_stream(vec![(SILENCE_MS, "data: one\n\n"), (0, "data: two\n\n")]);
+        let chunks = drain(state_for(upstream, Some(KEEPALIVE), None)).await;
+
+        assert!(ping_count(&chunks) >= 2, "{chunks:?}");
+        let payloads: Vec<&String> = chunks
+            .iter()
+            .filter(|c| *c != SSE_KEEPALIVE_FRAME)
+            .collect();
+        assert_eq!(payloads, vec!["data: one\n\n", "data: two\n\n"]);
+        // The second payload followed the first with no delay, so no ping can
+        // separate them.
+        let first = chunks.iter().position(|c| c == "data: one\n\n").unwrap();
+        assert_eq!(chunks[first + 1], "data: two\n\n", "{chunks:?}");
+    }
+
+    #[tokio::test]
+    async fn no_ping_after_the_stream_ends() {
+        let upstream = slow_stream(vec![(0, "data: only\n\n")]);
+        let chunks = drain(state_for(upstream, Some(KEEPALIVE), None)).await;
+        assert_eq!(chunks, vec!["data: only\n\n"]);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_keepalive_never_pings_however_long_the_silence() {
+        let upstream = slow_stream(vec![(SILENCE_MS, "data: one\n\n")]);
+        let chunks = drain(state_for(upstream, None, None)).await;
+        assert_eq!(chunks, vec!["data: one\n\n"]);
+    }
+
+    #[tokio::test]
+    async fn ping_bytes_reach_the_client_but_not_the_stats() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
+        let upstream = slow_stream(vec![(SILENCE_MS, "data: real\n\n")]);
+        let chunks = drain(state_for(upstream, Some(KEEPALIVE), Some(sender))).await;
+        assert!(ping_count(&chunks) >= 2, "{chunks:?}");
+
+        let summary = receiver.await.unwrap();
+        assert_eq!(String::from_utf8(summary.tail).unwrap(), "data: real\n\n");
+        // The clock starts at the real first byte, not at the first ping.
+        let ttft = summary.ttft_ms.unwrap();
+        assert!(ttft >= SILENCE_MS, "ttft {ttft}ms measured from a ping");
+    }
+
+    #[tokio::test]
+    async fn a_ping_is_never_fed_through_the_transform() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
+        let delta = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let mut state = state_for(
+            slow_stream(vec![(SILENCE_MS, delta), (0, "data: [DONE]\n\n")]),
+            Some(KEEPALIVE),
+            Some(sender),
+        );
+        state.transform = Some(BodyTransform::anthropic_stream(
+            "p/m".to_string(),
+            crate::services::tool_names::NameMap::default(),
+        ));
+        let chunks = drain(state).await;
+
+        assert!(ping_count(&chunks) >= 2, "{chunks:?}");
+        // The translator only ever saw the upstream frame, so it produced a
+        // complete Anthropic message and no ping leaked into an event payload.
+        let translated: String = chunks
+            .iter()
+            .filter(|c| *c != SSE_KEEPALIVE_FRAME)
+            .cloned()
+            .collect();
+        assert!(translated.contains("event: message_start"), "{translated}");
+        assert!(translated.contains("event: message_stop"), "{translated}");
+        assert!(!translated.contains("keepalive"), "{translated}");
+        assert!(receiver.await.is_ok());
+    }
 }

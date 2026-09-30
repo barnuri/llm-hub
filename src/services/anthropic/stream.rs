@@ -651,6 +651,21 @@ mod tests {
         assert_eq!(names(&events).last(), Some(&"message_stop"));
     }
 
+    /// The hub's keepalive bypasses the transform in `pump`, but an upstream is
+    /// free to send comment frames of its own — either way they must vanish.
+    #[test]
+    fn keepalive_comment_frames_are_inert() {
+        let (_, expected) = run(&[ROLE, TEXT_A, TEXT_B, STOP]);
+
+        let mut stream = AnthropicStream::new("p/m".to_string(), NameMap::default());
+        let mut out: Vec<u8> = Vec::new();
+        for payload in [ROLE, TEXT_A, TEXT_B, STOP] {
+            out.extend_from_slice(&stream.push(crate::consts::SSE_KEEPALIVE_FRAME.as_bytes()));
+            out.extend_from_slice(&stream.push(format!("data: {payload}\n\n").as_bytes()));
+        }
+        assert_eq!(parse(&out), expected);
+    }
+
     #[test]
     fn unparseable_frame_is_ignored_and_stream_continues() {
         let (_, events) = run(&[TEXT_A, "{not json", TEXT_B]);

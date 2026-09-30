@@ -14,6 +14,17 @@ pub const STATS_OVERFLOW_KEY: &str = "other";
 /// Rolling tail kept per response for scraping the `usage` object.
 pub const USAGE_SCRAPE_TAIL_BYTES: usize = 64 * 1024;
 
+/// How long an SSE response may produce no upstream bytes before the hub sends
+/// a keepalive comment. A slow local model answers the request headers in
+/// milliseconds and then goes silent for the whole prefill (measured: 113s on a
+/// ~30k-token prompt), which idle-timeout logic downstream cannot tell apart
+/// from a dead connection. 15s sits well inside the usual 30s/60s idle limits.
+pub const DEFAULT_SSE_KEEPALIVE_MS: u64 = 15_000;
+/// The keepalive itself. A line starting with `:` is a comment in the SSE
+/// grammar, so every conformant parser drops it before it reaches the message
+/// stream — it is inert in both the `OpenAI` and Anthropic dialects.
+pub const SSE_KEEPALIVE_FRAME: &str = ": llm-hub keepalive\n\n";
+
 pub const HEADER_FALLBACKS: &str = "x-llm-hub-fallbacks";
 pub const HEADER_FALLBACKS_ALIAS: &str = "x-fallbacks";
 pub const HEADER_TIMEOUT_MS: &str = "x-llm-hub-timeout-ms";

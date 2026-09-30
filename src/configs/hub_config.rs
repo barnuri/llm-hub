@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use super::profile_config::ProfileConfig;
-use crate::consts::{DEFAULT_BIND, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_PORT};
+use crate::consts::{
+    DEFAULT_BIND, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_PORT, DEFAULT_SSE_KEEPALIVE_MS,
+};
 
 const PREFIX: &str = "LLM_HUB_";
 
@@ -26,6 +29,9 @@ pub struct HubConfig {
     /// upstream omits it. Opt-out (`LLM_HUB_STREAM_ROLE=false`): the clients
     /// this repairs cannot set a request header, so it defaults on.
     pub stream_role_inject: bool,
+    /// Idle gap after which an SSE response gets a keepalive comment frame.
+    /// `None` when `LLM_HUB_SSE_KEEPALIVE_MS=0` — the knob's off switch.
+    pub sse_keepalive: Option<Duration>,
     /// Global USD/1M token defaults when a profile/model has no rates.
     pub pricing: crate::configs::TokenRates,
 }
@@ -76,6 +82,13 @@ impl HubConfig {
             None => DEFAULT_PORT,
         };
 
+        let sse_keepalive_ms = match get("SSE_KEEPALIVE_MS") {
+            Some(v) if !v.is_empty() => v
+                .parse()
+                .map_err(|_| format!("LLM_HUB_SSE_KEEPALIVE_MS is not a number: {v}"))?,
+            _ => DEFAULT_SSE_KEEPALIVE_MS,
+        };
+
         let pricing = crate::configs::TokenRates {
             input_per_1m: crate::configs::token_rates::parse_optional_f64(
                 get("INPUT_USD_PER_1M"),
@@ -108,6 +121,7 @@ impl HubConfig {
             store_path: get("STORE_PATH").filter(|v| !v.is_empty()),
             auto_update: get("AUTO_UPDATE").is_none_or(|v| !is_falsy(&v)),
             stream_role_inject: get("STREAM_ROLE").is_none_or(|v| !is_falsy(&v)),
+            sse_keepalive: (sse_keepalive_ms > 0).then(|| Duration::from_millis(sse_keepalive_ms)),
             pricing,
         })
     }
@@ -352,6 +366,40 @@ mod tests {
                 "LLM_HUB_STREAM_ROLE={value}"
             );
         }
+    }
+
+    #[test]
+    fn sse_keepalive_defaults_to_the_documented_interval() {
+        let cfg = HubConfig::from_map(&base_vars()).unwrap();
+        assert_eq!(
+            cfg.sse_keepalive,
+            Some(Duration::from_millis(DEFAULT_SSE_KEEPALIVE_MS))
+        );
+    }
+
+    #[test]
+    fn sse_keepalive_zero_disables_and_a_value_overrides() {
+        for (value, expected) in [
+            ("0", None),
+            ("2500", Some(Duration::from_millis(2500))),
+            ("", Some(Duration::from_millis(DEFAULT_SSE_KEEPALIVE_MS))),
+        ] {
+            let mut vars = base_vars();
+            vars.insert("LLM_HUB_SSE_KEEPALIVE_MS".into(), value.into());
+            let cfg = HubConfig::from_map(&vars).unwrap();
+            assert_eq!(
+                cfg.sse_keepalive, expected,
+                "LLM_HUB_SSE_KEEPALIVE_MS={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_keepalive_rejects_a_non_numeric_value() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_SSE_KEEPALIVE_MS".into(), "soon".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_SSE_KEEPALIVE_MS"), "{err}");
     }
 
     #[test]
