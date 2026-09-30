@@ -63,7 +63,8 @@ function formatContext(tokens: number | null): string {
   if (tokens >= 1_000_000) {
     return `${formatNumber(tokens / 1_000_000, 1)}M`;
   }
-  return `${formatNumber(Math.round(tokens / 1024))}k`;
+  const unit = tokens % 1024 === 0 ? 1024 : 1000;
+  return `${formatNumber(Math.round(tokens / unit))}k`;
 }
 
 function queryString(range: InsightsRange, minCalls: number): string {

@@ -175,6 +175,24 @@ curl 'localhost:8410/api/insights/pick?by=overall&profile=llama_swap'
 plus runners-up and answers 404 when no model is ranked yet, so scripts can
 fall back to a fixed model.
 
+`GET /api/insights/report` is the same data as one document for agents: a
+plain-language `summary`, every `pick`, `best_for` per use case, per-harness
+stats, failure reasons across models, and caveats.
+
+Each model also carries:
+
+- **Context window** from the upstream model list (`max_input_tokens`,
+  `context_length`, or llama-swap's `metadata.context_length`).
+- **Use cases and summary** from llama-swap `metadata.use_cases` /
+  `metadata.summary` (written by `llama-models sync-swap` from
+  `model-uses.registry`). `best_for` picks the best-ranked model per use case,
+  or the declared one when none has enough calls yet.
+- **Harness stats**: every call stores its client signature (User-Agent, plus
+  a marker for Copilot CLI's `x-initiator` header), classified as
+  `claude-code`, `claude-code-headless`, `claude-agent-sdk`, `copilot-cli`,
+  `opencode`, `cursor`, and so on. `best_harness` is the agent harness with
+  the highest success rate on that model (at least 3 calls).
+
 ## Request transforms
 
 Two opt-in request headers reshape the body on its way upstream, for the times

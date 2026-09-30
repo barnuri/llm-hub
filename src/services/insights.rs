@@ -321,29 +321,36 @@ fn criterion_label(by: PickBy) -> &'static str {
     }
 }
 
+/// Running totals for one failure reason while grouping.
+#[derive(Default)]
+struct ReasonTally {
+    count: u64,
+    models: BTreeSet<String>,
+    last_ms: u64,
+}
+
 fn failure_reasons(outcomes: &[RequestOutcome]) -> Vec<FailureReason> {
-    let mut groups: HashMap<String, (u64, Vec<String>, u64)> = HashMap::new();
+    let mut tallies: HashMap<String, ReasonTally> = HashMap::new();
     for call in outcomes.iter().filter(|call| !is_success(call)) {
-        let (count, models, last_ms) = groups.entry(failure_reason(call)).or_default();
-        *count += 1;
-        if !models.contains(&call.model_key) {
-            models.push(call.model_key.clone());
-        }
-        *last_ms = (*last_ms).max(call.ts_ms);
+        let tally = tallies.entry(failure_reason(call)).or_default();
+        tally.count += 1;
+        tally.models.insert(call.model_key.clone());
+        tally.last_ms = tally.last_ms.max(call.ts_ms);
     }
-    let mut reasons: Vec<(String, (u64, Vec<String>, u64))> = groups.into_iter().collect();
-    reasons.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| b.1.2.cmp(&a.1.2)));
+    let mut reasons: Vec<(String, ReasonTally)> = tallies.into_iter().collect();
+    reasons.sort_by(|a, b| {
+        b.1.count
+            .cmp(&a.1.count)
+            .then_with(|| b.1.last_ms.cmp(&a.1.last_ms))
+    });
     reasons
         .into_iter()
         .take(AGENT_FAILURE_REASONS)
-        .map(|(reason, (count, mut models, last_ms))| {
-            models.sort();
-            FailureReason {
-                reason,
-                count,
-                models,
-                last_seen: utc_iso8601(last_ms),
-            }
+        .map(|(reason, tally)| FailureReason {
+            reason,
+            count: tally.count,
+            models: tally.models.into_iter().collect(),
+            last_seen: utc_iso8601(tally.last_ms),
         })
         .collect()
 }

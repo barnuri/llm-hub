@@ -228,6 +228,8 @@ pub(crate) async fn attempt_loop(
 /// The SSE decision is the upstream's content-type, not the request's `stream`
 /// flag: an upstream that answers a streaming request with a JSON error must be
 /// translated as a message, not fed to the SSE machinery.
+// One argument over the lint's threshold, same trade-off as `send_attempt`.
+#[allow(clippy::too_many_arguments)]
 async fn deliver(
     state: &AppState,
     response: reqwest::Response,
