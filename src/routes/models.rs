@@ -151,6 +151,16 @@ fn annotate_context(
     obj.insert("context_window".into(), json!(tokens));
 }
 
+/// Spawned from main: keeps the cache warm so client startups never fan out.
+pub fn spawn_background_refresh(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            refresh_models(&state).await;
+            tokio::time::sleep(MODELS_CACHE_TTL).await;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,14 +249,4 @@ mod tests {
             })
         );
     }
-}
-
-/// Spawned from main: keeps the cache warm so client startups never fan out.
-pub fn spawn_background_refresh(state: AppState) {
-    tokio::spawn(async move {
-        loop {
-            refresh_models(&state).await;
-            tokio::time::sleep(MODELS_CACHE_TTL).await;
-        }
-    });
 }
