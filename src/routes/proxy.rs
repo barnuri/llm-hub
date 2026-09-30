@@ -474,7 +474,7 @@ fn build_response(
             cache_read_tokens: usage.cache_read_tokens,
             cache_write_tokens: usage.cache_write_tokens,
             error: (outcome_seed.status >= ERROR_STATUS_MIN)
-                .then(|| error_reason(&summary.tail)),
+                .then(|| error_reason(outcome_seed.status, &summary.tail)),
             ..outcome_seed
         };
         log_failure(&outcome);
@@ -732,7 +732,7 @@ async fn build_anthropic_response(
             if overflowed {
                 "upstream response too large to translate".to_string()
             } else {
-                error_reason(&raw)
+                error_reason(status.as_u16(), &raw)
             }
         }),
     };
@@ -887,7 +887,7 @@ fn extract_model_prefix(buffered: &Bytes) -> Option<String> {
 
 /// Short, human-readable reason for a failed upstream body: the JSON
 /// `error.message` / `message` / `detail` when present, else the raw text.
-fn error_reason(body: &[u8]) -> String {
+fn error_reason(status: u16, body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     let trimmed = text.trim();
     let from_json = serde_json::from_str::<Value>(trimmed).ok().and_then(|v| {
@@ -905,7 +905,9 @@ fn error_reason(body: &[u8]) -> String {
     });
     let reason = from_json.unwrap_or_else(|| trimmed.to_string());
     let reason = if reason.is_empty() {
-        "empty upstream error body".to_string()
+        // e.g. a backend with no handler for the path (the MLX proxy used to
+        // 404 every /v1/chat/completions this way) -- the status is all there is.
+        format!("HTTP {status} with empty body from upstream")
     } else {
         reason
     };
@@ -1071,14 +1073,14 @@ mod tests {
     fn error_reason_prefers_the_json_message() {
         let body = br#"{"error":{"code":400,"message":"request (69657 tokens) exceeds the available context size (65536 tokens)","type":"exceed_context_size_error"}}"#;
         assert_eq!(
-            error_reason(body),
+            error_reason(400, body),
             "request (69657 tokens) exceeds the available context size (65536 tokens)"
         );
-        assert_eq!(error_reason(br#"{"error":"bad model"}"#), "bad model");
-        assert_eq!(error_reason(b"  upstream exploded \n"), "upstream exploded");
-        assert_eq!(error_reason(b""), "empty upstream error body");
+        assert_eq!(error_reason(400, br#"{"error":"bad model"}"#), "bad model");
+        assert_eq!(error_reason(500, b"  upstream exploded \n"), "upstream exploded");
+        assert_eq!(error_reason(404, b""), "HTTP 404 with empty body from upstream");
         assert_eq!(
-            error_reason("x".repeat(2000).as_bytes()).len(),
+            error_reason(400, "x".repeat(2000).as_bytes()).len(),
             ERROR_REASON_MAX_CHARS
         );
     }

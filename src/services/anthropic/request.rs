@@ -82,6 +82,10 @@ fn translate_message(message: &Value, out: &mut Vec<Value>) -> Result<(), AppErr
         ));
     };
     let role = obj.get("role").and_then(Value::as_str).unwrap_or("user");
+    if role == "system" {
+        out.push(mid_conversation_system(obj.get("content")));
+        return Ok(());
+    }
     match obj.get("content") {
         Some(Value::String(text)) => out.push(json!({ "role": role, "content": text })),
         Some(Value::Array(blocks)) if role == "assistant" => push_assistant(blocks, out),
@@ -89,6 +93,23 @@ fn translate_message(message: &Value, out: &mut Vec<Value>) -> Result<(), AppErr
         _ => out.push(json!({ "role": role, "content": "" })),
     }
     Ok(())
+}
+
+/// Claude Code can put `role: "system"` messages inside `messages`. Qwen and
+/// other chat templates reject a system message that is not first ("System
+/// message must be at the beginning"), which 400s the whole turn. Sending it as
+/// a user-side reminder keeps the instruction and the leading prompt prefix,
+/// so the upstream prompt cache still hits.
+fn mid_conversation_system(content: Option<&Value>) -> Value {
+    let text = match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => join_text_blocks(blocks, "\n\n"),
+        _ => String::new(),
+    };
+    json!({
+        "role": "user",
+        "content": format!("<system-reminder>\n{text}\n</system-reminder>"),
+    })
 }
 
 /// One assistant message: joined text (or `null`) plus any `tool_use` blocks
@@ -320,6 +341,29 @@ mod tests {
             json!({"role": "system", "content": "be terse"})
         );
         assert_eq!(messages(&out)[1], json!({"role": "user", "content": "hi"}));
+    }
+
+    #[test]
+    fn mid_conversation_system_becomes_user_reminder() {
+        let out = translate(&json!({
+            "model": "p/m", "system": "top",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": [{"type": "text", "text": "mode changed"}]},
+                {"role": "system", "content": "plain"}
+            ]
+        }));
+        let msgs = messages(&out);
+        assert_eq!(msgs[0], json!({"role": "system", "content": "top"}));
+        assert_eq!(
+            msgs[2],
+            json!({"role": "user", "content": "<system-reminder>\nmode changed\n</system-reminder>"})
+        );
+        assert_eq!(
+            msgs[3],
+            json!({"role": "user", "content": "<system-reminder>\nplain\n</system-reminder>"})
+        );
+        assert_eq!(msgs.iter().filter(|m| m["role"] == "system").count(), 1);
     }
 
     #[test]
