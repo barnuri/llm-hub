@@ -46,6 +46,8 @@ pub fn classify(signature: Option<&str>) -> String {
         Some("copilot-cli")
     } else if lower.starts_with("opencode/") {
         Some("opencode")
+    } else if lower.starts_with("codex") {
+        Some("codex")
     } else if lower.contains("cursor") {
         Some("cursor")
     } else if lower.starts_with("openai/js") {
@@ -113,6 +115,10 @@ mod tests {
             (
                 "opencode/1.18.29 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
                 "opencode",
+            ),
+            (
+                "codex_exec/0.149.0 (Mac OS 26.5.2; arm64) vscode/1.141.0-insider (codex_exec; 0.149.0)",
+                "codex",
             ),
             ("Bun/1.4.0", "bun-app"),
             ("curl/8.7.1", "curl"),
