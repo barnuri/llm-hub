@@ -29,6 +29,10 @@ use crate::services::tool_names::{self, NameMap};
 const REASONING_KEYS: [&str; 3] = ["reasoning", "reasoning_effort", "thinking"];
 /// Roles the system-prompt transform considers a system prompt.
 const SYSTEM_ROLES: [&str; 2] = ["system", "developer"];
+const COPILOT_TOOLS_FINGERPRINT: &str = "copilotToolsFingerprint";
+const COPILOT_TOOL_GUARD_MARKER: &str = "Local Copilot tool-use guard";
+const COPILOT_TOOL_GUARD: &str = "\n\n# Local Copilot tool-use guard\nUse `read_bash` only when a previous `bash` call is still running and returned an active shellId. Never use shell IDs shown in completed-command markers such as `<shellId: 0 completed with exit code ...>`; for completed bash calls, use the output already in the tool result. Do not call `read_agent` unless you previously launched a background agent and have its exact agent_id. Do not call `list_bash` repeatedly; continue with the available command output and inspect files with `view`, `rg`, or `glob`.";
+const COPILOT_GUARDED_QWEN_MODELS: [&str; 3] = ["qwen3.6-35b", "qwen3-coder-next", "qwen3-4b-2507"];
 
 /// Which client-facing API shape a request arrived in. Decides body
 /// translation and the response transform; the fallback chain, retry policy,
@@ -144,6 +148,10 @@ pub fn apply_request(
 
     if header_is_truthy(headers, HEADER_REASONING_STRIP) && strip_reasoning(obj) {
         plan.applied.push("reasoning-strip".to_string());
+    }
+
+    if apply_copilot_tool_loop_guard(obj) {
+        plan.applied.push("copilot-tool-loop-guard".to_string());
     }
 
     plan
@@ -279,6 +287,55 @@ fn truncate_text(text: &str, max: usize) -> Option<String> {
         return None;
     }
     Some(text.chars().take(max).collect())
+}
+
+fn apply_copilot_tool_loop_guard(obj: &mut Map<String, Value>) -> bool {
+    if !obj.contains_key(COPILOT_TOOLS_FINGERPRINT) {
+        return false;
+    }
+    let Some(model) = obj.get("model").and_then(Value::as_str) else {
+        return false;
+    };
+    if !COPILOT_GUARDED_QWEN_MODELS
+        .iter()
+        .any(|guarded| model.ends_with(guarded))
+    {
+        return false;
+    }
+    let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let Some(system_message) = messages
+        .iter_mut()
+        .find(|message| is_system_message(message))
+    else {
+        return false;
+    };
+    append_guard_to_content(system_message)
+}
+
+fn append_guard_to_content(message: &mut Value) -> bool {
+    match message.get_mut("content") {
+        Some(Value::String(text)) => append_guard_to_text(text),
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                let Some(Value::String(text)) = part.get_mut("text") else {
+                    continue;
+                };
+                return append_guard_to_text(text);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn append_guard_to_text(text: &mut String) -> bool {
+    if text.contains(COPILOT_TOOL_GUARD_MARKER) {
+        return false;
+    }
+    text.push_str(COPILOT_TOOL_GUARD);
+    true
 }
 
 // --- feature 5: reasoning strip ---
@@ -543,6 +600,65 @@ mod tests {
         );
         assert_eq!(body, before);
         assert!(plan.applied.is_empty());
+    }
+
+    #[test]
+    fn copilot_qwen_requests_get_tool_loop_guard() {
+        let mut body = Some(json!({
+            "model": "llama_swap/qwen3.6-35b",
+            "copilotToolsFingerprint": "abc",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "fix tests"},
+            ],
+        }));
+
+        let plan = apply_request(&mut body, &headers(&[]), true);
+
+        let content = body.as_ref().unwrap()["messages"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(content.contains(COPILOT_TOOL_GUARD_MARKER));
+        assert_eq!(plan.applied, vec!["copilot-tool-loop-guard".to_string()]);
+    }
+
+    #[test]
+    fn copilot_tool_loop_guard_is_not_duplicated() {
+        let mut body = Some(json!({
+            "model": "llama_swap/qwen3-coder-next",
+            "copilotToolsFingerprint": "abc",
+            "messages": [
+                {"role": "system", "content": format!("sys\n{COPILOT_TOOL_GUARD_MARKER}")},
+                {"role": "user", "content": "fix tests"},
+            ],
+        }));
+        let before = body.clone();
+
+        let plan = apply_request(&mut body, &headers(&[]), true);
+
+        assert_eq!(body, before);
+        assert!(plan.applied.is_empty());
+    }
+
+    #[test]
+    fn copilot_tool_loop_guard_ignores_non_copilot_or_non_target_models() {
+        for mut body in [
+            Some(json!({
+                "model": "llama_swap/qwen3.6-35b",
+                "messages": [{"role": "system", "content": "sys"}],
+            })),
+            Some(json!({
+                "model": "llama_swap/ornith-1.0-35b",
+                "copilotToolsFingerprint": "abc",
+                "messages": [{"role": "system", "content": "sys"}],
+            })),
+        ] {
+            let before = body.clone();
+            let plan = apply_request(&mut body, &headers(&[]), true);
+
+            assert_eq!(body, before);
+            assert!(plan.applied.is_empty());
+        }
     }
 
     #[test]
