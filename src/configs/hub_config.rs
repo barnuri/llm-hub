@@ -6,6 +6,8 @@ use crate::consts::{
     DEFAULT_BIND, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_PORT, DEFAULT_SSE_KEEPALIVE_MS,
 };
 
+use crate::services::transforms::DEFAULT_COPILOT_GUARD_MODELS;
+
 const PREFIX: &str = "LLM_HUB_";
 
 // Env-driven feature flags: each one is an independent opt-in/opt-out switch
@@ -29,6 +31,11 @@ pub struct HubConfig {
     /// upstream omits it. Opt-out (`LLM_HUB_STREAM_ROLE=false`): the clients
     /// this repairs cannot set a request header, so it defaults on.
     pub stream_role_inject: bool,
+    /// Models (`<model>`, `<profile>/<model>` or `*`) whose Copilot CLI
+    /// requests get the tool-loop guard. `LLM_HUB_COPILOT_GUARD_MODELS`,
+    /// comma-separated; empty disables it; unset uses
+    /// [`DEFAULT_COPILOT_GUARD_MODELS`].
+    pub copilot_guard_models: Vec<String>,
     /// Idle gap after which an SSE response gets a keepalive comment frame.
     /// `None` when `LLM_HUB_SSE_KEEPALIVE_MS=0` — the knob's off switch.
     pub sse_keepalive: Option<Duration>,
@@ -121,6 +128,10 @@ impl HubConfig {
             store_path: get("STORE_PATH").filter(|v| !v.is_empty()),
             auto_update: get("AUTO_UPDATE").is_none_or(|v| !is_falsy(&v)),
             stream_role_inject: get("STREAM_ROLE").is_none_or(|v| !is_falsy(&v)),
+            copilot_guard_models: get("COPILOT_GUARD_MODELS").map_or_else(
+                || DEFAULT_COPILOT_GUARD_MODELS.map(String::from).to_vec(),
+                |list| split_list(&list),
+            ),
             sse_keepalive: (sse_keepalive_ms > 0).then(|| Duration::from_millis(sse_keepalive_ms)),
             pricing,
         })
@@ -216,6 +227,13 @@ fn discover_profile_names(vars: &HashMap<String, String>) -> Vec<String> {
 /// Env-var segment for a profile name: uppercased, `-` mapped to `_`.
 pub fn env_name(profile: &str) -> String {
     profile.to_uppercase().replace('-', "_")
+}
+
+fn split_list(list: &str) -> Vec<String> {
+    list.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn is_truthy(v: &str) -> bool {
@@ -365,6 +383,26 @@ mod tests {
                 cfg.stream_role_inject, expected,
                 "LLM_HUB_STREAM_ROLE={value}"
             );
+        }
+    }
+
+    #[test]
+    fn copilot_guard_models_default_and_parse() {
+        assert_eq!(
+            HubConfig::from_map(&base_vars())
+                .unwrap()
+                .copilot_guard_models,
+            DEFAULT_COPILOT_GUARD_MODELS.map(String::from).to_vec()
+        );
+        for (value, expected) in [
+            ("", vec![]),
+            ("*", vec!["*"]),
+            (" a , llama_swap/b ,", vec!["a", "llama_swap/b"]),
+        ] {
+            let mut vars = base_vars();
+            vars.insert("LLM_HUB_COPILOT_GUARD_MODELS".into(), value.into());
+            let cfg = HubConfig::from_map(&vars).unwrap();
+            assert_eq!(cfg.copilot_guard_models, expected, "value={value:?}");
         }
     }
 

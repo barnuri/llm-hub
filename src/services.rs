@@ -13,6 +13,7 @@ pub mod source_install;
 pub mod sse;
 pub mod stats;
 pub mod store;
+pub mod tool_loop_breaker;
 pub mod tool_names;
 pub mod transforms;
 pub mod update;

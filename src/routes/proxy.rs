@@ -139,7 +139,12 @@ pub(crate) async fn attempt_loop(
 
     // The single request-side transform seam. It runs once, before the chain is
     // built, so every attempt sends byte-identical bytes.
-    let plan = transforms::apply_request(&mut json_body, headers, config.stream_role_inject);
+    let plan = transforms::apply_request(
+        &mut json_body,
+        headers,
+        config.stream_role_inject,
+        &config.copilot_guard_models,
+    );
     // Whenever the hub reads the response body itself it must be handed
     // uncompressed bytes; passthrough requests keep the caller's header.
     let force_identity_encoding = route == RouteKind::Anthropic || plan.wants_response_transform();

@@ -23,16 +23,22 @@ use serde_json::{Map, Value};
 
 use crate::consts::{HEADER_REASONING_STRIP, HEADER_SYSTEM_PROMPT_MODE, SYSTEM_PROMPT_MAX_CHARS};
 use crate::services::body_transform::BodyTransform;
+use crate::services::harness;
+use crate::services::tool_loop_breaker;
 use crate::services::tool_names::{self, NameMap};
 
 /// Top-level request keys the reasoning strip removes.
 const REASONING_KEYS: [&str; 3] = ["reasoning", "reasoning_effort", "thinking"];
 /// Roles the system-prompt transform considers a system prompt.
 const SYSTEM_ROLES: [&str; 2] = ["system", "developer"];
-const COPILOT_TOOLS_FINGERPRINT: &str = "copilotToolsFingerprint";
 const COPILOT_TOOL_GUARD_MARKER: &str = "Local Copilot tool-use guard";
 const COPILOT_TOOL_GUARD: &str = "\n\n# Local Copilot tool-use guard\nUse `read_bash` only when a previous `bash` call is still running and returned an active shellId. Never use shell IDs shown in completed-command markers such as `<shellId: 0 completed with exit code ...>`; for completed bash calls, use the output already in the tool result. Do not call `read_agent` unless you previously launched a background agent and have its exact agent_id. Do not call `list_bash` repeatedly; continue with the available command output and inspect files with `view`, `rg`, or `glob`.";
-const COPILOT_GUARDED_QWEN_MODELS: [&str; 3] = ["qwen3.6-35b", "qwen3-coder-next", "qwen3-4b-2507"];
+/// `LLM_HUB_COPILOT_GUARD_MODELS` entry that guards every model.
+const COPILOT_GUARD_ALL: &str = "*";
+/// Default for `LLM_HUB_COPILOT_GUARD_MODELS`: every model. Qwen, Laguna and
+/// coder models all loop on Copilot's completed-shell markers, and the guard
+/// plus the loop breaker only act on Copilot CLI requests.
+pub const DEFAULT_COPILOT_GUARD_MODELS: [&str; 1] = [COPILOT_GUARD_ALL];
 
 /// Which client-facing API shape a request arrived in. Decides body
 /// translation and the response transform; the fallback chain, retry policy,
@@ -120,10 +126,15 @@ impl TransformPlan {
 /// `stream_role_inject` is the `LLM_HUB_STREAM_ROLE` kill switch: role
 /// injection is the one transform with no request header, because the clients
 /// it fixes cannot set one.
+///
+/// `copilot_guard_models` is `LLM_HUB_COPILOT_GUARD_MODELS`: the models whose
+/// Copilot CLI requests get the tool-loop guard appended to the system prompt
+/// and the [`tool_loop_breaker`] applied to their history.
 pub fn apply_request(
     body: &mut Option<Value>,
     headers: &HeaderMap,
     stream_role_inject: bool,
+    copilot_guard_models: &[String],
 ) -> TransformPlan {
     let mut plan = TransformPlan::default();
     let Some(Value::Object(obj)) = body.as_mut() else {
@@ -150,11 +161,33 @@ pub fn apply_request(
         plan.applied.push("reasoning-strip".to_string());
     }
 
+    apply_copilot_transforms(obj, headers, copilot_guard_models, &mut plan);
+
+    plan
+}
+
+fn apply_copilot_transforms(
+    obj: &mut Map<String, Value>,
+    headers: &HeaderMap,
+    guarded: &[String],
+    plan: &mut TransformPlan,
+) {
+    if !harness::is_copilot_cli(headers) {
+        return;
+    }
+    let model = obj.get("model").and_then(Value::as_str).unwrap_or_default();
+    let is_guarded = is_copilot_guarded_model(model, guarded);
+    tracing::debug!(model, is_guarded, "copilot-cli request");
+    if !is_guarded {
+        return;
+    }
     if apply_copilot_tool_loop_guard(obj) {
         plan.applied.push("copilot-tool-loop-guard".to_string());
     }
-
-    plan
+    if let Some(names) = tool_loop_breaker::break_repeated_tool_calls(obj) {
+        plan.applied
+            .push(format!("tool-loop-break={}", names.join("+")));
+    }
 }
 
 /// Builds the response-side transform for the winning upstream response.
@@ -290,18 +323,6 @@ fn truncate_text(text: &str, max: usize) -> Option<String> {
 }
 
 fn apply_copilot_tool_loop_guard(obj: &mut Map<String, Value>) -> bool {
-    if !obj.contains_key(COPILOT_TOOLS_FINGERPRINT) {
-        return false;
-    }
-    let Some(model) = obj.get("model").and_then(Value::as_str) else {
-        return false;
-    };
-    if !COPILOT_GUARDED_QWEN_MODELS
-        .iter()
-        .any(|guarded| model.ends_with(guarded))
-    {
-        return false;
-    }
     let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
         return false;
     };
@@ -312,6 +333,15 @@ fn apply_copilot_tool_loop_guard(obj: &mut Map<String, Value>) -> bool {
         return false;
     };
     append_guard_to_content(system_message)
+}
+
+/// Matches an entry against the full `<profile>/<model>` id or its model part,
+/// so `qwen3.6-35b` guards every profile serving that model.
+fn is_copilot_guarded_model(model: &str, guarded: &[String]) -> bool {
+    let bare = model.split_once('/').map_or(model, |(_, rest)| rest);
+    guarded
+        .iter()
+        .any(|entry| entry == COPILOT_GUARD_ALL || entry == model || entry == bare)
 }
 
 fn append_guard_to_content(message: &mut Value) -> bool {
@@ -373,6 +403,22 @@ mod tests {
     use axum::http::{HeaderName, HeaderValue};
     use serde_json::json;
 
+    fn default_guard_models() -> Vec<String> {
+        DEFAULT_COPILOT_GUARD_MODELS.map(String::from).to_vec()
+    }
+
+    fn apply(
+        body: &mut Option<Value>,
+        headers: &HeaderMap,
+        stream_role_inject: bool,
+    ) -> TransformPlan {
+        apply_request(body, headers, stream_role_inject, &default_guard_models())
+    }
+
+    fn copilot_headers() -> HeaderMap {
+        headers(&[("user-agent", "OpenAI/JS 5.20.1"), ("x-initiator", "agent")])
+    }
+
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
         for (key, value) in pairs {
@@ -429,7 +475,7 @@ mod tests {
         ] {
             let mut body = system_and_user(&"x".repeat(5000));
             let before = body.clone();
-            let plan = apply_request(&mut body, &header, true);
+            let plan = apply(&mut body, &header, true);
             assert_eq!(body, before, "body must be untouched");
             assert!(plan.applied.is_empty());
         }
@@ -442,7 +488,7 @@ mod tests {
             {"role": "developer", "content": "dev"},
             {"role": "user", "content": "hi"},
         ]));
-        let plan = apply_request(&mut body, &mode_headers("drop"), true);
+        let plan = apply(&mut body, &mode_headers("drop"), true);
         let messages = body.as_ref().unwrap()["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
@@ -453,7 +499,7 @@ mod tests {
     fn drop_is_skipped_when_it_would_empty_messages() {
         let mut body = chat(json!([{"role": "system", "content": "sys"}]));
         let before = body.clone();
-        let plan = apply_request(&mut body, &mode_headers("drop"), true);
+        let plan = apply(&mut body, &mode_headers("drop"), true);
         assert_eq!(body, before);
         assert!(plan.applied.is_empty());
     }
@@ -462,7 +508,7 @@ mod tests {
     fn drop_without_system_messages_reports_nothing() {
         let mut body = chat(json!([{"role": "user", "content": "hi"}]));
         let before = body.clone();
-        let plan = apply_request(&mut body, &mode_headers("drop"), true);
+        let plan = apply(&mut body, &mode_headers("drop"), true);
         assert_eq!(body, before);
         assert!(plan.applied.is_empty());
     }
@@ -470,7 +516,7 @@ mod tests {
     #[test]
     fn truncate_caps_string_content_at_the_char_limit() {
         let mut body = system_and_user(&"a".repeat(SYSTEM_PROMPT_MAX_CHARS + 500));
-        let plan = apply_request(&mut body, &mode_headers("truncate"), true);
+        let plan = apply(&mut body, &mode_headers("truncate"), true);
         let system = body.as_ref().unwrap()["messages"][0]["content"]
             .as_str()
             .unwrap();
@@ -483,7 +529,7 @@ mod tests {
     fn truncate_is_noop_below_the_cap() {
         let mut body = system_and_user("short prompt");
         let before = body.clone();
-        let plan = apply_request(&mut body, &mode_headers("truncate"), true);
+        let plan = apply(&mut body, &mode_headers("truncate"), true);
         assert_eq!(body, before);
         assert!(plan.applied.is_empty());
     }
@@ -493,7 +539,7 @@ mod tests {
         // Every char is 3 bytes: a byte slice at the cap would split a rune.
         let text = "あ".repeat(SYSTEM_PROMPT_MAX_CHARS + 10);
         let mut body = system_and_user(&text);
-        apply_request(&mut body, &mode_headers("truncate"), true);
+        apply(&mut body, &mode_headers("truncate"), true);
         let system = body.as_ref().unwrap()["messages"][0]["content"]
             .as_str()
             .unwrap();
@@ -512,7 +558,7 @@ mod tests {
             ]},
             {"role": "user", "content": "hi"},
         ]));
-        apply_request(&mut body, &mode_headers("truncate"), true);
+        apply(&mut body, &mode_headers("truncate"), true);
         let parts = body.as_ref().unwrap()["messages"][0]["content"]
             .as_array()
             .unwrap();
@@ -533,7 +579,7 @@ mod tests {
             ]},
             {"role": "user", "content": "hi"},
         ]));
-        apply_request(&mut body, &mode_headers("truncate"), true);
+        apply(&mut body, &mode_headers("truncate"), true);
         let parts = body.as_ref().unwrap()["messages"][0]["content"]
             .as_array()
             .unwrap();
@@ -545,7 +591,7 @@ mod tests {
     fn none_mode_is_an_explicit_noop() {
         let mut body = system_and_user(&"a".repeat(5000));
         let before = body.clone();
-        let plan = apply_request(&mut body, &mode_headers("none"), true);
+        let plan = apply(&mut body, &mode_headers("none"), true);
         assert_eq!(body, before);
         assert!(plan.applied.is_empty());
     }
@@ -560,7 +606,7 @@ mod tests {
                 "reasoning_effort": "high",
                 "thinking": {"type": "enabled"},
             }));
-            let plan = apply_request(
+            let plan = apply(
                 &mut body,
                 &headers(&[(HEADER_REASONING_STRIP, value)]),
                 true,
@@ -583,7 +629,7 @@ mod tests {
                 "reasoning_effort": "high",
             }));
             let before = body.clone();
-            let plan = apply_request(&mut body, &header, true);
+            let plan = apply(&mut body, &header, true);
             assert_eq!(body, before);
             assert!(plan.applied.is_empty());
         }
@@ -593,7 +639,7 @@ mod tests {
     fn reasoning_strip_reports_nothing_when_no_key_is_present() {
         let mut body = chat(json!([{"role": "user", "content": "hi"}]));
         let before = body.clone();
-        let plan = apply_request(
+        let plan = apply(
             &mut body,
             &headers(&[(HEADER_REASONING_STRIP, "true")]),
             true,
@@ -606,14 +652,13 @@ mod tests {
     fn copilot_qwen_requests_get_tool_loop_guard() {
         let mut body = Some(json!({
             "model": "llama_swap/qwen3.6-35b",
-            "copilotToolsFingerprint": "abc",
             "messages": [
                 {"role": "system", "content": "sys"},
                 {"role": "user", "content": "fix tests"},
             ],
         }));
 
-        let plan = apply_request(&mut body, &headers(&[]), true);
+        let plan = apply(&mut body, &copilot_headers(), true);
 
         let content = body.as_ref().unwrap()["messages"][0]["content"]
             .as_str()
@@ -626,7 +671,6 @@ mod tests {
     fn copilot_tool_loop_guard_is_not_duplicated() {
         let mut body = Some(json!({
             "model": "llama_swap/qwen3-coder-next",
-            "copilotToolsFingerprint": "abc",
             "messages": [
                 {"role": "system", "content": format!("sys\n{COPILOT_TOOL_GUARD_MARKER}")},
                 {"role": "user", "content": "fix tests"},
@@ -634,7 +678,7 @@ mod tests {
         }));
         let before = body.clone();
 
-        let plan = apply_request(&mut body, &headers(&[]), true);
+        let plan = apply(&mut body, &copilot_headers(), true);
 
         assert_eq!(body, before);
         assert!(plan.applied.is_empty());
@@ -642,19 +686,109 @@ mod tests {
 
     #[test]
     fn copilot_tool_loop_guard_ignores_non_copilot_or_non_target_models() {
-        for mut body in [
-            Some(json!({
-                "model": "llama_swap/qwen3.6-35b",
-                "messages": [{"role": "system", "content": "sys"}],
-            })),
-            Some(json!({
-                "model": "llama_swap/ornith-1.0-35b",
-                "copilotToolsFingerprint": "abc",
-                "messages": [{"role": "system", "content": "sys"}],
-            })),
+        let qwen_only = vec!["qwen3.6-35b".to_string()];
+        for (model, header) in [
+            ("llama_swap/qwen3.6-35b", headers(&[("user-agent", "OpenAI/JS 5.20.1")])),
+            ("llama_swap/ornith-1.0-35b", copilot_headers()),
         ] {
+            let mut body = Some(json!({
+                "model": model,
+                "messages": [{"role": "system", "content": "sys"}],
+            }));
             let before = body.clone();
-            let plan = apply_request(&mut body, &headers(&[]), true);
+            let plan = apply_request(&mut body, &header, true, &qwen_only);
+
+            assert_eq!(body, before);
+            assert!(plan.applied.is_empty());
+        }
+    }
+
+    #[test]
+    fn copilot_tool_loop_guard_follows_the_configured_model_list() {
+        let request = |model: &str| {
+            Some(json!({
+                "model": model,
+                "messages": [{"role": "system", "content": "sys"}],
+            }))
+        };
+        let guarded = |model: &str, list: &[&str]| {
+            let list: Vec<String> = list.iter().map(|m| (*m).to_string()).collect();
+            let mut body = request(model);
+            !apply_request(&mut body, &copilot_headers(), true, &list)
+                .applied
+                .is_empty()
+        };
+
+        assert!(guarded("llama_swap/ornith-1.0-35b", &["ornith-1.0-35b"]));
+        assert!(guarded(
+            "llama_swap/ornith-1.0-35b",
+            &["llama_swap/ornith-1.0-35b"]
+        ));
+        assert!(guarded("other/any-model", &["*"]));
+        assert!(!guarded("llama_swap/qwen3.6-35b", &[]));
+        assert!(!guarded("llama_swap/my-qwen3.6-35b", &["qwen3.6-35b"]));
+        assert!(!guarded("other/qwen3.6-35b", &["llama_swap/qwen3.6-35b"]));
+    }
+
+    // The `Option` is the shape `apply_request` takes, not a fallible result.
+    #[allow(clippy::unnecessary_wraps)]
+    fn read_agent_loop(model: &str) -> Option<Value> {
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "fix tests"}),
+        ];
+        for id in ["a", "b", "c"] {
+            messages.push(
+                json!({"role": "assistant", "tool_calls": [{"id": id, "type": "function",
+                "function": {"name": "read_agent", "arguments": "{\"agent_id\":\"0\"}"}}]}),
+            );
+            messages.push(json!({"role": "tool", "tool_call_id": id, "content": "No agent found"}));
+        }
+        Some(json!({
+            "model": model,
+            "messages": messages,
+            "tools": [
+                {"type": "function", "function": {"name": "bash"}},
+                {"type": "function", "function": {"name": "read_agent"}},
+            ],
+        }))
+    }
+
+    #[test]
+    fn guarded_copilot_request_in_a_tool_loop_gets_the_loop_breaker() {
+        let mut body = read_agent_loop("llama_swap/qwen3.6-35b");
+
+        let plan = apply(&mut body, &copilot_headers(), true);
+
+        assert_eq!(
+            plan.applied,
+            vec![
+                "copilot-tool-loop-guard".to_string(),
+                "tool-loop-break=read_agent".to_string()
+            ]
+        );
+        assert_eq!(body.as_ref().unwrap()["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn default_guard_list_covers_every_model_under_copilot() {
+        let mut body = read_agent_loop("llama_swap/ornith-1.0-35b");
+        let plan = apply(&mut body, &copilot_headers(), true);
+
+        assert!(plan.applied.contains(&"copilot-tool-loop-guard".to_string()));
+        assert!(plan.applied.contains(&"tool-loop-break=read_agent".to_string()));
+    }
+
+    #[test]
+    fn loop_breaker_is_gated_like_the_guard() {
+        let qwen_only = vec!["qwen3.6-35b".to_string()];
+        for (model, header) in [
+            ("llama_swap/qwen3.6-35b", headers(&[])),
+            ("llama_swap/ornith-1.0-35b", copilot_headers()),
+        ] {
+            let mut body = read_agent_loop(model);
+            let before = body.clone();
+            let plan = apply_request(&mut body, &header, true, &qwen_only);
 
             assert_eq!(body, before);
             assert!(plan.applied.is_empty());
@@ -664,14 +798,14 @@ mod tests {
     #[test]
     fn apply_request_on_a_bare_body_returns_an_empty_plan() {
         let mut body: Option<Value> = None;
-        let plan = apply_request(&mut body, &mode_headers("drop"), true);
+        let plan = apply(&mut body, &mode_headers("drop"), true);
         assert!(!plan.is_stream);
         assert!(!plan.inject_stream_role);
         assert!(plan.applied.is_empty());
         assert!(!plan.wants_response_transform());
 
         let mut not_an_object = Some(json!(["nope"]));
-        let plan = apply_request(&mut not_an_object, &mode_headers("drop"), true);
+        let plan = apply(&mut not_an_object, &mode_headers("drop"), true);
         assert!(plan.applied.is_empty());
         assert_eq!(not_an_object, Some(json!(["nope"])));
     }
@@ -679,13 +813,13 @@ mod tests {
     #[test]
     fn stream_role_is_planned_only_for_streaming_requests() {
         let mut streaming = Some(json!({"model": "p/m", "stream": true, "messages": []}));
-        let plan = apply_request(&mut streaming, &headers(&[]), true);
+        let plan = apply(&mut streaming, &headers(&[]), true);
         assert!(plan.is_stream);
         assert!(plan.inject_stream_role);
         assert!(plan.wants_response_transform());
 
         let mut buffered = Some(json!({"model": "p/m", "messages": []}));
-        let plan = apply_request(&mut buffered, &headers(&[]), true);
+        let plan = apply(&mut buffered, &headers(&[]), true);
         assert!(!plan.is_stream);
         assert!(!plan.inject_stream_role);
         assert!(!plan.wants_response_transform());
@@ -694,7 +828,7 @@ mod tests {
     #[test]
     fn stream_role_kill_switch_disables_the_plan() {
         let mut body = Some(json!({"model": "p/m", "stream": true, "messages": []}));
-        let plan = apply_request(&mut body, &headers(&[]), false);
+        let plan = apply(&mut body, &headers(&[]), false);
         assert!(plan.is_stream);
         assert!(!plan.inject_stream_role);
         assert!(!plan.wants_response_transform());
@@ -703,7 +837,7 @@ mod tests {
     #[test]
     fn applied_trail_lists_only_transforms_that_fired() {
         let mut body = system_and_user(&"a".repeat(5000));
-        let plan = apply_request(
+        let plan = apply(
             &mut body,
             &headers(&[
                 (HEADER_SYSTEM_PROMPT_MODE, "truncate"),
@@ -769,7 +903,7 @@ mod tests {
     #[test]
     fn long_tool_names_are_truncated_and_reported_in_the_trail() {
         let mut body = chat_with_tool(LONG_TOOL, false);
-        let plan = apply_request(&mut body, &headers(&[]), true);
+        let plan = apply(&mut body, &headers(&[]), true);
         let alias = body.as_ref().unwrap()["tools"][0]["function"]["name"]
             .as_str()
             .unwrap();
@@ -783,7 +917,7 @@ mod tests {
     fn short_tool_names_leave_the_body_and_the_plan_untouched() {
         let mut body = chat_with_tool("search", false);
         let before = body.clone();
-        let plan = apply_request(&mut body, &headers(&[]), true);
+        let plan = apply(&mut body, &headers(&[]), true);
         assert_eq!(body, before);
         assert!(plan.names.is_empty());
         assert!(plan.applied.is_empty());
@@ -795,7 +929,7 @@ mod tests {
         // Non-streaming OpenAI, which is otherwise the one path that never
         // reads the response body at all.
         let mut body = chat_with_tool(LONG_TOOL, false);
-        let plan = apply_request(&mut body, &headers(&[]), true);
+        let plan = apply(&mut body, &headers(&[]), true);
         assert!(plan.wants_response_transform());
         assert!(matches!(
             response_transform(RouteKind::OpenAi, &plan, "p/m", false),
@@ -805,7 +939,7 @@ mod tests {
         // Streaming, with the role repair switched off: the names alone are
         // enough to keep the rewriter engaged.
         let mut body = chat_with_tool(LONG_TOOL, true);
-        let plan = apply_request(&mut body, &headers(&[]), false);
+        let plan = apply(&mut body, &headers(&[]), false);
         assert!(!plan.inject_stream_role);
         assert!(matches!(
             response_transform(RouteKind::OpenAi, &plan, "p/m", true),
@@ -824,7 +958,7 @@ mod tests {
             ],
             "tools": [{"type": "function", "function": {"name": LONG_TOOL}}],
         }));
-        let plan = apply_request(
+        let plan = apply(
             &mut body,
             &headers(&[
                 (HEADER_SYSTEM_PROMPT_MODE, "truncate"),

@@ -264,6 +264,7 @@ renamed.
 | `LLM_HUB_STORE_PATH` | `llm-hub.db` | Store location |
 | `LLM_HUB_CONFIG_READONLY` | `false` | Block UI writes to `.env` |
 | `LLM_HUB_STREAM_ROLE` | `true` | Inject `role:"assistant"` into the first streamed delta when the upstream omits it |
+| `LLM_HUB_COPILOT_GUARD_MODELS` | `*` | Models (`<model>`, `<profile>/<model>` or `*`) whose Copilot CLI requests get the tool-loop guard (system-prompt note, plus withholding a tool the history shows called identically 3 times in a row); empty disables it |
 | `LLM_HUB_AUTO_UPDATE` | `true` | Apply updates automatically (startup + daily check); `false` = notice only |
 
 Profile names map to env segments uppercased with `-` → `_` (`my-proxy` →

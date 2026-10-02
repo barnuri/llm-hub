@@ -7,6 +7,7 @@ const MAX_SIGNATURE_CHARS: usize = 160;
 /// header is what separates it from any other program using that SDK.
 const COPILOT_MARKER: &str = "[x-initiator]";
 pub const UNKNOWN_HARNESS: &str = "unknown";
+const COPILOT_HARNESS: &str = "copilot-cli";
 
 /// Compact per-request client signature: the User-Agent plus a marker when
 /// Copilot CLI's `x-initiator` header is present. `None` without either.
@@ -27,6 +28,12 @@ pub fn client_signature(headers: &HeaderMap) -> Option<String> {
     (!signature.is_empty()).then_some(signature)
 }
 
+/// True when the request came from Copilot CLI.
+#[must_use]
+pub fn is_copilot_cli(headers: &HeaderMap) -> bool {
+    classify(client_signature(headers).as_deref()) == COPILOT_HARNESS
+}
+
 /// Harness name for a stored client signature.
 #[must_use]
 pub fn classify(signature: Option<&str>) -> String {
@@ -43,7 +50,7 @@ pub fn classify(signature: Option<&str>) -> String {
             "claude-code"
         })
     } else if lower.contains(&COPILOT_MARKER.to_ascii_lowercase()) {
-        Some("copilot-cli")
+        Some(COPILOT_HARNESS)
     } else if lower.starts_with("opencode/") {
         Some("opencode")
     } else if lower.starts_with("codex") {
@@ -96,6 +103,16 @@ mod tests {
             Some("OpenAI/JS 5.20.1 [x-initiator]")
         );
         assert_eq!(client_signature(&headers(&[])), None);
+    }
+
+    #[test]
+    fn is_copilot_cli__needs_the_x_initiator_header() {
+        assert!(is_copilot_cli(&headers(&[
+            ("user-agent", "OpenAI/JS 5.20.1"),
+            ("x-initiator", "user"),
+        ])));
+        assert!(!is_copilot_cli(&headers(&[("user-agent", "OpenAI/JS 5.20.1")])));
+        assert!(!is_copilot_cli(&headers(&[])));
     }
 
     #[test]
