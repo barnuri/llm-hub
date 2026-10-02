@@ -6,7 +6,7 @@
 
 use serde_json::{Value, json};
 
-use crate::consts::ANTHROPIC_MESSAGE_ID_PREFIX;
+use crate::consts::{ANTHROPIC_MESSAGE_ID_PREFIX, ANTHROPIC_THINKING_SIGNATURE};
 use crate::schemas::anthropic_error::error_type_for_status;
 use crate::schemas::stop_reason::{map_stop_reason, reconcile_tool_use};
 
@@ -45,6 +45,15 @@ fn success_message(completion: &Value, served_model: &str) -> Value {
     let message = choice.and_then(|choice| choice.get("message"));
 
     let mut content: Vec<Value> = Vec::new();
+    if let Some(reasoning) = message.and_then(reasoning_text)
+        && !reasoning.is_empty()
+    {
+        content.push(json!({
+            "type": "thinking",
+            "thinking": reasoning,
+            "signature": ANTHROPIC_THINKING_SIGNATURE,
+        }));
+    }
     if let Some(text) = message
         .and_then(|m| m.get("content"))
         .and_then(Value::as_str)
@@ -101,6 +110,22 @@ fn tool_use_block(call: &Value) -> Value {
             .unwrap_or_default(),
         "input": input,
     })
+}
+
+/// Upstream reasoning text, from either field name local servers use
+/// (`reasoning_content` from llama.cpp / vLLM, `reasoning_text` from others).
+/// Shared with the streaming translator, which reads it off each delta.
+pub(crate) fn reasoning_text(message: &Value) -> Option<&str> {
+    message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .or_else(|| {
+            message
+                .get("reasoning_text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+        })
 }
 
 /// Anthropic message ids are `msg_`-prefixed; upstream chat-completion ids are
@@ -242,6 +267,24 @@ mod tests {
         ));
         assert_eq!(out["content"][0]["type"], "text");
         assert_eq!(out["content"][1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn reasoning_text_becomes_thinking_block_before_visible_text() {
+        let completion = completion(
+            &json!({"role": "assistant", "reasoning_text": "check tests", "content": "done"}),
+            "stop",
+        );
+        let out = translate(&completion);
+        assert_eq!(
+            out["content"][0],
+            json!({
+                "type": "thinking",
+                "thinking": "check tests",
+                "signature": ANTHROPIC_THINKING_SIGNATURE,
+            })
+        );
+        assert_eq!(out["content"][1], json!({"type": "text", "text": "done"}));
     }
 
     #[test]

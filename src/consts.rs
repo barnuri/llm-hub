@@ -65,6 +65,11 @@ pub const TOOL_NAME_PREFIX_LEN: usize = MAX_TOOL_NAME_LEN - TOOL_NAME_HASH_LEN -
 /// endpoint regardless of the client-facing path.
 pub const ANTHROPIC_UPSTREAM_PATH: &str = "/v1/chat/completions";
 pub const ANTHROPIC_MESSAGE_ID_PREFIX: &str = "msg_";
+/// Signature attached to every `thinking` block translated from upstream
+/// reasoning. Claude Code silently drops a thinking block that has no
+/// signature, and there is no real signing key locally, so this only satisfies
+/// the shape. It is never forwarded upstream.
+pub const ANTHROPIC_THINKING_SIGNATURE: &str = "llm-hub-unsigned";
 /// Ceiling for a transform that must buffer a whole (non-SSE) body.
 pub const MAX_TRANSFORM_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 

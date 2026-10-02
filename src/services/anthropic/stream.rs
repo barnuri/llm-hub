@@ -10,7 +10,10 @@
 //!
 //! * **Blocks are serialized.** `OpenAI` may interleave `tool_calls` indices;
 //!   Anthropic's event stream cannot express that and its clients cannot
-//!   represent it, so opening a block closes the one before it.
+//!   represent it, so opening a block closes the one before it. Upstream
+//!   reasoning (`reasoning_content` / `reasoning_text`) becomes a `thinking`
+//!   block; reasoning that arrives while a text or `tool_use` block is open
+//!   has nowhere to go and is dropped rather than interleaved.
 //! * **The terminal events are flushed late.** `message_delta` carries the
 //!   final token counts, but `OpenAI` reports usage in a chunk that arrives
 //!   *after* the one carrying `finish_reason` (that is the whole point of
@@ -24,8 +27,9 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
+use crate::consts::ANTHROPIC_THINKING_SIGNATURE;
 use crate::schemas::stop_reason::{map_stop_reason, reconcile_tool_use};
-use crate::services::anthropic::response::qualify_message_id;
+use crate::services::anthropic::response::{qualify_message_id, reasoning_text};
 use crate::services::sse::{SseFrames, format_event, parse_data_frame};
 use crate::services::tool_names::NameMap;
 
@@ -72,6 +76,7 @@ enum Phase {
 
 #[derive(Clone, Copy)]
 enum OpenBlock {
+    Thinking(u32),
     Text(u32),
     Tool { index: u32, openai_index: u64 },
 }
@@ -79,7 +84,7 @@ enum OpenBlock {
 impl OpenBlock {
     fn index(self) -> u32 {
         match self {
-            Self::Text(index) | Self::Tool { index, .. } => index,
+            Self::Thinking(index) | Self::Text(index) | Self::Tool { index, .. } => index,
         }
     }
 }
@@ -176,6 +181,7 @@ impl AnthropicStream {
         if self.phase == Phase::Open
             && let Some(delta) = choice.get("delta")
         {
+            self.handle_reasoning(delta, out);
             self.handle_text(delta, out);
             self.handle_tool_calls(delta, out);
         }
@@ -225,6 +231,28 @@ impl AnthropicStream {
             cache_read_tokens: cached_details.max(field("cache_read_input_tokens")),
             cache_write_tokens: field("cache_creation_input_tokens"),
         });
+    }
+
+    fn handle_reasoning(&mut self, delta: &Value, out: &mut String) {
+        let Some(reasoning) = reasoning_text(delta) else {
+            return;
+        };
+        let index = match self.open {
+            Some(OpenBlock::Thinking(index)) => index,
+            None => self.open_thinking_block(out),
+            Some(OpenBlock::Text(_) | OpenBlock::Tool { .. }) => {
+                tracing::debug!("dropping reasoning fragment that arrived after visible output");
+                return;
+            }
+        };
+        out.push_str(&format_event(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "thinking_delta", "thinking": reasoning},
+            }),
+        ));
     }
 
     fn handle_text(&mut self, delta: &Value, out: &mut String) {
@@ -302,6 +330,21 @@ impl AnthropicStream {
         }
     }
 
+    fn open_thinking_block(&mut self, out: &mut String) -> u32 {
+        self.close_block(out);
+        let index = self.take_index();
+        self.open = Some(OpenBlock::Thinking(index));
+        out.push_str(&format_event(
+            "content_block_start",
+            &json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "thinking", "thinking": ""},
+            }),
+        ));
+        index
+    }
+
     fn open_text_block(&mut self, out: &mut String) -> u32 {
         self.close_block(out);
         let index = self.take_index();
@@ -366,6 +409,18 @@ impl AnthropicStream {
         let Some(block) = self.open.take() else {
             return;
         };
+        // Claude Code silently drops a thinking block that ends without a
+        // signature, so one always precedes the stop.
+        if let OpenBlock::Thinking(index) = block {
+            out.push_str(&format_event(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "signature_delta", "signature": ANTHROPIC_THINKING_SIGNATURE},
+                }),
+            ));
+        }
         out.push_str(&format_event(
             "content_block_stop",
             &json!({"type": "content_block_stop", "index": block.index()}),
@@ -427,6 +482,10 @@ mod tests {
         r#"{"id":"c1","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":6}}"#;
     const TOOL_HEAD: &str = r#"{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"search","arguments":""}}]}}]}"#;
     const TOOL_ARGS: &str = r#"{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":"}}]}}]}"#;
+    const THINK_A: &str =
+        r#"{"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"let me"}}]}"#;
+    const THINK_B: &str =
+        r#"{"id":"c1","choices":[{"index":0,"delta":{"reasoning_text":" think"}}]}"#;
     const TOOL_ARGS_TAIL: &str = r#"{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"rust\"}"}}]}}]}"#;
 
     /// Parses emitted SSE bytes back into `(event name, payload)` pairs.
@@ -759,5 +818,143 @@ mod tests {
                 "content_block_delta"
             ]
         );
+    }
+
+    fn signature_delta() -> Value {
+        json!({"type": "signature_delta", "signature": ANTHROPIC_THINKING_SIGNATURE})
+    }
+
+    #[test]
+    fn thinking_only_stream_emits_thinking_block_with_signature_before_stop() {
+        let (_, events) = run(&[ROLE, THINK_A, THINK_B, STOP, USAGE, "[DONE]"]);
+        assert_eq!(
+            names(&events),
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(
+            events[1].1["content_block"],
+            json!({"type": "thinking", "thinking": ""})
+        );
+        assert_eq!(
+            events[2].1["delta"],
+            json!({"type": "thinking_delta", "thinking": "let me"})
+        );
+        assert_eq!(
+            events[3].1["delta"],
+            json!({"type": "thinking_delta", "thinking": " think"})
+        );
+        assert_eq!(events[4].1["delta"], signature_delta());
+        assert_eq!(events[5].1["index"], 0);
+    }
+
+    #[test]
+    fn thinking_then_text_closes_thinking_with_signature_before_text_opens() {
+        let (_, events) = run(&[THINK_A, TEXT_A, TEXT_B, STOP, "[DONE]"]);
+        assert_eq!(
+            names(&events),
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(events[1].1["content_block"]["type"], "thinking");
+        assert_eq!(events[3].1["delta"], signature_delta());
+        assert_eq!(events[3].1["index"], 0);
+        assert_eq!(events[4].1["index"], 0);
+        assert_eq!(events[5].1["index"], 1);
+        assert_eq!(events[5].1["content_block"]["type"], "text");
+        assert_eq!(events[9].1["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn thinking_then_tool_call_closes_thinking_before_tool_use_opens() {
+        let (_, events) = run(&[THINK_A, TOOL_HEAD, TOOL_ARGS, TOOL_STOP, "[DONE]"]);
+        assert_eq!(
+            names(&events),
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(events[3].1["delta"], signature_delta());
+        assert_eq!(events[5].1["index"], 1);
+        assert_eq!(events[5].1["content_block"]["type"], "tool_use");
+        assert_eq!(events[8].1["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn interleaved_reasoning_and_text_stay_serialized() {
+        let mixed = r#"{"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"r2","content":"t2"}}]}"#;
+        let (_, events) = run(&[THINK_A, TEXT_A, THINK_B, mixed, TEXT_B, STOP, "[DONE]"]);
+        let mut open: Option<u64> = None;
+        let mut starts = Vec::new();
+        for (name, data) in &events {
+            let index = data["index"].as_u64();
+            match name.as_str() {
+                "content_block_start" => {
+                    assert!(open.is_none(), "block opened while {open:?} open: {data}");
+                    open = index;
+                    starts.push(data["content_block"]["type"].as_str().unwrap().to_string());
+                }
+                "content_block_delta" => assert_eq!(open, index, "delta for a closed block"),
+                "content_block_stop" => {
+                    assert_eq!(open, index);
+                    open = None;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(starts, vec!["thinking", "text"]);
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|(_, data)| data["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(texts, vec!["he", "t2", "llo"]);
+        assert_eq!(count(&events, "message_stop"), 1);
+    }
+
+    #[test]
+    fn truncated_thinking_stream_still_signs_the_block_before_stop() {
+        let (mut stream, mut events) = run(&[THINK_A]);
+        events.extend(parse(&stream.finish()));
+        assert_eq!(
+            names(&events),
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(events[3].1["delta"], signature_delta());
     }
 }

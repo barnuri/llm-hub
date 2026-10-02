@@ -8,9 +8,10 @@
 //! source the `OpenAI` shape cannot carry.
 //!
 //! Dropped on purpose, because `OpenAI` chat-completions has no equivalent:
-//! `thinking` / `redacted_thinking` content blocks, the top-level `thinking`
-//! parameter, `top_k`, and Anthropic server tools (`web_search_*`, `computer_*`
-//! — anything without an `input_schema`).
+//! `redacted_thinking` content blocks, the top-level `thinking` parameter,
+//! `top_k`, and Anthropic server tools (`web_search_*`, `computer_*` — anything
+//! without an `input_schema`). `thinking` blocks are preserved as
+//! `reasoning_content` for local chat templates that support multi-turn thinking.
 
 use serde_json::{Map, Value, json};
 
@@ -116,6 +117,7 @@ fn mid_conversation_system(content: Option<&Value>) -> Value {
 /// hoisted into `tool_calls`, in block order.
 fn push_assistant(blocks: &[Value], out: &mut Vec<Value>) {
     let text = join_text_blocks(blocks, "\n\n");
+    let thinking = join_thinking_blocks(blocks);
     let tool_calls: Vec<Value> = blocks
         .iter()
         .filter(|block| block_type(block) == "tool_use")
@@ -134,6 +136,9 @@ fn push_assistant(blocks: &[Value], out: &mut Vec<Value>) {
     );
     if !tool_calls.is_empty() {
         message.insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+    if !thinking.is_empty() {
+        message.insert("reasoning_content".into(), Value::String(thinking));
     }
     out.push(Value::Object(message));
 }
@@ -301,6 +306,19 @@ fn join_text_blocks(blocks: &[Value], separator: &str) -> String {
         .filter_map(|block| block.get("text").and_then(Value::as_str))
         .collect::<Vec<&str>>()
         .join(separator)
+}
+
+/// Only the reasoning text crosses over: the block's `signature` (our own
+/// `ANTHROPIC_THINKING_SIGNATURE` placeholder, or a real one from an earlier
+/// Anthropic turn) has no `OpenAI` meaning and is never forwarded.
+fn join_thinking_blocks(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter(|block| block_type(block) == "thinking")
+        .filter_map(|block| block.get("thinking").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<&str>>()
+        .join("\n\n")
 }
 
 fn block_type(block: &Value) -> &str {
@@ -602,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_and_redacted_thinking_blocks_are_dropped() {
+    fn thinking_blocks_become_reasoning_content_and_redacted_thinking_is_dropped() {
         let out = translate(&json!({
             "messages": [{"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "hmm"},
@@ -612,7 +630,25 @@ mod tests {
             "thinking": {"type": "enabled", "budget_tokens": 1024}
         }));
         assert_eq!(messages(&out)[0]["content"], "answer");
+        assert_eq!(messages(&out)[0]["reasoning_content"], "hmm");
         assert!(out.get("thinking").is_none());
+    }
+
+    #[test]
+    fn placeholder_signature_is_not_forwarded_with_reasoning_content() {
+        let out = translate(&json!({
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan", "signature": crate::consts::ANTHROPIC_THINKING_SIGNATURE},
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}}
+            ]}]
+        }));
+        let message = &messages(&out)[0];
+        assert_eq!(message["reasoning_content"], "plan");
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "bash");
+        assert!(
+            !out.to_string()
+                .contains(crate::consts::ANTHROPIC_THINKING_SIGNATURE)
+        );
     }
 
     #[test]
