@@ -119,6 +119,7 @@ mod tests {
             auto_update: false,
             stream_role_inject: true,
             copilot_guard_models: vec![],
+            copilot_strip_sampling_models: vec![],
             sse_keepalive: None,
             pricing: TokenRates::default(),
         }

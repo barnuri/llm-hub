@@ -39,6 +39,39 @@ const COPILOT_GUARD_ALL: &str = "*";
 /// coder models all loop on Copilot's completed-shell markers, and the guard
 /// plus the loop breaker only act on Copilot CLI requests.
 pub const DEFAULT_COPILOT_GUARD_MODELS: [&str; 1] = [COPILOT_GUARD_ALL];
+/// Sampling fields Copilot CLI hard-codes on every request (temperature 0,
+/// `top_p` 0.95, zero penalties). They override the model row's vendor sampling
+/// in llama-swap and the MLX proxy, and greedy decoding makes local models run
+/// away (a 1.33 MB single reply) or decode Qwen thinking models greedily.
+const COPILOT_SAMPLING_KEYS: [&str; 4] = [
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+];
+/// Default for `LLM_HUB_COPILOT_STRIP_SAMPLING_MODELS`: models whose Copilot CLI
+/// requests lose [`COPILOT_SAMPLING_KEYS`] so the serving row's sampling applies.
+pub const DEFAULT_COPILOT_STRIP_SAMPLING_MODELS: [&str; 10] = [
+    "qwen3-coder-next",
+    "glm-4.7-flash",
+    "laguna-xs-2.1",
+    "mlx-qwen3.6-27b",
+    "mlx-qwen3.6-35b",
+    "ornith-1.5-9b",
+    // Tiny rows: qwen3-4b-2507 under Copilot's temperature 0 streamed one reply for 561 s (ttft 285 ms) until the cap.
+    "qwen3-4b-2507",
+    "qwen3-4b-thinking-2507",
+    "lfm2.5-8b-a1b",
+    "lfm2.5-2.6b",
+];
+
+fn strip_copilot_sampling(obj: &mut Map<String, Value>) -> bool {
+    let mut stripped = false;
+    for key in COPILOT_SAMPLING_KEYS {
+        stripped |= obj.remove(key).is_some();
+    }
+    stripped
+}
 
 /// Which client-facing API shape a request arrived in. Decides body
 /// translation and the response transform; the fallback chain, retry policy,
@@ -127,14 +160,21 @@ impl TransformPlan {
 /// injection is the one transform with no request header, because the clients
 /// it fixes cannot set one.
 ///
-/// `copilot_guard_models` is `LLM_HUB_COPILOT_GUARD_MODELS`: the models whose
-/// Copilot CLI requests get the tool-loop guard appended to the system prompt
-/// and the [`tool_loop_breaker`] applied to their history.
+/// `copilot` holds the two Copilot CLI model lists from [`crate::configs::hub_config::HubConfig`]:
+/// `LLM_HUB_COPILOT_GUARD_MODELS` (tool-loop guard + [`tool_loop_breaker`]) and
+/// `LLM_HUB_COPILOT_STRIP_SAMPLING_MODELS` ([`COPILOT_SAMPLING_KEYS`] dropped).
+/// Models (`<model>`, `<profile>/<model>` or `*`) that get each Copilot CLI transform.
+#[derive(Clone, Copy)]
+pub struct CopilotModels<'a> {
+    pub guard: &'a [String],
+    pub strip_sampling: &'a [String],
+}
+
 pub fn apply_request(
     body: &mut Option<Value>,
     headers: &HeaderMap,
     stream_role_inject: bool,
-    copilot_guard_models: &[String],
+    copilot: CopilotModels<'_>,
 ) -> TransformPlan {
     let mut plan = TransformPlan::default();
     let Some(Value::Object(obj)) = body.as_mut() else {
@@ -161,7 +201,7 @@ pub fn apply_request(
         plan.applied.push("reasoning-strip".to_string());
     }
 
-    apply_copilot_transforms(obj, headers, copilot_guard_models, &mut plan);
+    apply_copilot_transforms(obj, headers, copilot, &mut plan);
 
     plan
 }
@@ -169,15 +209,18 @@ pub fn apply_request(
 fn apply_copilot_transforms(
     obj: &mut Map<String, Value>,
     headers: &HeaderMap,
-    guarded: &[String],
+    copilot: CopilotModels<'_>,
     plan: &mut TransformPlan,
 ) {
     if !harness::is_copilot_cli(headers) {
         return;
     }
     let model = obj.get("model").and_then(Value::as_str).unwrap_or_default();
-    let is_guarded = is_copilot_guarded_model(model, guarded);
+    let is_guarded = is_copilot_guarded_model(model, copilot.guard);
     tracing::debug!(model, is_guarded, "copilot-cli request");
+    if is_copilot_guarded_model(model, copilot.strip_sampling) && strip_copilot_sampling(obj) {
+        plan.applied.push("copilot-sampling-strip".to_string());
+    }
     if !is_guarded {
         return;
     }
@@ -407,12 +450,34 @@ mod tests {
         DEFAULT_COPILOT_GUARD_MODELS.map(String::from).to_vec()
     }
 
+    fn default_strip_models() -> Vec<String> {
+        DEFAULT_COPILOT_STRIP_SAMPLING_MODELS
+            .map(String::from)
+            .to_vec()
+    }
+
+    fn guard_only(guard: &[String]) -> CopilotModels<'_> {
+        CopilotModels {
+            guard,
+            strip_sampling: &[],
+        }
+    }
+
     fn apply(
         body: &mut Option<Value>,
         headers: &HeaderMap,
         stream_role_inject: bool,
     ) -> TransformPlan {
-        apply_request(body, headers, stream_role_inject, &default_guard_models())
+        let (guard, strip) = (default_guard_models(), default_strip_models());
+        apply_request(
+            body,
+            headers,
+            stream_role_inject,
+            CopilotModels {
+                guard: &guard,
+                strip_sampling: &strip,
+            },
+        )
     }
 
     fn copilot_headers() -> HeaderMap {
@@ -688,7 +753,10 @@ mod tests {
     fn copilot_tool_loop_guard_ignores_non_copilot_or_non_target_models() {
         let qwen_only = vec!["qwen3.6-35b".to_string()];
         for (model, header) in [
-            ("llama_swap/qwen3.6-35b", headers(&[("user-agent", "OpenAI/JS 5.20.1")])),
+            (
+                "llama_swap/qwen3.6-35b",
+                headers(&[("user-agent", "OpenAI/JS 5.20.1")]),
+            ),
             ("llama_swap/ornith-1.0-35b", copilot_headers()),
         ] {
             let mut body = Some(json!({
@@ -696,7 +764,7 @@ mod tests {
                 "messages": [{"role": "system", "content": "sys"}],
             }));
             let before = body.clone();
-            let plan = apply_request(&mut body, &header, true, &qwen_only);
+            let plan = apply_request(&mut body, &header, true, guard_only(&qwen_only));
 
             assert_eq!(body, before);
             assert!(plan.applied.is_empty());
@@ -714,7 +782,7 @@ mod tests {
         let guarded = |model: &str, list: &[&str]| {
             let list: Vec<String> = list.iter().map(|m| (*m).to_string()).collect();
             let mut body = request(model);
-            !apply_request(&mut body, &copilot_headers(), true, &list)
+            !apply_request(&mut body, &copilot_headers(), true, guard_only(&list))
                 .applied
                 .is_empty()
         };
@@ -775,8 +843,52 @@ mod tests {
         let mut body = read_agent_loop("llama_swap/ornith-1.0-35b");
         let plan = apply(&mut body, &copilot_headers(), true);
 
-        assert!(plan.applied.contains(&"copilot-tool-loop-guard".to_string()));
-        assert!(plan.applied.contains(&"tool-loop-break=read_agent".to_string()));
+        assert!(
+            plan.applied
+                .contains(&"copilot-tool-loop-guard".to_string())
+        );
+        assert!(
+            plan.applied
+                .contains(&"tool-loop-break=read_agent".to_string())
+        );
+    }
+
+    #[test]
+    fn copilot_sampling_is_stripped_only_for_listed_models_under_copilot() {
+        let strip = vec!["qwen3-coder-next".to_string()];
+        let sampled = |model: &str| {
+            Some(json!({
+                "model": model, "temperature": 0, "top_p": 0.95,
+                "frequency_penalty": 0, "presence_penalty": 0, "messages": [],
+            }))
+        };
+        let copilot = CopilotModels {
+            guard: &[],
+            strip_sampling: &strip,
+        };
+
+        let mut listed = sampled("llama_swap/qwen3-coder-next");
+        let plan = apply_request(&mut listed, &copilot_headers(), true, copilot);
+        let obj = listed.as_ref().unwrap().as_object().unwrap();
+        assert!(
+            COPILOT_SAMPLING_KEYS
+                .iter()
+                .all(|key| !obj.contains_key(*key))
+        );
+        assert!(plan.applied.contains(&"copilot-sampling-strip".to_string()));
+
+        for (model, headers) in [
+            ("llama_swap/qwen3.6-35b", copilot_headers()),
+            (
+                "llama_swap/qwen3-coder-next",
+                headers(&[("user-agent", "claude-cli/2.1")]),
+            ),
+        ] {
+            let mut body = sampled(model);
+            let before = body.clone();
+            apply_request(&mut body, &headers, true, copilot);
+            assert_eq!(body, before, "{model}");
+        }
     }
 
     #[test]
@@ -788,7 +900,7 @@ mod tests {
         ] {
             let mut body = read_agent_loop(model);
             let before = body.clone();
-            let plan = apply_request(&mut body, &header, true, &qwen_only);
+            let plan = apply_request(&mut body, &header, true, guard_only(&qwen_only));
 
             assert_eq!(body, before);
             assert!(plan.applied.is_empty());
@@ -970,5 +1082,24 @@ mod tests {
             plan.header_value(),
             Some("system-prompt=truncate, tool-names=1, reasoning-strip".to_string())
         );
+    }
+
+    #[test]
+    fn copilot_sampling_strip__only_listed_models_and_copilot() {
+        let sampled = || {
+            Some(json!({
+                "model": "llama_swap/qwen3-coder-next", "temperature": 0, "top_p": 0.95,
+                "frequency_penalty": 0, "presence_penalty": 0, "messages": []
+            }))
+        };
+        let mut body = sampled();
+        let plan = apply(&mut body, &copilot_headers(), true);
+        let obj = body.unwrap();
+        assert!(obj.get("temperature").is_none() && obj.get("top_p").is_none());
+        assert!(plan.applied.iter().any(|a| a == "copilot-sampling-strip"));
+
+        let mut other = sampled();
+        apply(&mut other, &HeaderMap::new(), true);
+        assert_eq!(other.unwrap()["temperature"], 0);
     }
 }

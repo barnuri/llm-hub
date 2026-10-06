@@ -265,6 +265,7 @@ renamed.
 | `LLM_HUB_CONFIG_READONLY` | `false` | Block UI writes to `.env` |
 | `LLM_HUB_STREAM_ROLE` | `true` | Inject `role:"assistant"` into the first streamed delta when the upstream omits it |
 | `LLM_HUB_COPILOT_GUARD_MODELS` | `*` | Models (`<model>`, `<profile>/<model>` or `*`) whose Copilot CLI requests get the tool-loop guard (system-prompt note, plus withholding a tool the history shows called identically 3 times in a row); empty disables it |
+| `LLM_HUB_COPILOT_STRIP_SAMPLING_MODELS` | 10 local ids (see `DEFAULT_COPILOT_STRIP_SAMPLING_MODELS`) | Models whose Copilot CLI requests drop Copilot's hard-coded `temperature`/`top_p`/penalties so the model row's sampling applies; empty disables it |
 | `LLM_HUB_AUTO_UPDATE` | `true` | Apply updates automatically (startup + daily check); `false` = notice only |
 
 Profile names map to env segments uppercased with `-` → `_` (`my-proxy` →

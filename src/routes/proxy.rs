@@ -143,7 +143,7 @@ pub(crate) async fn attempt_loop(
         &mut json_body,
         headers,
         config.stream_role_inject,
-        &config.copilot_guard_models,
+        config.copilot_models(),
     );
     // Whenever the hub reads the response body itself it must be handed
     // uncompressed bytes; passthrough requests keep the caller's header.

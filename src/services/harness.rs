@@ -111,7 +111,10 @@ mod tests {
             ("user-agent", "OpenAI/JS 5.20.1"),
             ("x-initiator", "user"),
         ])));
-        assert!(!is_copilot_cli(&headers(&[("user-agent", "OpenAI/JS 5.20.1")])));
+        assert!(!is_copilot_cli(&headers(&[(
+            "user-agent",
+            "OpenAI/JS 5.20.1"
+        )])));
         assert!(!is_copilot_cli(&headers(&[])));
     }
 

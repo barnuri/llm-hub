@@ -6,7 +6,9 @@ use crate::consts::{
     DEFAULT_BIND, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_PORT, DEFAULT_SSE_KEEPALIVE_MS,
 };
 
-use crate::services::transforms::DEFAULT_COPILOT_GUARD_MODELS;
+use crate::services::transforms::{
+    CopilotModels, DEFAULT_COPILOT_GUARD_MODELS, DEFAULT_COPILOT_STRIP_SAMPLING_MODELS,
+};
 
 const PREFIX: &str = "LLM_HUB_";
 
@@ -36,6 +38,11 @@ pub struct HubConfig {
     /// comma-separated; empty disables it; unset uses
     /// [`DEFAULT_COPILOT_GUARD_MODELS`].
     pub copilot_guard_models: Vec<String>,
+    /// Models whose Copilot CLI requests lose Copilot's hard-coded sampling
+    /// (temperature 0, `top_p`, penalties) so the serving row's sampling applies.
+    /// `LLM_HUB_COPILOT_STRIP_SAMPLING_MODELS`, comma-separated; empty disables
+    /// it; unset uses [`DEFAULT_COPILOT_STRIP_SAMPLING_MODELS`].
+    pub copilot_strip_sampling_models: Vec<String>,
     /// Idle gap after which an SSE response gets a keepalive comment frame.
     /// `None` when `LLM_HUB_SSE_KEEPALIVE_MS=0` — the knob's off switch.
     pub sse_keepalive: Option<Duration>,
@@ -44,6 +51,15 @@ pub struct HubConfig {
 }
 
 impl HubConfig {
+    /// The Copilot CLI model lists, as the request transforms take them.
+    #[must_use]
+    pub fn copilot_models(&self) -> CopilotModels<'_> {
+        CopilotModels {
+            guard: &self.copilot_guard_models,
+            strip_sampling: &self.copilot_strip_sampling_models,
+        }
+    }
+
     pub fn profile(&self, name: &str) -> Option<&ProfileConfig> {
         self.profiles.iter().find(|p| p.name == name)
     }
@@ -130,6 +146,14 @@ impl HubConfig {
             stream_role_inject: get("STREAM_ROLE").is_none_or(|v| !is_falsy(&v)),
             copilot_guard_models: get("COPILOT_GUARD_MODELS").map_or_else(
                 || DEFAULT_COPILOT_GUARD_MODELS.map(String::from).to_vec(),
+                |list| split_list(&list),
+            ),
+            copilot_strip_sampling_models: get("COPILOT_STRIP_SAMPLING_MODELS").map_or_else(
+                || {
+                    DEFAULT_COPILOT_STRIP_SAMPLING_MODELS
+                        .map(String::from)
+                        .to_vec()
+                },
                 |list| split_list(&list),
             ),
             sse_keepalive: (sse_keepalive_ms > 0).then(|| Duration::from_millis(sse_keepalive_ms)),
@@ -404,6 +428,26 @@ mod tests {
             let cfg = HubConfig::from_map(&vars).unwrap();
             assert_eq!(cfg.copilot_guard_models, expected, "value={value:?}");
         }
+    }
+
+    #[test]
+    fn copilot_strip_sampling_models_default_and_parse() {
+        assert_eq!(
+            HubConfig::from_map(&base_vars())
+                .unwrap()
+                .copilot_strip_sampling_models,
+            DEFAULT_COPILOT_STRIP_SAMPLING_MODELS
+                .map(String::from)
+                .to_vec()
+        );
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_COPILOT_STRIP_SAMPLING_MODELS".into(), "".into());
+        assert!(
+            HubConfig::from_map(&vars)
+                .unwrap()
+                .copilot_strip_sampling_models
+                .is_empty()
+        );
     }
 
     #[test]
