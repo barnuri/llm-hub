@@ -10,8 +10,8 @@ use serde_json::Value;
 
 use crate::consts::{
     ANTHROPIC_UPSTREAM_PATH, ERROR_REASON_MAX_CHARS, ERROR_STATUS_MIN, HEADER_ATTEMPTS,
-    HEADER_SERVED_MODEL, HEADER_TRANSFORMS, MAX_TRANSFORM_BUFFER_BYTES, SSE_KEEPALIVE_FRAME,
-    USAGE_SCRAPE_TAIL_BYTES,
+    HEADER_SERVED_MODEL, HEADER_TRANSFORMS, MAX_MULTIPART_BYTES, MAX_TRANSFORM_BUFFER_BYTES,
+    SSE_KEEPALIVE_FRAME, USAGE_SCRAPE_TAIL_BYTES,
 };
 use crate::dependencies::state::AppState;
 use crate::schemas::app_error::AppError;
@@ -20,6 +20,7 @@ use crate::services::anthropic;
 use crate::services::body_transform::BodyTransform;
 use crate::services::fallback::{RetryPolicy, fallback_chain, per_attempt_timeout_ms};
 use crate::services::harness::client_signature;
+use crate::services::multipart_model;
 use crate::services::stats::{RequestOutcome, ScrapedUsage, scrape_usage};
 use crate::services::transforms::{self, RouteKind, TransformPlan};
 use crate::utils::headers::{filter_request_headers, filter_response_headers};
@@ -32,17 +33,19 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Respon
         |pq| pq.as_str().to_string(),
     );
 
-    let content_type = header_value(&parts.headers, "content-type");
-    if content_type.starts_with("multipart/") {
-        return Err(AppError::NotImplemented(
-            "multipart endpoints (audio/files) are not supported yet".to_string(),
-        ));
-    }
-
-    let max_replay = state.config().max_replay_bytes;
+    let is_multipart = header_value(&parts.headers, "content-type").starts_with("multipart/");
+    let max_replay = if is_multipart {
+        state.config().max_replay_bytes.max(MAX_MULTIPART_BYTES)
+    } else {
+        state.config().max_replay_bytes
+    };
     let (buffered, overflow_stream) = read_body_capped(body, max_replay).await?;
 
     match overflow_stream {
+        // The model field can only be rewritten in a buffered body.
+        Some(_) if is_multipart => Err(AppError::BadRequest(format!(
+            "multipart body exceeds {max_replay} bytes"
+        ))),
         // Over the replay cap: stream straight through, fallbacks disabled.
         Some(rest) => {
             passthrough_oversized(
@@ -121,11 +124,8 @@ pub(crate) async fn attempt_loop(
         json_body = Some(anthropic::request::to_openai(json_body.as_ref())?);
     }
 
-    let primary = json_body
-        .as_ref()
-        .and_then(|v| v.get("model"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let boundary = multipart_boundary(headers);
+    let primary = requested_model(json_body.as_ref(), &body, boundary.as_deref());
 
     let Some(primary) = primary else {
         // No model in the body (e.g. GET without body): need a profile from the path? Reject clearly.
@@ -171,7 +171,8 @@ pub(crate) async fn attempt_loop(
     let last_index = chain.len() - 1;
 
     for (index, model_id) in chain.iter().enumerate() {
-        let attempt_body = body_for_attempt(json_body.as_ref(), &body, model_id);
+        let attempt_body =
+            body_for_attempt(json_body.as_ref(), &body, boundary.as_deref(), model_id);
         let started = Instant::now();
         let result = send_attempt(
             state,
@@ -339,7 +340,37 @@ fn inject_stream_usage(json_body: &mut Option<Value>) {
     );
 }
 
-fn body_for_attempt(json_body: Option<&Value>, original: &Bytes, model_id: &ModelId) -> Bytes {
+fn multipart_boundary(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .and_then(multipart_model::boundary)
+}
+
+fn requested_model(
+    json_body: Option<&Value>,
+    body: &Bytes,
+    multipart_boundary: Option<&str>,
+) -> Option<String> {
+    match multipart_boundary {
+        Some(boundary) => multipart_model::model_field(body, boundary),
+        None => json_body
+            .and_then(|v| v.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+fn body_for_attempt(
+    json_body: Option<&Value>,
+    original: &Bytes,
+    multipart_boundary: Option<&str>,
+    model_id: &ModelId,
+) -> Bytes {
+    if let Some(boundary) = multipart_boundary {
+        return multipart_model::with_model_field(original, boundary, &model_id.model)
+            .unwrap_or_else(|| original.clone());
+    }
     let Some(json) = json_body else {
         return original.clone();
     };

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::process::{Child, Command};
 use std::time::Duration;
 
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 struct HubProcess(Child);
@@ -168,5 +168,116 @@ async fn unprefixed_model_is_rejected_with_profile_list() {
     assert_eq!(response.status(), 400);
     let body: serde_json::Value = response.json().await.unwrap();
     assert!(body["error"]["message"].as_str().unwrap().contains("solo"));
+    drop(hub);
+}
+
+const AUDIO_BOUNDARY: &str = "VoiceNotesBoundary7";
+
+fn transcription_form(model: &str) -> Vec<u8> {
+    format!(
+        "--{AUDIO_BOUNDARY}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+         --{AUDIO_BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.m4a\"\r\n\
+         Content-Type: audio/mp4\r\n\r\nAUDIO-BYTES\r\n--{AUDIO_BOUNDARY}--\r\n"
+    )
+    .into_bytes()
+}
+
+async fn post_transcription(base: &str, body: Vec<u8>) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/v1/audio/transcriptions"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={AUDIO_BOUNDARY}"),
+        )
+        .header("x-llm-hub-fallbacks", "healthy/whisper-fallback")
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn multipart_transcription_routes_by_model_field_and_fails_over() {
+    let limited = MockServer::start().await;
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/audio/transcriptions"))
+        .and(body_string_contains("\r\n\r\nwhisper-main\r\n"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&limited)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/audio/transcriptions"))
+        .and(body_string_contains("\r\n\r\nwhisper-fallback\r\n"))
+        .and(body_string_contains("AUDIO-BYTES"))
+        .and(header(
+            "content-type",
+            format!("multipart/form-data; boundary={AUDIO_BOUNDARY}").as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "hi"})))
+        .expect(1)
+        .mount(&healthy)
+        .await;
+
+    let (hub, base) = start_hub(HashMap::from([
+        ("LLM_HUB_PROFILES".into(), "limited,healthy".into()),
+        ("LLM_HUB_LIMITED_BASE_URL".into(), limited.uri()),
+        ("LLM_HUB_HEALTHY_BASE_URL".into(), healthy.uri()),
+    ]))
+    .await;
+
+    let response = post_transcription(&base, transcription_form("limited/whisper-main")).await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["x-llm-hub-model"],
+        "healthy/whisper-fallback"
+    );
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["text"],
+        "hi"
+    );
+    drop(hub);
+}
+
+#[tokio::test]
+async fn multipart_without_model_field_is_rejected() {
+    let (hub, base) = start_hub(HashMap::from([
+        ("LLM_HUB_PROFILES".into(), "healthy".into()),
+        (
+            "LLM_HUB_HEALTHY_BASE_URL".into(),
+            "http://127.0.0.1:9".into(),
+        ),
+    ]))
+    .await;
+
+    let without_model = String::from_utf8(transcription_form("x"))
+        .unwrap()
+        .replace("name=\"model\"", "name=\"prompt\"");
+    let response = post_transcription(&base, without_model.into_bytes()).await;
+
+    assert_eq!(response.status(), 400);
+    drop(hub);
+}
+
+#[tokio::test]
+async fn multipart_over_upload_limit_is_rejected() {
+    let (hub, base) = start_hub(HashMap::from([
+        ("LLM_HUB_PROFILES".into(), "healthy".into()),
+        (
+            "LLM_HUB_HEALTHY_BASE_URL".into(),
+            "http://127.0.0.1:9".into(),
+        ),
+    ]))
+    .await;
+
+    let oversized_audio = "A".repeat(26 * 1024 * 1024);
+    let body = String::from_utf8(transcription_form("healthy/whisper"))
+        .unwrap()
+        .replace("AUDIO-BYTES", &oversized_audio);
+    let response = post_transcription(&base, body.into_bytes()).await;
+
+    assert_eq!(response.status(), 400);
     drop(hub);
 }

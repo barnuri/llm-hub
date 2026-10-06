@@ -6,6 +6,7 @@ pub mod env_writer;
 pub mod fallback;
 pub mod harness;
 pub mod insights;
+pub mod multipart_model;
 pub mod pricing;
 pub mod restart;
 pub mod service_manager;

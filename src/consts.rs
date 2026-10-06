@@ -3,6 +3,9 @@ use std::time::Duration;
 pub const MODELS_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MODELS_CACHE_TTL: Duration = Duration::from_mins(1);
 pub const DEFAULT_MAX_REPLAY_BYTES: usize = 2 * 1024 * 1024;
+/// The `OpenAI` audio upload limit: multipart bodies are buffered up to this so
+/// their `model` field can be rewritten per attempt.
+pub const MAX_MULTIPART_BYTES: usize = 25 * 1024 * 1024;
 pub const POOL_MAX_IDLE_PER_HOST: usize = 100;
 pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
