@@ -12,6 +12,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const AUDIO_BOUNDARY: &str = "ManagedBoundary1";
 
+#[cfg(windows)]
+const PYTHON: &str = "python";
+#[cfg(not(windows))]
+const PYTHON: &str = "python3";
+
 const TEST_SERVER: &str = r#"
 import http.server, os, sys, threading, time
 port, spawn_log = int(sys.argv[1]), sys.argv[2]
@@ -33,20 +38,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 "#;
 
-/// Stops the hub with SIGTERM so its graceful shutdown path runs.
+/// Stops the hub with SIGTERM so its graceful shutdown path runs. Windows has
+/// no SIGTERM, so there the hub is killed outright, which its job object must survive.
 struct HubProcess(Child);
 
 impl Drop for HubProcess {
     fn drop(&mut self) {
-        let _ = Command::new("kill")
-            .args(["-TERM", &self.0.id().to_string()])
-            .status();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if let Ok(Some(_)) = self.0.try_wait() {
-                return;
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .args(["-TERM", &self.0.id().to_string()])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if let Ok(Some(_)) = self.0.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
         }
         let _ = self.0.kill();
         let _ = self.0.wait();
@@ -111,7 +120,7 @@ fn test_server_command(dir: &Path, server_port: u16) -> (String, PathBuf) {
     std::fs::write(&script, TEST_SERVER).unwrap();
     let spawn_log = dir.join("spawns.txt");
     let command = format!(
-        "python3 '{}' {server_port} '{}'",
+        r#"{PYTHON} "{}" {server_port} "{}""#,
         script.display(),
         spawn_log.display()
     );
@@ -241,7 +250,7 @@ async fn start_timeout_fails_the_attempt_and_names_profile_and_log() {
         dir.path(),
         managed_profile(
             server_port,
-            "python3 -c 'import time; time.sleep(30)'",
+            &format!(r#"{PYTHON} -c "import time; time.sleep(30)""#),
             &[("START_TIMEOUT_SECS", "1")],
         ),
     )
@@ -269,7 +278,10 @@ async fn port_already_served_is_used_without_spawning() {
         .mount(&already_running)
         .await;
     let spawn_marker = dir.path().join("spawned");
-    let command = format!("touch '{}'", spawn_marker.display());
+    let command = format!(
+        r#"{PYTHON} -c "import sys; open(sys.argv[1], 'a')" "{}""#,
+        spawn_marker.display()
+    );
     let (hub, base) = start_hub(
         dir.path(),
         managed_profile(already_running.address().port(), &command, &[]),

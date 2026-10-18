@@ -199,7 +199,9 @@ impl HubConfig {
         let managed = ManagedCommand::from_env(
             &upper,
             &base_url,
-            vars.get("HOME").map(String::as_str),
+            vars.get("HOME")
+                .or_else(|| vars.get("USERPROFILE"))
+                .map(String::as_str),
             &get,
         )?;
         let (pricing, model_prices) =
@@ -405,6 +407,16 @@ mod tests {
     }
 
     #[test]
+    fn managed_command_home_falls_back_to_userprofile() {
+        let mut vars = base_vars();
+        vars.insert("USERPROFILE".into(), r"C:\Users\op".into());
+        vars.insert("LLM_HUB_GROQ_COMMAND".into(), "~/bin/whisper-server".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        let managed = cfg.profile("groq").unwrap().managed.clone().unwrap();
+        assert_eq!(managed.argv, vec![r"C:\Users\op/bin/whisper-server"]);
+    }
+
+    #[test]
     fn managed_command_bad_start_timeout_rejected() {
         let mut vars = base_vars();
         vars.insert("LLM_HUB_GROQ_COMMAND".into(), "srv".into());
@@ -478,7 +490,10 @@ mod tests {
                 .to_vec()
         );
         let mut vars = base_vars();
-        vars.insert("LLM_HUB_COPILOT_STRIP_SAMPLING_MODELS".into(), "".into());
+        vars.insert(
+            "LLM_HUB_COPILOT_STRIP_SAMPLING_MODELS".into(),
+            String::new(),
+        );
         assert!(
             HubConfig::from_map(&vars)
                 .unwrap()

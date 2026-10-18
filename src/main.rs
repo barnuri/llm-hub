@@ -147,7 +147,8 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     None
 }
 
-/// Ctrl-C, or SIGTERM from a supervisor, so managed processes are stopped on the way out.
+/// Ctrl-C, SIGTERM from a supervisor, or on Windows Ctrl+Break and a closed
+/// console window, so managed processes are stopped on the way out.
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
@@ -156,6 +157,18 @@ async fn wait_for_shutdown_signal() {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_close};
+        if let (Ok(mut ctrl_break), Ok(mut ctrl_close)) = (ctrl_break(), ctrl_close()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = ctrl_break.recv() => {}
+                _ = ctrl_close.recv() => {}
             }
             return;
         }

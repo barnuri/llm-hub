@@ -810,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn metrics__computed_from_successful_calls() {
+    fn metrics_computed_from_successful_calls() {
         let mut cached = ok("p/a", 500, 1500);
         cached.cache_read_tokens = 500;
         let outcomes = timed(vec![ok("p/a", 1000, 2000), cached, fail("p/a")]);
@@ -836,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn newest_three_failures__failing_and_unranked() {
+    fn newest_three_failures_failing_and_unranked() {
         let outcomes = timed(vec![
             ok("p/a", 100, 200),
             ok("p/a", 100, 200),
@@ -855,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn low_success_rate__degraded_but_ranked() {
+    fn low_success_rate_degraded_but_ranked() {
         let outcomes = timed(vec![
             fail("p/a"),
             fail("p/a"),
@@ -871,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn below_min_requests__insufficient_data_and_unranked() {
+    fn below_min_requests_insufficient_data_and_unranked() {
         let report = build_report(
             &timed(vec![ok("p/a", 100, 200)]),
             &HashMap::new(),
@@ -886,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn scores__stable_fast_model_leads() {
+    fn scores_stable_fast_model_leads() {
         let outcomes = timed(vec![
             ok("p/fast", 100, 1100),
             ok("p/fast", 100, 1100),
@@ -917,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_ttft__lowest_wins_with_alternatives() {
+    fn pick_ttft_lowest_wins_with_alternatives() {
         let outcomes = timed(vec![
             ok("p/a", 300, 1000),
             ok("p/b", 100, 1000),
@@ -939,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_without_ranked_models__none() {
+    fn pick_without_ranked_models_none() {
         let outcomes = timed(vec![fail("p/a"), fail("p/a"), fail("p/a")]);
         let report = build_report(&outcomes, &HashMap::new(), "7d", 1, NOW_MS);
 
@@ -947,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_report__summarises_picks_failures_and_unranked() {
+    fn agent_report_summarises_picks_failures_and_unranked() {
         let mut outcomes = timed(vec![
             ok("p/good", 100, 1100),
             ok("p/good", 100, 1100),
@@ -994,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_report_without_ranked_models__says_why() {
+    fn agent_report_without_ranked_models_says_why() {
         let report = build_agent_report(
             &timed(vec![ok("p/a", 100, 200)]),
             &HashMap::new(),
@@ -1028,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_from_models__reads_context_use_cases_and_strips_1m() {
+    fn catalog_from_models_reads_context_use_cases_and_strips_1m() {
         let payload = serde_json::json!({"data": [
             {"id": "llama_swap/qwen", "max_input_tokens": 262_144,
              "meta": {"llamaswap": {"use_cases": ["Coding", " planning "], "summary": "good coder"}}},
@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog__fills_fields_and_lists_unused_models() {
+    fn catalog_fills_fields_and_lists_unused_models() {
         let outcomes = timed(vec![ok("p/a", 100, 200)]);
         let known = catalog(&[
             ("p/a", 131_072, &["coding"]),
@@ -1071,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn best_harness__most_reliable_agent_harness_with_enough_calls() {
+    fn best_harness_most_reliable_agent_harness_with_enough_calls() {
         let outcomes = timed(vec![
             from("claude-cli/2.1 (external, cli)", ok("p/a", 300, 1000)),
             from("claude-cli/2.1 (external, cli)", ok("p/a", 300, 1000)),
@@ -1098,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn best_for__ranked_tagged_model_wins_else_declared_fallback() {
+    fn best_for_ranked_tagged_model_wins_else_declared_fallback() {
         let outcomes = timed(vec![
             ok("p/fast", 100, 1100),
             ok("p/fast", 100, 1100),
@@ -1126,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn percentile__nearest_rank() {
+    fn percentile_nearest_rank() {
         let values = [4.0, 1.0, 3.0, 2.0];
         assert_eq!(percentile(&values, MEDIAN), Some(2.0));
         assert_eq!(percentile(&values, P95), Some(4.0));

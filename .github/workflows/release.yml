@@ -9,7 +9,11 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -51,7 +55,14 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
             asset: llm-hub-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            asset: llm-hub-windows-x86_64.exe
+            exe: .exe
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,12 +75,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # Windows perl refuses to edit in place without a backup suffix.
       - name: Stamp version
         run: |
-          perl -pi -e '$done ||= s/^version = ".*"/version = "${{ needs.tag.outputs.version }}"/' Cargo.toml
+          perl -pi.bak -e '$done ||= s/^version = ".*"/version = "${{ needs.tag.outputs.version }}"/' Cargo.toml
           grep '^version' Cargo.toml
       - run: cargo build --release --target ${{ matrix.target }}
-      - run: cp target/${{ matrix.target }}/release/llm-hub ${{ matrix.asset }}
+      - run: cp target/${{ matrix.target }}/release/llm-hub${{ matrix.exe }} ${{ matrix.asset }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}

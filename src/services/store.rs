@@ -588,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_errors__keep_the_failure_reason() {
+    fn sqlite_errors_keep_the_failure_reason() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
         let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_errors__only_status_400_plus() {
+    fn sqlite_errors_only_status_400_plus() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
         let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();

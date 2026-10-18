@@ -68,7 +68,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn llama_swap_metadata__context_length_read() {
+    fn llama_swap_metadata_context_length_read() {
         let item = serde_json::json!({
             "id": "qwen3.6-35b",
             "meta": { "llamaswap": { "context_length": 262_144, "type": "model" } }
@@ -77,7 +77,7 @@ mod tests {
     }
 
     #[test]
-    fn top_level_context__wins_over_llama_swap_metadata() {
+    fn top_level_context_wins_over_llama_swap_metadata() {
         let item = serde_json::json!({
             "context_length": 131_072,
             "meta": { "llamaswap": { "context_length": 262_144 } }
@@ -86,7 +86,7 @@ mod tests {
     }
 
     #[test]
-    fn trailing_1m_suffix__stripped() {
+    fn trailing_1m_suffix_stripped() {
         assert_eq!(
             strip_1m_suffix("llmgw/bedrock/claude-opus-5[1m]"),
             "llmgw/bedrock/claude-opus-5"
@@ -98,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn id_without_suffix__unchanged() {
+    fn id_without_suffix_unchanged() {
         assert_eq!(
             strip_1m_suffix("llama_swap/meta/muse-glimmer"),
             "llama_swap/meta/muse-glimmer"
@@ -107,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_1m__advertises_suffix() {
+    fn upstream_1m_advertises_suffix() {
         assert_eq!(
             advertised_model_id("llmgw/bedrock/anthropic.claude-opus-5", Some(1_000_000)),
             "llmgw/bedrock/anthropic.claude-opus-5[1m]"
@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_200k__does_not_advertise_1m_even_for_sonnet_5_name() {
+    fn upstream_200k_does_not_advertise_1m_even_for_sonnet_5_name() {
         assert_eq!(
             advertised_model_id("llmgw/bedrock/anthropic.claude-sonnet-5", Some(200_000)),
             "llmgw/bedrock/anthropic.claude-sonnet-5"
@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_upstream_tokens__does_not_advertise_1m() {
+    fn missing_upstream_tokens_does_not_advertise_1m() {
         assert_eq!(
             advertised_model_id("llmgw/bedrock/anthropic.claude-sonnet-5", None),
             "llmgw/bedrock/anthropic.claude-sonnet-5"
@@ -143,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_tokens__passed_through() {
+    fn upstream_tokens_passed_through() {
         assert_eq!(
             inferred_max_input_tokens("llmgw/bedrock/anthropic.claude-opus-5", Some(1_000_000)),
             Some(1_000_000)
@@ -151,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn already_suffixed_id__not_double_suffixed() {
+    fn already_suffixed_id_not_double_suffixed() {
         assert_eq!(
             advertised_model_id("llmgw/bedrock/claude-opus-5[1m]", Some(1_000_000)),
             "llmgw/bedrock/claude-opus-5[1m]"
@@ -159,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn local_llama_id__no_inferred_window() {
+    fn local_llama_id_no_inferred_window() {
         assert_eq!(
             inferred_max_input_tokens("llama_swap/meta/muse-glimmer", None),
             None
@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_haiku_upstream_200k__no_1m_suffix() {
+    fn claude_haiku_upstream_200k_no_1m_suffix() {
         assert_eq!(
             inferred_max_input_tokens("llmgw/anthropic.claude-haiku-4-5", Some(200_000)),
             Some(200_000)

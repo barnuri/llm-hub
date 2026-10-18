@@ -205,14 +205,20 @@ async fn start(profile: &str, command: &ManagedCommand, log_path: &Path) -> Resu
     let stderr = log
         .try_clone()
         .map_err(|e| format!("cannot open log file: {e}"))?;
-    let mut child = Command::new(program)
+    let mut spawn = Command::new(program);
+    spawn
         .args(args)
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(stderr)
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    spawn.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+    let mut child = spawn
         .spawn()
         .map_err(|e| format!("cannot run {program}: {e}"))?;
+    #[cfg(windows)]
+    windows_job::bind_to_hub_lifetime(&child, profile);
     tracing::info!(
         profile,
         pid = child.id(),
@@ -267,28 +273,119 @@ async fn accepts_connections(address: &str) -> bool {
     )
 }
 
-/// SIGTERM, then SIGKILL once the grace period runs out.
+/// Asks the process to exit (SIGTERM, or Ctrl+Break on Windows), and kills it
+/// when the grace period runs out or the request cannot be delivered.
 async fn terminate(mut child: Child) {
-    request_exit(&child);
-    if tokio::time::timeout(MANAGED_STOP_GRACE, child.wait())
-        .await
-        .is_err()
+    if request_exit(&child)
+        && tokio::time::timeout(MANAGED_STOP_GRACE, child.wait())
+            .await
+            .is_ok()
     {
-        let _ = child.kill().await;
+        return;
     }
+    let _ = child.kill().await;
 }
 
 #[cfg(unix)]
-fn request_exit(child: &Child) {
+fn request_exit(child: &Child) -> bool {
     let Some(pid) = child.id().and_then(|id| libc::pid_t::try_from(id).ok()) else {
-        return;
+        return false;
     };
     // SAFETY: kill(2) takes plain integers and touches no memory. `pid` is our
     // own child, not yet reaped, so the id cannot belong to another process.
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
+    unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
 }
 
-#[cfg(not(unix))]
-fn request_exit(_child: &Child) {}
+#[cfg(windows)]
+fn request_exit(child: &Child) -> bool {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+
+    let Some(pid) = child.id() else {
+        return false;
+    };
+    // SAFETY: plain integers in, no memory touched. The child was spawned with
+    // CREATE_NEW_PROCESS_GROUP, so `pid` names its group alone, never the hub's.
+    unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0 }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn request_exit(_child: &Child) -> bool {
+    false
+}
+
+/// Windows has no parent-death signal, so every child joins one job object
+/// whose only handle the hub holds. When the hub exits, however it exits,
+/// Windows closes the handle and the job kills the children.
+#[cfg(windows)]
+mod windows_job {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::sync::OnceLock;
+
+    use tokio::process::Child;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+
+    static KILL_ON_CLOSE_JOB: OnceLock<Option<OwnedHandle>> = OnceLock::new();
+
+    pub fn bind_to_hub_lifetime(child: &Child, profile: &str) {
+        let Some(job) = KILL_ON_CLOSE_JOB.get_or_init(create_kill_on_close_job) else {
+            return;
+        };
+        let Some(process) = child.raw_handle() else {
+            return;
+        };
+        // SAFETY: both handles are open. The job handle lives in a static and
+        // `child` has not been reaped, so its process handle is still valid.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) } == 0 {
+            tracing::warn!(
+                profile,
+                "managed process may outlive the hub: cannot add it to the job object: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    fn create_kill_on_close_job() -> Option<OwnedHandle> {
+        // SAFETY: null attributes and a null name are valid arguments; the call
+        // returns a new handle or null.
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw.is_null() {
+            tracing::warn!(
+                "cannot create a job object for managed processes: {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        // SAFETY: `raw` is a new, open handle that nothing else owns.
+        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).ok()?;
+        // SAFETY: `limits` is the struct this information class expects, and
+        // `size` is its exact size.
+        let applied = unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                size,
+            )
+        };
+        if applied == 0 {
+            tracing::warn!(
+                "cannot make the job object kill managed processes: {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        Some(job)
+    }
+}

@@ -473,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn series_from_outcomes__same_hour_sums_requests() {
+    fn series_from_outcomes_same_hour_sums_requests() {
         let hour = SERIES_HOUR_MS;
         let mut first = outcome("openai", "openai/gpt-4o", 200);
         first.ts_ms = hour + 10;
@@ -489,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn series_from_outcomes__empty_hour_is_zero() {
+    fn series_from_outcomes_empty_hour_is_zero() {
         let hour = SERIES_HOUR_MS;
         let mut row = outcome("vllm", "vllm/qwen", 200);
         row.ts_ms = hour * 2 + 1;

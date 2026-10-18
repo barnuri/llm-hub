@@ -554,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_schema_without_properties__gets_empty_properties() {
+    fn tool_schema_without_properties_gets_empty_properties() {
         let out = translate(&json!({
             "messages": [],
             "tools": [{"name": "no_args", "input_schema": {"type": "object"}}]
@@ -566,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_schema_without_type__keeps_existing_properties() {
+    fn tool_schema_without_type_keeps_existing_properties() {
         let out = translate(&json!({
             "messages": [],
             "tools": [{
@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn non_object_tool_schema__becomes_empty_object_schema() {
+    fn non_object_tool_schema_becomes_empty_object_schema() {
         let out = translate(&json!({
             "messages": [],
             "tools": [{"name": "broken", "input_schema": "nonsense"}]

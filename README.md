@@ -34,6 +34,28 @@ updates via release binaries unless you run the binary from the repo. Source
 installs are auto-detected by the updater, which runs `git pull` + rebuild
 instead of downloading a release.
 
+## Install on Windows
+
+Download `llm-hub-windows-x86_64.exe` from
+[releases](https://github.com/barnuri/llm-hub/releases) and rename it to
+`llm-hub.exe`, or build from source with `cargo build --release` (needs the
+Visual Studio C++ build tools; the binary lands in `target\release\llm-hub.exe`).
+The install script above covers macOS and Linux only.
+
+```powershell
+mkdir C:\llm-hub; cd C:\llm-hub   # the directory that holds .env
+notepad .env
+.\llm-hub.exe service install
+```
+
+`service install` registers a Task Scheduler task that starts the hub when you
+log on. It needs no admin rights. The task runs
+`%LOCALAPPDATA%\llm-hub\llm-hub-service.cmd`, which changes to the directory
+you ran `service install` from, so the hub reads that directory's `.env`, and
+starts the hub again whenever it exits. The hub runs in a console window:
+closing the window stops it until the next logon or `schtasks /Run /TN llm-hub`.
+Logs go to `logs\llm-hub.log` in that directory.
+
 ## Quick start
 
 ```sh
@@ -269,6 +291,17 @@ runs `ffmpeg` from `PATH`, so start the command with
 `/usr/bin/env PATH=/opt/homebrew/bin:/usr/bin:/bin` there. `GET /api/profiles` reports
 `managed` and `running` per profile, never the command itself.
 
+On Windows, whisper.cpp releases include `whisper-server.exe`, and `--convert`
+needs `ffmpeg` on `PATH`. The hub splits `COMMAND` with Windows command-line
+rules there: a backslash is literal, double quotes group a path with spaces,
+and single quotes are plain text. Wrap the value in single quotes in `.env` so
+the `.env` parser keeps the backslashes. `~/` expands to `%USERPROFILE%` when
+`HOME` is not set.
+
+```sh
+LLM_HUB_WHISPER_COMMAND='"C:\Program Files\whisper.cpp\whisper-server.exe" --model C:\models\ggml-large-v3.bin --host 127.0.0.1 --port 11440 --inference-path /v1/audio/transcriptions --convert'
+```
+
 ## Environment reference
 
 | Variable | Default | Purpose |
@@ -286,7 +319,7 @@ runs `ffmpeg` from `PATH`, so start the command with
 | `LLM_HUB_<NAME>_CACHE_READ_USD_PER_1M` | 10% of input | Optional cache-hit price |
 | `LLM_HUB_<NAME>_CACHE_WRITE_USD_PER_1M` | = input | Optional cache-write price |
 | `LLM_HUB_<NAME>_MODEL_PRICES` | — | Per-model overrides: `model:in/out[,cache_read[/cache_write]]` |
-| `LLM_HUB_<NAME>_COMMAND` | — | Local server the hub starts on demand for this profile (program + args, shell-style quoting, no shell; leading `~/` expands to `$HOME`). Operator-set only: the admin API can neither set nor write it |
+| `LLM_HUB_<NAME>_COMMAND` | — | Local server the hub starts on demand for this profile (program + args, no shell; POSIX shell quoting, or Windows command-line rules on Windows; leading `~/` expands to `$HOME`, or `%USERPROFILE%` without `HOME`). Operator-set only: the admin API can neither set nor write it |
 | `LLM_HUB_<NAME>_IDLE_SECS` | `900` | Stop the managed process after this many seconds without a request; `0` = never |
 | `LLM_HUB_<NAME>_START_TIMEOUT_SECS` | `120` | How long the managed process may take to accept connections on the `BASE_URL` port |
 | `LLM_HUB_INPUT_USD_PER_1M` / `OUTPUT_…` | `0` | Global default rates when a profile has none |
@@ -315,7 +348,8 @@ llm-hub service install
 
 Registers the hub as an always-on background service: a launchd LaunchAgent on
 macOS, a systemd user unit on Linux (run `loginctl enable-linger $USER` to
-start at boot without a login session), a Task Scheduler task on Windows. Run
+start at boot without a login session), a Task Scheduler logon task on Windows
+(see [Install on Windows](#install-on-windows)). Run
 it from the directory containing your `.env` — that working directory is baked
 into the service definition, so the service reads that `.env` for profiles,
 keys, and fallbacks. The definition also bakes in `LLM_HUB_PORT=8888` and
@@ -334,6 +368,8 @@ daily, downloads the binary for your OS/arch, and swaps it atomically. Source
 installs are updated via `git pull` + `cargo build --release` instead (the
 automatic pull is skipped while the checkout has uncommitted changes). Set
 `LLM_HUB_AUTO_UPDATE=false` to only log a notice when a newer version exists.
+Windows cannot overwrite a running `.exe`, so the updater first renames it to
+`llm-hub.old.exe` and removes that file on the next update.
 
 ```sh
 llm-hub update   # manual one-shot update, same logic

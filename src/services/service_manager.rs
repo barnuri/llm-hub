@@ -2,6 +2,9 @@ use std::path::Path;
 
 use crate::consts::{SERVICE_BIND, SERVICE_LABEL, SERVICE_PORT};
 
+/// `ping -n 3` waits about two seconds, so a hub that keeps crashing does not spin.
+const WINDOWS_RESTART_DELAY_PINGS: u32 = 3;
+
 /// `llm-hub service install`: registers the hub as an always-on background
 /// service for the current user — launchd `LaunchAgent` on macOS, systemd user
 /// unit on Linux, Task Scheduler task on Windows. The definition captures the
@@ -25,8 +28,8 @@ pub fn status() -> Result<(), String> {
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn render_launchd_plist(exe: &Path, cwd: &Path) -> String {
-    let exe = xml_escape(exe);
-    let cwd = xml_escape(cwd);
+    let exe = xml_escape(exe.display());
+    let cwd = xml_escape(cwd.display());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -89,21 +92,56 @@ WantedBy=default.target
     )
 }
 
-/// Task Scheduler XML has no environment element, so the action wraps the
-/// binary through `cmd /c set` env pairs and `&& <exe>`.
+/// The script a Windows logon task runs. It restarts the hub whenever it
+/// exits, as launchd `KeepAlive` and systemd `Restart=always` do: Task
+/// Scheduler only restarts a task that fails to start.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn render_windows_task_xml(exe: &Path, cwd: &Path) -> String {
-    let exe = xml_escape(exe);
-    let cwd = xml_escape(cwd);
+pub fn render_windows_launcher(exe: &Path, cwd: &Path) -> String {
+    let exe = cmd_escape(exe);
+    let cwd = cmd_escape(cwd);
+    [
+        "@echo off".to_string(),
+        format!("cd /d \"{cwd}\""),
+        "set LLM_HUB_SERVICE=1".to_string(),
+        format!("set LLM_HUB_PORT={SERVICE_PORT}"),
+        format!("set LLM_HUB_BIND={SERVICE_BIND}"),
+        ":run".to_string(),
+        format!("\"{exe}\" >> \"{cwd}\\logs\\llm-hub.log\" 2>&1"),
+        format!("ping -n {WINDOWS_RESTART_DELAY_PINGS} 127.0.0.1 >nul"),
+        "goto run".to_string(),
+        String::new(),
+    ]
+    .join("\r\n")
+}
+
+/// A logon task for `user` alone, which a standard user may register without
+/// admin rights. `StopExisting` makes `schtasks /Run` replace a running instance.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn render_windows_task_xml(launcher: &Path, cwd: &Path, user: &str) -> String {
+    let launcher = xml_escape(launcher.display());
+    let cwd = xml_escape(cwd.display());
+    let user = xml_escape(user);
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+        r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>llm-hub LLM proxy</Description>
+  </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
       <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
     </LogonTrigger>
   </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
   <Settings>
+    <MultipleInstancesPolicy>StopExisting</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <StartWhenAvailable>true</StartWhenAvailable>
@@ -115,8 +153,8 @@ pub fn render_windows_task_xml(exe: &Path, cwd: &Path) -> String {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>cmd</Command>
-      <Arguments>/c set LLM_HUB_SERVICE=1&amp;&amp; set LLM_HUB_PORT={SERVICE_PORT}&amp;&amp; set LLM_HUB_BIND={SERVICE_BIND}&amp;&amp; "{exe}" >> "{cwd}\logs\llm-hub.log" 2&gt;&amp;1</Arguments>
+      <Command>cmd.exe</Command>
+      <Arguments>/d /c ""{launcher}""</Arguments>
       <WorkingDirectory>{cwd}</WorkingDirectory>
     </Exec>
   </Actions>
@@ -125,12 +163,27 @@ pub fn render_windows_task_xml(exe: &Path, cwd: &Path) -> String {
     )
 }
 
-fn xml_escape(path: &Path) -> String {
-    path.display()
-        .to_string()
+/// `schtasks /XML` reads the encoding Task Scheduler exports: UTF-16LE with a BOM.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn encode_utf16le_with_bom(text: &str) -> Vec<u8> {
+    const BOM: u16 = 0xFEFF;
+    std::iter::once(BOM)
+        .chain(text.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+fn xml_escape(text: impl std::fmt::Display) -> String {
+    text.to_string()
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// A batch file expands `%NAME%` even inside quotes; `%%` is a literal `%`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn cmd_escape(path: &Path) -> String {
+    path.display().to_string().replace('%', "%%")
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -304,29 +357,68 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use crate::consts::SERVICE_NAME;
 
-    use super::{render_windows_task_xml, run};
+    use super::{encode_utf16le_with_bom, render_windows_launcher, render_windows_task_xml, run};
 
     pub fn install(exe: &Path, cwd: &Path) -> Result<(), String> {
-        let xml = std::env::temp_dir().join("llm-hub-task.xml");
-        std::fs::write(&xml, render_windows_task_xml(exe, cwd)).map_err(|e| e.to_string())?;
-        println!("wrote {}", xml.display());
-        let xml_arg = xml.display().to_string();
+        let launcher = launcher_path()?;
+        if let Some(dir) = launcher.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&launcher, render_windows_launcher(exe, cwd)).map_err(|e| e.to_string())?;
+        println!("wrote {}", launcher.display());
+        let task = launcher.with_extension("xml");
+        let xml = render_windows_task_xml(&launcher, cwd, &current_user()?);
+        std::fs::write(&task, encode_utf16le_with_bom(&xml)).map_err(|e| e.to_string())?;
+        println!("wrote {}", task.display());
+        let task_arg = task.display().to_string();
         run(
             "schtasks",
-            &["/Create", "/TN", SERVICE_NAME, "/XML", &xml_arg, "/F"],
-        )
+            &["/Create", "/TN", SERVICE_NAME, "/XML", &task_arg, "/F"],
+        )?;
+        run("schtasks", &["/Run", "/TN", SERVICE_NAME])?;
+        println!("service {SERVICE_NAME} installed and running");
+        Ok(())
     }
 
     pub fn uninstall() -> Result<(), String> {
-        run("schtasks", &["/Delete", "/TN", SERVICE_NAME, "/F"])
+        if let Err(e) = run("schtasks", &["/End", "/TN", SERVICE_NAME]) {
+            println!("note: {e} (service may not be running)");
+        }
+        run("schtasks", &["/Delete", "/TN", SERVICE_NAME, "/F"])?;
+        let launcher = launcher_path()?;
+        for file in [launcher.with_extension("xml"), launcher] {
+            if file.exists() {
+                std::fs::remove_file(&file).map_err(|e| e.to_string())?;
+                println!("removed {}", file.display());
+            }
+        }
+        Ok(())
     }
 
     pub fn status() -> Result<(), String> {
-        run("schtasks", &["/Query", "/TN", SERVICE_NAME])
+        run(
+            "schtasks",
+            &["/Query", "/TN", SERVICE_NAME, "/V", "/FO", "LIST"],
+        )
+    }
+
+    fn launcher_path() -> Result<PathBuf, String> {
+        let local_app_data = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is not set")?;
+        Ok(PathBuf::from(local_app_data)
+            .join(SERVICE_NAME)
+            .join(format!("{SERVICE_NAME}-service.cmd")))
+    }
+
+    fn current_user() -> Result<String, String> {
+        let user = std::env::var("USERNAME").map_err(|_| "USERNAME is not set")?;
+        Ok(match std::env::var("USERDOMAIN") {
+            Ok(domain) if !domain.is_empty() => format!("{domain}\\{user}"),
+            _ => user,
+        })
     }
 }
 
@@ -383,16 +475,66 @@ mod tests {
     }
 
     #[test]
-    fn windows_task_xml_runs_exe_in_cwd_with_restart_on_failure() {
-        let out = render_windows_task_xml(Path::new("C:/hub/llm-hub.exe"), Path::new("C:/hub"));
+    fn windows_launcher_restarts_exe_in_cwd_with_service_env() {
+        let out = render_windows_launcher(
+            Path::new(r"C:\hub\llm-hub.exe"),
+            Path::new(r"C:\Users\me\100% hub"),
+        );
 
-        assert!(out.contains(&format!(
-            "set LLM_HUB_SERVICE=1&amp;&amp; set LLM_HUB_PORT={SERVICE_PORT}&amp;&amp; set LLM_HUB_BIND={SERVICE_BIND}&amp;&amp; \"C:/hub/llm-hub.exe\""
-        )));
-        assert!(out.contains("<WorkingDirectory>C:/hub</WorkingDirectory>"));
-        assert!(out.contains("<LogonTrigger>"));
-        assert!(out.contains("<RestartOnFailure>"));
-        assert!(out.contains(r#">> "C:/hub\logs\llm-hub.log" 2&gt;&amp;1"#));
+        let lines: Vec<&str> = out.split("\r\n").collect();
+        assert_eq!(
+            lines,
+            vec![
+                "@echo off",
+                r#"cd /d "C:\Users\me\100%% hub""#,
+                "set LLM_HUB_SERVICE=1",
+                &format!("set LLM_HUB_PORT={SERVICE_PORT}"),
+                &format!("set LLM_HUB_BIND={SERVICE_BIND}"),
+                ":run",
+                r#""C:\hub\llm-hub.exe" >> "C:\Users\me\100%% hub\logs\llm-hub.log" 2>&1"#,
+                "ping -n 3 127.0.0.1 >nul",
+                "goto run",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_task_xml_runs_launcher_at_users_logon() {
+        let out = render_windows_task_xml(
+            Path::new(r"C:\Users\me\AppData\Local\llm-hub\llm-hub-service.cmd"),
+            Path::new(r"C:\hub"),
+            r"DESKTOP\me",
+        );
+
+        assert!(out.contains(r#"<?xml version="1.0" encoding="UTF-16"?>"#));
+        assert!(out.contains(
+            r#"<Arguments>/d /c ""C:\Users\me\AppData\Local\llm-hub\llm-hub-service.cmd""</Arguments>"#
+        ));
+        assert!(out.contains(r"<WorkingDirectory>C:\hub</WorkingDirectory>"));
+        assert_eq!(out.matches(r"<UserId>DESKTOP\me</UserId>").count(), 2);
+        assert!(out.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(out.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(out.contains("<MultipleInstancesPolicy>StopExisting</MultipleInstancesPolicy>"));
+        assert!(out.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+    }
+
+    #[test]
+    fn windows_task_xml_escapes_user_and_paths() {
+        let out =
+            render_windows_task_xml(Path::new(r"C:\a&b\l.cmd"), Path::new(r"C:\a&b"), "R&D\\me");
+
+        assert!(out.contains(r#"""C:\a&amp;b\l.cmd"""#));
+        assert!(out.contains(r"<UserId>R&amp;D\me</UserId>"));
+        assert!(!out.contains("a&b"));
+    }
+
+    #[test]
+    fn utf16le_encoding_starts_with_bom() {
+        assert_eq!(
+            encode_utf16le_with_bom("<a>é"),
+            vec![0xFF, 0xFE, b'<', 0, b'a', 0, b'>', 0, 0xE9, 0]
+        );
     }
 
     #[test]

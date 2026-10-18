@@ -96,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn signature__copilot_marker_appended() {
+    fn signature_copilot_marker_appended() {
         let copilot = headers(&[("user-agent", "OpenAI/JS 5.20.1"), ("x-initiator", "agent")]);
         assert_eq!(
             client_signature(&copilot).as_deref(),
@@ -106,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn is_copilot_cli__needs_the_x_initiator_header() {
+    fn is_copilot_cli_needs_the_x_initiator_header() {
         assert!(is_copilot_cli(&headers(&[
             ("user-agent", "OpenAI/JS 5.20.1"),
             ("x-initiator", "user"),
@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn classify__known_harnesses() {
+    fn classify_known_harnesses() {
         let cases = [
             ("claude-cli/2.1.285 (external, cli)", "claude-code"),
             (

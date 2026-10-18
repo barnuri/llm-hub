@@ -65,7 +65,7 @@ mod tests {
     }
 
     #[test]
-    fn trailing_1m_suffix__stripped_from_upstream_id() {
+    fn trailing_1m_suffix_stripped_from_upstream_id() {
         let id = ModelId::parse("llmgw/bedrock/anthropic.claude-opus-5[1m]").unwrap();
         assert_eq!(id.profile, "llmgw");
         assert_eq!(id.model, "bedrock/anthropic.claude-opus-5");
@@ -73,7 +73,7 @@ mod tests {
     }
 
     #[test]
-    fn suffix_only_model_segment__rejected() {
+    fn suffix_only_model_segment_rejected() {
         assert_eq!(ModelId::parse("llmgw/[1m]"), None);
     }
 }

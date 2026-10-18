@@ -1085,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn copilot_sampling_strip__only_listed_models_and_copilot() {
+    fn copilot_sampling_strip_only_listed_models_and_copilot() {
         let sampled = || {
             Some(json!({
                 "model": "llama_swap/qwen3-coder-next", "temperature": 0, "top_p": 0.95,

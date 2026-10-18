@@ -183,9 +183,13 @@ async fn update_from_source(repo: &Path, current: &Path) -> Result<UpdateOutcome
         println!("source checkout already up to date");
         return Ok(UpdateOutcome::AlreadyUpToDate);
     }
-    run_in_repo(repo, "cargo", &["build", "--release"], BUILD_HINT).await?;
-
     let built = repo.join("target").join("release").join(binary_name());
+    let set_aside = set_aside_if_running_build(current, &built)?;
+    if let Err(e) = run_in_repo(repo, "cargo", &["build", "--release"], BUILD_HINT).await {
+        restore_set_aside(set_aside.as_deref(), &built);
+        return Err(e);
+    }
+
     if !is_same_file(current, &built) {
         let bytes = std::fs::read(&built)
             .map_err(|e| format!("read fresh build {} failed: {e}", built.display()))?;
@@ -333,11 +337,13 @@ fn http_client() -> Result<reqwest::Client, String> {
 fn expected_asset_name() -> String {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    format!("llm-hub-{os}-{arch}")
+    let suffix = std::env::consts::EXE_SUFFIX;
+    format!("llm-hub-{os}-{arch}{suffix}")
 }
 
 /// Writes the new binary next to the current one, then atomically renames
 /// over it. The running process keeps executing the old inode.
+#[cfg(not(windows))]
 fn replace_current_binary(bytes: &[u8]) -> Result<(), String> {
     let current = std::env::current_exe().map_err(|e| e.to_string())?;
     let tmp = current.with_extension("update-tmp");
@@ -349,4 +355,74 @@ fn replace_current_binary(bytes: &[u8]) -> Result<(), String> {
             .map_err(|e| format!("chmod failed: {e}"))?;
     }
     std::fs::rename(&tmp, &current).map_err(|e| format!("replace binary failed: {e}"))
+}
+
+/// Windows refuses to overwrite a running executable but lets it be renamed,
+/// so the running file moves aside before the new one takes its path.
+#[cfg(windows)]
+fn replace_current_binary(bytes: &[u8]) -> Result<(), String> {
+    let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    let tmp = current.with_extension("update-tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("write update failed: {e}"))?;
+    let aside = move_aside(&current)?;
+    if let Err(e) = std::fs::rename(&tmp, &current) {
+        restore_set_aside(Some(&aside), &current);
+        return Err(format!("replace binary failed: {e}"));
+    }
+    Ok(())
+}
+
+/// Cargo cannot write `target/release/llm-hub.exe` on Windows while that file
+/// runs, so a hub running its own build moves it aside first.
+#[cfg(windows)]
+fn set_aside_if_running_build(
+    current: &Path,
+    built: &Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if !is_same_file(current, built) {
+        return Ok(None);
+    }
+    move_aside(current).map(Some)
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::unnecessary_wraps)] // Matches the Windows variant, which can fail.
+fn set_aside_if_running_build(
+    _current: &Path,
+    _built: &Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn move_aside(running: &Path) -> Result<std::path::PathBuf, String> {
+    let aside = running.with_extension("old.exe");
+    if aside.exists() {
+        std::fs::remove_file(&aside).map_err(|e| {
+            format!(
+                "cannot remove {} from the previous update (restart llm-hub, then retry): {e}",
+                aside.display()
+            )
+        })?;
+    }
+    std::fs::rename(running, &aside)
+        .map_err(|e| format!("cannot move the running binary aside: {e}"))?;
+    Ok(aside)
+}
+
+/// Puts a set-aside binary back when nothing replaced it, so the path still runs.
+fn restore_set_aside(aside: Option<&Path>, original: &Path) {
+    let Some(aside) = aside else {
+        return;
+    };
+    if original.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::rename(aside, original) {
+        tracing::warn!(
+            "cannot move {} back to {}: {e}",
+            aside.display(),
+            original.display()
+        );
+    }
 }

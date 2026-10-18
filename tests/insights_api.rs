@@ -119,7 +119,7 @@ fn model<'a>(report: &'a Value, id: &str) -> &'a Value {
 }
 
 #[tokio::test]
-async fn insights__rank_the_stable_model_and_flag_the_failing_one() {
+async fn insights_rank_the_stable_model_and_flag_the_failing_one() {
     let upstream = mock_upstream().await;
     let (_hub, base) = start_hub(HashMap::from([
         ("LLM_HUB_PROFILES".into(), "local".into()),

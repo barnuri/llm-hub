@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_usage_costs__cloud_model_nonzero() {
+    fn apply_usage_costs_cloud_model_nonzero() {
         let book = PricingBook::default();
         let mut report = UsageReport {
             total_requests: 1,
@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_usage_costs__local_model_zero() {
+    fn apply_usage_costs_local_model_zero() {
         let book = PricingBook::default();
         let mut report = UsageReport {
             total_requests: 1,
@@ -375,6 +375,6 @@ mod tests {
             recent: vec![sample_usage_row("vllm/qwen-32b", 1_000_000, 0)],
         };
         apply_usage_costs(&mut report, &book);
-        assert_eq!(report.recent[0].cost_usd, 0.0);
+        assert!(report.recent[0].cost_usd.abs() < f64::EPSILON);
     }
 }

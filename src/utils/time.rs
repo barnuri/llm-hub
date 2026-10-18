@@ -51,7 +51,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn utc_iso8601__epoch_and_known_instants() {
+    fn utc_iso8601_epoch_and_known_instants() {
         assert_eq!(utc_iso8601(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(utc_iso8601(951_782_400_000), "2000-02-29T00:00:00.000Z");
         assert_eq!(utc_iso8601(1_790_792_466_123), "2026-09-30T18:21:06.123Z");

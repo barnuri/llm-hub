@@ -185,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_claude_opus__advertises_1m_id_and_tokens() {
+    fn rewrite_claude_opus_advertises_1m_id_and_tokens() {
         let item = json!({
             "id": "bedrock/anthropic.claude-opus-5",
             "object": "model",
@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_claude_opus_200k_upstream__keeps_plain_id() {
+    fn rewrite_claude_opus_200k_upstream_keeps_plain_id() {
         let item = json!({
             "id": "bedrock/anthropic.claude-opus-5",
             "object": "model",
@@ -211,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_local_model__keeps_plain_id() {
+    fn rewrite_local_model_keeps_plain_id() {
         let item = json!({"id": "meta/muse-glimmer", "object": "model"});
         let out = rewrite_model(&profile("llama_swap", &[]), &item);
         assert_eq!(out["id"], "llama_swap/meta/muse-glimmer");
@@ -219,14 +219,14 @@ mod tests {
     }
 
     #[test]
-    fn static_claude_sonnet__no_tokens_means_no_1m_suffix() {
+    fn static_claude_sonnet_no_tokens_means_no_1m_suffix() {
         let models = static_models(&profile("llmgw", &["bedrock/anthropic.claude-sonnet-5"]));
         assert_eq!(models[0]["id"], "llmgw/bedrock/anthropic.claude-sonnet-5");
         assert!(models[0].get("max_input_tokens").is_none());
     }
 
     #[test]
-    fn disabled_profile_models__only_enabled_profiles_remain() {
+    fn disabled_profile_models_only_enabled_profiles_remain() {
         let enabled = profile("enabled", &[]);
         let mut disabled = profile("disabled", &[]);
         disabled.enabled = false;

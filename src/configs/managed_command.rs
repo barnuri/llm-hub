@@ -51,13 +51,19 @@ impl ManagedCommand {
         }))
     }
 
-    /// Splits with POSIX shell quoting rules (no expansion, no operators) and
-    /// expands a leading `~/` in each word to `home`.
+    /// Splits with POSIX shell quoting rules, or with Windows command-line rules
+    /// on Windows (no expansion, no operators either way), and expands a
+    /// leading `~/` in each word to `home`.
     ///
     /// # Errors
     /// When the quoting is unbalanced or the command is empty.
     pub fn parse_argv(raw: &str, home: Option<&str>) -> Result<Vec<String>, String> {
-        let words = shlex::split(raw).ok_or("has unbalanced quotes")?;
+        let words = if cfg!(windows) {
+            Self::split_windows(raw)
+        } else {
+            shlex::split(raw)
+        }
+        .ok_or("has unbalanced quotes")?;
         if words.is_empty() {
             return Err("is empty".to_string());
         }
@@ -67,9 +73,64 @@ impl ManagedCommand {
             .collect())
     }
 
+    /// Splits like `CommandLineToArgvW`: a backslash is literal unless it
+    /// precedes a `"`, so `C:\tools\server.exe` needs no quoting. `None` when a
+    /// quote is left open.
+    fn split_windows(raw: &str) -> Option<Vec<String>> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut in_word = false;
+        let mut in_quotes = false;
+        let mut backslashes = 0;
+        let mut chars = raw.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                backslashes += 1;
+                in_word = true;
+                continue;
+            }
+            if c == '"' {
+                word.extend(std::iter::repeat_n('\\', backslashes / 2));
+                let escaped = backslashes % 2 == 1;
+                backslashes = 0;
+                in_word = true;
+                if escaped {
+                    word.push('"');
+                } else if in_quotes && chars.peek() == Some(&'"') {
+                    chars.next();
+                    word.push('"');
+                } else {
+                    in_quotes = !in_quotes;
+                }
+                continue;
+            }
+            word.extend(std::iter::repeat_n('\\', backslashes));
+            backslashes = 0;
+            if !in_quotes && matches!(c, ' ' | '\t') {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+                continue;
+            }
+            word.push(c);
+            in_word = true;
+        }
+        if in_quotes {
+            return None;
+        }
+        word.extend(std::iter::repeat_n('\\', backslashes));
+        if in_word {
+            words.push(word);
+        }
+        Some(words)
+    }
+
     fn expand_home(word: String, home: Option<&str>) -> String {
         match (word.strip_prefix("~/"), home) {
-            (Some(rest), Some(home)) => format!("{}/{rest}", home.trim_end_matches('/')),
+            (Some(rest), Some(home)) => {
+                format!("{}/{rest}", home.trim_end_matches(['/', '\\']))
+            }
             _ => word,
         }
     }
@@ -149,8 +210,91 @@ mod tests {
 
     #[test]
     fn parse_argv_unbalanced_or_empty_rejected() {
-        assert!(ManagedCommand::parse_argv("srv 'open", None).is_err());
+        assert!(ManagedCommand::parse_argv(r#"srv "open"#, None).is_err());
         assert!(ManagedCommand::parse_argv("   ", None).is_err());
+    }
+
+    #[test]
+    fn parse_argv_home_with_trailing_backslash_joined_once() {
+        let argv = ManagedCommand::parse_argv("srv ~/m.bin", Some(r"C:\Users\me\")).unwrap();
+        assert_eq!(argv, vec!["srv", r"C:\Users\me/m.bin"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_argv_on_windows_keeps_backslash_paths() {
+        let argv =
+            ManagedCommand::parse_argv(r"C:\tools\whisper-server.exe -m C:\m.bin", None).unwrap();
+        assert_eq!(
+            argv,
+            vec![r"C:\tools\whisper-server.exe", "-m", r"C:\m.bin"]
+        );
+    }
+
+    #[test]
+    fn split_windows_unquoted_backslash_paths_kept_literal() {
+        let argv = ManagedCommand::split_windows(
+            r"C:\tools\whisper-server.exe --model C:\models\ggml.bin --port 11440",
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                r"C:\tools\whisper-server.exe",
+                "--model",
+                r"C:\models\ggml.bin",
+                "--port",
+                "11440"
+            ]
+        );
+    }
+
+    #[test]
+    fn split_windows_tabs_separate_words() {
+        let argv = ManagedCommand::split_windows("srv\t-t\t4").unwrap();
+        assert_eq!(argv, vec!["srv", "-t", "4"]);
+    }
+
+    #[test]
+    fn split_windows_double_quoted_path_with_spaces_single_word() {
+        let argv = ManagedCommand::split_windows(
+            r#"  "C:\Program Files\whisper\whisper-server.exe"   --model "C:\my models\x.bin" -t 4 "#,
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                r"C:\Program Files\whisper\whisper-server.exe",
+                "--model",
+                r"C:\my models\x.bin",
+                "-t",
+                "4"
+            ]
+        );
+    }
+
+    #[test]
+    fn split_windows_backslashes_before_quote_follow_crt_rules() {
+        let argv = ManagedCommand::split_windows(r#"a\\\"b "c\\" d\\"#).unwrap();
+        assert_eq!(argv, vec![r#"a\"b"#, r"c\", r"d\\"]);
+    }
+
+    #[test]
+    fn split_windows_doubled_quote_inside_quotes_is_literal() {
+        let argv = ManagedCommand::split_windows(r#""say ""hi""" "" x"#).unwrap();
+        assert_eq!(argv, vec![r#"say "hi""#, "", "x"]);
+    }
+
+    #[test]
+    fn split_windows_single_quotes_and_operators_are_plain_text() {
+        let argv = ManagedCommand::split_windows("srv 'a b' & del %HOME%").unwrap();
+        assert_eq!(argv, vec!["srv", "'a", "b'", "&", "del", "%HOME%"]);
+    }
+
+    #[test]
+    fn split_windows_open_quote_rejected() {
+        assert_eq!(ManagedCommand::split_windows(r#"srv "C:\open"#), None);
+        assert_eq!(ManagedCommand::split_windows(r#"srv "C:\dir\" x"#), None);
     }
 
     #[test]
