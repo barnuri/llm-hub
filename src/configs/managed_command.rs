@@ -177,10 +177,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_argv_quoted_args_kept_as_single_words() {
-        let argv =
-            ManagedCommand::parse_argv(r#"server --name "two words" 'x y' plain"#, None).unwrap();
-        assert_eq!(argv, vec!["server", "--name", "two words", "x y", "plain"]);
+    fn parse_argv_double_quoted_args_kept_as_single_words() {
+        let argv = ManagedCommand::parse_argv(r#"server --name "two words" plain"#, None).unwrap();
+        assert_eq!(argv, vec!["server", "--name", "two words", "plain"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_argv_single_quoted_args_kept_as_single_words() {
+        let argv = ManagedCommand::parse_argv("server 'x y' plain", None).unwrap();
+        assert_eq!(argv, vec!["server", "x y", "plain"]);
     }
 
     #[test]
