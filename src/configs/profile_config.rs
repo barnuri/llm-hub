@@ -14,6 +14,8 @@ pub struct ProfileConfig {
     pub pricing: crate::configs::TokenRates,
     /// Bare model id → rates for this profile.
     pub model_prices: std::collections::HashMap<String, crate::configs::TokenRates>,
+    /// Local server llm-hub starts on demand; env-only, never set through the admin API.
+    pub managed: Option<crate::configs::ManagedCommand>,
 }
 
 impl ProfileConfig {

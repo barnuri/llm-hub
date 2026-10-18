@@ -44,6 +44,8 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
                 "enabled": p.enabled,
                 "models": p.static_models,
                 "healthy": health.get(&p.name).copied(),
+                "managed": p.managed.is_some(),
+                "running": state.managed().is_running(&p.name),
             })
         })
         .collect();
@@ -92,6 +94,7 @@ pub async fn upsert_profile(
         static_models: input.models.unwrap_or_default(),
         pricing: existing.map(|p| p.pricing).unwrap_or_default(),
         model_prices: existing.map(|p| p.model_prices.clone()).unwrap_or_default(),
+        managed: existing.and_then(|p| p.managed.clone()),
     };
     if !profile.base_url.starts_with("http://") && !profile.base_url.starts_with("https://") {
         return Err(AppError::BadRequest(

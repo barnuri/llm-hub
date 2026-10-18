@@ -12,6 +12,14 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_PORT: u16 = 8410;
 pub const DEFAULT_BIND: &str = "127.0.0.1";
 pub const ENV_FILE: &str = ".env";
+/// Hub log directory, relative to the working directory; managed processes log here too.
+pub const LOGS_DIR: &str = "logs";
+pub const DEFAULT_MANAGED_IDLE_SECS: u64 = 900;
+pub const DEFAULT_MANAGED_START_TIMEOUT_SECS: u64 = 120;
+pub const MANAGED_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+pub const MANAGED_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a managed process gets to exit after SIGTERM before it is killed.
+pub const MANAGED_STOP_GRACE: Duration = Duration::from_secs(5);
 pub const STATS_MAX_MODEL_KEYS: usize = 1000;
 pub const STATS_OVERFLOW_KEY: &str = "other";
 /// Rolling tail kept per response for scraping the `usage` object.

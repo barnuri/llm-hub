@@ -237,6 +237,38 @@ aliases echoed back by the client — are passed through untouched, so
 `X-LLM-Hub-Transforms` only reports `tool-names=N` when something was actually
 renamed.
 
+## Local speech-to-text
+
+A profile can carry a `COMMAND` that the hub runs itself, so a local
+OpenAI-compatible server (whisper.cpp `whisper-server`, mlx-audio, a local
+vLLM) only runs while it is used. The hub starts the process on the first
+request to the profile and waits until the host:port in `BASE_URL` accepts
+connections. Concurrent requests share that start. The hub stops the process
+after `IDLE_SECS` without requests, when `COMMAND` changes or is removed from
+`.env`, and when the hub shuts down. If something already listens on the port,
+the hub uses it and starts nothing. If the process exits, the next request
+starts it again. Its stdout and stderr go to `logs/<profile>.log`. A failed or
+timed-out start fails that attempt like an unreachable upstream, so fallbacks
+still apply.
+
+```sh
+LLM_HUB_WHISPER_BASE_URL=http://127.0.0.1:11440/v1
+LLM_HUB_WHISPER_MODELS=whisper-large-v3
+LLM_HUB_WHISPER_COMMAND='whisper-server --model ~/models/whisper/ggml-large-v3.bin --host 127.0.0.1 --port 11440 --inference-path /v1/audio/transcriptions --convert --suppress-nst --beam-size 5'
+LLM_HUB_WHISPER_IDLE_SECS=900
+```
+
+```sh
+curl -F model=whisper/whisper-large-v3 -F file=@a.wav http://127.0.0.1:8888/v1/audio/transcriptions
+```
+
+Quote the `COMMAND` value in `.env`: the `.env` parser skips an unquoted value that has spaces. Write the port in `COMMAND` and in `BASE_URL` the same. `MODELS` keeps the
+model in `/v1/models` while the server is stopped. An installed service runs
+with launchd's or systemd's minimal `PATH`. `whisper-server --convert` also
+runs `ffmpeg` from `PATH`, so start the command with
+`/usr/bin/env PATH=/opt/homebrew/bin:/usr/bin:/bin` there. `GET /api/profiles` reports
+`managed` and `running` per profile, never the command itself.
+
 ## Environment reference
 
 | Variable | Default | Purpose |
@@ -254,6 +286,9 @@ renamed.
 | `LLM_HUB_<NAME>_CACHE_READ_USD_PER_1M` | 10% of input | Optional cache-hit price |
 | `LLM_HUB_<NAME>_CACHE_WRITE_USD_PER_1M` | = input | Optional cache-write price |
 | `LLM_HUB_<NAME>_MODEL_PRICES` | — | Per-model overrides: `model:in/out[,cache_read[/cache_write]]` |
+| `LLM_HUB_<NAME>_COMMAND` | — | Local server the hub starts on demand for this profile (program + args, shell-style quoting, no shell; leading `~/` expands to `$HOME`). Operator-set only: the admin API can neither set nor write it |
+| `LLM_HUB_<NAME>_IDLE_SECS` | `900` | Stop the managed process after this many seconds without a request; `0` = never |
+| `LLM_HUB_<NAME>_START_TIMEOUT_SECS` | `120` | How long the managed process may take to accept connections on the `BASE_URL` port |
 | `LLM_HUB_INPUT_USD_PER_1M` / `OUTPUT_…` | `0` | Global default rates when a profile has none |
 | `LLM_HUB_BIND` / `LLM_HUB_PORT` | `127.0.0.1` / `8410` | Listen address |
 | `LLM_HUB_MASTER_KEY` | unset | Require this key on `/v1/*` and `/api/*`; unset = no auth |

@@ -410,6 +410,7 @@ async fn send_attempt(
         return Err(format!("profile disabled: {}", profile.name));
     }
     let client = state.client(&profile.name).ok_or("no client for profile")?;
+    state.managed().ensure_running(profile).await?;
 
     let upstream_path = path_and_query.strip_prefix("/v1").unwrap_or(path_and_query);
     let url = format!("{}{}", profile.base_url, upstream_path);
@@ -439,6 +440,7 @@ async fn send_attempt(
             .map_err(|_| "timeout".to_string())?,
         None => send.await,
     };
+    state.managed().touch(&profile.name);
     response.map_err(|e| format!("connect error: {e}"))
 }
 
@@ -892,6 +894,11 @@ async fn passthrough_oversized(
     let client = state
         .client(&profile.name)
         .ok_or_else(|| AppError::Internal("no client for profile".to_string()))?;
+    state
+        .managed()
+        .ensure_running(profile)
+        .await
+        .map_err(AppError::UpstreamUnavailable)?;
 
     let upstream_path = path_and_query.strip_prefix("/v1").unwrap_or(path_and_query);
     let url = format!("{}{}", profile.base_url, upstream_path);

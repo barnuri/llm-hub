@@ -4,10 +4,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::configs::{ProfileConfig, env_name};
 
 const PREFIX: &str = "LLM_HUB_";
+/// Profile keys only an operator may set (they run a program); upsert keeps
+/// them as written and never writes them itself.
+const OPERATOR_ONLY_KEYS: [&str; 3] = ["COMMAND", "IDLE_SECS", "START_TIMEOUT_SECS"];
 
 /// Rewrites the env file with a profile added/updated. Unrelated lines,
 /// comments, and ordering are preserved; the write is temp-file + atomic
 /// rename in the same directory (rename across filesystems is not atomic).
+/// Operator-only lines (`COMMAND`, `IDLE_SECS`, `START_TIMEOUT_SECS`) survive.
 pub fn upsert_profile(
     path: &Path,
     profile: &ProfileConfig,
@@ -16,7 +20,7 @@ pub fn upsert_profile(
     let mut lines = read_lines(path)?;
     let upper = env_name(&profile.name);
 
-    remove_profile_lines(&mut lines, &upper);
+    remove_profile_lines(&mut lines, &upper, &OPERATOR_ONLY_KEYS);
     set_var(&mut lines, "PROFILES", &all_profile_names.join(","));
 
     let mut new_vars: Vec<(String, String)> =
@@ -73,7 +77,7 @@ pub fn remove_profile(
     remaining_profile_names: &[String],
 ) -> Result<(), String> {
     let mut lines = read_lines(path)?;
-    remove_profile_lines(&mut lines, &env_name(name));
+    remove_profile_lines(&mut lines, &env_name(name), &[]);
     set_var(&mut lines, "PROFILES", &remaining_profile_names.join(","));
     write_atomic(path, &lines)
 }
@@ -86,9 +90,17 @@ fn read_lines(path: &Path) -> Result<Vec<String>, String> {
     }
 }
 
-fn remove_profile_lines(lines: &mut Vec<String>, upper: &str) {
+fn remove_profile_lines(lines: &mut Vec<String>, upper: &str, keep_keys: &[&str]) {
     let var_prefix = format!("{PREFIX}{upper}_");
-    lines.retain(|line| !line.trim_start().starts_with(&var_prefix));
+    lines.retain(|line| {
+        let Some(rest) = line.trim_start().strip_prefix(&var_prefix) else {
+            return true;
+        };
+        keep_keys.iter().any(|key| {
+            rest.strip_prefix(key)
+                .is_some_and(|tail| tail.starts_with('='))
+        })
+    });
 }
 
 /// Replaces `LLM_HUB_<key>=` in place if present, appends otherwise.
@@ -140,6 +152,7 @@ mod tests {
             static_models: vec![],
             pricing: TokenRates::default(),
             model_prices: HashMap::default(),
+            managed: None,
         }
     }
 
@@ -169,6 +182,72 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content.matches("LLM_HUB_GROQ_API_KEY=").count(), 1);
         assert!(content.contains("gsk-99999"));
+    }
+
+    #[test]
+    fn upsert_existing_operator_command_kept_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(
+            &path,
+            "LLM_HUB_GROQ_BASE_URL=https://old\nLLM_HUB_GROQ_COMMAND=srv --port 1\nLLM_HUB_GROQ_IDLE_SECS=5\nLLM_HUB_GROQ_START_TIMEOUT_SECS=9\nLLM_HUB_GROQ_COMMANDX=dropped\n",
+        )
+        .unwrap();
+
+        upsert_profile(&path, &sample_profile(), &["groq".to_string()]).unwrap();
+        upsert_profile(&path, &sample_profile(), &["groq".to_string()]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content
+                .matches("LLM_HUB_GROQ_COMMAND=srv --port 1\n")
+                .count(),
+            1
+        );
+        assert_eq!(content.matches("LLM_HUB_GROQ_IDLE_SECS=5\n").count(), 1);
+        assert_eq!(
+            content
+                .matches("LLM_HUB_GROQ_START_TIMEOUT_SECS=9\n")
+                .count(),
+            1
+        );
+        assert!(!content.contains("COMMANDX"));
+        assert!(!content.contains("https://old"));
+    }
+
+    #[test]
+    fn upsert_never_writes_operator_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let mut profile = sample_profile();
+        profile.managed = Some(crate::configs::ManagedCommand {
+            argv: vec!["srv".into()],
+            address: "127.0.0.1:1".into(),
+            idle_timeout: None,
+            start_timeout: std::time::Duration::from_secs(1),
+        });
+
+        upsert_profile(&path, &profile, &["groq".to_string()]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("COMMAND"), "{content}");
+        assert!(!content.contains("IDLE_SECS"), "{content}");
+    }
+
+    #[test]
+    fn remove_profile_with_command_drops_operator_keys_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(
+            &path,
+            "LLM_HUB_GROQ_BASE_URL=https://x\nLLM_HUB_GROQ_COMMAND=srv\n",
+        )
+        .unwrap();
+
+        remove_profile(&path, "groq", &[]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("LLM_HUB_GROQ_"), "{content}");
     }
 
     #[test]

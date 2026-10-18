@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::managed_command::ManagedCommand;
 use super::profile_config::ProfileConfig;
 use crate::consts::{
     DEFAULT_BIND, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_PORT, DEFAULT_SSE_KEEPALIVE_MS,
@@ -195,6 +196,12 @@ impl HubConfig {
         };
 
         let display_name = get("DISPLAY_NAME").filter(|v| !v.is_empty());
+        let managed = ManagedCommand::from_env(
+            &upper,
+            &base_url,
+            vars.get("HOME").map(String::as_str),
+            &get,
+        )?;
         let (pricing, model_prices) =
             crate::configs::token_rates::profile_rates_from_env(name, &get)?;
 
@@ -214,6 +221,7 @@ impl HubConfig {
                 .collect(),
             pricing,
             model_prices,
+            managed,
         })
     }
 }
@@ -374,6 +382,35 @@ mod tests {
         assert_eq!(groq.label(), "Groq Cloud");
         assert_eq!(cfg.master_key.as_deref(), Some("secret"));
         assert_eq!(cfg.profile("openai").unwrap().label(), "openai");
+    }
+
+    #[test]
+    fn managed_command_parsed_from_profile_env() {
+        let mut vars = base_vars();
+        vars.insert("HOME".into(), "/home/op".into());
+        vars.insert(
+            "LLM_HUB_GROQ_COMMAND".into(),
+            "~/bin/whisper-server --port 443".into(),
+        );
+        vars.insert("LLM_HUB_GROQ_IDLE_SECS".into(), "0".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        let managed = cfg.profile("groq").unwrap().managed.clone().unwrap();
+        assert_eq!(
+            managed.argv,
+            vec!["/home/op/bin/whisper-server", "--port", "443"]
+        );
+        assert_eq!(managed.address, "api.groq.com:443");
+        assert_eq!(managed.idle_timeout, None);
+        assert_eq!(cfg.profile("openai").unwrap().managed, None);
+    }
+
+    #[test]
+    fn managed_command_bad_start_timeout_rejected() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_GROQ_COMMAND".into(), "srv".into());
+        vars.insert("LLM_HUB_GROQ_START_TIMEOUT_SECS".into(), "x".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_GROQ_START_TIMEOUT_SECS"), "{err}");
     }
 
     #[test]

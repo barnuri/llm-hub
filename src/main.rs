@@ -17,7 +17,7 @@ use axum::middleware;
 use axum::routing::{any, delete, get, post};
 
 use crate::configs::HubConfig;
-use crate::consts::{ENV_FILE, VERSION};
+use crate::consts::{ENV_FILE, LOGS_DIR, VERSION};
 use crate::dependencies::state::AppState;
 use crate::services::store::Store;
 
@@ -73,6 +73,8 @@ async fn main() {
     };
 
     routes::models::spawn_background_refresh(state.clone());
+    state.managed().spawn_idle_reaper();
+    let managed = std::sync::Arc::clone(state.managed());
     let restart_notify = state.restart_notify();
     services::update::spawn_auto_update(auto_update, restart_notify.clone());
     services::config_reload::spawn_env_watcher(state.clone(), restart_notify.clone());
@@ -90,15 +92,17 @@ async fn main() {
     if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             tokio::select! {
-                () = wait_for_ctrl_c() => {}
+                () = wait_for_shutdown_signal() => {}
                 () = restart_notify.notified() => {}
             }
         })
         .await
     {
+        managed.stop_all().await;
         eprintln!("server error: {e}");
         std::process::exit(1);
     }
+    managed.stop_all().await;
 
     match services::restart::respawn_if_requested() {
         Ok(true) => tracing::info!("respawned llm-hub after restart request"),
@@ -143,9 +147,19 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     None
 }
 
-const LOGS_DIR: &str = "logs";
-
-async fn wait_for_ctrl_c() {
+/// Ctrl-C, or SIGTERM from a supervisor, so managed processes are stopped on the way out.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
     let _ = tokio::signal::ctrl_c().await;
 }
 

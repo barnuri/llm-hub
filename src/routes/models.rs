@@ -180,6 +180,7 @@ mod tests {
             static_models: static_ids.iter().map(|id| (*id).to_string()).collect(),
             pricing: TokenRates::default(),
             model_prices: HashMap::new(),
+            managed: None,
         }
     }
 

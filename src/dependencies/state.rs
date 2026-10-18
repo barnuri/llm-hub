@@ -6,6 +6,8 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 
 use crate::configs::HubConfig;
+use crate::consts::LOGS_DIR;
+use crate::services::managed_process::ProcessManager;
 use crate::services::stats::StatsRegistry;
 use crate::services::store::Store;
 use crate::services::upstream::build_clients;
@@ -27,6 +29,7 @@ struct Inner {
     upstream_health: DashMap<String, bool>,
     /// Fired to trigger graceful shutdown (auto-update, env watcher, /api/restart).
     restart_notify: Arc<tokio::sync::Notify>,
+    managed: Arc<ProcessManager>,
 }
 
 #[derive(Clone)]
@@ -44,6 +47,7 @@ impl AppState {
             model_cache: ArcSwap::from_pointee(None),
             upstream_health: DashMap::new(),
             restart_notify: Arc::new(tokio::sync::Notify::new()),
+            managed: Arc::new(ProcessManager::new(LOGS_DIR)),
         }));
         state.refresh_api_key_hashes();
         Ok(state)
@@ -58,6 +62,7 @@ impl AppState {
     pub fn swap_config(&self, config: HubConfig) -> Result<(), String> {
         let clients = build_clients(&config)?;
         self.0.clients.store(Arc::new(clients));
+        self.0.managed.reconcile(&config);
         self.0.config.store(Arc::new(config));
         Ok(())
     }
@@ -109,6 +114,10 @@ impl AppState {
 
     pub fn clear_model_cache(&self) {
         self.0.model_cache.store(Arc::new(None));
+    }
+
+    pub fn managed(&self) -> &Arc<ProcessManager> {
+        &self.0.managed
     }
 
     pub fn restart_notify(&self) -> Arc<tokio::sync::Notify> {

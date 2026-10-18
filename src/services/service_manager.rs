@@ -169,10 +169,29 @@ mod platform {
         if run("launchctl", &["bootout", &target]).is_err() {
             println!("note: service was not previously loaded");
         }
+        wait_until_unloaded(&target);
         run("launchctl", &["bootstrap", &domain, &plist_arg])?;
         allow_through_firewall(exe);
         println!("service {SERVICE_LABEL} installed and running");
         Ok(())
+    }
+
+    /// `bootout` returns before a graceful shutdown (stopping managed children) ends,
+    /// and `bootstrap` fails with status 5 while the old instance is still registered.
+    fn wait_until_unloaded(target: &str) {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(200);
+        const MAX_POLLS: u32 = 100;
+        for _ in 0..MAX_POLLS {
+            let loaded = std::process::Command::new("launchctl")
+                .args(["print", target])
+                .output()
+                .is_ok_and(|out| out.status.success());
+            if !loaded {
+                return;
+            }
+            std::thread::sleep(POLL);
+        }
+        println!("note: {target} still loaded after 20s; trying bootstrap anyway");
     }
 
     /// The macOS Application Firewall blocks inbound connections to unsigned
