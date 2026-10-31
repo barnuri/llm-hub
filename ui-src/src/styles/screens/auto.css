@@ -1,13 +1,82 @@
-.auto-intro {
-  margin: 0 0 12px;
+.auto-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: -6px 0 12px;
+}
+
+.auto-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--border);
+}
+
+.auto-kpis > .kpi {
+  gap: 4px;
+  padding: 12px 14px;
+  border: 0;
+  border-radius: 0;
+}
+
+.auto-kpis .kpi-row {
+  flex-wrap: wrap;
+}
+
+.auto-kpis .kpi.tone-warn .kpi-sub {
+  color: var(--warn-text);
+}
+
+.auto-mix {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.auto-mix > .panel {
+  margin-top: 0;
+  min-width: 0;
+}
+
+.auto .mix-share {
+  width: 110px;
+}
+
+.auto .mix-label {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auto-decisions {
+  margin-top: 12px;
+}
+
+.auto-decisions .panel-head {
+  flex-wrap: wrap;
 }
 
 .auto-filter {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+.auto-filter-label {
   color: var(--muted);
-  font-size: 12.5px;
+  font-size: 12px;
+}
+
+.auto-session.input.search {
+  width: 220px;
 }
 
 .auto-table-scroll {
@@ -15,14 +84,61 @@
   overflow-y: auto;
 }
 
+.auto .table .auto-turn {
+  text-align: right;
+}
+
+.auto-session-chip {
+  padding: 1px 8px;
+  font-size: 11px;
+}
+
+.auto-pick {
+  min-width: 200px;
+}
+
+.auto-reason {
+  display: -webkit-box;
+  max-width: 320px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  color: var(--muted);
+  font-family: var(--sans);
+  font-size: 11px;
+  white-space: normal;
+}
+
 .auto-empty {
   padding: 20px 10px;
   text-align: center;
 }
 
+.auto-foot {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+@media (max-width: 1100px) {
+  .auto-kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .auto-mix {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 @media (max-width: 720px) {
   .auto-filter,
-  .auto-filter .input.search {
+  .auto-session.input.search {
     width: 100%;
   }
 }

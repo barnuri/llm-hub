@@ -1,13 +1,61 @@
+.tab.active.keys {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .keys > .panel {
   margin-top: 0;
+}
+
+.kpi-strip.keys-kpis {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.keys-reveal {
+  border-color: var(--accent-tint);
+}
+
+.keys-reveal-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.keys-reveal-value {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--accent-tint);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font: 12.5px var(--mono);
+  word-break: break-all;
+  user-select: all;
 }
 
 .keys-note {
   margin: 0 0 10px;
 }
 
+.panel .toolbar.keys-create {
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+
+.keys-create > .dim,
+.keys-create-hint {
+  line-height: 30px;
+}
+
+.keys-create-field .input {
+  width: 260px;
+  max-width: 100%;
+}
+
 .keys-scroll {
-  max-height: calc(100vh - 220px);
+  max-height: calc(100vh - 360px);
   overflow-y: auto;
 }
 

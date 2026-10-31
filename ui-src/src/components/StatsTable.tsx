@@ -1,13 +1,38 @@
 import type { StatsEntry } from "../lib/types";
-import { formatMs, formatNumber, formatTps, formatUsd } from "../lib/format";
+import { formatMs, formatNumber, formatPct, formatUsd } from "../lib/format";
+import { CompactCount } from "./CompactCount";
 import { Panel } from "./Panel";
+import { ShareBar } from "./ShareBar";
 
 interface StatsTableProps {
   readonly label: string;
   readonly rows: readonly StatsEntry[];
 }
 
+const COLUMN_COUNT = 11;
+
+function formatRate(tokensPerSec: number): string {
+  if (!tokensPerSec) {
+    return "—";
+  }
+  return formatNumber(tokensPerSec, tokensPerSec >= 100 ? 0 : 1);
+}
+
+function KeyCell({ entryKey }: { readonly entryKey: string }) {
+  const slash = entryKey.indexOf("/");
+  if (slash <= 0) {
+    return <>{entryKey}</>;
+  }
+  return (
+    <>
+      <span className="stats-key-prefix">{entryKey.slice(0, slash + 1)}</span>
+      {entryKey.slice(slash + 1)}
+    </>
+  );
+}
+
 export function StatsTable({ label, rows }: StatsTableProps) {
+  const totalRequests = rows.reduce((sum, entry) => sum + entry.requests, 0);
   return (
     <Panel
       className="stats-table"
@@ -21,6 +46,9 @@ export function StatsTable({ label, rows }: StatsTableProps) {
               <th>{label}</th>
               <th className="num" title="How many times this was called">
                 Requests
+              </th>
+              <th className="stats-share-col" title="Share of all requests in this table">
+                Share
               </th>
               <th className="num" title="Estimated USD for tokens in this row">
                 Cost
@@ -51,27 +79,39 @@ export function StatsTable({ label, rows }: StatsTableProps) {
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td colSpan={10} className="table-empty">
+                <td colSpan={COLUMN_COUNT} className="table-empty">
                   No requests in this filter window yet.
                 </td>
               </tr>
             ) : (
-              rows.map((entry) => (
-                <tr key={entry.key}>
-                  <td className="mono stats-key" title={entry.key}>
-                    {entry.key}
-                  </td>
-                  <td className="num">{formatNumber(entry.requests)}</td>
-                  <td className="num">{formatUsd(entry.cost_usd)}</td>
-                  <td className={entry.errors > 0 ? "num t-err" : "num"}>{formatNumber(entry.errors)}</td>
-                  <td className="num">{formatMs(entry.ttft_p50_ms)}</td>
-                  <td className="num">{formatTps(entry.tokens_per_sec_p50)}</td>
-                  <td className="num">{formatNumber(entry.cache_read_tokens)}</td>
-                  <td className="num">{formatMs(entry.p50_ms)}</td>
-                  <td className="num">{formatNumber(entry.tokens_in)}</td>
-                  <td className="num">{formatNumber(entry.tokens_out)}</td>
-                </tr>
-              ))
+              rows.map((entry) => {
+                const share = totalRequests > 0 ? entry.requests / totalRequests : 0;
+                return (
+                  <tr key={entry.key}>
+                    <td className="mono stats-key" title={entry.key}>
+                      <KeyCell entryKey={entry.key} />
+                    </td>
+                    <td className="num">{formatNumber(entry.requests)}</td>
+                    <td>
+                      <ShareBar fraction={share} label={`${formatPct(share * 100)} of requests`} />
+                    </td>
+                    <td className="num">{formatUsd(entry.cost_usd)}</td>
+                    <td className={entry.errors > 0 ? "num t-err" : "num"}>{formatNumber(entry.errors)}</td>
+                    <td className="num">{formatMs(entry.ttft_p50_ms)}</td>
+                    <td className="num">{formatRate(entry.tokens_per_sec_p50)}</td>
+                    <td className="num">
+                      <CompactCount value={entry.cache_read_tokens} />
+                    </td>
+                    <td className="num">{formatMs(entry.p50_ms)}</td>
+                    <td className="num">
+                      <CompactCount value={entry.tokens_in} />
+                    </td>
+                    <td className="num">
+                      <CompactCount value={entry.tokens_out} />
+                    </td>
+                  </tr>
+                );
+              })
             )}
           </tbody>
         </table>

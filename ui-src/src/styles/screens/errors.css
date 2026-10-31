@@ -1,13 +1,99 @@
-.errors-toolbar {
-  margin-bottom: 12px;
+.toolbar.errors-toolbar {
+  margin-bottom: 14px;
+}
+
+.errors-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--border);
+}
+
+.errors-kpis > .kpi {
+  border: 0;
+  border-radius: 0;
+}
+
+.errors-kpis .kpi-row {
+  flex-wrap: wrap;
+}
+
+.errors-kpis > .kpi:last-child .kpi-value {
+  font-size: 16px;
+  line-height: 1.6;
 }
 
 .errors-body {
-  margin-top: 12px;
+  margin-top: 16px;
 }
 
-.errors-table .error-reason {
-  width: 55%;
+.errors-reasons .share-bar {
+  display: block;
+  flex: none;
+  width: 90px;
+  height: 4px;
+}
+
+.errors-reasons .share-fill {
+  border-radius: 2px;
+  background: var(--danger-text);
+}
+
+.errors-reasons .errors-reason-count {
+  width: 40px;
+  color: var(--danger-text);
+  font-weight: 600;
+}
+
+.errors-reasons .errors-reason-text {
+  max-width: 330px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.errors-reasons .errors-reason-models,
+.errors-reasons .errors-reason-last {
+  color: var(--muted);
+}
+
+.errors-reasons .errors-reason-last {
+  font-variant-numeric: tabular-nums;
+}
+
+.errors-reasons tbody tr.errors-reason-active {
+  background: var(--panel-hover);
+}
+
+.errors-reasons .chip {
+  padding: 1px 8px;
+  font-size: 11px;
+}
+
+.errors-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+}
+
+.errors-filter-text {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.errors-table .errors-call-reason {
+  max-width: 420px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .errors-table-scroll {
@@ -20,57 +106,13 @@
   text-align: center;
 }
 
-.errors-reasons {
-  display: grid;
-  gap: 6px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
+@media (max-width: 900px) {
+  .errors-kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 
-.errors-reason {
-  display: grid;
-  grid-template-columns: 56px 1fr;
-  column-gap: 12px;
-  row-gap: 2px;
-  width: 100%;
-  min-height: 44px;
-  padding: 8px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--panel-2);
-  color: var(--text);
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-  transition: border-color var(--ease), background-color var(--ease);
-}
-
-.errors-reason:hover {
-  border-color: var(--border-strong);
-  background: var(--panel-hover);
-}
-
-.errors-reason.active {
-  border-color: var(--border-strong);
-  background: var(--danger-soft);
-}
-
-.errors-reason-count {
-  grid-row: span 2;
-  align-self: center;
-  color: var(--danger-text);
-  font: 600 13px var(--mono);
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-}
-
-.errors-reason-text {
-  font: 12.5px var(--mono);
-  overflow-wrap: anywhere;
-}
-
-.errors-reason-meta {
-  color: var(--muted);
-  font-size: 12px;
+  .errors-reasons .errors-reason-text,
+  .errors-table .errors-call-reason {
+    max-width: 220px;
+  }
 }

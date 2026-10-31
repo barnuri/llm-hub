@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 
+import { KpiCard } from "../components/KpiCard";
 import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
+import { ShareBar } from "../components/ShareBar";
 import { api } from "../lib/api";
 import { formatMs, formatNumber, formatPct, formatTps } from "../lib/format";
 import { navigate, useRoute } from "../lib/router";
@@ -29,6 +31,10 @@ const RANGES: readonly SegmentedOption<InsightsRange>[] = [
 ];
 
 const MIN_CALL_OPTIONS: readonly number[] = [1, 3, 5, 10, 25];
+const MIN_CALL_SEGMENTS: readonly SegmentedOption<string>[] = MIN_CALL_OPTIONS.map((option) => ({
+  value: String(option),
+  label: String(option),
+}));
 const DEFAULT_MIN_CALLS = 5;
 const STABILITY_WEIGHT = 0.6;
 const SPEED_WEIGHT = 0.4;
@@ -76,6 +82,13 @@ function formatContext(tokens: number | null): string {
   }
   const unit = tokens % 1024 === 0 ? 1024 : 1000;
   return `${formatNumber(Math.round(tokens / unit))}k`;
+}
+
+function formatRate(tokensPerSec: number | null): string {
+  if (!tokensPerSec) {
+    return "—";
+  }
+  return formatNumber(tokensPerSec, tokensPerSec >= 100 ? 0 : 1);
 }
 
 function queryString(range: InsightsRange, minCalls: number): string {
@@ -130,25 +143,23 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
   const unranked = models.filter((model) => !model.ranked);
   const pickUrl = `${window.location.origin}/api/insights/pick?${queryString(range, minCalls)}`;
   const agentReportPath = `/api/insights/report?${queryString(range, minCalls)}`;
+  const agentReportUrl = `${window.location.origin}${agentReportPath}`;
+  const pickHealth = pick ? models.find((model) => model.model === pick.model)?.health : undefined;
 
   return (
     <section className="tab active insights" aria-busy={report === null && !unavailable}>
       <div className="toolbar insights-toolbar">
         <Segmented label="Insights period" options={RANGES} value={range} onChange={(value) => go(value, minCalls)} />
-        <label className="insights-min">
-          <span>Rank models with at least</span>
-          <select
-            className="input"
-            value={minCalls}
-            onChange={(event) => go(range, Number(event.target.value))}
-          >
-            {MIN_CALL_OPTIONS.map((option) => (
-              <option key={option} value={option}>
-                {option} {option === 1 ? "call" : "calls"}
-              </option>
-            ))}
-          </select>
-        </label>
+        <div className="insights-min">
+          <span aria-hidden="true">Rank models with at least</span>
+          <Segmented
+            label="Minimum calls to rank a model"
+            options={MIN_CALL_SEGMENTS}
+            value={String(minCalls)}
+            onChange={(value) => go(range, Number(value))}
+          />
+          <span aria-hidden="true">calls</span>
+        </div>
       </div>
       <p className="dim insights-intro">
         Which model has been fastest and most reliable, from real calls through the hub. These numbers measure speed
@@ -174,13 +185,15 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
               </button>
             }
           >
-            <div role="status">
+            <div role="status" className="insights-pick-body">
               <div className="insights-pick-title">
-                Use <span className="mono">{pick.model}</span>
+                <span>Use</span>
+                <span className="mono insights-pick-model">{pick.model}</span>
+                {pickHealth ? <HealthPill health={pickHealth} /> : null}
               </div>
-              <div className="dim">{pick.reason}</div>
+              <div className="insights-pick-reason">{pick.reason}</div>
               {pick.alternatives.length > 0 ? (
-                <div className="dim">
+                <div className="dim insights-pick-next">
                   Next best:{" "}
                   <span className="mono">{pick.alternatives.map((alt) => shortName(alt.model)).join(", ")}</span>
                 </div>
@@ -197,7 +210,8 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
           </Panel>
         )}
         <Panel title="Agent report" sub="JSON for agents and scripts">
-          <p className="dim insights-agent-text">One JSON with a summary, every pick and failure reasons.</p>
+          <p className="insights-agent-text">One JSON with a summary, every pick and failure reasons.</p>
+          <div className="mono insights-agent-url">{agentReportUrl.replace(/^https?:\/\//, "")}</div>
           <div className="toolbar">
             <a className="btn small" href={agentReportPath} target="_blank" rel="noreferrer">
               Open agent report
@@ -205,7 +219,7 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
             <button
               type="button"
               className="btn small"
-              onClick={() => onCopy(`${window.location.origin}${agentReportPath}`)}
+              onClick={() => onCopy(agentReportUrl)}
             >
               Copy agent report URL
             </button>
@@ -220,7 +234,7 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
       {ranked.length > 0 ? (
         <Panel
           title="Ranking"
-          sub="Overall score = 60% reliability + 40% speed"
+          sub="overall score = 60% reliability + 40% speed"
           actions={
             <div className="insights-legend dim" aria-hidden="true">
               <span className="insights-swatch reliability" /> Reliability
@@ -231,31 +245,64 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
           <p className="dim insights-panel-note">
             Speed compares first-token time and output speed with the best ranked model.
           </p>
-          <ol className="insights-ranking">
-            {ranked.map((model) => (
-              <RankingRow key={model.model} model={model} />
-            ))}
-          </ol>
+          <div className="table-scroll">
+            <table className="table insights-ranking">
+              <thead>
+                <tr>
+                  <th className="num">#</th>
+                  <th>Model</th>
+                  <th>Health</th>
+                  <th className="num">Calls</th>
+                  <th className="num">Success</th>
+                  <th className="insights-score-col">Score</th>
+                  <th className="num">Overall</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ranked.map((model, index) => (
+                  <RankingRow key={model.model} model={model} position={index + 1} />
+                ))}
+              </tbody>
+            </table>
+          </div>
         </Panel>
       ) : null}
 
       {models.length > 0 ? (
-        <Panel title="All models" sub={`${formatNumber(models.length)} models, ranked first`}>
+        <Panel
+          title="All models"
+          sub={`${formatNumber(models.length)} models, ranked first`}
+          actions={
+            <span className="insights-abbr">TTFT = first token · Out = output speed · Prefill = prompt reading</span>
+          }
+        >
           <div className="table-scroll insights-table-scroll">
-            <table className="table">
+            <table className="table insights-models">
               <thead>
                 <tr>
                   <th>Model</th>
                   <th>Good for</th>
                   <th>Health</th>
-                  <th className="num">Context</th>
+                  <th className="num" title="Context window">
+                    Ctx
+                  </th>
                   <th className="num">Calls</th>
                   <th className="num">Success</th>
-                  <th className="num">First token p50</th>
-                  <th className="num">First token p95</th>
-                  <th className="num">Output speed</th>
-                  <th className="num">Prompt reading</th>
-                  <th className="num">Cache hit</th>
+                  <th className="num" title="Time to first token, median">
+                    TTFT p50
+                  </th>
+                  <th className="num" title="Time to first token, slow tail">
+                    TTFT p95
+                  </th>
+                  <th className="num" title="Output speed, median">
+                    Out tok/s
+                  </th>
+                  <th className="num" title="Prompt reading speed, median">
+                    Prefill tok/s
+                  </th>
+                  <th className="num" title="Prompt share served from cache">
+                    Cache
+                  </th>
                   <th>Best harness</th>
                   <th>Most common error</th>
                 </tr>
@@ -281,12 +328,15 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
 
 function BestFor({ picks }: { readonly picks: readonly UseCasePick[] }) {
   return (
-    <Panel title="Best model for each job" sub="Best-ranked model declared for each use case in the registry">
-      <div className="kpis insights-cards">
+    <Panel title="Best model for each job" sub="best-ranked model declared for each use case in the registry">
+      <div className="insights-strip insights-cards">
         {picks.map((pick) => (
           <div key={pick.use_case} className="kpi insights-card" title={pick.reason}>
             <span className="kpi-label">Best for {pick.use_case}</span>
-            <span className="insights-card-model" title={pick.model ?? undefined}>
+            <span
+              className={pick.ranked ? "insights-card-model" : "insights-card-model declared"}
+              title={pick.model ?? undefined}
+            >
               {shortName(pick.model)}
             </span>
             <span className="kpi-sub">{pick.ranked ? "Ranked from calls" : "Declared only, not enough calls yet"}</span>
@@ -298,14 +348,16 @@ function BestFor({ picks }: { readonly picks: readonly UseCasePick[] }) {
 }
 
 function Harnesses({ harnesses }: { readonly harnesses: readonly HarnessInsight[] }) {
+  const totalCalls = harnesses.reduce((sum, harness) => sum + harness.requests, 0);
   return (
-    <Panel title="By harness" sub="Which client sent the calls, told apart by its User-Agent and headers">
+    <Panel title="By harness" sub="which client sent the calls, told apart by its User-Agent and headers">
       <div className="table-scroll insights-table-scroll">
         <table className="table insights-harness-table">
           <thead>
             <tr>
               <th>Harness</th>
               <th className="num">Calls</th>
+              <th className="insights-share-col">Share</th>
               <th className="num">Success</th>
               <th className="num">First token p50</th>
               <th className="num">Output speed</th>
@@ -316,6 +368,12 @@ function Harnesses({ harnesses }: { readonly harnesses: readonly HarnessInsight[
               <tr key={harness.harness}>
                 <td className="mono">{harness.harness}</td>
                 <td className="num">{formatNumber(harness.requests)}</td>
+                <td>
+                  <ShareBar
+                    fraction={totalCalls > 0 ? harness.requests / totalCalls : 0}
+                    label={`${formatPct(totalCalls > 0 ? (harness.requests / totalCalls) * 100 : 0)} of calls`}
+                  />
+                </td>
                 <td className="num">{formatPct(harness.success_rate_pct)}</td>
                 <td className="num nowrap">{formatMs(harness.ttft_p50_ms ?? 0)}</td>
                 <td className="num nowrap">{formatTps(harness.decode_tokens_per_sec_p50 ?? 0)}</td>
@@ -354,39 +412,45 @@ function Leaders({ report }: { readonly report: InsightsReport }) {
     ],
   ];
   return (
-    <div className="kpis insights-leaders">
+    <div className="insights-strip insights-leaders">
       {tiles.map(([label, model, value]) => (
-        <div key={label} className="kpi">
-          <span className="kpi-label">{label}</span>
-          <span className="kpi-value">{model ? value : "—"}</span>
-          <span className="kpi-sub insights-leader" title={model ?? undefined}>
-            {model ? shortName(model) : "No ranked model yet"}
-          </span>
-        </div>
+        <KpiCard
+          key={label}
+          label={label}
+          value={model ? value : "—"}
+          sub={model ? shortName(model) : "No ranked model yet"}
+        />
       ))}
     </div>
   );
 }
 
-function RankingRow({ model }: { readonly model: ModelInsight }) {
+function RankingRow({ model, position }: { readonly model: ModelInsight; readonly position: number }) {
   const reliability = STABILITY_WEIGHT * (model.stability_score ?? 0);
   const speed = SPEED_WEIGHT * (model.speed_score ?? 0);
   return (
-    <li className="insights-rank-row">
-      <span className="insights-rank-name mono" title={model.model}>
+    <tr>
+      <td className="num insights-rank">{position}</td>
+      <td className="mono nowrap insights-rank-name" title={model.model}>
         {shortName(model.model)}
-      </span>
-      <HealthPill health={model.health} />
-      <span
-        className="insights-bar"
-        role="img"
-        aria-label={`Overall ${formatNumber(model.overall_score ?? 0, 1)}: reliability ${formatNumber(reliability, 1)}, speed ${formatNumber(speed, 1)}`}
-      >
-        <span className="insights-bar-part reliability" style={{ width: `${reliability}%` }} />
-        <span className="insights-bar-part speed" style={{ width: `${speed}%` }} />
-      </span>
-      <span className="insights-score mono">{formatNumber(model.overall_score ?? 0, 1)}</span>
-    </li>
+      </td>
+      <td>
+        <HealthPill health={model.health} />
+      </td>
+      <td className="num">{formatNumber(model.requests)}</td>
+      <td className="num">{formatPct(model.success_rate_pct)}</td>
+      <td>
+        <span
+          className="insights-bar"
+          role="img"
+          aria-label={`Overall ${formatNumber(model.overall_score ?? 0, 1)}: reliability ${formatNumber(reliability, 1)}, speed ${formatNumber(speed, 1)}`}
+        >
+          <span className="insights-bar-part reliability" style={{ width: `${reliability}%` }} />
+          <span className="insights-bar-part speed" style={{ width: `${speed}%` }} />
+        </span>
+      </td>
+      <td className="num insights-score">{formatNumber(model.overall_score ?? 0, 1)}</td>
+    </tr>
   );
 }
 
@@ -394,14 +458,17 @@ function DetailRow({ model }: { readonly model: ModelInsight }) {
   const topError = model.top_errors[0];
   return (
     <tr>
-      <td className="mono nowrap" title={model.summary ?? model.model}>
+      <td
+        className={model.ranked ? "mono nowrap" : "mono nowrap insights-unranked"}
+        title={model.summary ?? model.model}
+      >
         {shortName(model.model)}
       </td>
       <td className="nowrap">
         {model.use_cases.length > 0 ? (
           model.use_cases.map((useCase) => (
             <span key={useCase} className="insights-use">
-              <Pill tone="info">{useCase}</Pill>
+              <Pill>{useCase}</Pill>
             </span>
           ))
         ) : (
@@ -416,11 +483,11 @@ function DetailRow({ model }: { readonly model: ModelInsight }) {
       <td className="num">{formatPct(model.success_rate_pct)}</td>
       <td className="num nowrap">{formatMs(model.ttft_p50_ms ?? 0)}</td>
       <td className="num nowrap">{formatMs(model.ttft_p95_ms ?? 0)}</td>
-      <td className="num nowrap">{formatTps(model.decode_tokens_per_sec_p50 ?? 0)}</td>
-      <td className="num nowrap">{formatTps(model.prefill_tokens_per_sec_p50 ?? 0)}</td>
+      <td className="num nowrap">{formatRate(model.decode_tokens_per_sec_p50)}</td>
+      <td className="num nowrap">{formatRate(model.prefill_tokens_per_sec_p50)}</td>
       <td className="num">{formatPct(model.cache_hit_rate_pct)}</td>
       <td className="mono nowrap">{model.best_harness ?? <span className="dim">—</span>}</td>
-      <td className="error-reason" title={topError?.reason}>
+      <td className={topError ? "mono insights-top-error" : undefined} title={topError?.reason}>
         {topError ? `${topError.reason} (×${topError.count})` : <span className="dim">None</span>}
       </td>
     </tr>

@@ -2,6 +2,7 @@ import { useState } from "react";
 
 import { api } from "../lib/api";
 import { Panel } from "./Panel";
+import { Pill } from "./Pill";
 
 interface FallbacksEditorProps {
   readonly chain: readonly string[];
@@ -18,31 +19,6 @@ interface FallbacksEditorProps {
  *
  * Mount with `key={chain.join(",")}` so a server-side change resets the draft.
  */
-const CHAIN_ICON_PATHS = {
-  up: "M12 19V5M6 11l6-6 6 6",
-  down: "M12 5v14M6 13l6 6 6-6",
-  remove: "M6 6l12 12M18 6L6 18",
-} as const;
-
-function ChainIcon({ name }: { readonly name: keyof typeof CHAIN_ICON_PATHS }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      width="14"
-      height="14"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-      focusable="false"
-    >
-      <path d={CHAIN_ICON_PATHS[name]} />
-    </svg>
-  );
-}
-
 export function FallbacksEditor({ chain, models, readonly, onSaved, onToast }: FallbacksEditorProps) {
   const [draft, setDraft] = useState<readonly string[]>(chain);
   const [saving, setSaving] = useState(false);
@@ -74,54 +50,62 @@ export function FallbacksEditor({ chain, models, readonly, onSaved, onToast }: F
   };
 
   return (
-    <Panel title="Default fallbacks" sub="Optional. Tried in order when the requested model fails.">
-      <p className="note">
-        Per-request override: <code>x-llm-hub-fallbacks</code>
-      </p>
+    <Panel title="Default fallbacks" sub="Tried in order when the requested model fails" className="fallbacks">
       {draft.length === 0 ? (
-        <p className="note">No default fallbacks. Pick a model below to build a chain.</p>
+        <p className="note fallbacks-empty">No default fallbacks. Pick a model below to build a chain.</p>
       ) : (
-        <ol className="chain-list">
-          {draft.map((id, index) => (
-            <li key={id}>
-              <span className="mono">{id}</span>
-              <span className="chain-actions">
-                <button
-                  type="button"
-                  className="btn small icon"
-                  aria-label={`Move ${id} up`}
-                  title="Move up"
-                  disabled={readonly || index === 0}
-                  onClick={() => move(index, -1)}
-                >
-                  <ChainIcon name="up" />
-                </button>
-                <button
-                  type="button"
-                  className="btn small icon"
-                  aria-label={`Move ${id} down`}
-                  title="Move down"
-                  disabled={readonly || index === draft.length - 1}
-                  onClick={() => move(index, 1)}
-                >
-                  <ChainIcon name="down" />
-                </button>
-                <button
-                  type="button"
-                  className="btn small icon danger"
-                  aria-label={`Remove ${id} from fallbacks`}
-                  title="Remove"
-                  disabled={readonly}
-                  onClick={() => setDraft(draft.filter((entry) => entry !== id))}
-                >
-                  <ChainIcon name="remove" />
-                </button>
-              </span>
-            </li>
-          ))}
-        </ol>
+        <div className="table-scroll">
+          <table className="table">
+            <thead>
+              <tr>
+                <th className="fallbacks-index">#</th>
+                <th>Model</th>
+                <th>
+                  <span className="sr-only">Actions</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {draft.map((id, index) => (
+                <tr key={id}>
+                  <td className="num dim fallbacks-index">{index + 1}</td>
+                  <td className="mono">{id}</td>
+                  <td className="fallbacks-actions">
+                    <button
+                      type="button"
+                      className="btn small"
+                      aria-label={`Move ${id} up`}
+                      disabled={readonly || index === 0}
+                      onClick={() => move(index, -1)}
+                    >
+                      Up
+                    </button>
+                    <button
+                      type="button"
+                      className="btn small"
+                      aria-label={`Move ${id} down`}
+                      disabled={readonly || index === draft.length - 1}
+                      onClick={() => move(index, 1)}
+                    >
+                      Down
+                    </button>
+                    <button
+                      type="button"
+                      className="btn small danger"
+                      aria-label={`Remove ${id} from fallbacks`}
+                      disabled={readonly}
+                      onClick={() => setDraft(draft.filter((entry) => entry !== id))}
+                    >
+                      Remove
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
-      <div className="toolbar">
+      <div className="toolbar fallbacks-add">
         <label className="dim" htmlFor="fallbacks-add">
           Add model
         </label>
@@ -146,6 +130,12 @@ export function FallbacksEditor({ chain, models, readonly, onSaved, onToast }: F
         <button type="button" className="btn primary" onClick={save} disabled={readonly || !dirty || saving}>
           {saving ? "Saving…" : "Save fallbacks"}
         </button>
+      </div>
+      <div className="fallbacks-foot">
+        <span>
+          Per-request override header: <code>x-llm-hub-fallbacks</code>
+        </span>
+        {dirty ? <Pill>unsaved changes</Pill> : null}
       </div>
     </Panel>
   );

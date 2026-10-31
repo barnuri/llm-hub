@@ -1,13 +1,33 @@
-.profiles > .panel:first-child {
+.tab.active.profiles {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.profiles > .panel,
+.profiles-split > .panel {
   margin-top: 0;
 }
 
-.profiles > .panel + .panel {
-  margin-top: 12px;
+.profiles-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.profiles-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.kpi-strip.profiles-kpis {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .profiles-scroll {
-  max-height: calc(100vh - 320px);
+  max-height: calc(100vh - 360px);
   overflow-y: auto;
 }
 
@@ -22,20 +42,108 @@
 }
 
 .profiles .table td.profiles-url {
-  max-width: 320px;
+  max-width: 280px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.profiles .table td.profiles-actions {
+.profiles .table td.profiles-last-test {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profiles .table td.profiles-actions,
+.fallbacks .table td.fallbacks-actions {
   width: 1%;
   text-align: right;
   white-space: nowrap;
 }
 
-.profiles-actions .btn + .btn {
+.profiles-actions .btn + .btn,
+.fallbacks-actions .btn + .btn {
   margin-left: 4px;
+}
+
+.profiles-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 380px;
+  gap: 12px;
+  align-items: start;
+}
+
+.fallbacks .table th.fallbacks-index,
+.fallbacks .table td.fallbacks-index {
+  width: 28px;
+  text-align: left;
+}
+
+.fallbacks-empty {
+  margin: 0 0 10px;
+}
+
+.fallbacks .table-scroll {
+  margin-bottom: 10px;
+}
+
+.panel .toolbar.fallbacks-add {
+  flex-wrap: nowrap;
+  margin-bottom: 10px;
+}
+
+.fallbacks-add select {
+  flex: 1;
+  min-width: 0;
+}
+
+.fallbacks-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 22px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.fallbacks-foot code {
+  color: var(--text);
+  font-family: var(--mono);
+}
+
+.profile-form .field {
+  margin-bottom: 8px;
+}
+
+.profile-form .input::placeholder {
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+.profile-form .input[readonly] {
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.profile-form-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.profile-form-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.profile-form-idle .note {
+  margin: 0;
 }
 
 .profiles .field-error {
@@ -48,7 +156,7 @@
   border-color: var(--danger);
 }
 
-.profiles .field label.field-check {
+.profiles label.field-check {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -63,4 +171,14 @@
   height: 15px;
   margin: 0;
   accent-color: var(--accent);
+}
+
+@media (max-width: 1100px) {
+  .profiles-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .kpi-strip.profiles-kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }

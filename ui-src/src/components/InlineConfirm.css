@@ -1,0 +1,29 @@
+.inline-confirm {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-color: var(--danger-tint);
+}
+
+.inline-confirm-text {
+  margin: 0;
+  font-size: 12.5px;
+}
+
+.inline-confirm-text .dim {
+  font-size: inherit;
+}
+
+.inline-confirm-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 600px) {
+  .inline-confirm {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}

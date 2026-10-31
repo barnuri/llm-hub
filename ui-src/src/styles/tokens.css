@@ -79,8 +79,8 @@
   --chart-7: #e11d48;
   --chart-8: #a16207;
   --upstream-1: #1f8a5b;
-  --upstream-2: #11563a;
-  --upstream-rest: #6db394;
+  --upstream-2: #6fb894;
+  --upstream-rest: #b9dcc9;
 }
 
 @media (prefers-color-scheme: light) {
@@ -122,8 +122,8 @@
     --chart-7: #e11d48;
     --chart-8: #a16207;
     --upstream-1: #1f8a5b;
-    --upstream-2: #11563a;
-    --upstream-rest: #6db394;
+    --upstream-2: #6fb894;
+    --upstream-rest: #b9dcc9;
   }
 }
 

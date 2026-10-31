@@ -3,15 +3,19 @@ import { useEffect, useState } from "react";
 import { KpiCard } from "../components/KpiCard";
 import { Panel } from "../components/Panel";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
+import { ShareBar } from "../components/ShareBar";
 import { api } from "../lib/api";
-import { formatDateTime, formatMs, formatNumber } from "../lib/format";
+import { formatDateTime, formatMs, formatNumber, formatPct } from "../lib/format";
 import { navigate, useRoute } from "../lib/router";
-import type { ErrorsRange, ErrorsReport, UsageRow } from "../lib/types";
+import type { ErrorsRange, ErrorsReport, StatsSnapshot, UsageRow } from "../lib/types";
 import "../styles/screens/errors.css";
 
 const PAGE_SIZE = 25;
 const TOP_REASONS = 5;
 const UNRECORDED_REASON = "Reason not recorded (before error capture)";
+const DAY_MS = 86_400_000;
+const SPARK_DAYS = 7;
+const PERCENT = 100;
 const RANGES: readonly SegmentedOption<ErrorsRange>[] = [
   { value: "1d", label: "Today" },
   { value: "7d", label: "7 days" },
@@ -44,6 +48,23 @@ function groupReasons(rows: readonly UsageRow[]): readonly ReasonGroup[] {
     .sort((a, b) => b.count - a.count || b.lastTsMs - a.lastTsMs);
 }
 
+function dayOf(tsMs: number): number {
+  return Math.floor(tsMs / DAY_MS) * DAY_MS;
+}
+
+function lastDays(nowMs: number): number[] {
+  const today = dayOf(nowMs);
+  return Array.from({ length: SPARK_DAYS }, (_, index) => today - (SPARK_DAYS - 1 - index) * DAY_MS);
+}
+
+function dailyErrors(days: readonly number[], rows: readonly UsageRow[]): number[] {
+  return days.map((day) => rows.filter((row) => dayOf(row.ts_ms) === day).length);
+}
+
+function dailyModels(days: readonly number[], rows: readonly UsageRow[]): number[] {
+  return days.map((day) => new Set(rows.filter((row) => dayOf(row.ts_ms) === day).map((row) => row.model)).size);
+}
+
 function parseRange(value: string | null): ErrorsRange {
   if (value === "1d" || value === "7d" || value === "30d" || value === "all") {
     return value;
@@ -55,9 +76,12 @@ export function ErrorsScreen() {
   const route = useRoute();
   const range = parseRange(route.query.get("range"));
   const [report, setReport] = useState<ErrorsReport | null>(null);
+  const [loadedAtMs, setLoadedAtMs] = useState(0);
   const [unavailable, setUnavailable] = useState(false);
   const [page, setPage] = useState(0);
   const [reasonFilter, setReasonFilter] = useState<string | null>(null);
+  const [showAllReasons, setShowAllReasons] = useState(false);
+  const [calls, setCalls] = useState<StatsSnapshot | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,6 +90,7 @@ export function ErrorsScreen() {
       .then((body) => {
         if (!cancelled) {
           setReport(body);
+          setLoadedAtMs(Date.now());
           setPage(0);
         }
       })
@@ -73,6 +98,18 @@ export function ErrorsScreen() {
         if (!cancelled) {
           setUnavailable(true);
           setReport(null);
+        }
+      });
+    api<StatsSnapshot>(`/api/stats?range=${range}`)
+      .then((body) => {
+        if (!cancelled) {
+          setCalls(body);
+        }
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          console.warn("Call totals unavailable for the error rate", err);
+          setCalls(null);
         }
       });
     return () => {
@@ -106,8 +143,22 @@ export function ErrorsScreen() {
 
   const totalErrors = report?.total_errors ?? 0;
   const modelsAffected = new Set(allRows.map((row) => row.model)).size;
-  const lastErrorMs = allRows.reduce((latest, row) => Math.max(latest, row.ts_ms), 0);
+  const lastError = allRows.reduce<UsageRow | null>(
+    (latest, row) => (latest === null || row.ts_ms > latest.ts_ms ? row : latest),
+    null,
+  );
   const rangeLabel = RANGES.find((option) => option.value === range)?.label ?? range;
+  const totalCalls = calls?.filterable && calls.range === range ? calls.overview.requests : 0;
+  const errorsSub =
+    totalCalls > 0
+      ? `${rangeLabel} · ${formatPct((totalErrors / totalCalls) * PERCENT)} of ${formatNumber(totalCalls)} calls`
+      : rangeLabel;
+  const sparkDays = report && range === "7d" && allRows.length === totalErrors ? lastDays(loadedAtMs) : null;
+  const shownReasons = showAllReasons ? reasons : reasons.slice(0, TOP_REASONS);
+  const reasonsSub =
+    reasons.length > TOP_REASONS && !showAllReasons
+      ? `Select a reason to show only those calls · top ${TOP_REASONS} of ${formatNumber(reasons.length)}`
+      : "Select a reason to show only those calls";
 
   return (
     <section className="tab active errors" aria-busy={report === null}>
@@ -121,19 +172,27 @@ export function ErrorsScreen() {
         <span className="dim">Failed calls (HTTP 400+) in the selected window</span>
       </div>
 
-      <div className="kpis">
+      <div className="errors-kpis">
         <KpiCard
           label="Errors"
           value={report ? formatNumber(totalErrors) : "…"}
-          sub={rangeLabel}
+          sub={errorsSub}
           tone={totalErrors > 0 ? "danger" : "default"}
+          series={sparkDays ? dailyErrors(sparkDays, allRows) : undefined}
+          seriesLabel="Errors per day, last 7 days"
         />
         <KpiCard label="Distinct reasons" value={report ? formatNumber(reasons.length) : "…"} sub="In recent failures" />
-        <KpiCard label="Models affected" value={report ? formatNumber(modelsAffected) : "…"} sub="In recent failures" />
+        <KpiCard
+          label="Models affected"
+          value={report ? formatNumber(modelsAffected) : "…"}
+          sub="In recent failures"
+          series={sparkDays ? dailyModels(sparkDays, allRows) : undefined}
+          seriesLabel="Models with a failure per day, last 7 days"
+        />
         <KpiCard
           label="Last error"
-          value={lastErrorMs > 0 ? formatDateTime(lastErrorMs) : "None"}
-          sub={lastErrorMs > 0 ? "Most recent failed call" : "No failures in this window"}
+          value={lastError ? formatDateTime(lastError.ts_ms) : "None"}
+          sub={lastError ? `Most recent failed call · ${lastError.model}` : "No failures in this window"}
         />
       </div>
 
@@ -141,33 +200,74 @@ export function ErrorsScreen() {
         {reasons.length > 0 ? (
           <Panel
             title="Top reasons"
-            sub={reasonFilter ? "Filtering the calls below" : "Select a reason to show only those calls"}
+            sub={reasonsSub}
             actions={
-              reasonFilter ? (
-                <button type="button" className="btn small" onClick={() => toggleReason(reasonFilter)}>
-                  Show all reasons
-                </button>
-              ) : null
-            }
-          >
-            <ul className="errors-reasons">
-              {reasons.slice(0, TOP_REASONS).map((group) => (
-                <li key={group.reason}>
+              <>
+                {reasonFilter ? (
                   <button
                     type="button"
-                    className={reasonFilter === group.reason ? "errors-reason active" : "errors-reason"}
-                    aria-pressed={reasonFilter === group.reason}
-                    onClick={() => toggleReason(group.reason)}
+                    className="chip errors-filter-chip"
+                    title="Clear the reason filter"
+                    onClick={() => toggleReason(reasonFilter)}
                   >
-                    <span className="errors-reason-count">{formatNumber(group.count)}×</span>
-                    <span className="errors-reason-text">{group.reason}</span>
-                    <span className="errors-reason-meta">
-                      {group.models.join(", ")}. Last {formatDateTime(group.lastTsMs)}
-                    </span>
+                    Filter: <span className="errors-filter-text">{reasonFilter}</span>
+                    <span aria-hidden="true">×</span>
                   </button>
-                </li>
-              ))}
-            </ul>
+                ) : null}
+                {reasons.length > TOP_REASONS ? (
+                  <button type="button" className="btn small" onClick={() => setShowAllReasons((shown) => !shown)}>
+                    {showAllReasons ? `Show top ${TOP_REASONS}` : "Show all reasons"}
+                  </button>
+                ) : null}
+              </>
+            }
+          >
+            <div className="table-scroll">
+              <table className="table errors-reasons">
+                <thead>
+                  <tr>
+                    <th className="num">Count</th>
+                    <th>Share</th>
+                    <th>Reason</th>
+                    <th>Models</th>
+                    <th>Last</th>
+                    <th>
+                      <span className="sr-only">Filter</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {shownReasons.map((group) => {
+                    const active = reasonFilter === group.reason;
+                    const share = allRows.length > 0 ? group.count / allRows.length : 0;
+                    return (
+                      <tr key={group.reason} className={active ? "errors-reason-active" : undefined}>
+                        <td className="num errors-reason-count">{formatNumber(group.count)}×</td>
+                        <td>
+                          <ShareBar fraction={share} label={`${formatPct(share * PERCENT)} of failures`} />
+                        </td>
+                        <td className="mono errors-reason-text" title={group.reason}>
+                          {group.reason}
+                        </td>
+                        <td className="mono errors-reason-models">{group.models.join(", ")}</td>
+                        <td className="nowrap errors-reason-last">{formatDateTime(group.lastTsMs)}</td>
+                        <td>
+                          <button
+                            type="button"
+                            className={active ? "chip active" : "chip"}
+                            aria-pressed={active}
+                            aria-label={active ? `Stop filtering by ${group.reason}` : `Filter by ${group.reason}`}
+                            onClick={() => toggleReason(group.reason)}
+                          >
+                            {active ? "On" : "Filter"}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           </Panel>
         ) : null}
 
@@ -223,7 +323,7 @@ export function ErrorsScreen() {
                       <td className="mono nowrap">{row.model}</td>
                       <td className="num t-err">{row.status}</td>
                       <td className="num nowrap">{formatMs(row.latency_ms)}</td>
-                      <td className="mono error-reason" title={row.error ?? undefined}>
+                      <td className="mono errors-call-reason" title={row.error ?? undefined}>
                         {row.error ?? <span className="dim">not recorded</span>}
                       </td>
                     </tr>

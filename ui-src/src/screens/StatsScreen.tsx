@@ -1,11 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 
+import { CompactCount } from "../components/CompactCount";
 import { KpiCard } from "../components/KpiCard";
 import { Panel } from "../components/Panel";
+import { Pill } from "../components/Pill";
+import { Segmented, type SegmentedOption } from "../components/Segmented";
 import { StatsTable } from "../components/StatsTable";
 import { api } from "../lib/api";
 import { formatMs, formatNumber, formatPct, formatTps, formatUsd } from "../lib/format";
-import type { StatsOverview, StatsRange, StatsSnapshot } from "../lib/types";
+import type { SeriesPoint, StatsOverview, StatsRange, StatsSnapshot } from "../lib/types";
 import "../styles/screens/stats.css";
 
 interface StatsScreenProps {
@@ -13,15 +16,32 @@ interface StatsScreenProps {
 }
 
 const REFRESH_MS = 5000;
+const REFRESH_LABEL = `refresh ${REFRESH_MS / 1000} s`;
 const HERO_SKELETONS = ["ttft", "tps", "cost", "cache", "requests"] as const;
+const SPARK_DAYS = 7;
+const PERCENT = 100;
 
-const RANGES: ReadonlyArray<{ readonly id: StatsRange; readonly label: string; readonly needsPersistent: boolean }> = [
-  { id: "live", label: "Live (since start)", needsPersistent: false },
-  { id: "1d", label: "Last 24 hours", needsPersistent: true },
-  { id: "7d", label: "Last 7 days", needsPersistent: true },
-  { id: "30d", label: "Last 30 days", needsPersistent: true },
-  { id: "all", label: "All time", needsPersistent: true },
+const LIVE_RANGE: SegmentedOption<StatsRange> = { value: "live", label: "Live" };
+const RANGES: readonly SegmentedOption<StatsRange>[] = [
+  LIVE_RANGE,
+  { value: "1d", label: "24 h" },
+  { value: "7d", label: "7 days" },
+  { value: "30d", label: "30 days" },
+  { value: "all", label: "All time" },
 ];
+
+interface DayTotals {
+  requests: number;
+  cost: number;
+  cacheRead: number;
+  tokensIn: number;
+}
+
+interface DailySparks {
+  readonly requests: number[];
+  readonly cost: number[];
+  readonly cacheHitPct: number[];
+}
 
 const METRIC_HELP: ReadonlyArray<{ readonly title: string; readonly body: string }> = [
   {
@@ -30,27 +50,27 @@ const METRIC_HELP: ReadonlyArray<{ readonly title: string; readonly body: string
   },
   {
     title: "Tokens per second",
-    body: "How fast the model keeps writing after it starts. Higher means the answer streams in quicker. Computed from output tokens ÷ generation time.",
+    body: "How fast the model keeps writing after it starts. Computed from output tokens ÷ generation time.",
   },
   {
     title: "Cache read / write",
-    body: "Prompt-cache hits and fills. Cache read = tokens reused from a previous similar prompt (usually cheaper). Cache write = tokens stored for later reuse.",
+    body: "Cache read = tokens reused from a previous similar prompt (usually cheaper). Cache write = tokens stored for later reuse.",
   },
   {
     title: "Cache hit rate",
-    body: "Share of input tokens that came from cache: cache read ÷ tokens in. 0% means nothing was reused; higher means you are saving work.",
+    body: "Share of input tokens that came from cache: cache read ÷ tokens in.",
   },
   {
     title: "Latency p50 / p95",
-    body: "End-to-end time for the whole reply. p50 is the typical call; p95 is the slow tail (95% of calls were this fast or faster).",
+    body: "End-to-end time for the whole reply. p50 is the typical call; p95 is the slow tail.",
   },
   {
     title: "Tokens in / out",
-    body: "Tokens in = size of your prompt. Tokens out = size of the model’s answer. Billing and speed usually track these.",
+    body: "Tokens in = size of your prompt. Tokens out = size of the model’s answer.",
   },
   {
     title: "Cost (USD)",
-    body: "Estimated spend from token counts × your rates (USD per 1M tokens). Cache hits usually cost less than fresh input. Local/unknown models stay $0 unless you set prices.",
+    body: "Estimated spend from token counts × your rates (USD per 1M tokens). Local or unknown models stay $0 unless you set prices.",
   },
 ];
 
@@ -71,6 +91,31 @@ function emptyOverview(): StatsOverview {
     tokens_per_sec_avg: 0,
     cost_usd: 0,
   };
+}
+
+function dailySparks(snapshot: StatsSnapshot | null, range: StatsRange): DailySparks | null {
+  if (!snapshot || snapshot.range !== range || snapshot.series_bucket !== "day" || !snapshot.series?.length) {
+    return null;
+  }
+  const byDay = new Map<number, DayTotals>();
+  for (const point of snapshot.series) {
+    addPoint(byDay, point);
+  }
+  const days = [...byDay.entries()].sort(([left], [right]) => left - right).slice(-SPARK_DAYS);
+  return {
+    requests: days.map(([, day]) => day.requests),
+    cost: days.map(([, day]) => day.cost),
+    cacheHitPct: days.map(([, day]) => (day.tokensIn > 0 ? (day.cacheRead / day.tokensIn) * PERCENT : 0)),
+  };
+}
+
+function addPoint(byDay: Map<number, DayTotals>, point: SeriesPoint): void {
+  const day = byDay.get(point.ts_ms) ?? { requests: 0, cost: 0, cacheRead: 0, tokensIn: 0 };
+  day.requests += point.requests;
+  day.cost += point.cost_usd;
+  day.cacheRead += point.cache_read_tokens;
+  day.tokensIn += point.tokens_in;
+  byDay.set(point.ts_ms, day);
 }
 
 export function StatsScreen({ onError }: StatsScreenProps) {
@@ -127,30 +172,16 @@ export function StatsScreen({ onError }: StatsScreenProps) {
     return [...keys].sort();
   }, [snapshot, profile]);
 
+  const rangeOptions = persistent ? RANGES : [LIVE_RANGE];
+  const sparks = dailySparks(snapshot, range);
+
   return (
     <section className="tab active stats">
-      <div className="stats-filters" role="group" aria-label="Stats filters">
-        <div className="stats-filter">
-          <label htmlFor="stats-range">Time range</label>
+      <div className="toolbar stats-toolbar" role="group" aria-label="Stats filters">
+        <Segmented label="Time range" options={rangeOptions} value={range} onChange={setRange} />
+        <label className="stats-filter">
+          <span>Profile</span>
           <select
-            id="stats-range"
-            className="input"
-            value={range}
-            onChange={(event) => setRange(event.target.value as StatsRange)}
-          >
-            {RANGES.map((option) => (
-              <option key={option.id} value={option.id} disabled={option.needsPersistent && !persistent}>
-                {option.label}
-                {option.needsPersistent && !persistent ? " (needs persistence)" : ""}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div className="stats-filter">
-          <label htmlFor="stats-profile">Profile</label>
-          <select
-            id="stats-profile"
             className="input"
             value={profile}
             onChange={(event) => {
@@ -165,16 +196,10 @@ export function StatsScreen({ onError }: StatsScreenProps) {
               </option>
             ))}
           </select>
-        </div>
-
-        <div className="stats-filter">
-          <label htmlFor="stats-model">Model</label>
-          <select
-            id="stats-model"
-            className="input"
-            value={model}
-            onChange={(event) => setModel(event.target.value)}
-          >
+        </label>
+        <label className="stats-filter">
+          <span>Model</span>
+          <select className="input" value={model} onChange={(event) => setModel(event.target.value)}>
             <option value="">All models</option>
             {modelOptions.map((name) => (
               <option key={name} value={name}>
@@ -182,34 +207,38 @@ export function StatsScreen({ onError }: StatsScreenProps) {
               </option>
             ))}
           </select>
-        </div>
-
-        <p className="note stats-filters-note">
-          {persistent ? (
-            "Live counters refresh every few seconds. Day ranges use durable history from the store."
-          ) : (
-            <>
-              Showing live counters since process start. Enable <code>LLM_HUB_PERSISTENT=true</code> for day filters
-              and durable history.
-            </>
-          )}
-        </p>
+        </label>
+        <span className="stats-refresh">
+          <Pill tone="ok" dot title="Stats refresh on a timer">
+            {REFRESH_LABEL}
+          </Pill>
+        </span>
       </div>
+
+      <p className="dim stats-intro">
+        {persistent ? (
+          "Live counters refresh every few seconds. Day ranges use durable history from the store."
+        ) : (
+          <>
+            Showing live counters since process start. Enable <code>LLM_HUB_PERSISTENT=true</code> for day filters
+            and durable history.
+          </>
+        )}
+        {snapshot?.pricing?.note ? ` ${snapshot.pricing.note}` : null}
+      </p>
 
       {!filterable && range !== "live" ? (
         <p className="note">Day filters need persistence — fell back to live counters.</p>
       ) : null}
 
-      {snapshot?.pricing?.note ? <p className="note">{snapshot.pricing.note}</p> : null}
-
       {snapshot === null ? (
-        <div className="kpis" aria-busy="true" aria-label="Loading stats">
+        <div className="stats-kpis" aria-busy="true" aria-label="Loading stats">
           {HERO_SKELETONS.map((id) => (
             <div key={id} className="skeleton" />
           ))}
         </div>
       ) : (
-        <div className="kpis">
+        <div className="stats-kpis">
           <KpiCard
             tone="info"
             label="TTFT (p50)"
@@ -221,13 +250,24 @@ export function StatsScreen({ onError }: StatsScreenProps) {
             value={formatTps(overview.tokens_per_sec_p50)}
             sub="Streaming speed after the reply starts"
           />
-          <KpiCard label="Est. cost" value={formatUsd(overview.cost_usd)} sub="Estimated USD in this window" />
+          <KpiCard
+            label="Est. cost"
+            value={formatUsd(overview.cost_usd)}
+            sub="Estimated USD in this window"
+            series={sparks?.cost}
+          />
           <KpiCard
             label="Cache hit rate"
             value={formatPct(overview.cache_hit_rate_pct)}
             sub="Prompt share reused from cache"
+            series={sparks?.cacheHitPct}
           />
-          <KpiCard label="Requests" value={formatNumber(overview.requests)} sub="Total calls in this window" />
+          <KpiCard
+            label="Requests"
+            value={formatNumber(overview.requests)}
+            sub="Total calls in this window"
+            series={sparks?.requests}
+          />
         </div>
       )}
 
@@ -239,20 +279,40 @@ export function StatsScreen({ onError }: StatsScreenProps) {
             hint="Failed calls (HTTP 400+)."
             danger={overview.errors > 0}
           />
-          <Metric label="Cache read" value={formatNumber(overview.cache_read_tokens)} hint="Input tokens served from prompt cache." />
-          <Metric label="Cache write" value={formatNumber(overview.cache_write_tokens)} hint="Input tokens stored into prompt cache." />
+          <Metric
+            label="Cache read"
+            value={<CompactCount value={overview.cache_read_tokens} />}
+            hint="Input tokens served from prompt cache."
+          />
+          <Metric
+            label="Cache write"
+            value={<CompactCount value={overview.cache_write_tokens} />}
+            hint="Input tokens stored into prompt cache."
+          />
           <Metric label="Latency p50" value={formatMs(overview.p50_ms)} hint="Typical end-to-end time for a full reply." />
           <Metric label="Latency p95" value={formatMs(overview.p95_ms)} hint="Slow-tail end-to-end time." />
-          <Metric label="Tokens in" value={formatNumber(overview.tokens_in)} hint="Prompt size across matching calls." />
-          <Metric label="Tokens out" value={formatNumber(overview.tokens_out)} hint="Answer size across matching calls." />
-          <Metric label="Tok/s avg" value={formatTps(overview.tokens_per_sec_avg)} hint="Average streaming speed (not just the median)." />
+          <Metric
+            label="Tokens in"
+            value={<CompactCount value={overview.tokens_in} />}
+            hint="Prompt size across matching calls."
+          />
+          <Metric
+            label="Tokens out"
+            value={<CompactCount value={overview.tokens_out} />}
+            hint="Answer size across matching calls."
+          />
+          <Metric
+            label="Tok/s avg"
+            value={formatTps(overview.tokens_per_sec_avg)}
+            hint="Average streaming speed (not just the median)."
+          />
         </dl>
       </Panel>
 
       <StatsTable label="Profile" rows={snapshot?.profiles ?? []} />
       <StatsTable label="Model" rows={snapshot?.models ?? []} />
 
-      <details className="stats-help">
+      <details className="panel stats-help">
         <summary>What do these numbers mean?</summary>
         <dl>
           {METRIC_HELP.map((item) => (
@@ -269,7 +329,7 @@ export function StatsScreen({ onError }: StatsScreenProps) {
 
 interface MetricProps {
   readonly label: string;
-  readonly value: string;
+  readonly value: ReactNode;
   readonly hint: string;
   readonly danger?: boolean;
 }
