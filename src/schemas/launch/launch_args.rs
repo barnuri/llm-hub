@@ -7,6 +7,7 @@ pub struct LaunchArgs {
 }
 
 impl LaunchArgs {
+    /// Splits the arguments after the harness name into the model and the rest.
     #[must_use]
     pub fn parse(args: Vec<String>) -> Self {
         let mut args = args.into_iter().peekable();
@@ -17,11 +18,20 @@ impl LaunchArgs {
         }
     }
 
+    /// Parses borrowed test arguments.
+    #[cfg(test)]
+    #[must_use]
+    pub fn from_strs(args: &[&str]) -> Self {
+        Self::parse(args.iter().map(ToString::to_string).collect())
+    }
+
+    /// The model the user named, if any.
     #[must_use]
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
 
+    /// The arguments the harness receives unchanged.
     #[must_use]
     pub fn into_passthrough(self) -> Vec<String> {
         self.passthrough
@@ -32,13 +42,9 @@ impl LaunchArgs {
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> LaunchArgs {
-        LaunchArgs::parse(args.iter().map(ToString::to_string).collect())
-    }
-
     #[test]
     fn first_plain_argument_is_the_model() {
-        let args = parse(&["copilot/claude-opus-5-5", "-p", "hi"]);
+        let args = LaunchArgs::from_strs(&["copilot/claude-opus-5-5", "-p", "hi"]);
 
         assert_eq!(args.model(), Some("copilot/claude-opus-5-5"));
         assert_eq!(args.into_passthrough(), ["-p", "hi"]);
@@ -46,7 +52,7 @@ mod tests {
 
     #[test]
     fn leading_flag_means_no_model() {
-        let args = parse(&["-p", "hi"]);
+        let args = LaunchArgs::from_strs(&["-p", "hi"]);
 
         assert_eq!(args.model(), None);
         assert_eq!(args.into_passthrough(), ["-p", "hi"]);
@@ -54,7 +60,7 @@ mod tests {
 
     #[test]
     fn empty_first_argument_is_not_a_model() {
-        let args = parse(&["", "--resume"]);
+        let args = LaunchArgs::from_strs(&["", "--resume"]);
 
         assert_eq!(args.model(), None);
         assert_eq!(args.into_passthrough(), ["", "--resume"]);
@@ -62,7 +68,7 @@ mod tests {
 
     #[test]
     fn no_arguments_means_no_model_and_nothing_to_pass() {
-        let args = parse(&[]);
+        let args = LaunchArgs::from_strs(&[]);
 
         assert_eq!(args.model(), None);
         assert!(args.into_passthrough().is_empty());

@@ -495,7 +495,15 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            ["copilot/gpt-4.1", "copilot/gemini-2.5-pro", "copilot/auto"]
+            [
+                "copilot/gpt-4.1",
+                "copilot/gemini-2.5-pro",
+                "copilot/auto",
+                "copilot/auto-efficiency",
+                "copilot/auto-balance",
+                "copilot/auto-intelligence",
+                "copilot/auto-fast"
+            ]
         );
         assert_eq!(state.upstream_health().get("copilot"), Some(&true));
     }

@@ -120,6 +120,9 @@ export type ErrorsRange = "1d" | "7d" | "30d" | "all";
 
 export type AutoTurn = "routed" | "reused" | "default";
 
+/** The Copilot Auto tier a decision was routed on. */
+export type AutoTier = "efficiency" | "balance" | "intelligence" | "fast";
+
 export interface AutoDecision {
   readonly ts_ms: number;
   readonly session: string | null;
@@ -131,6 +134,7 @@ export interface AutoDecision {
   readonly selection_reason: string | null;
   readonly turn: AutoTurn;
   readonly estimated_prompt_tokens: number;
+  readonly tier: AutoTier;
 }
 
 export interface AutoDecisionsResponse {

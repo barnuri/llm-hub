@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::consts::{AUTO_DECISIONS_DEFAULT_LIMIT, AUTO_DECISIONS_MAX_LIMIT};
 use crate::dependencies::state::AppState;
 use crate::schemas::app_error::AppError;
-use crate::services::copilot_auto_decisions::AutoDecision;
+use crate::services::copilot_auto_decisions::TieredDecision;
 use crate::services::copilot_usage::{self, CopilotUsage};
 
 #[derive(Debug, Deserialize, Default)]
@@ -30,7 +30,7 @@ pub struct DecisionsQuery {
 
 #[derive(Serialize)]
 struct DecisionsBody {
-    decisions: Vec<AutoDecision>,
+    decisions: Vec<TieredDecision>,
 }
 
 /// `GET /api/copilot/auto/decisions?session=<id>&limit=N`: recent Copilot Auto

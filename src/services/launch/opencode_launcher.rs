@@ -1,13 +1,12 @@
 use serde_json::{Map, Value, json};
 
 use super::hub_endpoint::HubEndpoint;
-use super::hub_model::HubModel;
-use super::launch_args::LaunchArgs;
-use super::launch_spec::LaunchSpec;
+use crate::schemas::launch::hub_model::HubModel;
+use crate::schemas::launch::launch_args::LaunchArgs;
+use crate::schemas::launch::launch_spec::LaunchSpec;
 
-/// `llm-hub opencode`: opencode on the hub's `/v1/chat/completions`. The
-/// provider arrives in `OPENCODE_CONFIG_CONTENT`, which opencode merges over
-/// the user's own config.
+/// `llm-hub opencode`: opencode on the hub's `/v1/chat/completions`, with the
+/// provider in `OPENCODE_CONFIG_CONTENT`, merged over the user's config.
 #[derive(Debug)]
 pub struct OpencodeLauncher;
 
@@ -16,6 +15,7 @@ impl OpencodeLauncher {
     const PROVIDER_ID: &str = "llm-hub";
     const CONFIG_VAR: &str = "OPENCODE_CONFIG_CONTENT";
 
+    /// The opencode command, with every catalog model in the `llm-hub` provider.
     #[must_use]
     pub fn spec(endpoint: &HubEndpoint, args: LaunchArgs, catalog: &[HubModel]) -> LaunchSpec {
         let config = Self::config(endpoint, args.model(), catalog);
@@ -63,10 +63,6 @@ impl OpencodeLauncher {
 mod tests {
     use super::*;
 
-    fn args(values: &[&str]) -> LaunchArgs {
-        LaunchArgs::parse(values.iter().map(ToString::to_string).collect())
-    }
-
     fn config_of(spec: &LaunchSpec) -> Value {
         serde_json::from_str(spec.env_value("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap()
     }
@@ -80,7 +76,7 @@ mod tests {
 
         let spec = OpencodeLauncher::spec(
             &HubEndpoint::from_lookup(|_| None),
-            args(&["run", "hi"]),
+            LaunchArgs::from_strs(&["run", "hi"]),
             &catalog,
         );
 
@@ -111,7 +107,7 @@ mod tests {
     fn model_selects_the_hub_provider_entry() {
         let spec = OpencodeLauncher::spec(
             &HubEndpoint::from_lookup(|_| None),
-            args(&["copilot/auto", "--continue"]),
+            LaunchArgs::from_strs(&["copilot/auto", "--continue"]),
             &[],
         );
 
@@ -123,7 +119,7 @@ mod tests {
     fn without_a_model_the_user_default_model_stays() {
         let spec = OpencodeLauncher::spec(
             &HubEndpoint::from_lookup(|_| None),
-            args(&["--continue"]),
+            LaunchArgs::from_strs(&["--continue"]),
             &[],
         );
 

@@ -3,20 +3,24 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::hub_endpoint::HubEndpoint;
-use super::hub_model::HubModel;
 use crate::consts::VERSION;
+use crate::schemas::launch::hub_model::HubModel;
+use crate::schemas::launch::profile_filter::ProfileFilter;
 
 /// The few hub calls a launcher makes before it starts the harness.
 #[derive(Debug, Clone)]
 pub struct HubClient {
     endpoint: HubEndpoint,
     http: reqwest::Client,
+    profiles: ProfileFilter,
 }
 
 impl HubClient {
     const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
     const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
+    /// A client for `endpoint`.
+    ///
     /// # Errors
     /// Returns a message when the HTTP client cannot be built.
     pub fn new(endpoint: HubEndpoint) -> Result<Self, String> {
@@ -24,14 +28,34 @@ impl HubClient {
             .user_agent(format!("llm-hub/{VERSION}"))
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Self { endpoint, http })
+        Ok(Self {
+            endpoint,
+            http,
+            profiles: ProfileFilter::default(),
+        })
     }
 
+    /// Limits every model and settings fetch to `profiles`.
+    #[must_use]
+    pub fn with_profiles(mut self, profiles: ProfileFilter) -> Self {
+        self.profiles = profiles;
+        self
+    }
+
+    /// The profiles the launched harness is limited to.
+    #[must_use]
+    pub fn profiles(&self) -> &ProfileFilter {
+        &self.profiles
+    }
+
+    /// The hub the client calls.
     #[must_use]
     pub fn endpoint(&self) -> &HubEndpoint {
         &self.endpoint
     }
 
+    /// Checks that the hub answers `GET /healthz`.
+    ///
     /// # Errors
     /// Returns a message when `GET /healthz` fails or takes more than 2 s.
     pub async fn check_reachable(&self) -> Result<(), String> {
@@ -64,10 +88,14 @@ impl HubClient {
     }
 
     async fn fetch(&self, path: &str) -> Option<String> {
-        let response = self
+        let mut request = self
             .http
             .get(format!("{}{path}", self.endpoint.url()))
-            .bearer_auth(self.endpoint.api_key())
+            .bearer_auth(self.endpoint.api_key());
+        if !self.profiles.is_empty() {
+            request = request.query(&[(ProfileFilter::QUERY_PARAM, self.profiles.to_list())]);
+        }
+        let response = request
             .timeout(Self::FETCH_TIMEOUT)
             .send()
             .await
@@ -80,7 +108,7 @@ impl HubClient {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -152,6 +180,28 @@ mod tests {
             client.models().await,
             [HubModel::new("copilot/auto", Some(128_000))]
         );
+    }
+
+    #[tokio::test]
+    async fn profiles_are_sent_on_settings_and_models() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/claude-code/settings"))
+            .and(query_param("profiles", "copilot,ivrit"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1/models"))
+            .and(query_param("profiles", "copilot,ivrit"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "ivrit/m"}]})),
+            )
+            .mount(&server)
+            .await;
+        let client =
+            client_for(&server.uri()).with_profiles(ProfileFilter::from_list("copilot,ivrit"));
+
+        assert_eq!(client.claude_settings().await.as_deref(), Some("{}"));
+        assert_eq!(client.models().await, [HubModel::new("ivrit/m", None)]);
     }
 
     #[tokio::test]

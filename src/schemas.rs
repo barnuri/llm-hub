@@ -10,6 +10,7 @@ pub mod copilot_user_response;
 pub mod errors_report;
 pub mod fallbacks_input;
 pub mod insights;
+pub mod launch;
 pub mod model_context;
 pub mod model_id;
 pub mod profile_input;

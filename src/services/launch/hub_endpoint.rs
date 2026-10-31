@@ -36,6 +36,7 @@ impl HubEndpoint {
         format!("{}/v1", self.url)
     }
 
+    /// The bearer harnesses send to the hub.
     #[must_use]
     pub fn api_key(&self) -> &str {
         &self.api_key
@@ -47,6 +48,7 @@ impl HubEndpoint {
         Self::API_KEY_VAR
     }
 
+    /// The variable that carries the hub URL into harnesses that read it by name.
     #[must_use]
     pub fn url_var() -> &'static str {
         Self::URL_VAR

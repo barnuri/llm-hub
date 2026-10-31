@@ -11,6 +11,7 @@ impl HubModel {
     /// Output budget cap, matching the reserve the benchmark harnesses use.
     const MAX_OUTPUT_TOKENS: u64 = 32_768;
 
+    /// A catalog entry with the given window.
     #[cfg(test)]
     #[must_use]
     pub fn new(id: &str, context_window: Option<u64>) -> Self {
@@ -45,11 +46,13 @@ impl HubModel {
         })
     }
 
+    /// The hub model id.
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
     }
 
+    /// The context window the hub reports, in tokens.
     #[must_use]
     pub fn context_window(&self) -> Option<u64> {
         self.context_window

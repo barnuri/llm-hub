@@ -16,6 +16,9 @@ use crate::services::copilot_auto_decisions::AutoDecisionLog;
 use crate::services::model_limits::{ModelLimit, ModelLimits};
 
 const AUTO_PATH: &str = "auto";
+/// The bare model id of Copilot Auto on its default tier; `auto-<tier>` names a tier.
+pub const AUTO_MODEL: &str = "auto";
+const AUTO_TIER_SEPARATOR: char = '-';
 const HEADER_API_VERSION: &str = "x-github-api-version";
 /// `/auto` rejects every other version with "invalid apiVersion".
 const AUTO_API_VERSION: &str = "2026-08-01";
@@ -66,6 +69,19 @@ pub struct AutoRoute {
     pub estimated_prompt_tokens: u64,
 }
 
+/// A Copilot Auto tier, sent as the `tier` field of the `/auto` body. The
+/// names match VS Code's `autoModeTiers.ts`; `fast` is the tier VS Code keeps
+/// for inline chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoTier {
+    Efficiency,
+    #[default]
+    Balance,
+    Intelligence,
+    Fast,
+}
+
 /// How a turn got its model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -88,6 +104,7 @@ enum SwapReason {
 
 /// The request facts routing needs: the upstream path, the parsed body and its raw size.
 struct AutoInput<'a> {
+    tier: AutoTier,
     path: &'a str,
     body: &'a Value,
     prompt_bytes: usize,
@@ -210,6 +227,64 @@ impl std::fmt::Display for SwapReason {
     }
 }
 
+impl AutoTier {
+    /// Every tier, in the order the model list shows them.
+    pub const ALL: [AutoTier; 4] = [
+        AutoTier::Efficiency,
+        AutoTier::Balance,
+        AutoTier::Intelligence,
+        AutoTier::Fast,
+    ];
+
+    /// The tier of an advertised bare model id: `auto` is the default tier,
+    /// `auto-<tier>` names one, and the retired names `eco`, `balanced` and
+    /// `max` still work. Any other id is not Auto.
+    pub fn from_model(bare_id: &str) -> Option<AutoTier> {
+        if bare_id == AUTO_MODEL {
+            return Some(AutoTier::default());
+        }
+        let name = bare_id
+            .strip_prefix(AUTO_MODEL)?
+            .strip_prefix(AUTO_TIER_SEPARATOR)?;
+        AutoTier::from_name(name)
+    }
+
+    fn from_name(name: &str) -> Option<AutoTier> {
+        match name {
+            "efficiency" | "eco" => Some(AutoTier::Efficiency),
+            "balance" | "balanced" => Some(AutoTier::Balance),
+            "intelligence" | "max" => Some(AutoTier::Intelligence),
+            "fast" => Some(AutoTier::Fast),
+            _ => None,
+        }
+    }
+
+    /// The wire name `/auto` takes, e.g. `balance`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutoTier::Efficiency => "efficiency",
+            AutoTier::Balance => "balance",
+            AutoTier::Intelligence => "intelligence",
+            AutoTier::Fast => "fast",
+        }
+    }
+
+    /// The name shown in model pickers, e.g. `Balance`.
+    pub fn label(self) -> &'static str {
+        match self {
+            AutoTier::Efficiency => "Efficiency",
+            AutoTier::Balance => "Balance",
+            AutoTier::Intelligence => "Intelligence",
+            AutoTier::Fast => "Fast",
+        }
+    }
+
+    /// The bare model id that selects this tier, e.g. `auto-balance`.
+    pub fn model_id(self) -> String {
+        format!("{AUTO_MODEL}{AUTO_TIER_SEPARATOR}{}", self.as_str())
+    }
+}
+
 impl CopilotAutoRouter {
     /// Creates a router with an empty conversation cache and only the seeded prompt limits.
     pub fn new() -> CopilotAutoRouter {
@@ -230,8 +305,9 @@ impl CopilotAutoRouter {
         &self.decisions
     }
 
-    /// Routes this request and returns the upstream model id, the Copilot
-    /// session token to send with it, and what Auto decided. `path` is the
+    /// Routes this request on `tier` and returns the upstream model id, the
+    /// Copilot session token to send with it, and what Auto decided. Each tier
+    /// keeps its own conversation decision. `path` is the
     /// upstream path, which sets the body shape and the endpoint the model must
     /// support. `prompt_bytes` is the raw request size, used to skip models whose
     /// prompt window is too small. `catalog` holds the profile's raw `/models`
@@ -244,6 +320,7 @@ impl CopilotAutoRouter {
         profile: &str,
         bearer: &str,
         api_base: &str,
+        tier: AutoTier,
         path: &str,
         body: &Value,
         prompt_bytes: usize,
@@ -257,6 +334,7 @@ impl CopilotAutoRouter {
             api_base,
         };
         let input = AutoInput {
+            tier,
             path,
             body,
             prompt_bytes,
@@ -274,7 +352,7 @@ impl CopilotAutoRouter {
         now_secs: u64,
     ) -> AutoRoute {
         let estimated = estimated_prompt_tokens(input.prompt_bytes);
-        let Some(turn) = Turn::parse(upstream.profile, input.path, input.body) else {
+        let Some(turn) = Turn::parse(upstream.profile, input.tier, input.path, input.body) else {
             return AutoRoute::default_model(default_model, estimated);
         };
         let slot = self.slot(turn.key);
@@ -288,6 +366,7 @@ impl CopilotAutoRouter {
         if let (Some(kind), Some(prompt)) = (kind, turn.prompt.as_deref()) {
             let request = auto_request_body(
                 prompt,
+                input.tier,
                 &turn,
                 state.as_ref().filter(|_| kind == RouteKind::Check),
             );
@@ -530,11 +609,17 @@ fn parse_schedule(multi_turn: Option<&Value>) -> Option<Schedule> {
     multi_turn.and_then(|value| serde_json::from_value(value.clone()).ok())
 }
 
-/// The `/auto` body: the prompt, the image flag, and on a schedule check the
-/// conversation's multi-turn state.
-fn auto_request_body(prompt: &str, turn: &Turn, conversation: Option<&Conversation>) -> Value {
+/// The `/auto` body: the prompt, the tier, the image flag, and on a schedule
+/// check the conversation's multi-turn state.
+fn auto_request_body(
+    prompt: &str,
+    tier: AutoTier,
+    turn: &Turn,
+    conversation: Option<&Conversation>,
+) -> Value {
     let mut body = Map::new();
     body.insert("prompt".to_string(), Value::from(prompt));
+    body.insert("tier".to_string(), Value::from(tier.as_str()));
     if turn.has_image {
         body.insert("has_image".to_string(), Value::Bool(true));
     }
@@ -837,7 +922,7 @@ impl BodyShape {
 }
 
 impl Turn {
-    fn parse(profile: &str, path: &str, body: &Value) -> Option<Turn> {
+    fn parse(profile: &str, tier: AutoTier, path: &str, body: &Value) -> Option<Turn> {
         let shape = BodyShape::from_path(path)?;
         let items = items(shape, body);
         let system = system_text(shape, body, &items);
@@ -851,7 +936,7 @@ impl Turn {
             latest.is_some_and(|item| content_has_image(item.content, shape.image_part_type()));
         let first_user = user_texts.first().map_or("", String::as_str);
         Some(Turn {
-            key: conversation_key(profile, &system, first_user),
+            key: conversation_key(profile, tier, &system, first_user),
             endpoint: shape.endpoint(),
             prompt,
             has_image,
@@ -962,11 +1047,17 @@ fn content_has_image(content: &Value, image_type: &str) -> bool {
     })
 }
 
-/// Stable across the turns of one conversation: the profile, the system prompt
-/// and the first user message, each length-prefixed so the parts cannot run together.
-fn conversation_key(profile: &str, system: &str, first_user: &str) -> ConversationKey {
+/// Stable across the turns of one conversation: the profile, the tier, the
+/// system prompt and the first user message, each length-prefixed so the parts
+/// cannot run together. A tier switch starts a new decision.
+fn conversation_key(
+    profile: &str,
+    tier: AutoTier,
+    system: &str,
+    first_user: &str,
+) -> ConversationKey {
     let mut hasher = Sha256::new();
-    for part in [profile, system, first_user] {
+    for part in [profile, tier.as_str(), system, first_user] {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }
@@ -1078,6 +1169,7 @@ mod tests {
             api_base: &uri,
         };
         let input = AutoInput {
+            tier: AutoTier::Balance,
             path: upstream_path,
             body,
             prompt_bytes,
@@ -1138,7 +1230,10 @@ mod tests {
         assert_eq!(first, expected);
         assert_eq!(follow_up, expected);
         let bodies = auto_bodies(&server.received_requests().await.unwrap());
-        assert_eq!(bodies[0], json!({"prompt": "fix the bug"}));
+        assert_eq!(
+            bodies[0],
+            json!({"prompt": "fix the bug", "tier": "balance"})
+        );
     }
 
     #[tokio::test]
@@ -1512,17 +1607,157 @@ mod tests {
     }
 
     #[test]
+    fn tier_parses_auto_ids_and_retired_aliases() {
+        let cases = [
+            ("auto", Some(AutoTier::Balance)),
+            ("auto-efficiency", Some(AutoTier::Efficiency)),
+            ("auto-balance", Some(AutoTier::Balance)),
+            ("auto-intelligence", Some(AutoTier::Intelligence)),
+            ("auto-fast", Some(AutoTier::Fast)),
+            ("auto-eco", Some(AutoTier::Efficiency)),
+            ("auto-balanced", Some(AutoTier::Balance)),
+            ("auto-max", Some(AutoTier::Intelligence)),
+            ("auto-turbo", None),
+            ("auto-", None),
+            ("autobalance", None),
+            ("gpt-4.1", None),
+        ];
+
+        for (id, tier) in cases {
+            assert_eq!(AutoTier::from_model(id), tier, "{id}");
+        }
+        for tier in AutoTier::ALL {
+            assert_eq!(AutoTier::from_model(&tier.model_id()), Some(tier));
+        }
+        assert_eq!(AutoTier::Efficiency.model_id(), "auto-efficiency");
+        assert_eq!(json!(AutoTier::Intelligence), json!("intelligence"));
+    }
+
+    async fn route_on_tier(
+        router: &CopilotAutoRouter,
+        server: &MockServer,
+        tier: AutoTier,
+        body: &Value,
+    ) -> AutoRoute {
+        let client = reqwest::Client::new();
+        let uri = server.uri();
+        let upstream = Upstream {
+            client: &client,
+            profile: PROFILE,
+            bearer: BEARER,
+            api_base: &uri,
+        };
+        let input = AutoInput {
+            tier,
+            path: UPSTREAM_CHAT_PATH,
+            body,
+            prompt_bytes: 0,
+        };
+        router
+            .route_at(&upstream, &input, &[], DEFAULT_MODEL, NOW)
+            .await
+    }
+
+    #[tokio::test]
+    async fn auto_body_sends_the_tier_and_a_tier_switch_routes_again() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auto"))
+            .and(body_partial_json(json!({"tier": "efficiency"})))
+            .respond_with(auto_response(
+                &chat_model("gpt-cheap"),
+                "sess-eco",
+                NOW + DAY_SECS,
+                &scores(0.5),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/auto"))
+            .and(body_partial_json(json!({"tier": "intelligence"})))
+            .respond_with(auto_response(
+                &chat_model("gpt-smart"),
+                "sess-max",
+                NOW + DAY_SECS,
+                &scores(0.5),
+            ))
+            .mount(&server)
+            .await;
+        let router = CopilotAutoRouter::new();
+
+        let efficient =
+            route_on_tier(&router, &server, AutoTier::Efficiency, &chat_body(&["hi"])).await;
+        let reused = route_on_tier(
+            &router,
+            &server,
+            AutoTier::Efficiency,
+            &chat_body(&["hi", "more"]),
+        )
+        .await;
+        let smart = route_on_tier(
+            &router,
+            &server,
+            AutoTier::Intelligence,
+            &chat_body(&["hi", "more"]),
+        )
+        .await;
+
+        assert_eq!(efficient.model, "gpt-cheap");
+        assert_eq!(reused.model, "gpt-cheap");
+        assert_eq!(reused.turn, AutoTurn::Reused);
+        assert_eq!(smart.model, "gpt-smart");
+        assert_eq!(smart.turn, AutoTurn::Routed);
+        let tiers: Vec<Value> = auto_bodies(&server.received_requests().await.unwrap())
+            .into_iter()
+            .map(|body| body["tier"].clone())
+            .collect();
+        assert_eq!(tiers, [json!("efficiency"), json!("intelligence")]);
+    }
+
+    #[test]
     fn conversation_key_is_stable_across_turns_and_differs_by_system_prompt() {
-        let first = Turn::parse(PROFILE, UPSTREAM_CHAT_PATH, &chat_body(&["a"])).unwrap();
-        let later = Turn::parse(PROFILE, UPSTREAM_CHAT_PATH, &chat_body(&["a", "b", "c"])).unwrap();
+        let first = Turn::parse(
+            PROFILE,
+            AutoTier::Balance,
+            UPSTREAM_CHAT_PATH,
+            &chat_body(&["a"]),
+        )
+        .unwrap();
+        let later = Turn::parse(
+            PROFILE,
+            AutoTier::Balance,
+            UPSTREAM_CHAT_PATH,
+            &chat_body(&["a", "b", "c"]),
+        )
+        .unwrap();
         let mut other_system = chat_body(&["a"]);
         other_system["messages"][0]["content"] = json!("be verbose");
-        let other = Turn::parse(PROFILE, UPSTREAM_CHAT_PATH, &other_system).unwrap();
-        let other_profile = Turn::parse("other", UPSTREAM_CHAT_PATH, &chat_body(&["a"])).unwrap();
+        let other = Turn::parse(
+            PROFILE,
+            AutoTier::Balance,
+            UPSTREAM_CHAT_PATH,
+            &other_system,
+        )
+        .unwrap();
+        let other_profile = Turn::parse(
+            "other",
+            AutoTier::Balance,
+            UPSTREAM_CHAT_PATH,
+            &chat_body(&["a"]),
+        )
+        .unwrap();
+        let other_tier = Turn::parse(
+            PROFILE,
+            AutoTier::Intelligence,
+            UPSTREAM_CHAT_PATH,
+            &chat_body(&["a"]),
+        )
+        .unwrap();
 
         assert_eq!(first.key, later.key);
         assert_ne!(first.key, other.key);
         assert_ne!(first.key, other_profile.key);
+        assert_ne!(first.key, other_tier.key);
         assert_eq!(later.user_turns, 3);
         assert_eq!(later.prompt.as_deref(), Some("c"));
     }
@@ -1568,7 +1803,7 @@ mod tests {
             {"role": "system", "content": "late context"},
         ]});
 
-        let turn = Turn::parse(PROFILE, UPSTREAM_MESSAGES_PATH, &body).unwrap();
+        let turn = Turn::parse(PROFILE, AutoTier::Balance, UPSTREAM_MESSAGES_PATH, &body).unwrap();
 
         assert_eq!(turn.prompt.as_deref(), Some("reply ok"));
         assert_eq!(turn.user_turns, 1);
@@ -1585,7 +1820,7 @@ mod tests {
             ]},
         ]});
 
-        let turn = Turn::parse(PROFILE, UPSTREAM_MESSAGES_PATH, &body).unwrap();
+        let turn = Turn::parse(PROFILE, AutoTier::Balance, UPSTREAM_MESSAGES_PATH, &body).unwrap();
 
         assert_eq!(turn.prompt, None);
         assert_eq!(turn.user_turns, 1);
@@ -1602,8 +1837,20 @@ mod tests {
             {"role": "user", "content": [{"type": "text", "text": "what is this"}, {"type": "image"}]},
         ]});
 
-        let tool = Turn::parse(PROFILE, UPSTREAM_MESSAGES_PATH, &tool_turn).unwrap();
-        let image = Turn::parse(PROFILE, UPSTREAM_MESSAGES_PATH, &image_turn).unwrap();
+        let tool = Turn::parse(
+            PROFILE,
+            AutoTier::Balance,
+            UPSTREAM_MESSAGES_PATH,
+            &tool_turn,
+        )
+        .unwrap();
+        let image = Turn::parse(
+            PROFILE,
+            AutoTier::Balance,
+            UPSTREAM_MESSAGES_PATH,
+            &image_turn,
+        )
+        .unwrap();
 
         assert_eq!(tool.prompt, None);
         assert_eq!(tool.user_turns, 1);
@@ -1621,8 +1868,8 @@ mod tests {
         ]});
         let plain = json!({"input": "summarise"});
 
-        let tool = Turn::parse(PROFILE, "/responses", &follow_up).unwrap();
-        let prompt = Turn::parse(PROFILE, "/responses", &plain).unwrap();
+        let tool = Turn::parse(PROFILE, AutoTier::Balance, "/responses", &follow_up).unwrap();
+        let prompt = Turn::parse(PROFILE, AutoTier::Balance, "/responses", &plain).unwrap();
 
         assert_eq!(tool.prompt, None);
         assert_eq!(tool.user_turns, 1);
@@ -1634,14 +1881,19 @@ mod tests {
     fn conversation_cache_is_bounded() {
         let router = CopilotAutoRouter::new();
         for index in 0..=MAX_CONVERSATIONS {
-            router.slot(conversation_key(PROFILE, "", &index.to_string()));
+            router.slot(conversation_key(
+                PROFILE,
+                AutoTier::Balance,
+                "",
+                &index.to_string(),
+            ));
         }
         let cache = router.conversations.lock().unwrap();
         assert_eq!(cache.slots.len(), MAX_CONVERSATIONS);
         assert!(
             !cache
                 .slots
-                .contains_key(&conversation_key(PROFILE, "", "0"))
+                .contains_key(&conversation_key(PROFILE, AutoTier::Balance, "", "0"))
         );
     }
 

@@ -36,7 +36,7 @@ pub async fn self_update() -> Result<UpdateOutcome, String> {
 
     let release = fetch_latest().await?;
     let latest = release.tag_name.trim_start_matches('v').to_string();
-    if latest == VERSION {
+    if latest == release_version() {
         println!("already up to date (v{VERSION})");
         return Ok(UpdateOutcome::AlreadyUpToDate);
     }
@@ -101,7 +101,7 @@ async fn check_and_maybe_update(auto_update_enabled: bool, restart_notify: &toki
         }
     };
     let latest = release.tag_name.trim_start_matches('v');
-    if latest == VERSION {
+    if latest == release_version() {
         return;
     }
     if !auto_update_enabled {
@@ -425,4 +425,10 @@ fn restore_set_aside(aside: Option<&Path>, original: &Path) {
             original.display()
         );
     }
+}
+
+/// The release this build is based on: `0.1.30+3.g842543c` is a local build on
+/// top of release `0.1.30`, so the update check compares `0.1.30`.
+fn release_version() -> &'static str {
+    VERSION.split_once('+').map_or(VERSION, |(base, _)| base)
 }

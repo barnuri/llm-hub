@@ -5,7 +5,9 @@ const MAX_OUTPUT_TOKENS = 32768;
 
 export default async function (pi: ExtensionAPI) {
   const base = process.env.LLM_HUB_URL ?? "http://localhost:8888";
-  const res = await fetch(`${base}/v1/models`, {
+  const profiles = process.env.LLM_HUB_MODEL_PROFILES;
+  const query = profiles ? `?profiles=${encodeURIComponent(profiles)}` : "";
+  const res = await fetch(`${base}/v1/models${query}`, {
     headers: { authorization: `Bearer ${process.env.LLM_HUB_API_KEY ?? "llm-hub"}` },
   });
   if (!res.ok) {

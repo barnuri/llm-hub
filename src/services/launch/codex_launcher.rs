@@ -1,7 +1,7 @@
 use super::hub_endpoint::HubEndpoint;
-use super::hub_model::HubModel;
-use super::launch_args::LaunchArgs;
-use super::launch_spec::LaunchSpec;
+use crate::schemas::launch::hub_model::HubModel;
+use crate::schemas::launch::launch_args::LaunchArgs;
+use crate::schemas::launch::launch_spec::LaunchSpec;
 
 /// `llm-hub codex`: Codex CLI on the hub's `/v1/responses`, through `-c`
 /// overrides, so `~/.codex/config.toml` stays untouched.
@@ -13,6 +13,7 @@ impl CodexLauncher {
     const PROVIDER_ID: &str = "llm_hub";
     const PROVIDER_NAME: &str = "llm-hub";
 
+    /// The codex command, sized to the model's catalog limits when it has them.
     #[must_use]
     pub fn spec(endpoint: &HubEndpoint, args: LaunchArgs, catalog: &[HubModel]) -> LaunchSpec {
         let provider = format!(
@@ -70,15 +71,11 @@ mod tests {
         })
     }
 
-    fn args(values: &[&str]) -> LaunchArgs {
-        LaunchArgs::parse(values.iter().map(ToString::to_string).collect())
-    }
-
     const PROVIDER: &str = "model_providers.llm_hub={name=\"llm-hub\",base_url=\"http://hub:8410/v1\",env_key=\"LLM_HUB_API_KEY\",wire_api=\"responses\"}";
 
     #[test]
     fn without_a_model_only_the_provider_is_selected() {
-        let spec = CodexLauncher::spec(&endpoint(), args(&["--full-auto"]), &[]);
+        let spec = CodexLauncher::spec(&endpoint(), LaunchArgs::from_strs(&["--full-auto"]), &[]);
 
         assert_eq!(spec.program(), "codex");
         assert_eq!(spec.env_value("LLM_HUB_API_KEY"), Some("llm-hub"));
@@ -100,7 +97,7 @@ mod tests {
 
         let spec = CodexLauncher::spec(
             &endpoint(),
-            args(&["llama_swap/glm-4.7-flash", "exec", "hi"]),
+            LaunchArgs::from_strs(&["llama_swap/glm-4.7-flash", "exec", "hi"]),
             &catalog,
         );
 
@@ -121,14 +118,14 @@ mod tests {
 
     #[test]
     fn unknown_model_keeps_codex_default_limits() {
-        let spec = CodexLauncher::spec(&endpoint(), args(&["other"]), &[]);
+        let spec = CodexLauncher::spec(&endpoint(), LaunchArgs::from_strs(&["other"]), &[]);
 
         assert_eq!(&spec.argv()[4..], ["-c", "model=\"other\""]);
     }
 
     #[test]
     fn quotes_in_the_model_id_stay_inside_the_toml_string() {
-        let spec = CodexLauncher::spec(&endpoint(), args(&["a\"b"]), &[]);
+        let spec = CodexLauncher::spec(&endpoint(), LaunchArgs::from_strs(&["a\"b"]), &[]);
 
         assert_eq!(spec.argv()[5], "model=\"a\\\"b\"");
     }

@@ -101,6 +101,7 @@ export function AutoScreen() {
             <tr>
               <th>Time</th>
               <th>Session</th>
+              <th>Tier</th>
               <th>Auto pick</th>
               <th>Model used</th>
               <th>Swap reason</th>
@@ -111,7 +112,7 @@ export function AutoScreen() {
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td colSpan={7} className="dim">
+                <td colSpan={8} className="dim">
                   {decisions === null ? "Loading…" : "No Auto decisions yet."}
                 </td>
               </tr>
@@ -133,6 +134,7 @@ export function AutoScreen() {
                       <span className="dim">none</span>
                     )}
                   </td>
+                  <td className="mono nowrap">{row.tier}</td>
                   <td className="mono nowrap" title={row.selection_reason ?? undefined}>
                     {row.auto_pick}
                   </td>

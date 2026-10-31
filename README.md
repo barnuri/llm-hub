@@ -1,610 +1,79 @@
 # llm-hub
 
-One local endpoint for every LLM provider you use. llm-hub merges the model
-lists of any number of OpenAI-compatible APIs into a single `/v1/models`, and
-routes every request by prefix: `groq/llama-3.3-70b-versatile` goes to your
-groq profile, `openai/gpt-4o` to OpenAI, `vllm/qwen-32b` to your local vLLM.
+llm-hub is one local endpoint for all your LLM providers. It merges the model lists of any number
+of OpenAI-compatible APIs into one `/v1/models` and routes each request by its prefix:
+`groq/llama-3.3-70b-versatile` goes to the `groq` profile, `copilot/claude-opus-4-5` to Copilot.
 
 ![demo](docs/demo.gif)
 
-- **Single binary** (Rust, ~7 MB) — no runtime, no database required
-- **Model aggregation** — every upstream's `/v1/models`, prefixed `<profile>/<model>`, one list
-- **Streaming passthrough** — SSE streams forwarded unbuffered
-- **Fallbacks via header** — `X-LLM-Hub-Fallbacks: groq/llama-3.3-70b, openai/gpt-4o-mini`
-- **Web UI** — models, live stats, usage history, profile CRUD, hub API keys, copy-paste setup snippets for Claude Code / Codex / Cursor / SDKs
-- **Local-first** — binds `127.0.0.1`, auth optional, self-update built in
-
-## Install
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/barnuri/llm-hub/main/scripts/install.sh | sh
-```
-
-Or grab a binary from [releases](https://github.com/barnuri/llm-hub/releases), or install from source below.
-
-## Install from source
-
-```sh
-git clone https://github.com/barnuri/llm-hub && cd llm-hub
-cargo build --release   # binary at target/release/llm-hub
-```
-
-Or `cargo install --path .` — note that copy lives outside the repo tree, so it
-updates via release binaries unless you run the binary from the repo. Source
-installs are auto-detected by the updater, which runs `git pull` + rebuild
-instead of downloading a release.
-
-## Install on Windows
-
-Download `llm-hub-windows-x86_64.exe` from
-[releases](https://github.com/barnuri/llm-hub/releases) and rename it to
-`llm-hub.exe`, or build from source with `cargo build --release` (needs the
-Visual Studio C++ build tools; the binary lands in `target\release\llm-hub.exe`).
-The install script above covers macOS and Linux only.
-
-```powershell
-mkdir C:\llm-hub; cd C:\llm-hub   # the directory that holds .env
-notepad .env
-.\llm-hub.exe service install
-```
-
-`service install` registers a Task Scheduler task that starts the hub when you
-log on. It needs no admin rights. The task runs
-`%LOCALAPPDATA%\llm-hub\llm-hub-service.cmd`, which changes to the directory
-you ran `service install` from, so the hub reads that directory's `.env`, and
-starts the hub again whenever it exits. The hub runs in a console window:
-closing the window stops it until the next logon or `schtasks /Run /TN llm-hub`.
-Logs go to `logs\llm-hub.log` in that directory.
-
 ## Quick start
 
-```sh
-cd ~/somewhere
-cat > .env <<'ENV'
-LLM_HUB_OPENAI_BASE_URL=https://api.openai.com/v1
-LLM_HUB_OPENAI_API_KEY=sk-...
-LLM_HUB_GROQ_BASE_URL=https://api.groq.com/openai/v1
-LLM_HUB_GROQ_API_KEY=gsk_...
-ENV
-llm-hub
-# UI:     http://127.0.0.1:8410
-# models: curl localhost:8410/v1/models
-```
+1. Get the binary. Pick one way:
 
-Point any OpenAI-compatible client at it:
+   ```sh
+   # From source (binary at target/release/llm-hub)
+   git clone https://github.com/barnuri/llm-hub && cd llm-hub
+   cargo build --release
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8410/v1", api_key="dummy")
-client.chat.completions.create(model="groq/llama-3.3-70b-versatile", messages=[...])
-```
+   # Install script, macOS and Linux
+   curl -fsSL https://raw.githubusercontent.com/barnuri/llm-hub/main/scripts/install.sh | sh
+   ```
 
-The `api_key` is ignored while auth is off (the hub injects each profile's real
-key upstream). Set `LLM_HUB_MASTER_KEY` or create hub API keys in the UI to
-require one. The **Setup** tab in the UI generates ready snippets for Claude
-Code, Codex CLI, Cursor, Continue, aider, OpenAI SDKs, Claude Agent SDK,
-LangChain, and LiteLLM.
+   For release binaries and Windows, see [Install](docs/service-and-updates.md#install).
 
-## Anthropic Messages endpoint
+2. Write a `.env` with one profile in the directory the hub will run from:
 
-`POST /v1/messages` speaks the Anthropic Messages API on the front and OpenAI
-chat-completions to whichever profile you route to, so an Anthropic SDK can
-target any upstream the hub knows about.
+   ```sh
+   mkdir -p ~/llm-hub && cd ~/llm-hub
+   printf 'LLM_HUB_GROQ_BASE_URL=https://api.groq.com/openai/v1\nLLM_HUB_GROQ_API_KEY=gsk_...\n' > .env
+   ```
 
-```sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8410
-export ANTHROPIC_API_KEY=dummy   # ignored while auth is off
-curl localhost:8410/v1/messages \
-  -H 'content-type: application/json' \
-  -d '{"model":"groq/llama-3.3-70b-versatile","max_tokens":256,
-       "system":"be terse","messages":[{"role":"user","content":"hi"}]}'
-```
+   For Copilot, local models and other upstreams, see [Providers](docs/providers.md).
 
-The model id is the usual `<profile>/<model>`, and every `X-LLM-Hub-*` control
-header works here exactly as it does on `/v1/chat/completions` — fallback
-chains, `X-LLM-Hub-Retry-On`, `X-LLM-Hub-Timeout-Ms`, and the
-`X-LLM-Hub-Model` / `X-LLM-Hub-Attempts` response headers. The translated
-message body also reports the model actually served, so a request that fell
-over to a fallback says so in `model`. Tool names longer than 64 characters —
-routine once MCP servers are in play — are aliased on the way upstream and
-restored on the way back (see [request transforms](#request-transforms)), so an
-Anthropic client keeps using its own names.
+3. Install the hub as a background service, from the same directory:
 
-`"stream": true` works: the upstream's OpenAI SSE stream is translated frame by
-frame into the Anthropic event sequence (`message_start`, `content_block_start` /
-`_delta` / `_stop` for text and for streamed `tool_use` with `input_json_delta`,
-`message_delta`, `message_stop`). Nothing is buffered beyond the frame being
-assembled, and the stream is left well-formed even if the upstream is cut
-mid-flight. Two deviations worth knowing:
+   ```sh
+   llm-hub service install
+   ```
 
-- Content blocks are **serialized**: OpenAI may interleave `tool_calls` indices,
-  Anthropic's protocol cannot, so opening a block closes the previous one.
-- `message_start` reports zero tokens and `message_delta` carries the real
-  counts — OpenAI only reports usage in a chunk that arrives after the one
-  carrying `finish_reason`, so the terminal events are flushed on `[DONE]` (or
-  at end of stream) rather than earlier.
+4. Open the UI at <http://127.0.0.1:8888>. The **Models** tab lists every model the hub can
+   route to. The **Setup** tab generates client snippets.
 
-Current limits:
+5. Start a coding agent against the hub:
 
-- `POST /v1/messages/count_tokens` is not implemented.
-- Content that OpenAI chat-completions cannot represent is dropped rather than
-  faked: `thinking` / `redacted_thinking` blocks, the `thinking` parameter,
-  `top_k`, and Anthropic server tools (`web_search_*`, `computer_*`). An image
-  block whose `source.type` is neither `base64` nor `url` is a 400.
-- `stop_reason` is never `stop_sequence`, and `stop_sequence` is always `null`:
-  the OpenAI wire format never reports which stop string matched. A message that
-  carries a `tool_use` block always reports `tool_use`, even when the upstream
-  reported `finish_reason: "stop"` alongside its tool calls (llama.cpp, vLLM in
-  some configs, and several gateways do) — Anthropic clients drive their agent
-  loop off that field, not off the block list.
-- Request bodies over `LLM_HUB_MAX_REPLAY_BYTES` are a 400 here rather than an
-  unbuffered passthrough — translation needs the whole document.
+   ```sh
+   llm-hub claude                               # Claude Code, default models
+   llm-hub claude copilot/claude-opus-4-5       # Claude Code, one model for every role
+   ```
 
-## Fallbacks
+## Harness commands
 
-Send an ordered chain; the hub retries the next model only on connect errors,
-timeouts, 408, 429, or 5xx. It never retries 400/401/403/404/422 — those
-describe your request and would fail identically everywhere.
-
-```sh
-curl localhost:8410/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -H 'X-LLM-Hub-Fallbacks: groq/llama-3.3-70b-versatile, openai/gpt-4o-mini' \
-  -d '{"model":"openai/gpt-5","messages":[{"role":"user","content":"hi"}]}'
-```
-
-Response headers always tell you what happened:
-
-```
-X-LLM-Hub-Model: groq/llama-3.3-70b-versatile
-X-LLM-Hub-Attempts: openai/gpt-5=429, groq/llama-3.3-70b-versatile=200
-```
-
-Extras: `X-LLM-Hub-Timeout-Ms` (per-attempt deadline), `X-LLM-Hub-Retry-On:
-429,503` (replace the retry status set), `LLM_HUB_DEFAULT_FALLBACKS` (chain
-applied when no header is present). Fallback needs the request body buffered
-for replay; bodies over `LLM_HUB_MAX_REPLAY_BYTES` (default 2 MB) stream
-through with fallbacks disabled.
-
-Set the default chain any of three ways (per-request header always wins):
-
-- **UI** — the **Profiles** tab has a "Default fallbacks" editor: pick models
-  from the live list, reorder, save. For the per-request header, the **Setup**
-  tab has an optional fallback picker that bakes `X-LLM-Hub-Fallbacks` into
-  every generated client snippet.
-- **API** — `POST /api/fallbacks` with
-  `{"fallbacks":["groq/llama-3.3-70b-versatile","openai/gpt-4o-mini"]}`.
-- **Env** — `LLM_HUB_DEFAULT_FALLBACKS=groq/llama-3.3-70b-versatile,openai/gpt-4o-mini`
-  in `.env`. The UI and API persist to the same variable.
-
-## Model insights
-
-With `LLM_HUB_PERSISTENT=true`, the **Insights** tab ranks models by what
-actually happened through the hub: success rate, current failure streak,
-time to first token, output speed, prompt-reading speed, cache hits, and the
-most common failure reasons. Overall score = 60% reliability + 40% speed,
-where speed is relative to the best ranked model. A model is ranked once it
-has `min_requests` calls in the window (default 5) and its newest 3 calls did
-not all fail. The scores measure speed and failed calls, not answer quality.
-
-```sh
-curl 'localhost:8410/api/insights?range=7d&min_requests=5'
-curl 'localhost:8410/api/insights/pick?by=overall&profile=llama_swap'
-```
-
-`range` is `1d`, `7d` (default), `30d` or `all`. `by` is `overall`,
-`stability`, `speed`, `ttft`, `decode` or `prefill`. `pick` returns the winner
-plus runners-up and answers 404 when no model is ranked yet, so scripts can
-fall back to a fixed model.
-
-`GET /api/insights/report` is the same data as one document for agents: a
-plain-language `summary`, every `pick`, `best_for` per use case, per-harness
-stats, failure reasons across models, and caveats.
-
-Each model also carries:
-
-- **Context window** from the upstream model list (`max_input_tokens`,
-  `context_length`, or llama-swap's `metadata.context_length`).
-- **Use cases and summary** from llama-swap `metadata.use_cases` /
-  `metadata.summary` (written by `llama-models sync-swap` from
-  `model-uses.registry`). `best_for` picks the best-ranked model per use case,
-  or the declared one when none has enough calls yet.
-- **Harness stats**: every call stores its client signature (User-Agent, plus
-  a marker for Copilot CLI's `x-initiator` header), classified as
-  `claude-code`, `claude-code-headless`, `claude-agent-sdk`, `copilot-cli`,
-  `opencode`, `cursor`, and so on. `best_harness` is the agent harness with
-  the highest success rate on that model (at least 3 calls).
-
-## Request transforms
-
-Two opt-in request headers reshape the body on its way upstream, for the times
-the client cannot. Both apply to `/v1/chat/completions` and to `/v1/messages`
-alike — the Anthropic body is translated first, so one implementation covers
-both — and both run once, before the fallback chain, so every attempt sends
-byte-identical bytes.
-
-| Header | Direction | Values | Effect |
+| Command | Harness | API it uses | Example |
 |---|---|---|---|
-| `X-LLM-Hub-System-Prompt-Mode` | request | `none` \| `truncate` \| `drop` | Trims or drops the system prompt. `truncate` caps each `system`/`developer` message at 1000 characters (`system` on the Anthropic route); `drop` removes them, unless that would leave no messages at all. |
-| `X-LLM-Hub-Reasoning-Strip` | request | `true` \| `1` \| `yes` \| `on` | Removes `reasoning`, `reasoning_effort` and `thinking` from the request — for upstreams that 400 on parameters they do not model. |
-| `X-LLM-Hub-Transforms` | response | e.g. `system-prompt=truncate, tool-names=3, reasoning-strip` | Diagnostic: which transforms actually fired. Omitted when none did. |
-
-An unrecognized value — or an absent header — leaves the request untouched, with
-no error and no warning. Nothing here is inferred from the model name or the
-profile: a transform that fired for the primary but not for a fallback would
-make `X-LLM-Hub-Attempts` describe two different requests.
-
-Two more repairs are always on, because the clients they fix cannot ask for
-them.
-
-**Streamed first-delta role.** When a streamed first `choices[0].delta` arrives
-without a `role`, the hub inserts `role: "assistant"` (the OpenAI spec requires
-it; some local servers omit it, which breaks clients that rebuild the message
-from deltas alone). An existing role is never overwritten, only the first delta
-is touched, and the rewriter stops framing the stream the moment it is done.
-Set `LLM_HUB_STREAM_ROLE=false` to disable it.
-
-**Tool-name truncation.** OpenAI-compatible upstreams reject a function name
-over 64 characters with a 400, and MCP tools blow past that routinely — a tool
-reached through a server prefix is named `mcp__<server>__<tool>`. Any longer
-name is replaced on the way upstream with `<first 55 chars>_<8 hex of its
-sha256>`, and the original is put back in the response — in the OpenAI
-`tool_calls[].function.name`, in the Anthropic route's `tool_use` blocks, and
-frame by frame in a stream. `tools[]`, `tool_choice`, and `tool_calls[]` on prior assistant
-messages are all rewritten, so a forced tool choice keeps naming a tool the
-request still declares. The alias is a pure function of the name: it is the
-same on every turn of a conversation and on every attempt in a fallback chain,
-and nothing is stored between requests. Names of 64 characters or fewer — and
-aliases echoed back by the client — are passed through untouched, so
-`X-LLM-Hub-Transforms` only reports `tool-names=N` when something was actually
-renamed.
-
-## Local speech-to-text
-
-A profile can carry a `COMMAND` that the hub runs itself, so a local
-OpenAI-compatible server (whisper.cpp `whisper-server`, mlx-audio, a local
-vLLM) only runs while it is used. The hub starts the process on the first
-request to the profile and waits until the host:port in `BASE_URL` accepts
-connections. Concurrent requests share that start. The hub stops the process
-after `IDLE_SECS` without requests, when `COMMAND` changes or is removed from
-`.env`, and when the hub shuts down. If something already listens on the port,
-the hub uses it and starts nothing. If the process exits, the next request
-starts it again. Its stdout and stderr go to `logs/<profile>.log`. A failed or
-timed-out start fails that attempt like an unreachable upstream, so fallbacks
-still apply.
-
-```sh
-LLM_HUB_WHISPER_BASE_URL=http://127.0.0.1:11440/v1
-LLM_HUB_WHISPER_MODELS=whisper-large-v3
-LLM_HUB_WHISPER_COMMAND='whisper-server --model ~/models/whisper/ggml-large-v3.bin --host 127.0.0.1 --port 11440 --inference-path /v1/audio/transcriptions --convert --suppress-nst --beam-size 5'
-LLM_HUB_WHISPER_IDLE_SECS=900
-```
-
-```sh
-curl -F model=whisper/whisper-large-v3 -F file=@a.wav http://127.0.0.1:8888/v1/audio/transcriptions
-```
-
-Quote the `COMMAND` value in `.env`: the `.env` parser skips an unquoted value that has spaces. Write the port in `COMMAND` and in `BASE_URL` the same. `MODELS` keeps the
-model in `/v1/models` while the server is stopped. An installed service runs
-with launchd's or systemd's minimal `PATH`. `whisper-server --convert` also
-runs `ffmpeg` from `PATH`, so start the command with
-`/usr/bin/env PATH=/opt/homebrew/bin:/usr/bin:/bin` there. `GET /api/profiles` reports
-`managed` and `running` per profile, never the command itself.
-
-On Windows, whisper.cpp releases include `whisper-server.exe`, and `--convert`
-needs `ffmpeg` on `PATH`. The hub splits `COMMAND` with Windows command-line
-rules there: a backslash is literal, double quotes group a path with spaces,
-and single quotes are plain text. Wrap the value in single quotes in `.env` so
-the `.env` parser keeps the backslashes. `~/` expands to `%USERPROFILE%` when
-`HOME` is not set.
-
-```sh
-LLM_HUB_WHISPER_COMMAND='"C:\Program Files\whisper.cpp\whisper-server.exe" --model C:\models\ggml-large-v3.bin --host 127.0.0.1 --port 11440 --inference-path /v1/audio/transcriptions --convert'
-```
-
-## GitHub Copilot upstream
-
-A Copilot subscription can serve as an ordinary profile, so `copilot/<model>`
-shows up in `/v1/models` and works in fallback chains. There are two ways to
-connect: a local [copilot-api](https://github.com/ericc-ch/copilot-api) proxy,
-or native auth in the hub.
-
-Warning: heavy automated use of Copilot outside its own clients can trigger
-GitHub's abuse detection and suspend your Copilot access. The copilot-api
-README gives the same warning, and it applies to both ways.
-
-### Through copilot-api
-
-copilot-api is a local server that speaks the OpenAI API to Copilot. Log in
-once, then point a plain profile at it:
-
-```sh
-npx copilot-api@latest auth   # one time, copilot-api stores its own token
-```
-
-```sh
-LLM_HUB_COPILOT_API_BASE_URL=http://127.0.0.1:4141/v1
-LLM_HUB_COPILOT_API_COMMAND='/usr/bin/env PATH=/opt/homebrew/bin:/usr/bin:/bin npx copilot-api@latest start --port 4141'
-LLM_HUB_COPILOT_API_START_TIMEOUT_SECS=180
-LLM_HUB_COPILOT_API_MODELS=gpt-4.1,claude-sonnet-4.5
-```
-
-`COMMAND` is optional. With it, the hub starts copilot-api on the first request
-and stops it when idle, the same as in [Local speech-to-text](#local-speech-to-text).
-The `PATH` prefix lets `npx` run under the service's minimal `PATH`. The first
-`npx` run downloads the package, so give `START_TIMEOUT_SECS` some headroom.
-`MODELS` keeps a static list in `/v1/models` while the server is stopped.
-Without `COMMAND`, run `npx copilot-api@latest start --port 4141` yourself.
-
-### Native auth
-
-Set `AUTH` on a profile and the hub talks to Copilot itself. `BASE_URL` stays
-required, but it is only a fallback for when Copilot reports no API endpoint of
-its own. Do not set `API_KEY` on a profile that has `AUTH`: that is a config
-error.
-
-| `AUTH` | Flow | GitHub token |
-|---|---|---|
-| `github-copilot` | The GitHub token is the bearer for every Copilot request (opencode's flow). The hub reads the API base and the entitlement from `copilot_internal/user` | `gh`, else `llm-hub copilot login` |
-| `github-copilot-vscode` | The hub exchanges the GitHub token for a short-lived Copilot token at `copilot_internal/v2/token` and refreshes it before expiry. It sends the VS Code `Editor-*` and `vscode-chat` headers (the copilot-api flow) | `llm-hub copilot login` only |
-
-`GITHUB_TOKEN_SOURCE` picks where the GitHub token comes from:
-
-- `auto` (the default for `github-copilot`) uses `gh auth token` when `gh` is
-  installed and logged in. Otherwise it uses the token from
-  `llm-hub copilot login`. A missing `gh` is not an error.
-- `gh` uses only `gh`.
-- `login` uses only the `llm-hub copilot login` token. It is the default, and
-  the only allowed value, for `github-copilot-vscode`: the token exchange
-  rejects `gh` tokens with a 403.
-
-When a Copilot request gets a 401, the hub drops its cached token, gets a new
-one, and retries the request once.
-
-**With gh.** After `gh auth login`, this is the whole profile:
-
-```sh
-LLM_HUB_COPILOT_BASE_URL=https://api.githubcopilot.com
-LLM_HUB_COPILOT_AUTH=github-copilot
-```
-
-An installed service runs with launchd's or systemd's minimal `PATH`, which
-does not include Homebrew. Set `GH_PATH` to the absolute path of `gh` there
-(`LLM_HUB_COPILOT_GH_PATH=/opt/homebrew/bin/gh`). `GH_USER` picks one of
-several logged-in accounts (`gh auth token --user <login>`). If `GH_TOKEN` (for
-github.com) or `GH_ENTERPRISE_TOKEN` (for other hosts) is set in the hub
-process environment, the hub uses it and does not run `gh`. Set those in the
-service environment only. Never put them in `.env`.
-
-**Without gh.** Log in once with the GitHub device flow:
-
-```sh
-cd ~/somewhere   # the directory with your .env
-llm-hub copilot login --profile copilot
-```
-
-The command reads `.env` from the current directory to find the profile, so run
-it where the hub runs. `--profile` can be left out when only one profile has
-`AUTH`. The command prints a code and a URL, checks your Copilot entitlement
-after you approve, and stores the token in the OS credential store under
-service `llm-hub`, account `<AUTH>:<domain>` (for example
-`github-copilot:github.com`). The token is never written to a file or to `.env`.
-`llm-hub copilot logout --profile copilot` removes it. Profiles that share the
-same `AUTH` value and domain share one login.
-
-`github-copilot-vscode` works the same way, but only with this login. Give it its
-own profile name, here `copilot_vscode`:
-
-```sh
-LLM_HUB_COPILOT_VSCODE_BASE_URL=https://api.githubcopilot.com
-LLM_HUB_COPILOT_VSCODE_AUTH=github-copilot-vscode
-```
-
-Run `llm-hub copilot login --profile copilot_vscode` once. Its models route as
-`copilot_vscode/<model>`.
-
-The two `AUTH` values use different OAuth client ids, so each needs its own
-`copilot login`.
-
-**Credential store per OS:**
-
-- **macOS:** the login Keychain. The LaunchAgent runs as the logged-in user, so
-  it can read the item. On first access, macOS may ask whether `llm-hub` may
-  use the item. Choose **Always Allow**. Requests to the profile fail until you
-  answer the prompt. A rebuilt or auto-updated binary is likely to prompt
-  again (not yet verified).
-- **Linux:** a Secret Service provider, for example gnome-keyring, must run in
-  the user session. On a host without one, use `gh`.
-- **Windows:** Credential Manager.
-
-**GitHub Enterprise.** `GITHUB_DOMAIN` sets the GitHub host for the device
-login, for `gh auth token --hostname`, and for the credential account
-(`LLM_HUB_COPILOT_GITHUB_DOMAIN=acme.ghe.com`). The REST base defaults to
-`https://api.<domain>`. Set `GITHUB_API_URL` when it differs, for example on
-GitHub Enterprise Server.
-
-**Headers.** `github-copilot` sends a small header set: `Authorization`,
-`User-Agent`, `Openai-Intent`, `X-Initiator`, and `Copilot-Vision-Request` when
-the request has an image. It omits `Copilot-Integration-Id` and
-`X-GitHub-Api-Version` on purpose. With a `gh` token, Copilot answers 400 "IDE
-authentication failed: IDE token is malformed" when either header is present.
-`X-Initiator` is `agent` for tool-loop follow-ups and `user` for a new user
-turn, so follow-ups do not use premium requests. A `HEADERS` entry with the
-same name overrides the hub's value.
-
-The hub drops Copilot models that Copilot itself hides (`model_picker_enabled:
-false`) or that your policy disables. Models that Copilot serves only through
-the Responses API (for example gpt-5 and later, except gpt-5-mini) work on
-`/v1/responses`. They do not work on `/v1/chat/completions` or on `/v1/messages`.
-
-### Claude Code on Copilot models
-
-Claude Code can list hub models in its `/model` picker. Its gateway model
-discovery reads `GET /v1/models`, but it keeps only ids that contain `claude`
-or `anthropic`. Copilot names Claude models with dots (`claude-opus-4.5`),
-which Claude Code does not recognise. So a native Copilot profile advertises
-them with dashes (`copilot/claude-opus-4-5`) and sends the dotted id upstream.
-Dotted ids still work in requests. Profiles through copilot-api keep the
-dotted ids.
-
-A `/v1/messages` request for a Copilot Claude model goes to Copilot's own
-`/v1/messages` unchanged, with no OpenAI translation, so thinking blocks and
-tool use pass through as sent. The [limits](#anthropic-messages-endpoint)
-of the translated route do not apply to those models.
-
-Discovery does not show non-Claude models. `GET /api/claude-code/settings`
-returns a `modelPicker` list with every hub model, for `claude --settings`.
-
-A launcher script, saved for example as `~/.local/bin/claude-copilot`, puts
-it together:
-
-```sh
-#!/usr/bin/env bash
-set -euo pipefail
-hub=http://127.0.0.1:8888
-export ANTHROPIC_BASE_URL="$hub"
-export ANTHROPIC_AUTH_TOKEN="${LLM_HUB_API_KEY:-placeholder}"
-export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
-export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
-export ANTHROPIC_DEFAULT_OPUS_MODEL=copilot/claude-opus-4-5
-export ANTHROPIC_DEFAULT_SONNET_MODEL=copilot/claude-sonnet-4-5
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=copilot/claude-haiku-4-5
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=128000
-settings="$(curl -fsS --max-time 3 "$hub/api/claude-code/settings" || true)"
-exec claude ${settings:+--settings "$settings"} "$@"
-```
-
-- `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` turns discovery on. Claude
-  Code skips discovery when it has no credential, so the token must be
-  non-empty even while hub auth is off. With hub auth on, use a real hub key.
-- Pick the `ANTHROPIC_DEFAULT_*_MODEL` ids from your own `/v1/models` list.
-- Claude Code assumes 1M context for recent Opus and Sonnet models. Copilot's
-  prompt limit is likely lower. Set `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to the
-  smallest `max_input_tokens` of the pinned models.
-- `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` stops pre-release
-  `anthropic-beta` values that Copilot may reject.
-- Discovery times out after 3 s. The hub serves the cached model list at once
-  and refreshes it in the background, so discovery does not wait on upstreams.
-
-In Claude Code, `/model` then lists the Copilot Claude models from discovery
-and every other hub model from `--settings`. A discovered model may collapse
-into its built-in alias row, for example `opus`.
-
-### Copilot Auto
-
-A native Copilot profile also lists `<profile>/auto`, for example
-`copilot/auto`. It routes like Auto in VS Code: Copilot's router (hydra) picks
-the model, and the hub sends the request to that model.
-
-- On a routing turn the hub calls Copilot's `POST /auto` with the prompt. This
-  adds about 0.5 s to that turn only. The server's `multi_turn` schedule decides
-  which user turns re-route. Tool-loop follow-ups (`X-Initiator: agent`) never
-  re-route and add no latency.
-- Each `copilot/auto` request carries the `Copilot-Session-Token` from
-  `/auto`, which gives the 10% Auto discount on the model Auto picked. Whether
-  the discount also applies after a swap (below) is not verified.
-- Auto can pick a model that Copilot serves only through the Responses API.
-  When the caller is Claude Code (`/v1/messages`), the hub then uses the
-  compatible model of the closest price tier instead. When `/models` has no
-  prices, the hub maps Auto's complexity verdict to a family (low to Haiku,
-  medium to Sonnet, high to Opus) and takes its newest version.
-
-`copilot/auto` appears in the Claude Code `/model` picker through the
-`--settings` list of the `claude-copilot` launcher above.
-
-## Environment reference
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `LLM_HUB_PROFILES` | auto | Optional: profiles are discovered from `_BASE_URL` vars; set this to control order, subset, or dashed names |
-| `LLM_HUB_<NAME>_BASE_URL` | — | Upstream base URL (per profile, required) |
-| `LLM_HUB_<NAME>_API_KEY` | empty | Upstream key, injected on forward |
-| `LLM_HUB_<NAME>_DISPLAY_NAME` | — | Optional UI label; routing id stays `<NAME>` |
-| `LLM_HUB_<NAME>_HEADERS` | — | Extra headers, JSON object |
-| `LLM_HUB_<NAME>_TIMEOUT_MS` | none | Per-attempt timeout for this profile |
-| `LLM_HUB_<NAME>_ENABLED` | `true` | Disable without deleting |
-| `LLM_HUB_<NAME>_MODELS` | — | Static model list when upstream lacks `/v1/models` |
-| `LLM_HUB_<NAME>_INPUT_USD_PER_1M` | `0` | Estimated input token price for stats cost |
-| `LLM_HUB_<NAME>_OUTPUT_USD_PER_1M` | `0` | Estimated output token price for stats cost |
-| `LLM_HUB_<NAME>_CACHE_READ_USD_PER_1M` | 10% of input | Optional cache-hit price |
-| `LLM_HUB_<NAME>_CACHE_WRITE_USD_PER_1M` | = input | Optional cache-write price |
-| `LLM_HUB_<NAME>_MODEL_PRICES` | — | Per-model overrides: `model:in/out[,cache_read[/cache_write]]` |
-| `LLM_HUB_<NAME>_COMMAND` | — | Local server the hub starts on demand for this profile (program + args, no shell; POSIX shell quoting, or Windows command-line rules on Windows; leading `~/` expands to `$HOME`, or `%USERPROFILE%` without `HOME`). Operator-set only: the admin API can neither set nor write it |
-| `LLM_HUB_<NAME>_IDLE_SECS` | `900` | Stop the managed process after this many seconds without a request; `0` = never |
-| `LLM_HUB_<NAME>_START_TIMEOUT_SECS` | `120` | How long the managed process may take to accept connections on the `BASE_URL` port |
-| `LLM_HUB_<NAME>_AUTH` | unset | Native [Copilot auth](#native-auth): `github-copilot` or `github-copilot-vscode`. Not allowed together with `API_KEY`. Operator-set only |
-| `LLM_HUB_<NAME>_GITHUB_TOKEN_SOURCE` | `auto` (`github-copilot`), `login` (`github-copilot-vscode`) | `auto` (gh, else `copilot login`), `gh` or `login`. `github-copilot-vscode` accepts only `login` |
-| `LLM_HUB_<NAME>_GH_PATH` | `gh` on `PATH` | gh binary. Use an absolute path under launchd or systemd |
-| `LLM_HUB_<NAME>_GH_USER` | unset | Passed as `gh auth token --user`. Letters, digits and `-` only |
-| `LLM_HUB_<NAME>_GITHUB_DOMAIN` | `github.com` | GitHub host for the device login, `gh --hostname` and the credential account |
-| `LLM_HUB_<NAME>_GITHUB_API_URL` | `https://api.github.com`, or `https://api.<domain>` | REST base for `copilot_internal/*`. Must be http(s) |
-| `LLM_HUB_INPUT_USD_PER_1M` / `OUTPUT_…` | `0` | Global default rates when a profile has none |
-| `LLM_HUB_BIND` / `LLM_HUB_PORT` | `127.0.0.1` / `8410` | Listen address |
-| `LLM_HUB_MASTER_KEY` | unset | Require this key on `/v1/*` and `/api/*`; unset = no auth |
-| `LLM_HUB_DEFAULT_FALLBACKS` | — | Default fallback chain |
-| `LLM_HUB_MAX_REPLAY_BYTES` | `2097152` | Body buffer cap for fallback replay |
-| `LLM_HUB_PERSISTENT` | `false` | Durable usage history + hub API keys |
-| `LLM_HUB_STORE` | `sqlite` | `sqlite` or `json` (when persistent) |
-| `LLM_HUB_STORE_PATH` | `llm-hub.db` | Store location |
-| `LLM_HUB_CONFIG_READONLY` | `false` | Block UI writes to `.env` |
-| `LLM_HUB_STREAM_ROLE` | `true` | Inject `role:"assistant"` into the first streamed delta when the upstream omits it |
-| `LLM_HUB_COPILOT_GUARD_MODELS` | `*` | Models (`<model>`, `<profile>/<model>` or `*`) whose Copilot CLI requests get the tool-loop guard (system-prompt note, plus withholding a tool the history shows called identically 3 times in a row); empty disables it |
-| `LLM_HUB_COPILOT_STRIP_SAMPLING_MODELS` | 10 local ids (see `DEFAULT_COPILOT_STRIP_SAMPLING_MODELS`) | Models whose Copilot CLI requests drop Copilot's hard-coded `temperature`/`top_p`/penalties so the model row's sampling applies; empty disables it |
-| `LLM_HUB_AUTO_UPDATE` | `true` | Apply updates automatically (startup + daily check); `false` = notice only |
-
-Profile names map to env segments uppercased with `-` → `_` (`my-proxy` →
-`LLM_HUB_MY_PROXY_BASE_URL`). See [.env.example](.env.example).
-
-## Run as a service
-
-```sh
-cd ~/somewhere   # the directory with your .env
-llm-hub service install
-```
-
-Registers the hub as an always-on background service: a launchd LaunchAgent on
-macOS, a systemd user unit on Linux (run `loginctl enable-linger $USER` to
-start at boot without a login session), a Task Scheduler logon task on Windows
-(see [Install on Windows](#install-on-windows)). Run
-it from the directory containing your `.env` — that working directory is baked
-into the service definition, so the service reads that `.env` for profiles,
-keys, and fallbacks. The definition also bakes in `LLM_HUB_PORT=8888` and
-`LLM_HUB_BIND=0.0.0.0`, which win over `.env` — an installed service always
-serves on `0.0.0.0:8888`, while foreground runs keep using `.env`. Logs land in
-`<that directory>/logs/llm-hub.log`. `llm-hub service uninstall` removes it,
-`llm-hub service status` checks it. Reinstall after updating to pick up
-definition changes. On macOS, install also adds the binary to the Application
-Firewall allow list (sudo may prompt) — without it, macOS silently drops LAN
-connections to unsigned background binaries on every port.
-
-## Updating
-
-Auto-update is on by default: the hub checks GitHub releases on startup and
-daily, downloads the binary for your OS/arch, and swaps it atomically. Source
-installs are updated via `git pull` + `cargo build --release` instead (the
-automatic pull is skipped while the checkout has uncommitted changes). Set
-`LLM_HUB_AUTO_UPDATE=false` to only log a notice when a newer version exists.
-Windows cannot overwrite a running `.exe`, so the updater first renames it to
-`llm-hub.old.exe` and removes that file on the next update.
-
-```sh
-llm-hub update   # manual one-shot update, same logic
-```
-
-## Docker
-
-```sh
-docker build -t llm-hub .
-docker run --rm -p 8410:8410 --env-file .env -e LLM_HUB_BIND=0.0.0.0 llm-hub
-```
-
-## Development
-
-```sh
-cargo test                 # unit + integration (wiremock)
-cargo run                  # uses ./.env
-node scripts/record-demo.mjs   # re-record docs/demo.gif (playwright + ffmpeg)
-```
+| `llm-hub claude` | Claude Code (`claude`) | Anthropic Messages, `/v1/messages` | `llm-hub claude copilot/auto` |
+| `llm-hub codex` | Codex CLI (`codex`) | OpenAI Responses, `/v1/responses` | `llm-hub codex openai/gpt-5 exec "fix the tests"` |
+| `llm-hub opencode` | opencode (`opencode`) | OpenAI chat completions | `llm-hub opencode groq/llama-3.3-70b-versatile` |
+| `llm-hub copilot-cli` | GitHub Copilot CLI (`copilot`) | OpenAI chat completions | `llm-hub copilot-cli copilot/gpt-4.1` |
+| `llm-hub pi` | pi (`pi`) | OpenAI chat completions | `llm-hub pi copilot/claude-sonnet-4-5` |
+
+See [Coding agents](docs/coding-agents.md) for what each command sets.
+
+## Documentation
+
+- [Commands](docs/commands.md): every `llm-hub` command, including `help` and `serve`.
+- [Providers](docs/providers.md): profiles, local models, managed commands and the copilot-api proxy.
+- [GitHub Copilot](docs/github-copilot.md): native Copilot auth, model limits and the usage API.
+- [Copilot Auto](docs/copilot-auto.md): how `copilot/auto` picks a model, and what hydra is.
+- [Coding agents](docs/coding-agents.md): the five harness commands, their environment and a shell wrapper.
+- [HTTP API](docs/http-api.md): routes, control headers and hub authentication.
+- [Anthropic Messages](docs/anthropic-messages.md): the translated `/v1/messages` route and its limits.
+- [Fallbacks and transforms](docs/fallbacks-and-transforms.md): fallback chains and request changes.
+- [Usage and insights](docs/usage-and-insights.md): UI tabs, stats and model rankings.
+- [Configuration](docs/configuration.md): every `LLM_HUB_*` variable.
+- [Service and updates](docs/service-and-updates.md): install, the background service, Docker and updates.
+- [Troubleshooting](docs/troubleshooting.md): common failures and their fixes.
+- [Development](docs/development.md): build, test and reinstall from a checkout.
+- [Subscriptions](docs/subscriptions.md): why llm-hub does not proxy Claude, ChatGPT or Cursor plans.
 
 ## License
 

@@ -25,7 +25,8 @@ use crate::services::anthropic;
 use crate::services::anthropic::native_reply::NativeReplyRepair;
 use crate::services::anthropic::responses_stream::ResponsesStream;
 use crate::services::body_transform::BodyTransform;
-use crate::services::copilot_auto_decisions::AutoDecision;
+use crate::services::copilot_auto::AutoTier;
+use crate::services::copilot_auto_decisions::{AutoDecision, TieredDecision};
 use crate::services::copilot_body_fields::BodyField;
 use crate::services::fallback::{RetryPolicy, fallback_chain, per_attempt_timeout_ms};
 use crate::services::harness::client_signature;
@@ -206,6 +207,7 @@ pub(crate) async fn attempt_loop(
                     if let Some(pick) = &auto {
                         insert_header(out.headers_mut(), HEADER_AUTO_PICK, &pick.pick);
                         insert_header(out.headers_mut(), HEADER_AUTO_REASON, &pick.reason);
+                        insert_header(out.headers_mut(), HEADER_AUTO_TIER, pick.tier.as_str());
                     }
                     return Ok(out);
                 }
@@ -485,28 +487,30 @@ impl<'a> AttemptBodies<'a> {
     }
 }
 
-/// The model sent in place of `<profile>/auto`, its Copilot session token,
-/// and the values of the Auto response headers.
+/// The Auto tier a `<profile>/auto` or `<profile>/auto-<tier>` request routed on.
+const HEADER_AUTO_TIER: &str = "x-llm-hub-auto-tier";
+
+/// The model sent in place of `<profile>/auto` or `<profile>/auto-<tier>`, its
+/// Copilot session token, and the values of the Auto response headers.
 struct AutoPick {
     model_id: ModelId,
     session_token: Option<String>,
+    tier: AutoTier,
     /// Auto's own choice, as a qualified id.
     pick: String,
     /// Header-safe: the swap reason, else Auto's selection reason, else `auto`.
     reason: String,
 }
 
-/// Resolves `<profile>/auto` on a Copilot profile through Copilot Auto and
-/// records the outcome in the router's decision log. Any other model returns
-/// `None` before any lookup.
+/// Resolves `<profile>/auto` (the default tier) or `<profile>/auto-<tier>` on a
+/// Copilot profile through Copilot Auto and records the outcome in the router's
+/// decision log. Any other model returns `None` before any lookup.
 async fn resolve_auto(
     state: &AppState,
     bodies: &AttemptBodies<'_>,
     model_id: &ModelId,
 ) -> Option<AutoPick> {
-    if model_id.model != COPILOT_AUTO_MODEL {
-        return None;
-    }
+    let tier = AutoTier::from_model(&model_id.model)?;
     let config = state.config();
     let profile = config.profile(&model_id.profile).filter(|p| p.enabled)?;
     let auth = profile.copilot.as_ref()?;
@@ -532,6 +536,7 @@ async fn resolve_auto(
             &profile.name,
             &bearer,
             &api_base,
+            tier,
             path,
             body,
             bodies.original.len(),
@@ -554,7 +559,7 @@ async fn resolve_auto(
         .or(route.selection_reason.as_deref())
         .unwrap_or("auto");
     let reason = header_safe(reason, AUTO_REASON_HEADER_MAX_CHARS);
-    state.copilot_auto().decisions().record(AutoDecision {
+    let decision = AutoDecision {
         ts_ms: now_ms(),
         session: claude_code_session_id(&bodies.headers),
         profile: profile.name.clone(),
@@ -565,10 +570,15 @@ async fn resolve_auto(
         selection_reason: route.selection_reason,
         turn: route.turn,
         estimated_prompt_tokens: route.estimated_prompt_tokens,
-    });
+    };
+    state
+        .copilot_auto()
+        .decisions()
+        .record(TieredDecision { decision, tier });
     Some(AutoPick {
         model_id,
         session_token: route.session_token,
+        tier,
         pick: auto_pick,
         reason,
     })
@@ -3183,6 +3193,7 @@ mod tests {
             );
             assert_eq!(header(&headers, HEADER_AUTO_PICK), None);
             assert_eq!(header(&headers, HEADER_AUTO_REASON), None);
+            assert_eq!(header(&headers, HEADER_AUTO_TIER), None);
             assert!(
                 copilot
                     .state
@@ -3235,13 +3246,15 @@ mod tests {
             assert_eq!(header(&headers, HEADER_SERVED_MODEL), Some(served.as_str()));
             assert_eq!(header(&headers, HEADER_AUTO_PICK), Some(auto_pick.as_str()));
             assert_eq!(header(&headers, HEADER_AUTO_REASON), Some(reason.as_str()));
+            assert_eq!(header(&headers, HEADER_AUTO_TIER), Some("balance"));
             let decisions = copilot
                 .state
                 .copilot_auto()
                 .decisions()
                 .recent(Some(session), 1);
             assert_eq!(decisions.len(), 1);
-            let decision = &decisions[0];
+            assert_eq!(decisions[0].tier, AutoTier::Balance);
+            let decision = &decisions[0].decision;
             assert_eq!(decision.session.as_deref(), Some(session));
             assert_eq!(decision.profile, PROFILE);
             assert_eq!(decision.auto_pick, auto_pick);
@@ -3249,6 +3262,29 @@ mod tests {
             assert_eq!(decision.swap_reason.as_deref(), Some(reason.as_str()));
             assert_eq!(decision.selection_reason.as_deref(), Some("test pick"));
             assert_eq!(decision.turn, AutoTurn::Routed);
+        }
+
+        #[tokio::test]
+        async fn auto_tier_model_routes_on_its_tier_and_names_it_in_header_and_log() {
+            let copilot = copilot().await;
+            mount_auto(&copilot, NATIVE_UPSTREAM_ID).await;
+            mount_native_reply(&copilot).await;
+
+            let headers = send_for_headers(
+                &copilot,
+                &client_headers(),
+                &anthropic_body("auto-max", false),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(header(&headers, HEADER_AUTO_TIER), Some("intelligence"));
+            let auto = requests_to(&copilot, "/auto").await;
+            assert_eq!(sent_json(&auto[0])["tier"], "intelligence");
+            let sent = requests_to(&copilot, NATIVE_MESSAGES_PATH).await;
+            assert_eq!(sent_json(&sent[0])["model"], NATIVE_UPSTREAM_ID);
+            let decisions = copilot.state.copilot_auto().decisions().recent(None, 10);
+            assert_eq!(decisions[0].tier, AutoTier::Intelligence);
         }
 
         #[tokio::test]
@@ -3268,7 +3304,7 @@ mod tests {
 
             let decisions = copilot.state.copilot_auto().decisions().recent(None, 10);
             assert_eq!(decisions.len(), 1);
-            assert_eq!(decisions[0].session, None);
+            assert_eq!(decisions[0].decision.session, None);
             assert!(
                 copilot
                     .state

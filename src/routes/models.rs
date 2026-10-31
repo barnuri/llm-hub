@@ -1,34 +1,49 @@
 use std::collections::HashMap;
 
 use axum::Json;
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 use futures_util::future::join_all;
 use reqwest::header::HeaderMap;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::configs::ProfileConfig;
 use crate::consts::{MODELS_CACHE_TTL, MODELS_FANOUT_TIMEOUT};
 use crate::dependencies::state::AppState;
+use crate::schemas::launch::profile_filter::ProfileFilter;
 use crate::schemas::model_context::{
     advertised_model_id, inferred_max_input_tokens, max_input_tokens_from_item,
 };
 use crate::schemas::upstream_model::UpstreamModel;
+use crate::services::copilot_auto::{AUTO_MODEL, AutoTier};
 use crate::services::model_limits::ModelLimit;
 use crate::services::upstream_auth;
 
 pub(crate) const MODELS_PATH: &str = "/models";
 /// The bare model id a Copilot profile advertises for Copilot Auto routing.
-pub(crate) const COPILOT_AUTO_MODEL: &str = "auto";
+pub(crate) const COPILOT_AUTO_MODEL: &str = AUTO_MODEL;
 const COPILOT_AUTO_ENDPOINTS: [&str; 3] = ["/chat/completions", "/responses", "/v1/messages"];
 const COPILOT_POLICY_DISABLED: &str = "disabled";
 const CLAUDE_ID_PREFIX: &str = "claude-";
 const NATIVE_MESSAGES_ENDPOINT: &str = "/v1/messages";
 const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
 
-pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
+/// `?profiles=a,b` limits a model list to those profiles, like the
+/// `x-llm-hub-profiles` header.
+#[derive(Debug, Deserialize, Default)]
+pub struct ProfilesQuery {
+    pub profiles: Option<String>,
+}
+
+pub async fn list_models(
+    State(state): State<AppState>,
+    Query(query): Query<ProfilesQuery>,
+    headers: HeaderMap,
+) -> Json<Value> {
     let mut payload = enabled_models(&state).await;
+    ProfileFilter::from_request(query.profiles.as_deref(), &headers).retain_models(&mut payload);
     if headers.contains_key(ANTHROPIC_VERSION_HEADER) {
         add_anthropic_list_fields(&mut payload);
     }
@@ -148,18 +163,28 @@ fn fallback_models(state: &AppState, profile: &ProfileConfig) -> Vec<Value> {
 }
 
 /// Rewrites Copilot catalog entries to `<profile>/<id>` and adds
-/// `<profile>/auto` when Copilot does not list it.
+/// `<profile>/auto` plus one `<profile>/auto-<tier>` per Auto tier, each only
+/// when Copilot does not list that id itself.
 fn copilot_models(state: &AppState, profile: &ProfileConfig, items: &[&Value]) -> Vec<Value> {
-    let lists_auto = items
-        .iter()
-        .any(|item| item.get("id").and_then(Value::as_str) == Some(COPILOT_AUTO_MODEL));
+    let lists = |id: &str| {
+        items
+            .iter()
+            .any(|item| item.get("id").and_then(Value::as_str) == Some(id))
+    };
     let limits = state.model_limits().for_profile(&profile.name);
     let mut models: Vec<Value> = items
         .iter()
         .map(|item| rewrite_model(profile, item, Some(&limits)))
         .collect();
-    if !lists_auto {
-        models.push(copilot_auto_model(profile));
+    let auto_ids = std::iter::once((COPILOT_AUTO_MODEL.to_string(), AutoTier::default())).chain(
+        AutoTier::ALL
+            .into_iter()
+            .map(|tier| (tier.model_id(), tier)),
+    );
+    for (id, tier) in auto_ids {
+        if !lists(&id) {
+            models.push(copilot_auto_model(profile, &id, tier));
+        }
     }
     models
 }
@@ -225,16 +250,17 @@ async fn first_refresh(state: &AppState) {
         .await;
 }
 
-/// `<profile>/auto`: Copilot's router picks the model, on every wire API.
-fn copilot_auto_model(profile: &ProfileConfig) -> Value {
+/// `<profile>/<bare_id>` on `tier`: Copilot's router picks the model, on every wire API.
+fn copilot_auto_model(profile: &ProfileConfig, bare_id: &str, tier: AutoTier) -> Value {
     json!({
-        "id": format!("{}/{COPILOT_AUTO_MODEL}", profile.name),
+        "id": format!("{}/{bare_id}", profile.name),
         "object": "model",
         "type": "model",
         "owned_by": profile.name,
-        "display_name": format!("Auto · {}", profile.label()),
+        "display_name": format!("Auto ({}) · {}", tier.label(), profile.label()),
         "description": format!(
-            "Copilot Auto picks the model per conversation, via llm-hub profile {}",
+            "Copilot Auto picks the model per conversation on the {} tier, via llm-hub profile {}",
+            tier.as_str(),
             profile.label()
         ),
         "supported_endpoints": COPILOT_AUTO_ENDPOINTS,
@@ -615,7 +641,7 @@ mod tests {
         let payload = enabled_models(&restarted).await;
 
         let listed = ids(&payload);
-        assert_eq!(listed.len(), 3, "unexpected list {payload}");
+        assert_eq!(listed.len(), 7, "unexpected list {payload}");
         assert!(
             listed
                 .iter()
@@ -715,7 +741,12 @@ mod tests {
         let cached = json!({"object": "list", "data": [{"id": "proxy/old", "owned_by": "proxy"}]});
         state.set_model_cache(cached);
 
-        let Json(payload) = list_models(State(state), HeaderMap::new()).await;
+        let Json(payload) = list_models(
+            State(state),
+            Query(ProfilesQuery::default()),
+            HeaderMap::new(),
+        )
+        .await;
 
         assert_eq!(ids(&payload), ["proxy/old"]);
     }
@@ -734,7 +765,12 @@ mod tests {
             ("LLM_HUB_PROXY_BASE_URL", &upstream.uri()),
         ]);
 
-        let Json(payload) = list_models(State(state), HeaderMap::new()).await;
+        let Json(payload) = list_models(
+            State(state),
+            Query(ProfilesQuery::default()),
+            HeaderMap::new(),
+        )
+        .await;
 
         assert_eq!(ids(&payload), ["proxy/m"]);
     }
@@ -767,6 +803,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copilot_listing_its_own_auto_ids_is_not_duplicated() {
+        let catalog = json!([
+            {"id": "auto", "name": "Copilot Auto"},
+            {"id": "auto-fast", "name": "Copilot Auto Fast"},
+        ]);
+        let (github, _copilot) = copilot_upstream(catalog, Duration::ZERO, None).await;
+        let state = copilot_state(&github.uri());
+
+        let payload = refresh_models(&state).await;
+
+        assert_eq!(
+            ids(&payload),
+            [
+                "copilot/auto",
+                "copilot/auto-fast",
+                "copilot/auto-efficiency",
+                "copilot/auto-balance",
+                "copilot/auto-intelligence",
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn copilot_refresh_advertises_dashed_ids_and_records_catalog() {
         let github = MockServer::start().await;
         let copilot = MockServer::start().await;
@@ -792,25 +851,57 @@ mod tests {
 
         assert_eq!(
             ids(&payload),
-            ["copilot/claude-opus-4-5", "copilot/gpt-4.1", "copilot/auto"]
+            [
+                "copilot/claude-opus-4-5",
+                "copilot/gpt-4.1",
+                "copilot/auto",
+                "copilot/auto-efficiency",
+                "copilot/auto-balance",
+                "copilot/auto-intelligence",
+                "copilot/auto-fast",
+            ]
         );
         assert_eq!(state.copilot_catalog("copilot")[0]["id"], "claude-opus-4.5");
+        let labels: Vec<&str> = payload["data"].as_array().unwrap()[2..]
+            .iter()
+            .map(|model| model["display_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Auto (Balance) · copilot",
+                "Auto (Efficiency) · copilot",
+                "Auto (Balance) · copilot",
+                "Auto (Intelligence) · copilot",
+                "Auto (Fast) · copilot",
+            ]
+        );
         let auto = &payload["data"][2];
-        assert_eq!(auto["display_name"], "Auto · copilot");
         assert_eq!(auto["type"], "model");
         assert_eq!(
             auto["supported_endpoints"],
             json!(["/chat/completions", "/responses", "/v1/messages"])
         );
-        let Json(settings) = crate::routes::claude_code::settings(State(state.clone())).await;
-        assert!(
-            settings["modelPicker"]["options"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|option| option["model"] == "copilot/auto"
-                    && option["label"] == "Auto · copilot")
-        );
+        let Json(settings) = crate::routes::claude_code::settings(
+            State(state.clone()),
+            Query(ProfilesQuery::default()),
+            HeaderMap::new(),
+        )
+        .await;
+        let options = settings["modelPicker"]["options"].as_array().unwrap();
+        for (model, label) in [
+            ("copilot/auto", "Auto (Balance) · copilot"),
+            ("copilot/auto-efficiency", "Auto (Efficiency) · copilot"),
+            ("copilot/auto-intelligence", "Auto (Intelligence) · copilot"),
+            ("copilot/auto-fast", "Auto (Fast) · copilot"),
+        ] {
+            assert!(
+                options
+                    .iter()
+                    .any(|option| option["model"] == model && option["label"] == label),
+                "{model} missing from {settings}"
+            );
+        }
         assert_eq!(
             state.upstream_model("copilot", "claude-opus-4-5"),
             Some(UpstreamModel {
@@ -857,7 +948,8 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(ANTHROPIC_VERSION_HEADER, "2023-06-01".parse().unwrap());
 
-        let Json(payload) = list_models(State(state), headers).await;
+        let Json(payload) =
+            list_models(State(state), Query(ProfilesQuery::default()), headers).await;
 
         assert_eq!(payload["has_more"], false);
         assert_eq!(payload["first_id"], "proxy/claude-a");
@@ -876,10 +968,74 @@ mod tests {
             json!({"object": "list", "data": [{"id": "proxy/m", "owned_by": "proxy"}]}),
         );
 
-        let Json(payload) = list_models(State(state), HeaderMap::new()).await;
+        let Json(payload) = list_models(
+            State(state),
+            Query(ProfilesQuery::default()),
+            HeaderMap::new(),
+        )
+        .await;
 
         assert!(payload.get("has_more").is_none());
         assert!(payload["data"][0].get("type").is_none());
+    }
+
+    fn two_profile_state() -> AppState {
+        let state = state_from(&[
+            ("LLM_HUB_PROFILES", "copilot,ivrit,local"),
+            ("LLM_HUB_COPILOT_BASE_URL", DEAD_BASE_URL),
+            ("LLM_HUB_IVRIT_BASE_URL", DEAD_BASE_URL),
+            ("LLM_HUB_LOCAL_BASE_URL", DEAD_BASE_URL),
+        ]);
+        state.set_model_cache(json!({"object": "list", "data": [
+            {"id": "copilot/auto", "owned_by": "copilot"},
+            {"id": "local/qwen", "owned_by": "local"},
+            {"id": "ivrit/whisper", "owned_by": "ivrit"},
+        ]}));
+        state
+    }
+
+    #[tokio::test]
+    async fn profiles_header_limits_the_list() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ProfileFilter::HEADER, "copilot, ivrit".parse().unwrap());
+        headers.insert(ANTHROPIC_VERSION_HEADER, "2023-06-01".parse().unwrap());
+
+        let Json(payload) = list_models(
+            State(two_profile_state()),
+            Query(ProfilesQuery::default()),
+            headers,
+        )
+        .await;
+
+        assert_eq!(ids(&payload), ["copilot/auto", "ivrit/whisper"]);
+        assert_eq!(payload["last_id"], "ivrit/whisper");
+    }
+
+    #[tokio::test]
+    async fn profiles_query_limits_the_list() {
+        let query = ProfilesQuery {
+            profiles: Some("local".to_string()),
+        };
+
+        let Json(payload) =
+            list_models(State(two_profile_state()), Query(query), HeaderMap::new()).await;
+
+        assert_eq!(ids(&payload), ["local/qwen"]);
+    }
+
+    #[tokio::test]
+    async fn no_profiles_filter_lists_everything() {
+        let Json(payload) = list_models(
+            State(two_profile_state()),
+            Query(ProfilesQuery::default()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(
+            ids(&payload),
+            ["copilot/auto", "local/qwen", "ivrit/whisper"]
+        );
     }
 
     fn profile(name: &str, static_ids: &[&str]) -> ProfileConfig {

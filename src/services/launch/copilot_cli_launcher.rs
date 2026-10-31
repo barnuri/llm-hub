@@ -1,7 +1,7 @@
 use super::hub_endpoint::HubEndpoint;
-use super::hub_model::HubModel;
-use super::launch_args::LaunchArgs;
-use super::launch_spec::LaunchSpec;
+use crate::schemas::launch::hub_model::HubModel;
+use crate::schemas::launch::launch_args::LaunchArgs;
+use crate::schemas::launch::launch_spec::LaunchSpec;
 
 /// `llm-hub copilot-cli`: GitHub Copilot CLI in BYOK mode on the hub's
 /// `/v1/chat/completions`. `llm-hub copilot` stays the upstream login command.
@@ -12,6 +12,7 @@ impl CopilotCliLauncher {
     const PROGRAM: &str = "copilot";
     const PROVIDER_TYPE: &str = "openai";
 
+    /// The copilot command, sized to the model's catalog limits when it has them.
     #[must_use]
     pub fn spec(endpoint: &HubEndpoint, args: LaunchArgs, catalog: &[HubModel]) -> LaunchSpec {
         let mut spec = LaunchSpec::new(Self::PROGRAM)
@@ -42,17 +43,13 @@ impl CopilotCliLauncher {
 mod tests {
     use super::*;
 
-    fn args(values: &[&str]) -> LaunchArgs {
-        LaunchArgs::parse(values.iter().map(ToString::to_string).collect())
-    }
-
     fn endpoint() -> HubEndpoint {
         HubEndpoint::from_lookup(|name| (name == "LLM_HUB_API_KEY").then(|| "k".to_string()))
     }
 
     #[test]
     fn without_a_model_only_the_provider_is_set() {
-        let spec = CopilotCliLauncher::spec(&endpoint(), args(&["--yolo"]), &[]);
+        let spec = CopilotCliLauncher::spec(&endpoint(), LaunchArgs::from_strs(&["--yolo"]), &[]);
 
         assert_eq!(spec.program(), "copilot");
         assert_eq!(
@@ -78,7 +75,7 @@ mod tests {
 
         let spec = CopilotCliLauncher::spec(
             &endpoint(),
-            args(&["copilot/claude-opus-5-5", "-p", "hi"]),
+            LaunchArgs::from_strs(&["copilot/claude-opus-5-5", "-p", "hi"]),
             &catalog,
         );
 
@@ -99,7 +96,7 @@ mod tests {
 
     #[test]
     fn unknown_model_sets_no_budgets() {
-        let spec = CopilotCliLauncher::spec(&endpoint(), args(&["other"]), &[]);
+        let spec = CopilotCliLauncher::spec(&endpoint(), LaunchArgs::from_strs(&["other"]), &[]);
 
         assert_eq!(spec.env_value("COPILOT_MODEL"), Some("other"));
         assert_eq!(spec.env_value("COPILOT_PROVIDER_MAX_PROMPT_TOKENS"), None);

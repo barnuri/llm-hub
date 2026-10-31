@@ -19,7 +19,7 @@ const HOP_BY_HOP: [&str; 8] = [
 /// Headers that must never be forwarded upstream on top of hop-by-hop ones:
 /// the caller's auth (replaced by the profile key), host/length (set by the
 /// client lib), and llm-hub control headers.
-const REQUEST_ONLY_STRIP: [&str; 10] = [
+const REQUEST_ONLY_STRIP: [&str; 11] = [
     "authorization",
     "x-api-key",
     "host",
@@ -30,6 +30,7 @@ const REQUEST_ONLY_STRIP: [&str; 10] = [
     HEADER_RETRY_ON,
     HEADER_SYSTEM_PROMPT_MODE,
     HEADER_REASONING_STRIP,
+    crate::schemas::launch::profile_filter::ProfileFilter::HEADER,
 ];
 
 pub fn filter_request_headers(headers: &HeaderMap) -> HeaderMap {
@@ -86,6 +87,7 @@ mod tests {
             ("authorization", "Bearer caller-key"),
             ("transfer-encoding", "chunked"),
             ("x-llm-hub-fallbacks", "a/b"),
+            ("x-llm-hub-profiles", "copilot"),
             ("content-type", "application/json"),
         ]));
         assert_eq!(out.len(), 1);

@@ -5,7 +5,6 @@
 mod configs;
 mod consts;
 mod dependencies;
-mod launch;
 mod routes;
 mod schemas;
 mod services;
@@ -20,6 +19,7 @@ use axum::routing::{any, delete, get, post};
 use crate::configs::HubConfig;
 use crate::consts::{ENV_FILE, LOGS_DIR, VERSION};
 use crate::dependencies::state::AppState;
+use crate::services::launch;
 use crate::services::store::Store;
 
 /// Env-file pairs merged with process env (process env wins). Reads via
@@ -200,6 +200,9 @@ Coding agents on the hub ([model] is optional, e.g. copilot/claude-opus-5-5):
   llm-hub opencode [model] [args]     opencode
   llm-hub copilot-cli [model] [args]  GitHub Copilot CLI
   llm-hub pi [model] [args]           pi
+  --profiles a,b                      only list models from those profiles; goes before or
+                                      after the agent name (also --profiles=a,b), e.g.
+                                      llm-hub --profiles copilot,ivrit claude
 
 GitHub Copilot upstream:
   llm-hub copilot login [--profile NAME]   sign in with the GitHub device flow
@@ -249,19 +252,20 @@ async fn run_cli_command() -> bool {
     }
 }
 
-/// `llm-hub <claude|codex|opencode|copilot-cli|pi> [model] [args...]` starts
-/// that harness on the hub. It runs before tracing starts, so no `logs/` dir
-/// appears in the project the harness opens.
+/// `llm-hub [--profiles a,b] <claude|codex|opencode|copilot-cli|pi> [model] [args...]`
+/// starts that harness on the hub. It runs before tracing starts, so no `logs/`
+/// dir appears in the project the harness opens.
 async fn run_launch_command() -> bool {
-    let mut args = std::env::args().skip(1);
-    let Some(harness) = args
-        .next()
-        .as_deref()
-        .and_then(launch::harness::Harness::from_command)
-    else {
-        return false;
+    let command = match launch::LaunchCommand::parse(std::env::args().skip(1).collect()) {
+        Ok(Some(command)) => command,
+        Ok(None) => return false,
+        Err(e) => {
+            eprintln!("llm-hub: {e}\n\n{HELP}");
+            std::process::exit(2);
+        }
     };
-    if let Err(e) = launch::run(harness, args.collect()).await {
+    let harness = command.harness;
+    if let Err(e) = launch::run(command).await {
         eprintln!("llm-hub {}: {e}", harness.command());
         std::process::exit(1);
     }

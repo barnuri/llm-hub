@@ -19,6 +19,7 @@ pub mod github_token_resolver;
 pub mod harness;
 pub mod insights;
 pub mod keyring_credential_store;
+pub mod launch;
 pub mod managed_process;
 #[cfg(test)]
 pub mod memory_credential_store;

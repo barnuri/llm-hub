@@ -5,7 +5,7 @@ use std::sync::{Mutex, PoisonError};
 
 use serde::Serialize;
 
-use crate::services::copilot_auto::AutoTurn;
+use crate::services::copilot_auto::{AutoTier, AutoTurn};
 
 const MAX_DECISIONS: usize = 500;
 const MAX_SESSIONS: usize = 256;
@@ -27,6 +27,24 @@ pub struct AutoDecision {
     pub estimated_prompt_tokens: u64,
 }
 
+/// A logged decision and the Auto tier it was routed on, serialized as one flat object.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TieredDecision {
+    #[serde(flatten)]
+    pub decision: AutoDecision,
+    pub tier: AutoTier,
+}
+
+/// A decision recorded without a tier was routed on the default tier.
+impl From<AutoDecision> for TieredDecision {
+    fn from(decision: AutoDecision) -> TieredDecision {
+        TieredDecision {
+            decision,
+            tier: AutoTier::default(),
+        }
+    }
+}
+
 /// The latest decisions in a ring, plus the latest decision of each recent
 /// session, so a quiet session still shows its model after the ring moves on.
 #[derive(Debug, Default)]
@@ -36,16 +54,17 @@ pub struct AutoDecisionLog {
 
 #[derive(Debug, Default)]
 struct LogState {
-    ring: VecDeque<AutoDecision>,
-    latest_by_session: HashMap<String, AutoDecision>,
+    ring: VecDeque<TieredDecision>,
+    latest_by_session: HashMap<String, TieredDecision>,
     session_order: VecDeque<String>,
 }
 
 impl AutoDecisionLog {
     /// Appends `decision`, dropping the oldest entry once the ring is full.
-    pub fn record(&self, decision: AutoDecision) {
+    pub fn record(&self, decision: impl Into<TieredDecision>) {
+        let decision = decision.into();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(session) = decision.session.clone() {
+        if let Some(session) = decision.decision.session.clone() {
             state.remember_session(session, decision.clone());
         }
         if state.ring.len() >= MAX_DECISIONS {
@@ -55,16 +74,16 @@ impl AutoDecisionLog {
     }
 
     /// Up to `limit` decisions, newest first, for one session or for all of them.
-    pub fn recent(&self, session: Option<&str>, limit: usize) -> Vec<AutoDecision> {
+    pub fn recent(&self, session: Option<&str>, limit: usize) -> Vec<TieredDecision> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(session) = session else {
             return state.ring.iter().rev().take(limit).cloned().collect();
         };
-        let found: Vec<AutoDecision> = state
+        let found: Vec<TieredDecision> = state
             .ring
             .iter()
             .rev()
-            .filter(|decision| decision.session.as_deref() == Some(session))
+            .filter(|entry| entry.decision.session.as_deref() == Some(session))
             .take(limit)
             .cloned()
             .collect();
@@ -82,7 +101,7 @@ impl AutoDecisionLog {
 
 impl LogState {
     /// Keeps `decision` as the session's latest; the least recently recorded session goes first.
-    fn remember_session(&mut self, session: String, decision: AutoDecision) {
+    fn remember_session(&mut self, session: String, decision: TieredDecision) {
         if self
             .latest_by_session
             .insert(session.clone(), decision)
@@ -119,8 +138,26 @@ mod tests {
         }
     }
 
-    fn timestamps(decisions: &[AutoDecision]) -> Vec<u64> {
-        decisions.iter().map(|decision| decision.ts_ms).collect()
+    fn timestamps(decisions: &[TieredDecision]) -> Vec<u64> {
+        decisions.iter().map(|entry| entry.decision.ts_ms).collect()
+    }
+
+    #[test]
+    fn entries_carry_the_tier_flat_and_default_to_balance() {
+        let log = AutoDecisionLog::default();
+        log.record(decision(Some("a"), 1));
+        log.record(TieredDecision {
+            decision: decision(Some("a"), 2),
+            tier: AutoTier::Efficiency,
+        });
+
+        let recent = log.recent(Some("a"), 10);
+        let json = serde_json::to_value(&recent).unwrap();
+
+        assert_eq!(json[0]["tier"], "efficiency");
+        assert_eq!(json[0]["ts_ms"], 2);
+        assert_eq!(json[1]["tier"], "balance");
+        assert_eq!(json[1]["session"], "a");
     }
 
     #[test]
@@ -148,7 +185,7 @@ mod tests {
         let all = log.recent(None, MAX_DECISIONS + 10);
 
         assert_eq!(all.len(), MAX_DECISIONS);
-        assert_eq!(all[0].ts_ms, MAX_DECISIONS as u64);
+        assert_eq!(all[0].decision.ts_ms, MAX_DECISIONS as u64);
         assert_eq!(timestamps(&log.recent(Some("quiet"), 10)), [0]);
     }
 
