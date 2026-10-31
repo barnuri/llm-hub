@@ -18,6 +18,7 @@ use crate::dependencies::state::AppState;
 use crate::routes::models::{COPILOT_AUTO_MODEL, advertised_bare_id};
 use crate::schemas::app_error::AppError;
 use crate::schemas::model_id::ModelId;
+use crate::schemas::upstream_model::UpstreamModel;
 use crate::services::anthropic;
 use crate::services::body_transform::BodyTransform;
 use crate::services::fallback::{RetryPolicy, fallback_chain, per_attempt_timeout_ms};
@@ -30,6 +31,7 @@ use crate::utils::headers::{filter_request_headers, filter_response_headers};
 
 /// Copilot serves Claude models on the Anthropic Messages API at this path.
 const NATIVE_MESSAGES_PATH: &str = "/v1/messages";
+const NATIVE_COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 const HEADER_ANTHROPIC_VERSION: &str = "anthropic-version";
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 const HEADER_COPILOT_SESSION_TOKEN: &str = "copilot-session-token";
@@ -319,7 +321,7 @@ impl<'a> AttemptBodies<'a> {
         let native = self
             .native
             .as_ref()
-            .filter(|_| catalog.is_some_and(|m| m.native_messages));
+            .filter(|_| catalog.as_ref().is_some_and(|m| m.native_messages));
         match native {
             // The request transforms only ever touched the translated body,
             // and the response, error bodies included, goes back untouched.
@@ -332,7 +334,8 @@ impl<'a> AttemptBodies<'a> {
                 plan: &self.passthrough_plan,
             },
             None => Attempt {
-                path: UpstreamPath::Strip(self.upstream_path),
+                path: native_count_tokens_path(self.upstream_path, catalog.as_ref())
+                    .unwrap_or(UpstreamPath::Strip(self.upstream_path)),
                 headers: self.headers,
                 body: body_for_attempt(
                     self.json_body.as_ref(),
@@ -640,6 +643,20 @@ async fn send_attempt(
         return Ok(response);
     }
     upstream.send(body).await.map(|(retried, _)| retried)
+}
+
+/// Copilot serves Anthropic token counting at `/v1/messages/count_tokens`, so a
+/// native Claude model keeps the `/v1` that `Strip` would drop.
+fn native_count_tokens_path(
+    client_path: &str,
+    catalog: Option<&UpstreamModel>,
+) -> Option<UpstreamPath<'static>> {
+    let bare_path = client_path
+        .split_once('?')
+        .map_or(client_path, |(path, _)| path);
+    let is_count_tokens = bare_path == NATIVE_COUNT_TOKENS_PATH;
+    (is_count_tokens && catalog.is_some_and(|model| model.native_messages))
+        .then_some(UpstreamPath::Verbatim(NATIVE_COUNT_TOKENS_PATH))
 }
 
 /// The path an attempt is sent to, appended to the profile's base URL.
@@ -1381,6 +1398,28 @@ mod tests {
     const SILENCE_MS: u64 = 120;
 
     type TestStream = BoxStream<'static, reqwest::Result<Bytes>>;
+
+    #[test]
+    fn count_tokens_on_native_claude_model_keeps_v1_prefix() {
+        let native = UpstreamModel {
+            upstream_id: "claude-opus-5.5".into(),
+            native_messages: true,
+        };
+        let translated = UpstreamModel {
+            upstream_id: "gpt-6-luna".into(),
+            native_messages: false,
+        };
+
+        let routed = native_count_tokens_path("/v1/messages/count_tokens?beta=true", Some(&native));
+
+        assert_eq!(
+            routed.map(UpstreamPath::as_str),
+            Some(NATIVE_COUNT_TOKENS_PATH)
+        );
+        assert!(native_count_tokens_path("/v1/messages/count_tokens", Some(&translated)).is_none());
+        assert!(native_count_tokens_path("/v1/chat/completions", Some(&native)).is_none());
+        assert!(native_count_tokens_path("/v1/messages/count_tokens", None).is_none());
+    }
 
     /// Upstream that sleeps `delay_ms` before handing over each payload, which
     /// is what gives `pump` a real idle gap to react to.
