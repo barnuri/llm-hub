@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
 
+import { Panel } from "../components/Panel";
+import { Pill, type PillTone } from "../components/Pill";
+import { Segmented, type SegmentedOption } from "../components/Segmented";
 import { api } from "../lib/api";
 import { formatMs, formatNumber, formatPct, formatTps } from "../lib/format";
 import { navigate, useRoute } from "../lib/router";
@@ -12,16 +15,17 @@ import type {
   ModelPick,
   UseCasePick,
 } from "../lib/types";
+import "../styles/screens/insights.css";
 
 interface InsightsScreenProps {
   readonly onCopy: (text: string) => void;
 }
 
-const RANGES: ReadonlyArray<readonly [InsightsRange, string]> = [
-  ["1d", "Today"],
-  ["7d", "Last 7 days"],
-  ["30d", "Last 30 days"],
-  ["all", "All time"],
+const RANGES: readonly SegmentedOption<InsightsRange>[] = [
+  { value: "1d", label: "Today" },
+  { value: "7d", label: "7 days" },
+  { value: "30d", label: "30 days" },
+  { value: "all", label: "All time" },
 ];
 
 const MIN_CALL_OPTIONS: readonly number[] = [1, 3, 5, 10, 25];
@@ -34,6 +38,13 @@ const HEALTH_LABEL: Readonly<Record<ModelHealth, string>> = {
   degraded: "Degraded",
   failing: "Failing now",
   insufficient_data: "Too few calls",
+};
+
+const HEALTH_TONE: Readonly<Record<ModelHealth, PillTone>> = {
+  healthy: "ok",
+  degraded: "warn",
+  failing: "danger",
+  insufficient_data: "neutral",
 };
 
 function parseRange(value: string | null): InsightsRange {
@@ -121,26 +132,11 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
   const agentReportPath = `/api/insights/report?${queryString(range, minCalls)}`;
 
   return (
-    <section className="tab active insights">
-      <h2>Insights</h2>
-      <p className="dim">
-        Which model has been fastest and most reliable, from real calls through the hub. These numbers measure
-        speed and failed calls, not answer quality.
-      </p>
-
-      <div className="toolbar">
-        {RANGES.map(([id, label]) => (
-          <button
-            key={id}
-            type="button"
-            className={range === id ? "chip active" : "chip"}
-            onClick={() => go(id, minCalls)}
-          >
-            {label}
-          </button>
-        ))}
+    <section className="tab active insights" aria-busy={report === null && !unavailable}>
+      <div className="toolbar insights-toolbar">
+        <Segmented label="Insights period" options={RANGES} value={range} onChange={(value) => go(value, minCalls)} />
         <label className="insights-min">
-          <span className="dim">Rank models with at least</span>
+          <span>Rank models with at least</span>
           <select
             className="input"
             value={minCalls}
@@ -154,77 +150,98 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
           </select>
         </label>
       </div>
-
-      <div className="insights-agent">
-        <span className="dim">For agents and scripts: one JSON with a summary, every pick and failure reasons.</span>
-        <a className="btn small" href={agentReportPath} target="_blank" rel="noreferrer">
-          Open agent report
-        </a>
-        <button
-          type="button"
-          className="btn small"
-          onClick={() => onCopy(`${window.location.origin}${agentReportPath}`)}
-        >
-          Copy agent report URL
-        </button>
-      </div>
+      <p className="dim insights-intro">
+        Which model has been fastest and most reliable, from real calls through the hub. These numbers measure speed
+        and failed calls, not answer quality.
+      </p>
 
       {unavailable ? (
-        <p className="note" role="status">
-          {unavailable}
-        </p>
+        <Panel title="Insights unavailable">
+          <p className="note" role="status">
+            {unavailable}
+          </p>
+        </Panel>
       ) : null}
 
-      {pick ? (
-        <div className="insights-pick" role="status">
-          <div>
-            <div className="insights-pick-title">
-              Use <span className="mono">{pick.model}</span>
-            </div>
-            <div className="dim">{pick.reason}</div>
-            {pick.alternatives.length > 0 ? (
-              <div className="dim">
-                Next best: {pick.alternatives.map((alt) => shortName(alt.model)).join(", ")}
+      <div className="grid-main-side insights-top">
+        {pick ? (
+          <Panel
+            title="Recommended model"
+            className="insights-pick"
+            actions={
+              <button type="button" className="btn small" onClick={() => onCopy(pickUrl)}>
+                Copy pick URL
+              </button>
+            }
+          >
+            <div role="status">
+              <div className="insights-pick-title">
+                Use <span className="mono">{pick.model}</span>
               </div>
-            ) : null}
+              <div className="dim">{pick.reason}</div>
+              {pick.alternatives.length > 0 ? (
+                <div className="dim">
+                  Next best:{" "}
+                  <span className="mono">{pick.alternatives.map((alt) => shortName(alt.model)).join(", ")}</span>
+                </div>
+              ) : null}
+            </div>
+          </Panel>
+        ) : (
+          <Panel title="Recommended model" className="insights-pick">
+            <p className="note" role="status">
+              {report && !unavailable
+                ? `No model has ${minCalls} or more calls in this window yet. Lower the minimum or pick a longer range.`
+                : "Loading…"}
+            </p>
+          </Panel>
+        )}
+        <Panel title="Agent report" sub="JSON for agents and scripts">
+          <p className="dim insights-agent-text">One JSON with a summary, every pick and failure reasons.</p>
+          <div className="toolbar">
+            <a className="btn small" href={agentReportPath} target="_blank" rel="noreferrer">
+              Open agent report
+            </a>
+            <button
+              type="button"
+              className="btn small"
+              onClick={() => onCopy(`${window.location.origin}${agentReportPath}`)}
+            >
+              Copy agent report URL
+            </button>
           </div>
-          <button type="button" className="btn small" onClick={() => onCopy(pickUrl)}>
-            Copy pick URL
-          </button>
-        </div>
-      ) : report && !unavailable ? (
-        <p className="note" role="status">
-          No model has {minCalls} or more calls in this window yet. Lower the minimum or pick a longer range.
-        </p>
-      ) : null}
+        </Panel>
+      </div>
 
       {report ? <Leaders report={report} /> : null}
 
       {report && report.best_for.length > 0 ? <BestFor picks={report.best_for} /> : null}
 
       {ranked.length > 0 ? (
-        <>
-          <h3>Ranking</h3>
-          <p className="dim">
-            Overall score = 60% reliability + 40% speed. Speed compares first-token time and output speed with the
-            best ranked model.
+        <Panel
+          title="Ranking"
+          sub="Overall score = 60% reliability + 40% speed"
+          actions={
+            <div className="insights-legend dim" aria-hidden="true">
+              <span className="insights-swatch reliability" /> Reliability
+              <span className="insights-swatch speed" /> Speed
+            </div>
+          }
+        >
+          <p className="dim insights-panel-note">
+            Speed compares first-token time and output speed with the best ranked model.
           </p>
           <ol className="insights-ranking">
             {ranked.map((model) => (
               <RankingRow key={model.model} model={model} />
             ))}
           </ol>
-          <div className="insights-legend dim" aria-hidden="true">
-            <span className="insights-swatch reliability" /> Reliability share
-            <span className="insights-swatch speed" /> Speed share
-          </div>
-        </>
+        </Panel>
       ) : null}
 
       {models.length > 0 ? (
-        <>
-          <h3>All models</h3>
-          <div className="table-scroll">
+        <Panel title="All models" sub={`${formatNumber(models.length)} models, ranked first`}>
+          <div className="table-scroll insights-table-scroll">
             <table className="table">
               <thead>
                 <tr>
@@ -250,7 +267,11 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
               </tbody>
             </table>
           </div>
-        </>
+        </Panel>
+      ) : report && !unavailable ? (
+        <Panel title="All models">
+          <p className="note insights-empty">No calls in this window yet.</p>
+        </Panel>
       ) : null}
 
       {report && report.harnesses.length > 0 ? <Harnesses harnesses={report.harnesses} /> : null}
@@ -260,30 +281,26 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
 
 function BestFor({ picks }: { readonly picks: readonly UseCasePick[] }) {
   return (
-    <>
-      <h3>Best model for each job</h3>
-      <p className="dim">
-        Use cases come from the model registry; the pick is the best-ranked model declared for each one.
-      </p>
-      <div className="stat-tiles">
+    <Panel title="Best model for each job" sub="Best-ranked model declared for each use case in the registry">
+      <div className="kpis insights-cards">
         {picks.map((pick) => (
-          <div key={pick.use_case} className="stat-tile" title={pick.reason}>
-            <div className="label">Best for {pick.use_case}</div>
-            <div className="insights-leader mono">{shortName(pick.model)}</div>
-            <div className="hint">{pick.ranked ? "Ranked from calls" : "Declared only, not enough calls yet"}</div>
+          <div key={pick.use_case} className="kpi insights-card" title={pick.reason}>
+            <span className="kpi-label">Best for {pick.use_case}</span>
+            <span className="insights-card-model" title={pick.model ?? undefined}>
+              {shortName(pick.model)}
+            </span>
+            <span className="kpi-sub">{pick.ranked ? "Ranked from calls" : "Declared only, not enough calls yet"}</span>
           </div>
         ))}
       </div>
-    </>
+    </Panel>
   );
 }
 
 function Harnesses({ harnesses }: { readonly harnesses: readonly HarnessInsight[] }) {
   return (
-    <>
-      <h3>By harness</h3>
-      <p className="dim">Which client sent the calls, told apart by its User-Agent and headers.</p>
-      <div className="table-scroll">
+    <Panel title="By harness" sub="Which client sent the calls, told apart by its User-Agent and headers">
+      <div className="table-scroll insights-table-scroll">
         <table className="table insights-harness-table">
           <thead>
             <tr>
@@ -307,7 +324,7 @@ function Harnesses({ harnesses }: { readonly harnesses: readonly HarnessInsight[
           </tbody>
         </table>
       </div>
-    </>
+    </Panel>
   );
 }
 
@@ -337,14 +354,14 @@ function Leaders({ report }: { readonly report: InsightsReport }) {
     ],
   ];
   return (
-    <div className="stat-tiles">
+    <div className="kpis insights-leaders">
       {tiles.map(([label, model, value]) => (
-        <div key={label} className="stat-tile">
-          <div className="label">{label}</div>
-          <div className="insights-leader mono" title={model ?? undefined}>
-            {shortName(model)}
-          </div>
-          <div className="hint">{model ? value : "No ranked model yet"}</div>
+        <div key={label} className="kpi">
+          <span className="kpi-label">{label}</span>
+          <span className="kpi-value">{model ? value : "—"}</span>
+          <span className="kpi-sub insights-leader" title={model ?? undefined}>
+            {model ? shortName(model) : "No ranked model yet"}
+          </span>
         </div>
       ))}
     </div>
@@ -384,7 +401,7 @@ function DetailRow({ model }: { readonly model: ModelInsight }) {
         {model.use_cases.length > 0 ? (
           model.use_cases.map((useCase) => (
             <span key={useCase} className="insights-use">
-              {useCase}
+              <Pill tone="info">{useCase}</Pill>
             </span>
           ))
         ) : (
@@ -411,5 +428,5 @@ function DetailRow({ model }: { readonly model: ModelInsight }) {
 }
 
 function HealthPill({ health }: { readonly health: ModelHealth }) {
-  return <span className={`insights-health ${health}`}>{HEALTH_LABEL[health]}</span>;
+  return <Pill tone={HEALTH_TONE[health]}>{HEALTH_LABEL[health]}</Pill>;
 }

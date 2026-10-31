@@ -1,0 +1,20 @@
+.models > .panel {
+  margin-top: 0;
+}
+
+.models-scroll {
+  max-height: calc(100vh - 220px);
+  overflow-y: auto;
+}
+
+.models-empty {
+  margin: 0;
+  padding: 24px 0;
+  text-align: center;
+}
+
+.models .table td.models-actions {
+  width: 1%;
+  text-align: right;
+  white-space: nowrap;
+}

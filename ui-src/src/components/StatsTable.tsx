@@ -1,5 +1,6 @@
 import type { StatsEntry } from "../lib/types";
 import { formatMs, formatNumber, formatTps, formatUsd } from "../lib/format";
+import { Panel } from "./Panel";
 
 interface StatsTableProps {
   readonly label: string;
@@ -8,8 +9,11 @@ interface StatsTableProps {
 
 export function StatsTable({ label, rows }: StatsTableProps) {
   return (
-    <>
-      <h2>{label}</h2>
+    <Panel
+      className="stats-table"
+      title={`By ${label.toLowerCase()}`}
+      sub={rows.length === 1 ? "1 row" : `${formatNumber(rows.length)} rows`}
+    >
       <div className="table-scroll">
         <table className="table">
           <thead>
@@ -47,17 +51,19 @@ export function StatsTable({ label, rows }: StatsTableProps) {
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td colSpan={10} className="dim">
+                <td colSpan={10} className="table-empty">
                   No requests in this filter window yet.
                 </td>
               </tr>
             ) : (
               rows.map((entry) => (
                 <tr key={entry.key}>
-                  <td className="mono">{entry.key}</td>
+                  <td className="mono stats-key" title={entry.key}>
+                    {entry.key}
+                  </td>
                   <td className="num">{formatNumber(entry.requests)}</td>
                   <td className="num">{formatUsd(entry.cost_usd)}</td>
-                  <td className="num">{formatNumber(entry.errors)}</td>
+                  <td className={entry.errors > 0 ? "num t-err" : "num"}>{formatNumber(entry.errors)}</td>
                   <td className="num">{formatMs(entry.ttft_p50_ms)}</td>
                   <td className="num">{formatTps(entry.tokens_per_sec_p50)}</td>
                   <td className="num">{formatNumber(entry.cache_read_tokens)}</td>
@@ -70,6 +76,6 @@ export function StatsTable({ label, rows }: StatsTableProps) {
           </tbody>
         </table>
       </div>
-    </>
+    </Panel>
   );
 }

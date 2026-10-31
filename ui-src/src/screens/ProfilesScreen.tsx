@@ -2,8 +2,11 @@ import { useState } from "react";
 
 import { FallbacksEditor } from "../components/FallbacksEditor";
 import { Modal } from "../components/Modal";
+import { Panel } from "../components/Panel";
+import { Pill } from "../components/Pill";
 import { api } from "../lib/api";
 import type { HubMeta, ProfileRow } from "../lib/types";
+import "../styles/screens/profiles.css";
 
 interface ProfilesScreenProps {
   readonly meta: HubMeta | null;
@@ -22,10 +25,50 @@ interface FormState {
   enabled: boolean;
 }
 
+interface FormErrors {
+  readonly name?: string;
+  readonly baseUrl?: string;
+}
+
+const HTTP_URL = /^https?:\/\//;
+
+function validate(form: FormState): FormErrors {
+  const name = form.name.trim();
+  const baseUrl = form.baseUrl.trim();
+  return {
+    name: name === "" || name.includes("/") ? "Enter a name without a “/”." : undefined,
+    baseUrl: baseUrl !== "" && !HTTP_URL.test(baseUrl) ? "Start the URL with http:// or https://." : undefined,
+  };
+}
+
+function healthPill(profile: ProfileRow) {
+  if (!profile.enabled) {
+    return <Pill dot>Disabled</Pill>;
+  }
+  if (profile.healthy === false) {
+    return (
+      <Pill tone="danger" dot>
+        Unreachable
+      </Pill>
+    );
+  }
+  return (
+    <Pill tone="ok" dot>
+      Enabled
+    </Pill>
+  );
+}
+
 export function ProfilesScreen({ meta, models, onChanged, onToast }: ProfilesScreenProps) {
   const [form, setForm] = useState<FormState | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
+  const [errors, setErrors] = useState<FormErrors>({});
   const readonly = meta?.readonly ?? false;
+
+  const closeForm = () => {
+    setForm(null);
+    setErrors({});
+  };
 
   const openAdd = () =>
     setForm({
@@ -53,6 +96,11 @@ export function ProfilesScreen({ meta, models, onChanged, onToast }: ProfilesScr
     if (!form) {
       return;
     }
+    const found = validate(form);
+    if (found.name || found.baseUrl) {
+      setErrors(found);
+      return;
+    }
     try {
       await api("/api/profiles", {
         method: "POST",
@@ -66,7 +114,7 @@ export function ProfilesScreen({ meta, models, onChanged, onToast }: ProfilesScr
         }),
       });
       onToast(form.existing ? "Profile saved" : "Profile added");
-      setForm(null);
+      closeForm();
       onChanged();
     } catch (err) {
       onToast(err instanceof Error ? err.message : String(err), true);
@@ -105,48 +153,104 @@ export function ProfilesScreen({ meta, models, onChanged, onToast }: ProfilesScr
     }
   };
 
+  const profiles = meta?.profiles ?? [];
+
+  const fieldProps = (id: string, error: string | undefined) => ({
+    id,
+    className: "input",
+    "aria-invalid": error !== undefined,
+    "aria-describedby": error ? `${id}-error` : undefined,
+  });
+
+  const fieldError = (id: string, error: string | undefined) =>
+    error ? (
+      <p id={`${id}-error`} className="field-error" role="alert">
+        {error}
+      </p>
+    ) : null;
+
   return (
-    <section className="tab active">
-      <div className="toolbar">
-        <button type="button" className="btn primary" onClick={openAdd} disabled={readonly}>
-          Add profile
-        </button>
-        {readonly ? <span className="dim">read-only mode — edits disabled</span> : null}
-      </div>
-      <table className="table">
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Label</th>
-            <th>Base URL</th>
-            <th>Key</th>
-            <th>Enabled</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {(meta?.profiles ?? []).map((profile) => (
-            <tr key={profile.name}>
-              <td className="mono">{profile.name}</td>
-              <td>{profile.label}</td>
-              <td className="mono">{profile.base_url}</td>
-              <td className="mono">{profile.api_key_masked || "—"}</td>
-              <td>{profile.enabled ? "yes" : "no"}</td>
-              <td>
-                <button type="button" className="btn small" onClick={() => test(profile.name)}>
-                  Test
-                </button>{" "}
-                <button type="button" className="btn small" onClick={() => openEdit(profile)} disabled={readonly}>
-                  Edit
-                </button>{" "}
-                <button type="button" className="btn small danger" onClick={() => setDeleting(profile.name)} disabled={readonly}>
-                  Delete
-                </button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <section className="tab active profiles">
+      <Panel
+        title="Upstream profiles"
+        sub={meta ? `${profiles.length} configured` : undefined}
+        actions={
+          <>
+            {readonly ? (
+              <Pill tone="warn" dot title="Edits are disabled">
+                Read-only
+              </Pill>
+            ) : null}
+            <button type="button" className="btn primary" onClick={openAdd} disabled={readonly}>
+              Add profile
+            </button>
+          </>
+        }
+      >
+        {meta === null ? (
+          <div className="skeleton profiles-skeleton" aria-label="Loading profiles" />
+        ) : profiles.length === 0 ? (
+          <p className="note profiles-empty">No profiles yet. Add one to route models through an upstream.</p>
+        ) : (
+          <div className="table-scroll profiles-scroll">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Label</th>
+                  <th>Base URL</th>
+                  <th>Key</th>
+                  <th>Status</th>
+                  <th>
+                    <span className="sr-only">Actions</span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {profiles.map((profile) => (
+                  <tr key={profile.name}>
+                    <td className="mono">{profile.name}</td>
+                    <td>{profile.label}</td>
+                    <td className="mono dim profiles-url" title={profile.base_url}>
+                      {profile.base_url}
+                    </td>
+                    <td className="mono dim">{profile.api_key_masked || "—"}</td>
+                    <td>{healthPill(profile)}</td>
+                    <td className="profiles-actions">
+                      <button
+                        type="button"
+                        className="btn small"
+                        aria-label={`Test ${profile.name}`}
+                        onClick={() => test(profile.name)}
+                      >
+                        Test
+                      </button>
+                      <button
+                        type="button"
+                        className="btn small"
+                        aria-label={`Edit ${profile.name}`}
+                        onClick={() => openEdit(profile)}
+                        disabled={readonly}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        className="btn small danger"
+                        aria-label={`Delete ${profile.name}`}
+                        onClick={() => setDeleting(profile.name)}
+                        disabled={readonly}
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
 
       <FallbacksEditor
         key={(meta?.default_fallbacks ?? []).join(",")}
@@ -162,17 +266,20 @@ export function ProfilesScreen({ meta, models, onChanged, onToast }: ProfilesScr
           title={form.existing ? `Edit profile ${form.existing.name}` : "Add profile"}
           confirmLabel={form.existing ? "Save changes" : "Add profile"}
           onConfirm={save}
-          onCancel={() => setForm(null)}
+          onCancel={closeForm}
         >
           <div className="field">
             <label htmlFor="f-name">Name (becomes the model prefix)</label>
             <input
-              id="f-name"
-              className="input"
+              {...fieldProps("f-name", errors.name)}
               value={form.name}
               readOnly={form.existing !== null}
-              onChange={(event) => setForm({ ...form, name: event.target.value })}
+              onChange={(event) => {
+                setForm({ ...form, name: event.target.value });
+                setErrors({ ...errors, name: undefined });
+              }}
             />
+            {fieldError("f-name", errors.name)}
           </div>
           <div className="field">
             <label htmlFor="f-display">Display name (optional UI label)</label>
@@ -187,12 +294,15 @@ export function ProfilesScreen({ meta, models, onChanged, onToast }: ProfilesScr
           <div className="field">
             <label htmlFor="f-url">Base URL (OpenAI-compatible, ends with /v1)</label>
             <input
-              id="f-url"
-              className="input"
+              {...fieldProps("f-url", errors.baseUrl)}
               placeholder="https://api.groq.com/openai/v1"
               value={form.baseUrl}
-              onChange={(event) => setForm({ ...form, baseUrl: event.target.value })}
+              onChange={(event) => {
+                setForm({ ...form, baseUrl: event.target.value });
+                setErrors({ ...errors, baseUrl: undefined });
+              }}
             />
+            {fieldError("f-url", errors.baseUrl)}
           </div>
           <div className="field">
             <label htmlFor="f-apikey">API key {form.existing ? "(leave empty to keep current)" : ""}</label>
@@ -215,12 +325,12 @@ export function ProfilesScreen({ meta, models, onChanged, onToast }: ProfilesScr
             />
           </div>
           <div className="field">
-            <label>
+            <label className="field-check">
               <input
                 type="checkbox"
                 checked={form.enabled}
                 onChange={(event) => setForm({ ...form, enabled: event.target.checked })}
-              />{" "}
+              />
               Enabled
             </label>
           </div>

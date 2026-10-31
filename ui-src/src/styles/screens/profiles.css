@@ -1,0 +1,66 @@
+.profiles > .panel:first-child {
+  margin-top: 0;
+}
+
+.profiles > .panel + .panel {
+  margin-top: 12px;
+}
+
+.profiles-scroll {
+  max-height: calc(100vh - 320px);
+  overflow-y: auto;
+}
+
+.profiles-skeleton {
+  height: 96px;
+}
+
+.profiles-empty {
+  margin: 0;
+  padding: 24px 0;
+  text-align: center;
+}
+
+.profiles .table td.profiles-url {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profiles .table td.profiles-actions {
+  width: 1%;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.profiles-actions .btn + .btn {
+  margin-left: 4px;
+}
+
+.profiles .field-error {
+  margin: 4px 0 0;
+  color: var(--danger-text);
+  font-size: 12px;
+}
+
+.profiles .input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.profiles .field label.field-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.profiles .field-check input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+}

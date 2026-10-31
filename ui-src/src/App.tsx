@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { Icon, type IconName } from "./components/Icon";
 import { Modal } from "./components/Modal";
+import { Pill } from "./components/Pill";
+import { Segmented, type SegmentedOption } from "./components/Segmented";
+import { ThemeToggle } from "./components/ThemeToggle";
 import { Toasts, type ToastItem } from "./components/Toasts";
 import { api, saveKey, UnauthorizedError } from "./lib/api";
-import { navigate, useRoute } from "./lib/router";
+import { navigate, setQueryParam, useRoute } from "./lib/router";
 import type { HubMeta } from "./lib/types";
 import { KeysScreen } from "./screens/KeysScreen";
 import { ModelsScreen } from "./screens/ModelsScreen";
@@ -15,17 +19,53 @@ import { InsightsScreen } from "./screens/InsightsScreen";
 import { AutoScreen } from "./screens/AutoScreen";
 import { UsageScreen } from "./screens/UsageScreen";
 
-const TABS: ReadonlyArray<readonly [string, string]> = [
-  ["overview", "Overview"],
-  ["insights", "Insights"],
-  ["errors", "Errors"],
-  ["models", "Models"],
-  ["stats", "Stats"],
-  ["auto", "Copilot Auto"],
-  ["profiles", "Profiles"],
-  ["keys", "API keys"],
-  ["setup", "Setup"],
+interface Page {
+  readonly id: string;
+  readonly label: string;
+  readonly icon: IconName;
+  readonly periods?: readonly SegmentedOption<string>[];
+}
+
+interface NavGroup {
+  readonly title: string;
+  readonly pages: readonly Page[];
+}
+
+const OVERVIEW_PERIODS: readonly SegmentedOption<string>[] = [
+  { value: "1d", label: "Today" },
+  { value: "7d", label: "7 days" },
 ];
+
+const NAV_GROUPS: readonly NavGroup[] = [
+  {
+    title: "Monitor",
+    pages: [
+      { id: "overview", label: "Overview", icon: "overview", periods: OVERVIEW_PERIODS },
+      { id: "insights", label: "Insights", icon: "insights" },
+      { id: "errors", label: "Errors", icon: "errors" },
+      { id: "stats", label: "Stats", icon: "stats" },
+      { id: "auto", label: "Copilot Auto", icon: "auto" },
+    ],
+  },
+  {
+    title: "Configure",
+    pages: [
+      { id: "models", label: "Models", icon: "models" },
+      { id: "profiles", label: "Profiles", icon: "profiles" },
+      { id: "keys", label: "API keys", icon: "keys" },
+      { id: "setup", label: "Setup", icon: "setup" },
+    ],
+  },
+];
+
+const PAGES: readonly Page[] = NAV_GROUPS.flatMap((group) => group.pages);
+const DEFAULT_PAGE: Page = PAGES[0] ?? { id: "overview", label: "Overview", icon: "overview" };
+
+function periodOf(page: Page, requested: string | null): string | null {
+  const periods = page.periods ?? [];
+  const match = periods.find((option) => option.value === requested);
+  return (match ?? periods[0])?.value ?? null;
+}
 
 interface ModelsResponse {
   readonly data: ReadonlyArray<{ readonly id: string }>;
@@ -35,7 +75,9 @@ export function App() {
   const route = useRoute();
   const routeTab = route.path.split("/")[0] ?? "";
   const normalizedTab = routeTab === "usage" ? "overview" : routeTab;
-  const tab = TABS.some(([id]) => id === normalizedTab) ? normalizedTab : "overview";
+  const page = PAGES.find((candidate) => candidate.id === normalizedTab) ?? DEFAULT_PAGE;
+  const tab = page.id;
+  const period = periodOf(page, route.query.get("range"));
   const [meta, setMeta] = useState<HubMeta | null>(null);
   const [models, setModels] = useState<readonly string[]>([]);
   const [toasts, setToasts] = useState<readonly ToastItem[]>([]);
@@ -121,76 +163,99 @@ export function App() {
 
   return (
     <>
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">◆</span> llm-hub{" "}
-          <span className="version">{meta ? `v${meta.version}` : ""}</span>
-        </div>
-        <div className="topbar-right">
-          {meta ? (
-            <>
-              <span className={meta.auth_enabled ? "badge on" : "badge"}>
-                {meta.auth_enabled ? "auth on" : "auth off"}
-              </span>
-              <span className={meta.persistent ? "badge on" : "badge"}>
-                {meta.persistent ? "persistent" : "in-memory"}
-              </span>
-              <button type="button" className="btn small danger" onClick={() => setConfirmRestart(true)}>
-                Restart
-              </button>
-            </>
-          ) : null}
-        </div>
-      </header>
-
-      <div className="shell">
-        <nav className="sidebar">
-          <div className="nav-tabs" role="tablist">
-            {TABS.map(([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                role="tab"
-                className={tab === id ? "nav-tab active" : "nav-tab"}
-                onClick={() => navigate(`/${id}`)}
-              >
-                {label}
-              </button>
-            ))}
+      <div className="app">
+        <nav className="side" aria-label="Main">
+          <div className="side-brand">
+            <span className="brand-mark">
+              <Icon name="logo" />
+            </span>
+            llm-hub
+            <span className="version">{meta ? `v${meta.version}` : ""}</span>
           </div>
-          <div className="ports">
-            <div className="ports-title">Upstreams</div>
-            <ul className="port-list">
+          {NAV_GROUPS.map((group) => (
+            <div key={group.title} className="nav-group">
+              <div className="nav-group-title">{group.title}</div>
+              {group.pages.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={tab === item.id ? "nav-item active" : "nav-item"}
+                  aria-current={tab === item.id ? "page" : undefined}
+                  onClick={() => navigate(`/${item.id}`)}
+                >
+                  <Icon name={item.icon} className="nav-icon" />
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          ))}
+          <div className="nav-group side-upstreams">
+            <div className="nav-group-title">Upstreams</div>
+            <ul className="upstream-list">
               {(meta?.profiles ?? []).map((profile) => {
                 const led = profile.healthy === true ? "up" : profile.healthy === false ? "down" : "off";
+                const health = led === "up" ? "healthy" : led === "down" ? "unhealthy" : "unknown";
                 return (
-                  <li key={profile.name}>
-                    <span className={`led ${led}`}></span>
+                  <li key={profile.name} className="upstream" title={`${profile.label}: ${health}`}>
+                    <span className={`led ${led}`} aria-hidden="true"></span>
                     {profile.label}
+                    <span className="sr-only">({health})</span>
                   </li>
                 );
               })}
             </ul>
+            {meta && meta.profiles.length === 0 ? <div className="upstream-empty">No profiles yet</div> : null}
           </div>
         </nav>
 
-        <main className="content">
-          {tab === "models" ? (
-            <ModelsScreen models={models} profiles={meta?.profiles ?? []} onCopy={copy} />
-          ) : null}
-          {tab === "stats" ? <StatsScreen onError={(message) => toast(message, true)} /> : null}
-          {tab === "overview" ? <UsageScreen /> : null}
-          {tab === "errors" ? <ErrorsScreen /> : null}
-          {tab === "auto" ? <AutoScreen /> : null}
-          {tab === "insights" ? <InsightsScreen onCopy={copy} /> : null}
-          {tab === "profiles" ? (
-            <ProfilesScreen meta={meta} models={models} onChanged={loadAll} onToast={toast} />
-          ) : null}
-          {tab === "keys" ? <KeysScreen onToast={toast} /> : null}
-          {tab === "setup" ? (
-            <SetupScreen models={models} authEnabled={meta?.auth_enabled ?? false} onCopy={copy} />
-          ) : null}
-        </main>
+        <div className="main">
+          <header className="header">
+            <h1 className="page-title">{page.label}</h1>
+            <div className="header-actions">
+              {page.periods && period ? (
+                <Segmented
+                  label="Period"
+                  options={page.periods}
+                  value={period}
+                  onChange={(value) => setQueryParam("range", value)}
+                />
+              ) : null}
+              {meta ? (
+                <>
+                  <Pill tone={meta.auth_enabled ? "ok" : "neutral"} dot>
+                    {meta.auth_enabled ? "auth on" : "auth off"}
+                  </Pill>
+                  <Pill tone={meta.persistent ? "ok" : "warn"} dot>
+                    {meta.persistent ? "persistent" : "in-memory"}
+                  </Pill>
+                  <button type="button" className="btn small danger" onClick={() => setConfirmRestart(true)}>
+                    <Icon name="restart" />
+                    Restart
+                  </button>
+                </>
+              ) : null}
+              <ThemeToggle />
+            </div>
+          </header>
+
+          <main className="content">
+            {tab === "models" ? (
+              <ModelsScreen models={models} profiles={meta?.profiles ?? []} onCopy={copy} />
+            ) : null}
+            {tab === "stats" ? <StatsScreen onError={(message) => toast(message, true)} /> : null}
+            {tab === "overview" ? <UsageScreen period={period === "7d" ? "7d" : "1d"} /> : null}
+            {tab === "errors" ? <ErrorsScreen /> : null}
+            {tab === "auto" ? <AutoScreen /> : null}
+            {tab === "insights" ? <InsightsScreen onCopy={copy} /> : null}
+            {tab === "profiles" ? (
+              <ProfilesScreen meta={meta} models={models} onChanged={loadAll} onToast={toast} />
+            ) : null}
+            {tab === "keys" ? <KeysScreen onToast={toast} /> : null}
+            {tab === "setup" ? (
+              <SetupScreen models={models} authEnabled={meta?.auth_enabled ?? false} onCopy={copy} />
+            ) : null}
+          </main>
+        </div>
       </div>
 
       {confirmRestart ? (

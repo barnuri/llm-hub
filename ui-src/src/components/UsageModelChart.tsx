@@ -296,7 +296,10 @@ export function UsageTrendChart({
                 const row = hover.find((point) => point.key === key);
                 return (
                   <div key={key}>
-                    <span style={{ color: modelColor(key, ranked) }}>{shortModel(key)}</span>
+                    <svg width="8" height="8" viewBox="0 0 8 8" aria-hidden="true" focusable="false">
+                      <circle cx="4" cy="4" r="4" fill={modelColor(key, ranked)} />
+                    </svg>{" "}
+                    <span>{shortModel(key)}</span>
                     {": "}
                     {requestsOn ? `${formatNumber(row?.requests ?? 0)} req` : ""}
                     {requestsOn && costOn ? " · " : ""}

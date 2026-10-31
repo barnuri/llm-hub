@@ -229,3 +229,25 @@ export interface ModelPick {
   readonly reason: string;
   readonly alternatives: ReadonlyArray<{ readonly model: string; readonly value: number }>;
 }
+
+export interface CopilotQuota {
+  readonly id: string;
+  /** `aic` is AI credits (100 AIC = $1). */
+  readonly unit: "aic" | "requests";
+  readonly used: number;
+  readonly entitlement: number;
+  readonly remaining?: number;
+  readonly remainingPercentage: number;
+  readonly overagePermitted?: boolean;
+  readonly resetDate?: string;
+  readonly usedUsd?: number;
+  readonly limitUsd?: number;
+}
+
+export interface CopilotUsageReport {
+  readonly profile: string;
+  readonly source: string;
+  readonly updatedAt: number;
+  readonly fetchedAt: string;
+  readonly quotas: readonly CopilotQuota[];
+}

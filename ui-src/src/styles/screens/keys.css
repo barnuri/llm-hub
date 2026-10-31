@@ -1,0 +1,38 @@
+.keys > .panel {
+  margin-top: 0;
+}
+
+.keys-note {
+  margin: 0 0 10px;
+}
+
+.keys-scroll {
+  max-height: calc(100vh - 220px);
+  overflow-y: auto;
+}
+
+.keys-skeleton {
+  height: 96px;
+}
+
+.keys-empty {
+  margin: 0;
+  padding: 24px 0;
+  text-align: center;
+}
+
+.keys .table td.keys-actions {
+  width: 1%;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.keys .field-error {
+  margin: 4px 0 0;
+  color: var(--danger-text);
+  font-size: 12px;
+}
+
+.keys .input[aria-invalid="true"] {
+  border-color: var(--danger);
+}

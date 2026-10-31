@@ -1,0 +1,28 @@
+.auto-intro {
+  margin: 0 0 12px;
+}
+
+.auto-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.auto-table-scroll {
+  max-height: min(70vh, 720px);
+  overflow-y: auto;
+}
+
+.auto-empty {
+  padding: 20px 10px;
+  text-align: center;
+}
+
+@media (max-width: 720px) {
+  .auto-filter,
+  .auto-filter .input.search {
+    width: 100%;
+  }
+}

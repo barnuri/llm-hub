@@ -1,0 +1,168 @@
+.overview .kpis {
+  margin-bottom: 12px;
+}
+
+.overview-skeleton-chart {
+  height: 240px;
+  margin-top: 12px;
+}
+
+.top-models .table td:first-child {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-chart-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.usage-chart-legend {
+  display: flex;
+  gap: 6px;
+}
+
+.usage-chart-swatch {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color var(--ease), color var(--ease);
+}
+
+.usage-chart-swatch::before {
+  content: "";
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border-radius: 2px;
+}
+
+.usage-chart-swatch.requests::before {
+  background: var(--info);
+}
+
+.usage-chart-swatch.cost::before {
+  background: repeating-linear-gradient(45deg, var(--accent-tint), var(--accent-tint) 2px, var(--accent) 2px, var(--accent) 4px);
+}
+
+.usage-chart-swatch.active {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.usage-model-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.usage-model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--muted);
+  font: 12px var(--mono);
+  cursor: pointer;
+  transition: border-color var(--ease), color var(--ease);
+}
+
+.usage-model-chip:hover,
+.usage-chart-swatch:hover {
+  color: var(--text);
+}
+
+.usage-model-chip.active {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.usage-model-chip-swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.usage-trend h2 {
+  display: none;
+}
+
+.usage-trend > .dim {
+  display: none;
+}
+
+.usage-chart-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.usage-chart-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.usage-chart-tick {
+  fill: var(--muted);
+  font: 10px var(--mono);
+}
+
+.usage-chart-xlabel {
+  fill: var(--muted);
+  font: 10px var(--mono);
+}
+
+.usage-chart-hover {
+  stroke: var(--info);
+  stroke-width: 1;
+  stroke-opacity: 0.5;
+}
+
+.usage-chart-series {
+  cursor: pointer;
+}
+
+.usage-chart-hit-line {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 16;
+}
+
+.usage-chart-line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.usage-chart-line.cost {
+  stroke-dasharray: 5 3;
+}
+
+.usage-chart-tooltip {
+  min-height: 36px;
+  margin-top: 6px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.usage-chart-tooltip .mono {
+  color: var(--info);
+}
