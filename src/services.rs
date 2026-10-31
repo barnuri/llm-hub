@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod auth;
 pub mod body_transform;
 pub mod config_reload;
+pub mod copilot_auto;
 pub mod copilot_headers;
 pub mod copilot_login;
 pub mod copilot_sessions;

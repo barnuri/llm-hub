@@ -16,6 +16,9 @@ use crate::schemas::upstream_model::UpstreamModel;
 use crate::services::upstream_auth;
 
 pub(crate) const MODELS_PATH: &str = "/models";
+/// The bare model id a Copilot profile advertises for Copilot Auto routing.
+pub(crate) const COPILOT_AUTO_MODEL: &str = "auto";
+const COPILOT_AUTO_ENDPOINTS: [&str; 3] = ["/chat/completions", "/responses", "/v1/messages"];
 const COPILOT_POLICY_DISABLED: &str = "disabled";
 const CLAUDE_ID_PREFIX: &str = "claude-";
 const NATIVE_MESSAGES_ENDPOINT: &str = "/v1/messages";
@@ -115,13 +118,41 @@ async fn fetch_profile_models(
         .iter()
         .filter(|item| profile.copilot.is_none() || is_copilot_model_usable(item))
         .collect();
-    if profile.copilot.is_some() {
-        state.set_upstream_models(&profile.name, upstream_catalog(profile, &usable));
+    if profile.copilot.is_none() {
+        return Ok(usable
+            .into_iter()
+            .map(|item| rewrite_model(profile, item))
+            .collect());
     }
-    Ok(usable
+    state.set_upstream_models(&profile.name, upstream_catalog(profile, &usable));
+    state.set_copilot_catalog(&profile.name, usable.iter().copied().cloned().collect());
+    let lists_auto = usable
+        .iter()
+        .any(|item| item.get("id").and_then(Value::as_str) == Some(COPILOT_AUTO_MODEL));
+    let mut models: Vec<Value> = usable
         .into_iter()
         .map(|item| rewrite_model(profile, item))
-        .collect())
+        .collect();
+    if !lists_auto {
+        models.push(copilot_auto_model(profile));
+    }
+    Ok(models)
+}
+
+/// `<profile>/auto`: Copilot's router picks the model, on every wire API.
+fn copilot_auto_model(profile: &ProfileConfig) -> Value {
+    json!({
+        "id": format!("{}/{COPILOT_AUTO_MODEL}", profile.name),
+        "object": "model",
+        "type": "model",
+        "owned_by": profile.name,
+        "display_name": format!("Auto · {}", profile.label()),
+        "description": format!(
+            "Copilot Auto picks the model per conversation, via llm-hub profile {}",
+            profile.label()
+        ),
+        "supported_endpoints": COPILOT_AUTO_ENDPOINTS,
+    })
 }
 
 /// Advertised bare id → the id upstream expects and whether it speaks `/v1/messages`.
@@ -149,7 +180,7 @@ fn upstream_catalog(profile: &ProfileConfig, items: &[&Value]) -> HashMap<String
 
 /// Copilot lists Claude ids dotted (`claude-opus-4.5`); Claude Code recognises
 /// only the dashed Anthropic form (`claude-opus-4-5`).
-fn advertised_bare_id(profile: &ProfileConfig, raw_id: &str) -> String {
+pub(crate) fn advertised_bare_id(profile: &ProfileConfig, raw_id: &str) -> String {
     if profile.copilot.is_none() || !raw_id.starts_with(CLAUDE_ID_PREFIX) {
         return raw_id.to_string();
     }
@@ -431,7 +462,24 @@ mod tests {
 
         assert_eq!(
             ids(&payload),
-            ["copilot/claude-opus-4-5", "copilot/gpt-4.1"]
+            ["copilot/claude-opus-4-5", "copilot/gpt-4.1", "copilot/auto"]
+        );
+        assert_eq!(state.copilot_catalog("copilot")[0]["id"], "claude-opus-4.5");
+        let auto = &payload["data"][2];
+        assert_eq!(auto["display_name"], "Auto · copilot");
+        assert_eq!(auto["type"], "model");
+        assert_eq!(
+            auto["supported_endpoints"],
+            json!(["/chat/completions", "/responses", "/v1/messages"])
+        );
+        let Json(settings) = crate::routes::claude_code::settings(State(state.clone())).await;
+        assert!(
+            settings["modelPicker"]["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option["model"] == "copilot/auto"
+                    && option["label"] == "Auto · copilot")
         );
         assert_eq!(
             state.upstream_model("copilot", "claude-opus-4-5"),

@@ -2,6 +2,7 @@ pub mod anthropic_error;
 pub mod api_key_input;
 pub mod api_key_record;
 pub mod app_error;
+pub mod copilot_auto_response;
 pub mod copilot_endpoints;
 pub mod copilot_token_response;
 pub mod copilot_user_response;

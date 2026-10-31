@@ -490,6 +490,28 @@ In Claude Code, `/model` then lists the Copilot Claude models from discovery
 and every other hub model from `--settings`. A discovered model may collapse
 into its built-in alias row, for example `opus`.
 
+### Copilot Auto
+
+A native Copilot profile also lists `<profile>/auto`, for example
+`copilot/auto`. It routes like Auto in VS Code: Copilot's router (hydra) picks
+the model, and the hub sends the request to that model.
+
+- On a routing turn the hub calls Copilot's `POST /auto` with the prompt. This
+  adds about 0.5 s to that turn only. The server's `multi_turn` schedule decides
+  which user turns re-route. Tool-loop follow-ups (`X-Initiator: agent`) never
+  re-route and add no latency.
+- Each `copilot/auto` request carries the `Copilot-Session-Token` from
+  `/auto`, which gives the 10% Auto discount on the model Auto picked. Whether
+  the discount also applies after a swap (below) is not verified.
+- Auto can pick a model that Copilot serves only through the Responses API.
+  When the caller is Claude Code (`/v1/messages`), the hub then uses the
+  compatible model of the closest price tier instead. When `/models` has no
+  prices, the hub maps Auto's complexity verdict to a family (low to Haiku,
+  medium to Sonnet, high to Opus) and takes its newest version.
+
+`copilot/auto` appears in the Claude Code `/model` picker through the
+`--settings` list of the `claude-copilot` launcher above.
+
 ## Environment reference
 
 | Variable | Default | Purpose |

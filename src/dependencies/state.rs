@@ -7,6 +7,7 @@ use dashmap::DashMap;
 use crate::configs::HubConfig;
 use crate::consts::LOGS_DIR;
 use crate::schemas::upstream_model::UpstreamModel;
+use crate::services::copilot_auto::CopilotAutoRouter;
 use crate::services::copilot_sessions::CopilotSessionCache;
 use crate::services::credential_store::CredentialStore;
 use crate::services::gh_cli::GhCli;
@@ -33,10 +34,13 @@ struct Inner {
     upstream_health: DashMap<String, bool>,
     /// Copilot profile name -> advertised bare model id -> upstream entry.
     upstream_models: DashMap<String, Arc<HashMap<String, UpstreamModel>>>,
+    /// Copilot profile name -> its usable raw `/models` entries, for Auto routing.
+    copilot_catalogs: DashMap<String, Arc<Vec<serde_json::Value>>>,
     /// Fired to trigger graceful shutdown (auto-update, env watcher, /api/restart).
     restart_notify: Arc<tokio::sync::Notify>,
     managed: Arc<ProcessManager>,
     copilot_sessions: CopilotSessionCache,
+    copilot_auto: CopilotAutoRouter,
 }
 
 #[derive(Clone)]
@@ -70,9 +74,11 @@ impl AppState {
             model_cache: ArcSwap::from_pointee(None),
             upstream_health: DashMap::new(),
             upstream_models: DashMap::new(),
+            copilot_catalogs: DashMap::new(),
             restart_notify: Arc::new(tokio::sync::Notify::new()),
             managed: Arc::new(ProcessManager::new(LOGS_DIR)),
             copilot_sessions: CopilotSessionCache::new(credentials, gh),
+            copilot_auto: CopilotAutoRouter::new(),
         }));
         state.refresh_api_key_hashes();
         Ok(state)
@@ -89,12 +95,14 @@ impl AppState {
         self.0.clients.store(Arc::new(clients));
         self.0.managed.reconcile(&config);
         self.0.copilot_sessions.reconcile(&config);
-        self.0.upstream_models.retain(|name, _| {
+        let is_copilot = |name: &String| {
             config
                 .profiles
                 .iter()
                 .any(|p| p.name == *name && p.copilot.is_some())
-        });
+        };
+        self.0.upstream_models.retain(|name, _| is_copilot(name));
+        self.0.copilot_catalogs.retain(|name, _| is_copilot(name));
         self.0.config.store(Arc::new(config));
         Ok(())
     }
@@ -157,6 +165,25 @@ impl AppState {
             .upstream_models
             .get(profile)
             .and_then(|models| models.get(bare).cloned())
+    }
+
+    pub fn set_copilot_catalog(&self, profile: &str, entries: Vec<serde_json::Value>) {
+        self.0
+            .copilot_catalogs
+            .insert(profile.to_string(), Arc::new(entries));
+    }
+
+    /// Empty when the profile's models were never fetched.
+    pub fn copilot_catalog(&self, profile: &str) -> Arc<Vec<serde_json::Value>> {
+        self.0
+            .copilot_catalogs
+            .get(profile)
+            .map(|entries| Arc::clone(&entries))
+            .unwrap_or_default()
+    }
+
+    pub fn copilot_auto(&self) -> &CopilotAutoRouter {
+        &self.0.copilot_auto
     }
 
     pub fn managed(&self) -> &Arc<ProcessManager> {

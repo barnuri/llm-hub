@@ -15,6 +15,7 @@ use crate::consts::{
     SSE_KEEPALIVE_FRAME, USAGE_SCRAPE_TAIL_BYTES,
 };
 use crate::dependencies::state::AppState;
+use crate::routes::models::{COPILOT_AUTO_MODEL, advertised_bare_id};
 use crate::schemas::app_error::AppError;
 use crate::schemas::model_id::ModelId;
 use crate::services::anthropic;
@@ -31,6 +32,8 @@ use crate::utils::headers::{filter_request_headers, filter_response_headers};
 const NATIVE_MESSAGES_PATH: &str = "/v1/messages";
 const HEADER_ANTHROPIC_VERSION: &str = "anthropic-version";
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+const HEADER_COPILOT_SESSION_TOKEN: &str = "copilot-session-token";
+static NO_BODY: Value = Value::Null;
 
 /// Catch-all /v1/* passthrough with header-driven fallbacks.
 pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Response, AppError> {
@@ -137,7 +140,9 @@ pub(crate) async fn attempt_loop(
     let mut attempts_trail: Vec<String> = Vec::new();
     let last_index = chain.len() - 1;
 
-    for (index, model_id) in chain.iter().enumerate() {
+    for (index, requested) in chain.iter().enumerate() {
+        let auto = resolve_auto(state, &bodies, requested).await;
+        let model_id = auto.as_ref().map_or(requested, |pick| &pick.model_id);
         let attempt = bodies.for_model(state, model_id);
         let started = Instant::now();
         let result = send_attempt(
@@ -149,6 +154,7 @@ pub(crate) async fn attempt_loop(
             model_id,
             attempt_timeout,
             attempt.force_identity_encoding,
+            auto.as_ref().and_then(|pick| pick.session_token.as_deref()),
         )
         .await;
 
@@ -340,6 +346,90 @@ impl<'a> AttemptBodies<'a> {
             },
         }
     }
+
+    /// The upstream path and body Copilot Auto routes on. The Anthropic route
+    /// offers its own body for `/v1/messages`, which a Claude pick serves natively.
+    fn auto_input(&self) -> (&str, &Value) {
+        match &self.native {
+            Some((anthropic_body, _)) => (NATIVE_MESSAGES_PATH, anthropic_body),
+            None => (
+                UpstreamPath::Strip(self.upstream_path).as_str(),
+                self.json_body.as_ref().unwrap_or(&NO_BODY),
+            ),
+        }
+    }
+}
+
+/// The model sent in place of `<profile>/auto`, and its Copilot session token.
+struct AutoPick {
+    model_id: ModelId,
+    session_token: Option<String>,
+}
+
+/// Resolves `<profile>/auto` on a Copilot profile through Copilot Auto. Any
+/// other model returns `None` before any lookup.
+async fn resolve_auto(
+    state: &AppState,
+    bodies: &AttemptBodies<'_>,
+    model_id: &ModelId,
+) -> Option<AutoPick> {
+    if model_id.model != COPILOT_AUTO_MODEL {
+        return None;
+    }
+    let config = state.config();
+    let profile = config.profile(&model_id.profile).filter(|p| p.enabled)?;
+    let auth = profile.copilot.as_ref()?;
+    let client = state.client(&profile.name)?;
+    let (bearer, api_base) = match state
+        .copilot_sessions()
+        .get(&client, &profile.name, auth)
+        .await
+    {
+        Ok(session) => session,
+        Err(e) => {
+            tracing::warn!("profile {}: Copilot Auto has no session: {e}", profile.name);
+            return None;
+        }
+    };
+    let api_base = api_base.unwrap_or_else(|| profile.base_url.clone());
+    let (path, body) = bodies.auto_input();
+    let catalog = state.copilot_catalog(&profile.name);
+    let (upstream_id, session_token) = state
+        .copilot_auto()
+        .route(
+            &client,
+            &profile.name,
+            &bearer,
+            &api_base,
+            path,
+            body,
+            &catalog,
+            default_auto_model(&catalog, path),
+        )
+        .await;
+    Some(AutoPick {
+        model_id: ModelId {
+            profile: profile.name.clone(),
+            model: advertised_bare_id(profile, &upstream_id),
+        },
+        session_token,
+    })
+}
+
+/// The model a failed Auto route falls back to: the first catalog model that
+/// serves the endpoint of `path`.
+fn default_auto_model<'c>(catalog: &'c [Value], path: &str) -> &'c str {
+    let endpoint = path.split_once('?').map_or(path, |(bare, _)| bare);
+    catalog
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("supported_endpoints")
+                .and_then(Value::as_array)
+                .is_some_and(|list| list.iter().any(|e| e.as_str() == Some(endpoint)))
+        })
+        .find_map(|entry| entry.get("id").and_then(Value::as_str))
+        .unwrap_or(COPILOT_AUTO_MODEL)
 }
 
 /// Renders the winning upstream response for the client-facing API shape.
@@ -412,6 +502,7 @@ async fn attempt_single(
         model_id,
         attempt_timeout,
         false,
+        None,
     )
     .await
     .map_err(AppError::UpstreamUnavailable)?;
@@ -514,6 +605,7 @@ async fn send_attempt(
     model_id: &ModelId,
     attempt_timeout: Option<Duration>,
     force_identity_encoding: bool,
+    session_token: Option<&str>,
 ) -> Result<reqwest::Response, String> {
     let config = state.config();
     let profile = config
@@ -534,6 +626,7 @@ async fn send_attempt(
         headers,
         force_identity_encoding,
         timeout: attempt_timeout.or(profile.timeout_ms.map(Duration::from_millis)),
+        session_token,
     };
     let (response, copilot_bearer) = upstream.send(body.clone()).await?;
     let rejected = upstream_auth::invalidate_if_unauthorized(
@@ -593,6 +686,8 @@ struct UpstreamRequest<'a> {
     headers: &'a HeaderMap,
     force_identity_encoding: bool,
     timeout: Option<Duration>,
+    /// Copilot Auto's `Copilot-Session-Token`, on `<profile>/auto` requests only.
+    session_token: Option<&'a str>,
 }
 
 impl UpstreamRequest<'_> {
@@ -617,6 +712,13 @@ impl UpstreamRequest<'_> {
         let mut forwarded = filter_request_headers(self.headers);
         if self.force_identity_encoding {
             forwarded.insert("accept-encoding", HeaderValue::from_static("identity"));
+        }
+        if let Some(token) = self.session_token {
+            let mut value = HeaderValue::from_str(token).map_err(|_| {
+                "the Copilot Auto session token is not a valid header value".to_string()
+            })?;
+            value.set_sensitive(true);
+            forwarded.insert(HEADER_COPILOT_SESSION_TOKEN, value);
         }
         let (base, copilot_bearer) = upstream_auth::resolve(
             self.state,
@@ -1795,6 +1897,126 @@ mod tests {
             assert_eq!(requests_to(&copilot, NATIVE_MESSAGES_PATH).await.len(), 1);
             let chat = requests_to(&copilot, UPSTREAM_CHAT_PATH).await;
             assert_eq!(sent_json(&chat[0])["model"], PLAIN_ID);
+        }
+
+        const AUTO_SESSION: &str = "auto-session";
+        const RESPONSES_ONLY_ID: &str = "gpt-5.5";
+        const UPSTREAM_RESPONSES_PATH: &str = "/responses";
+
+        /// Lists the catalog Auto routes over and answers `/auto` with `selected`.
+        async fn mount_auto(copilot: &Copilot, selected: &str) {
+            copilot.state.set_copilot_catalog(
+                PROFILE,
+                vec![
+                    json!({"id": NATIVE_UPSTREAM_ID, "supported_endpoints": ["/chat/completions", "/v1/messages"]}),
+                    json!({"id": RESPONSES_ONLY_ID, "supported_endpoints": ["/responses"]}),
+                ],
+            );
+            Mock::given(method("POST"))
+                .and(path("/auto"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "session_token": AUTO_SESSION,
+                    "expires_at": u64::MAX / 2,
+                    "selected_model": {"id": selected},
+                    "selection_reason": "test pick",
+                })))
+                .expect(1)
+                .mount(&copilot.upstream)
+                .await;
+        }
+
+        fn session_tokens(request: &Request) -> Vec<String> {
+            request
+                .headers
+                .get_all(HEADER_COPILOT_SESSION_TOKEN)
+                .iter()
+                .map(|value| value.to_str().unwrap().to_string())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn auto_on_v1_messages_sends_a_claude_model_natively_with_the_session_token() {
+            let copilot = copilot().await;
+            mount_auto(&copilot, RESPONSES_ONLY_ID).await;
+            Mock::given(method("POST"))
+                .and(path(NATIVE_MESSAGES_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "msg_1", "type": "message", "role": "assistant",
+                    "content": [{"type": "text", "text": "native"}],
+                    "usage": {"input_tokens": 3, "output_tokens": 1},
+                })))
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, _) = send(
+                &copilot,
+                &client_headers(),
+                &anthropic_body(COPILOT_AUTO_MODEL, false),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            let sent = requests_to(&copilot, NATIVE_MESSAGES_PATH).await;
+            assert_eq!(sent_json(&sent[0])["model"], NATIVE_UPSTREAM_ID);
+            assert_eq!(session_tokens(&sent[0]), [AUTO_SESSION]);
+        }
+
+        #[tokio::test]
+        async fn auto_on_v1_responses_sends_the_selected_model_with_the_session_token() {
+            let copilot = copilot().await;
+            mount_auto(&copilot, RESPONSES_ONLY_ID).await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_RESPONSES_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "resp_1"})))
+                .mount(&copilot.upstream)
+                .await;
+            let body = json!({
+                "model": format!("{PROFILE}/{COPILOT_AUTO_MODEL}"),
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            });
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &client_headers(),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let sent = requests_to(&copilot, UPSTREAM_RESPONSES_PATH).await;
+            assert_eq!(sent_json(&sent[0])["model"], RESPONSES_ONLY_ID);
+            assert_eq!(session_tokens(&sent[0]), [AUTO_SESSION]);
+        }
+
+        #[tokio::test]
+        async fn non_auto_request_never_calls_auto_and_sends_no_session_token() {
+            let copilot = copilot().await;
+            Mock::given(method("POST"))
+                .and(path("/auto"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&copilot.upstream)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+            let body = json!({
+                "model": format!("{PROFILE}/{PLAIN_ID}"),
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+
+            send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
+
+            let sent = requests_to(&copilot, UPSTREAM_CHAT_PATH).await;
+            assert_eq!(sent_json(&sent[0])["model"], PLAIN_ID);
+            assert!(session_tokens(&sent[0]).is_empty());
         }
     }
 

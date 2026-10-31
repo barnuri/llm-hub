@@ -493,7 +493,10 @@ mod tests {
             .iter()
             .filter_map(|model| model["id"].as_str())
             .collect();
-        assert_eq!(ids, ["copilot/gpt-4.1", "copilot/gemini-2.5-pro"]);
+        assert_eq!(
+            ids,
+            ["copilot/gpt-4.1", "copilot/gemini-2.5-pro", "copilot/auto"]
+        );
         assert_eq!(state.upstream_health().get("copilot"), Some(&true));
     }
 
