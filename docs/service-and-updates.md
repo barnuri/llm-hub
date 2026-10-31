@@ -7,7 +7,7 @@ Pick one way:
 - **Install script**, macOS and Linux only:
 
   ```sh
-  curl -fsSL https://raw.githubusercontent.com/barnuri/llm-hub/main/scripts/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/barnuri/llm-hub/master/scripts/install.sh | sh
   ```
 
 - **Release binary.** Download it from [releases](https://github.com/barnuri/llm-hub/releases).

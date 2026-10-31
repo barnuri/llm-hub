@@ -16,7 +16,7 @@ of OpenAI-compatible APIs into one `/v1/models` and routes each request by its p
    cargo build --release
 
    # Install script, macOS and Linux
-   curl -fsSL https://raw.githubusercontent.com/barnuri/llm-hub/main/scripts/install.sh | sh
+   curl -fsSL https://raw.githubusercontent.com/barnuri/llm-hub/master/scripts/install.sh | sh
    ```
 
    For release binaries and Windows, see [Install](docs/service-and-updates.md#install).
