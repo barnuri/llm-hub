@@ -16,11 +16,12 @@ fn resolve_links(exe: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::source_install::find_source_repo;
 
     #[cfg(unix)]
     #[test]
     fn link_on_path_into_a_checkout_resolves_to_the_source_repo() {
+        use crate::services::source_install::find_source_repo;
+
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir(repo.path().join(".git")).unwrap();
         std::fs::write(
