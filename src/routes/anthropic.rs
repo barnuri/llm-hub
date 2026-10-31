@@ -19,9 +19,9 @@ use crate::services::transforms::RouteKind;
 /// Anthropic-only request headers. Stripped here rather than in
 /// `utils::headers` so the `/v1/{*path}` passthrough — which may legitimately
 /// front a real Anthropic-shaped upstream — keeps forwarding them.
-const ANTHROPIC_REQUEST_HEADERS: [&str; 3] = [
+/// `anthropic-beta` stays: the attempt loop sends it on native attempts only.
+const ANTHROPIC_REQUEST_HEADERS: [&str; 2] = [
     "anthropic-version",
-    "anthropic-beta",
     "anthropic-dangerous-direct-browser-access",
 ];
 
@@ -92,13 +92,14 @@ mod tests {
     use axum::http::HeaderValue;
 
     #[test]
-    fn strips_anthropic_only_request_headers() {
+    fn strips_anthropic_only_request_headers_but_keeps_the_beta() {
         let mut headers = HeaderMap::new();
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         headers.insert("anthropic-beta", HeaderValue::from_static("tools-2024"));
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         let out = strip_anthropic_request_headers(&headers);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         assert!(out.contains_key("content-type"));
+        assert_eq!(out["anthropic-beta"], "tools-2024");
     }
 }

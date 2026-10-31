@@ -29,7 +29,7 @@ pub enum UpdateOutcome {
 /// `llm-hub update`: source checkouts update via `git pull` + `cargo build`,
 /// everything else via the latest GitHub release binary.
 pub async fn self_update() -> Result<UpdateOutcome, String> {
-    let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    let current = crate::utils::exe::current_exe_resolved().map_err(|e| e.to_string())?;
     if let Some(repo) = source_install::find_source_repo(&current) {
         return update_from_source(&repo, &current).await;
     }
@@ -81,7 +81,7 @@ pub fn spawn_auto_update(auto_update_enabled: bool, restart_notify: Arc<tokio::s
 }
 
 async fn check_and_maybe_update(auto_update_enabled: bool, restart_notify: &tokio::sync::Notify) {
-    let current = match std::env::current_exe() {
+    let current = match crate::utils::exe::current_exe_resolved() {
         Ok(current) => current,
         Err(e) => {
             tracing::debug!("update check failed: {e}");
@@ -345,7 +345,7 @@ fn expected_asset_name() -> String {
 /// over it. The running process keeps executing the old inode.
 #[cfg(not(windows))]
 fn replace_current_binary(bytes: &[u8]) -> Result<(), String> {
-    let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    let current = crate::utils::exe::current_exe_resolved().map_err(|e| e.to_string())?;
     let tmp = current.with_extension("update-tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("write update failed: {e}"))?;
     #[cfg(unix)]
@@ -361,7 +361,7 @@ fn replace_current_binary(bytes: &[u8]) -> Result<(), String> {
 /// so the running file moves aside before the new one takes its path.
 #[cfg(windows)]
 fn replace_current_binary(bytes: &[u8]) -> Result<(), String> {
-    let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    let current = crate::utils::exe::current_exe_resolved().map_err(|e| e.to_string())?;
     let tmp = current.with_extension("update-tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("write update failed: {e}"))?;
     let aside = move_aside(&current)?;

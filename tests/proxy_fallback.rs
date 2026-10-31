@@ -264,6 +264,10 @@ async fn multipart_without_model_field_is_rejected() {
 #[tokio::test]
 async fn multipart_over_upload_limit_is_rejected() {
     let (hub, base) = start_hub(HashMap::from([
+        (
+            "LLM_HUB_MAX_REPLAY_BYTES".into(),
+            (2 * 1024 * 1024).to_string(),
+        ),
         ("LLM_HUB_PROFILES".into(), "healthy".into()),
         (
             "LLM_HUB_HEALTHY_BASE_URL".into(),

@@ -25,6 +25,9 @@ const HEADER_EDITOR_VERSION: &str = "editor-version";
 const HEADER_EDITOR_PLUGIN_VERSION: &str = "editor-plugin-version";
 const HEADER_API_VERSION: &str = "x-github-api-version";
 const LOCALHOST: &str = "localhost";
+const COPILOT_API_HOST: &str = "githubcopilot.com";
+const GHE_DOMAIN_SUFFIX: &str = ".ghe.com";
+const GHE_COPILOT_API_PREFIX: &str = "copilot-api.";
 
 /// Each Copilot profile's bearer and API base, shared by every request so the
 /// GitHub token lookup and the Copilot handshake run once per session.
@@ -182,7 +185,11 @@ async fn exchange(
         format!("profile {profile}: the Copilot token exchange returned a body that is not a token response")
     })?;
     let refresh_at_secs = exchange_refresh_at(&body, now_secs);
-    let api_base = reported_api_base(profile, body.endpoints.and_then(|e| e.api))?;
+    let api_base = reported_api_base(
+        profile,
+        &auth.github_domain,
+        body.endpoints.and_then(|e| e.api),
+    )?;
     Ok(Session {
         bearer: body.token,
         api_base,
@@ -215,7 +222,11 @@ async fn lookup_user(
             if let Some(reason) = user.entitlement_error() {
                 return Err(format!("profile {profile}: {reason}"));
             }
-            let api_base = reported_api_base(profile, user.endpoints.and_then(|e| e.api))?;
+            let api_base = reported_api_base(
+                profile,
+                &auth.github_domain,
+                user.endpoints.and_then(|e| e.api),
+            )?;
             (api_base, COPILOT_USER_TTL)
         }
         None => (None, COPILOT_USER_RETRY),
@@ -228,7 +239,7 @@ async fn lookup_user(
 }
 
 /// `Ok(None)` when the lookup failed in a way that must not deny access.
-async fn fetch_user(
+pub(crate) async fn fetch_user(
     client: &reqwest::Client,
     profile: &str,
     auth: &CopilotAuth,
@@ -274,8 +285,13 @@ fn is_access_denied(status: StatusCode) -> bool {
 /// The reported `endpoints.api` without its trailing `/`.
 ///
 /// # Errors
-/// When the endpoint is not a URL, or is neither https nor http to a loopback address.
-fn reported_api_base(profile: &str, api: Option<String>) -> Result<Option<String>, String> {
+/// When the endpoint is not a URL, or is neither http(s) to a loopback address
+/// nor https to a Copilot API host for `github_domain`.
+fn reported_api_base(
+    profile: &str,
+    github_domain: &str,
+    api: Option<String>,
+) -> Result<Option<String>, String> {
     let Some(api) = api else {
         return Ok(None);
     };
@@ -283,18 +299,37 @@ fn reported_api_base(profile: &str, api: Option<String>) -> Result<Option<String
     let url = Url::parse(trimmed).map_err(|_| {
         format!("profile {profile}: Copilot reported an API endpoint that is not a URL: {api}")
     })?;
-    let is_safe = match url.scheme() {
-        "https" => true,
-        "http" => url.host_str().is_some_and(is_loopback_host),
-        _ => false,
-    };
-    if !is_safe {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if matches!(url.scheme(), "http" | "https") && is_loopback_host(&host) {
+        return Ok(Some(trimmed.to_string()));
+    }
+    if url.scheme() != "https" {
         return Err(format!(
             "profile {profile}: Copilot reported the API endpoint {api}. \
              The hub sends a bearer only over https, or over http to a loopback address"
         ));
     }
+    if !is_copilot_api_host(&host, github_domain) {
+        return Err(format!(
+            "profile {profile}: Copilot reported the API endpoint {api}. \
+             The hub does not send a bearer to the host {host}. \
+             Allowed hosts are {COPILOT_API_HOST} and its subdomains, \
+             or {GHE_COPILOT_API_PREFIX}<tenant>{GHE_DOMAIN_SUFFIX} for a GHE.com domain"
+        ));
+    }
     Ok(Some(trimmed.to_string()))
+}
+
+/// `host` must be lowercase. `github_domain` is matched without case.
+fn is_copilot_api_host(host: &str, github_domain: &str) -> bool {
+    let is_github_copilot = host == COPILOT_API_HOST
+        || host
+            .strip_suffix(COPILOT_API_HOST)
+            .is_some_and(|prefix| prefix.ends_with('.'));
+    let github_domain = github_domain.to_ascii_lowercase();
+    let is_ghe_tenant = github_domain.ends_with(GHE_DOMAIN_SUFFIX)
+        && host.strip_prefix(GHE_COPILOT_API_PREFIX) == Some(github_domain.as_str());
+    is_github_copilot || is_ghe_tenant
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -328,6 +363,7 @@ mod tests {
     use crate::services::memory_credential_store::MemoryCredentialStore;
 
     const PROFILE: &str = "copilot";
+    const GITHUB_DOMAIN: &str = "github.com";
     const GH_TOKEN: &str = "gho_from_gh";
     const LOGIN_TOKEN: &str = "gho_from_login";
     const COPILOT_TOKEN: &str = "tid=1;exp=2;sku=business";
@@ -725,35 +761,127 @@ mod tests {
     }
 
     #[test]
-    fn reported_api_base_accepts_https_and_loopback_http() {
+    fn reported_api_base_accepts_copilot_hosts_and_loopback() {
         for (api, expected) in [
             (
                 "https://api.githubcopilot.com/",
                 "https://api.githubcopilot.com",
             ),
+            ("https://githubcopilot.com", "https://githubcopilot.com"),
+            (
+                "https://API.Business.GithubCopilot.com",
+                "https://API.Business.GithubCopilot.com",
+            ),
             ("http://127.0.0.1:4141/", "http://127.0.0.1:4141"),
             ("http://localhost:4141", "http://localhost:4141"),
             ("http://[::1]:4141", "http://[::1]:4141"),
+            ("https://127.0.0.1:4141", "https://127.0.0.1:4141"),
         ] {
             assert_eq!(
-                reported_api_base(PROFILE, Some(api.to_string())),
+                reported_api_base(PROFILE, GITHUB_DOMAIN, Some(api.to_string())),
                 Ok(Some(expected.to_string())),
                 "{api}"
             );
         }
-        assert_eq!(reported_api_base(PROFILE, None), Ok(None));
+        assert_eq!(reported_api_base(PROFILE, GITHUB_DOMAIN, None), Ok(None));
     }
 
     #[test]
     fn reported_api_base_rejects_remote_http_and_non_urls() {
         for api in [
             "http://10.0.0.1",
+            "http://api.githubcopilot.com",
             "ftp://api.githubcopilot.com",
             "not a url",
         ] {
             assert!(
-                reported_api_base(PROFILE, Some(api.to_string())).is_err(),
+                reported_api_base(PROFILE, GITHUB_DOMAIN, Some(api.to_string())).is_err(),
                 "{api}"
+            );
+        }
+    }
+
+    #[test]
+    fn reported_api_base_rejects_other_https_hosts_and_names_the_host() {
+        for (api, host) in [
+            ("https://evil.example/v1", "evil.example"),
+            ("https://evilgithubcopilot.com", "evilgithubcopilot.com"),
+            (
+                "https://githubcopilot.com.evil.example",
+                "githubcopilot.com.evil.example",
+            ),
+            (
+                "https://copilot-api.acme.ghe.com",
+                "copilot-api.acme.ghe.com",
+            ),
+            ("https://10.0.0.1", "10.0.0.1"),
+        ] {
+            let err = reported_api_base(PROFILE, GITHUB_DOMAIN, Some(api.to_string())).unwrap_err();
+            assert!(err.contains(&format!("the host {host}")), "{api}: {err}");
+        }
+    }
+
+    #[test]
+    fn reported_api_base_accepts_only_the_own_ghe_tenant_host() {
+        let ghe_domain = "acme.ghe.com";
+        for api in [
+            "https://copilot-api.acme.ghe.com",
+            "https://Copilot-API.Acme.GHE.com/",
+            "https://api.githubcopilot.com",
+        ] {
+            assert!(
+                reported_api_base(PROFILE, ghe_domain, Some(api.to_string())).is_ok(),
+                "{api}"
+            );
+        }
+        for api in [
+            "https://copilot-api.other.ghe.com",
+            "https://api.acme.ghe.com",
+            "https://copilot-api.acme.ghe.com.evil.example",
+        ] {
+            assert!(
+                reported_api_base(PROFILE, ghe_domain, Some(api.to_string())).is_err(),
+                "{api}"
+            );
+        }
+        assert!(
+            reported_api_base(
+                PROFILE,
+                "github.acme.com",
+                Some("https://copilot-api.github.acme.com".to_string())
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn both_flows_reject_an_https_endpoint_outside_the_allowlist() {
+        let foreign = "https://copilot.evil.example";
+        let server = MockServer::start().await;
+        mount_exchange(
+            &server,
+            json!({"token": COPILOT_TOKEN, "expires_at": NOW + 1800, "endpoints": {"api": foreign}}),
+            1,
+        )
+        .await;
+        let user = ResponseTemplate::new(200)
+            .set_body_json(json!({"chat_enabled": true, "endpoints": {"api": foreign}}));
+        mount_user(&server, user, 1).await;
+        let client = reqwest::Client::new();
+
+        for auth in [vscode_auth(&server), opencode_auth(&server)] {
+            let cache = cache_with(
+                &auth,
+                Arc::new(FakeGhCli::new(GhOutcome::Token(GH_TOKEN.to_string()))),
+            );
+            let err = cache
+                .get_at(&client, PROFILE, &auth, NOW)
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("copilot.evil.example"),
+                "{:?}: {err}",
+                auth.flow
             );
         }
     }

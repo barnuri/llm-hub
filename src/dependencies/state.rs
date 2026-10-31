@@ -8,14 +8,17 @@ use crate::configs::HubConfig;
 use crate::consts::LOGS_DIR;
 use crate::schemas::upstream_model::UpstreamModel;
 use crate::services::copilot_auto::CopilotAutoRouter;
+use crate::services::copilot_body_fields::{BodyField, UnsupportedBodyFields};
 use crate::services::copilot_sessions::CopilotSessionCache;
+use crate::services::copilot_usage::CopilotUsageCache;
 use crate::services::credential_store::CredentialStore;
 use crate::services::gh_cli::GhCli;
 use crate::services::keyring_credential_store::KeyringCredentialStore;
 use crate::services::managed_process::ProcessManager;
+use crate::services::model_limits::{ModelLimit, ModelLimits};
 use crate::services::process_gh_cli::ProcessGhCli;
 use crate::services::stats::StatsRegistry;
-use crate::services::store::Store;
+use crate::services::store::{Store, now_ms};
 use crate::services::upstream::build_clients;
 
 pub struct CachedModels {
@@ -36,11 +39,18 @@ struct Inner {
     upstream_models: DashMap<String, Arc<HashMap<String, UpstreamModel>>>,
     /// Copilot profile name -> its usable raw `/models` entries, for Auto routing.
     copilot_catalogs: DashMap<String, Arc<Vec<serde_json::Value>>>,
+    /// Set once the first models fan-out since startup has finished.
+    first_refresh: tokio::sync::OnceCell<()>,
     /// Fired to trigger graceful shutdown (auto-update, env watcher, /api/restart).
     restart_notify: Arc<tokio::sync::Notify>,
     managed: Arc<ProcessManager>,
     copilot_sessions: CopilotSessionCache,
     copilot_auto: CopilotAutoRouter,
+    copilot_usage: CopilotUsageCache,
+    /// Real prompt limits per Copilot model, shared with `copilot_auto`.
+    model_limits: Arc<ModelLimits>,
+    /// Request fields each Copilot profile rejected on `/v1/messages`.
+    unsupported_body_fields: UnsupportedBodyFields,
 }
 
 #[derive(Clone)]
@@ -65,6 +75,17 @@ impl AppState {
         gh: Arc<dyn GhCli>,
     ) -> Result<AppState, String> {
         let clients = build_clients(&config)?;
+        let copilot_profiles = config
+            .profiles
+            .iter()
+            .filter(|p| p.copilot.is_some())
+            .map(|p| p.name.as_str());
+        let model_limits = Arc::new(ModelLimits::load(
+            store.as_ref(),
+            copilot_profiles,
+            now_ms(),
+        ));
+        let unsupported_body_fields = UnsupportedBodyFields::load(store.as_ref());
         let state = AppState(Arc::new(Inner {
             config: ArcSwap::from_pointee(config),
             clients: ArcSwap::from_pointee(clients),
@@ -75,10 +96,14 @@ impl AppState {
             upstream_health: DashMap::new(),
             upstream_models: DashMap::new(),
             copilot_catalogs: DashMap::new(),
+            first_refresh: tokio::sync::OnceCell::new(),
             restart_notify: Arc::new(tokio::sync::Notify::new()),
             managed: Arc::new(ProcessManager::new(LOGS_DIR)),
-            copilot_sessions: CopilotSessionCache::new(credentials, gh),
-            copilot_auto: CopilotAutoRouter::new(),
+            copilot_sessions: CopilotSessionCache::new(Arc::clone(&credentials), Arc::clone(&gh)),
+            copilot_auto: CopilotAutoRouter::with_limits(Arc::clone(&model_limits)),
+            copilot_usage: CopilotUsageCache::new(credentials, gh),
+            model_limits,
+            unsupported_body_fields,
         }));
         state.refresh_api_key_hashes();
         Ok(state)
@@ -95,6 +120,7 @@ impl AppState {
         self.0.clients.store(Arc::new(clients));
         self.0.managed.reconcile(&config);
         self.0.copilot_sessions.reconcile(&config);
+        self.0.copilot_usage.reconcile(&config);
         let is_copilot = |name: &String| {
             config
                 .profiles
@@ -167,6 +193,37 @@ impl AppState {
             .and_then(|models| models.get(bare).cloned())
     }
 
+    /// False until a catalog for `profile` was fetched or restored from the store.
+    pub fn has_upstream_models(&self, profile: &str) -> bool {
+        self.0.upstream_models.contains_key(profile)
+    }
+
+    /// Swaps in a freshly fetched Copilot catalog and saves it to the store.
+    /// Unchanged entries skip both, so a steady refresh never writes to disk.
+    pub fn update_copilot_catalog(
+        &self,
+        profile: &str,
+        entries: Vec<serde_json::Value>,
+        models: HashMap<String, UpstreamModel>,
+    ) {
+        let unchanged = self.has_upstream_models(profile)
+            && self
+                .0
+                .copilot_catalogs
+                .get(profile)
+                .is_some_and(|current| **current == entries);
+        if unchanged {
+            return;
+        }
+        if let Some(store) = self.store()
+            && let Err(e) = store.save_model_catalog(profile, &entries)
+        {
+            tracing::warn!(profile, "cannot save the model catalog: {e}");
+        }
+        self.set_upstream_models(profile, models);
+        self.set_copilot_catalog(profile, entries);
+    }
+
     pub fn set_copilot_catalog(&self, profile: &str, entries: Vec<serde_json::Value>) {
         self.0
             .copilot_catalogs
@@ -182,8 +239,84 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    pub fn first_refresh(&self) -> &tokio::sync::OnceCell<()> {
+        &self.0.first_refresh
+    }
+
     pub fn copilot_auto(&self) -> &CopilotAutoRouter {
         &self.0.copilot_auto
+    }
+
+    pub fn model_limits(&self) -> &ModelLimits {
+        &self.0.model_limits
+    }
+
+    /// Learns `model`'s prompt limit from a Copilot rejection body. A changed
+    /// limit is logged and saved to the store off the calling task.
+    pub fn learn_prompt_limit(&self, profile: &str, model: &str, error_body: &[u8]) {
+        let Some(limit) = ModelLimits::limit_from_error(error_body) else {
+            return;
+        };
+        let Some((entry, previous)) = self.0.model_limits.learn(profile, model, limit, now_ms())
+        else {
+            return;
+        };
+        let previous = previous.map_or_else(|| "unknown".to_string(), |p| p.to_string());
+        tracing::info!(
+            "profile {profile}: Copilot model {model} allows {limit} prompt tokens (was {previous})"
+        );
+        if self.store().is_some() {
+            let state = self.clone();
+            let (profile, model) = (profile.to_string(), model.to_string());
+            tokio::task::spawn_blocking(move || state.save_prompt_limit(&profile, &model, &entry));
+        }
+    }
+
+    /// The request fields `profile`'s Copilot upstream rejects.
+    pub fn unsupported_body_fields(&self, profile: &str) -> Arc<Vec<BodyField>> {
+        self.0.unsupported_body_fields.for_profile(profile)
+    }
+
+    /// Records the fields a Copilot rejection named. Each new field is logged
+    /// once and saved to the store off the calling task.
+    pub fn learn_unsupported_body_fields(&self, profile: &str, fields: &[BodyField]) {
+        let new = self.0.unsupported_body_fields.learn(profile, fields);
+        if new.is_empty() {
+            return;
+        }
+        let stored: Vec<String> = new.iter().map(BodyField::stored).collect();
+        for field in &stored {
+            tracing::info!(
+                "profile {profile}: Copilot rejects the request field {field}; the hub strips it from now on"
+            );
+        }
+        if self.store().is_some() {
+            let state = self.clone();
+            let profile = profile.to_string();
+            tokio::task::spawn_blocking(move || {
+                let learned_at = now_ms();
+                for field in &stored {
+                    if let Some(store) = state.store()
+                        && let Err(e) =
+                            store.save_unsupported_body_field(&profile, field, learned_at)
+                    {
+                        tracing::warn!(
+                            profile,
+                            field,
+                            "cannot save the unsupported body field: {e}"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    fn save_prompt_limit(&self, profile: &str, model: &str, entry: &ModelLimit) {
+        if let Some(store) = self.store()
+            && let Err(e) = store.save_model_limit(profile, model, entry)
+        {
+            tracing::warn!(profile, model, "cannot save the prompt limit: {e}");
+        }
     }
 
     pub fn managed(&self) -> &Arc<ProcessManager> {
@@ -192,6 +325,10 @@ impl AppState {
 
     pub fn copilot_sessions(&self) -> &CopilotSessionCache {
         &self.0.copilot_sessions
+    }
+
+    pub fn copilot_usage(&self) -> &CopilotUsageCache {
+        &self.0.copilot_usage
     }
 
     pub fn restart_notify(&self) -> Arc<tokio::sync::Notify> {

@@ -4,6 +4,7 @@ pub mod api_key_record;
 pub mod app_error;
 pub mod copilot_auto_response;
 pub mod copilot_endpoints;
+pub mod copilot_quota_snapshot;
 pub mod copilot_token_response;
 pub mod copilot_user_response;
 pub mod errors_report;

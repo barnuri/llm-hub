@@ -37,6 +37,8 @@ body {
   padding: 2px 8px; margin-left: 8px; color: var(--dim);
 }
 .badge.on { color: var(--accent); border-color: var(--accent-dim); }
+.badge.warn { color: var(--warn); border-color: var(--warn); }
+.auto-turn { margin-left: 0; }
 
 .shell { display: flex; min-height: calc(100vh - 45px); }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,9 +8,11 @@ use crate::schemas::usage_report::UsageReport;
 use crate::schemas::usage_row::UsageRow;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::consts::ERROR_STATUS_MIN;
+use crate::services::model_limits::{LimitSource, ModelLimit};
 use crate::services::stats::{RequestOutcome, StatsSnapshot, snapshot_from_outcomes};
 
 const DEFAULT_SQLITE_PATH: &str = "llm-hub.db";
@@ -35,6 +38,15 @@ struct JsonState {
     totals: Totals,
     recent: Vec<UsageRow>,
     api_keys: Vec<ApiKeyRecord>,
+    /// Older files have no catalogs; without the default the whole file would fail to parse.
+    #[serde(default)]
+    model_catalogs: HashMap<String, Vec<Value>>,
+    /// Profile -> upstream model id -> prompt limit. Absent from older files.
+    #[serde(default)]
+    model_limits: HashMap<String, HashMap<String, ModelLimit>>,
+    /// Profile -> stored body fields its upstream rejects. Absent from older files.
+    #[serde(default)]
+    unsupported_body_fields: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -92,6 +104,26 @@ impl Store {
                 masked TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS model_catalogs (
+                profile TEXT PRIMARY KEY,
+                entries TEXT NOT NULL,
+                updated_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS model_limits (
+                profile TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_limit INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                learned_at INTEGER NOT NULL,
+                PRIMARY KEY (profile, model),
+                CONSTRAINT ck_model_limits_source CHECK (source IN ('seeded', 'learned'))
+            );
+            CREATE TABLE IF NOT EXISTS unsupported_body_fields (
+                profile TEXT NOT NULL,
+                field TEXT NOT NULL,
+                learned_at INTEGER NOT NULL,
+                PRIMARY KEY (profile, field)
             );",
         )
         .map_err(|e| format!("sqlite schema init failed: {e}"))?;
@@ -469,6 +501,272 @@ impl Store {
             }
         }
     }
+    /// Profile name -> the raw upstream `/models` entries last saved for it.
+    pub fn load_model_catalogs(&self) -> Result<HashMap<String, Vec<Value>>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut stmt = guard
+                    .prepare("SELECT profile, entries FROM model_catalogs")
+                    .map_err(|e| e.to_string())?;
+                let rows: Vec<(String, String)> = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(Result::ok)
+                    .collect();
+                Ok(rows
+                    .into_iter()
+                    .filter_map(|(profile, entries)| {
+                        let entries = serde_json::from_str(&entries)
+                            .inspect_err(|e| {
+                                tracing::warn!(profile, "stored model catalog is unreadable: {e}");
+                            })
+                            .ok()?;
+                        Some((profile, entries))
+                    })
+                    .collect())
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                Ok(guard.state.model_catalogs.clone())
+            }
+        }
+    }
+
+    /// Replaces the saved catalog of `profile`.
+    pub fn save_model_catalog(&self, profile: &str, entries: &[Value]) -> Result<(), String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let json = serde_json::to_string(entries).map_err(|e| e.to_string())?;
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                guard
+                    .execute(
+                        "INSERT INTO model_catalogs (profile, entries, updated_ms) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(profile) DO UPDATE SET
+                             entries = excluded.entries, updated_ms = excluded.updated_ms",
+                        rusqlite::params![profile, json, db_i64(now_ms())],
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                guard
+                    .state
+                    .model_catalogs
+                    .insert(profile.to_string(), entries.to_vec());
+                guard.flush()
+            }
+        }
+    }
+
+    /// Saves `seeds` for `profile`. A model whose limit was learned keeps it.
+    pub fn seed_model_limits(
+        &self,
+        profile: &str,
+        seeds: &[(&str, u64)],
+        now_ms: u64,
+    ) -> Result<(), String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                for (model, limit) in seeds {
+                    guard
+                        .execute(
+                            "INSERT INTO model_limits (profile, model, prompt_limit, source, learned_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5)
+                             ON CONFLICT(profile, model) DO UPDATE SET
+                                 prompt_limit = excluded.prompt_limit, learned_at = excluded.learned_at
+                             WHERE model_limits.source = excluded.source
+                                 AND model_limits.prompt_limit <> excluded.prompt_limit",
+                            rusqlite::params![
+                                profile,
+                                model,
+                                db_i64(*limit),
+                                LimitSource::Seeded.as_str(),
+                                db_i64(now_ms)
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                let limits = guard
+                    .state
+                    .model_limits
+                    .entry(profile.to_string())
+                    .or_default();
+                let mut changed = false;
+                for (model, limit) in seeds {
+                    let stale = limits.get(*model).is_none_or(|current| {
+                        current.source == LimitSource::Seeded && current.limit != *limit
+                    });
+                    if stale {
+                        let entry = ModelLimit {
+                            limit: *limit,
+                            source: LimitSource::Seeded,
+                            learned_at: now_ms,
+                        };
+                        limits.insert((*model).to_string(), entry);
+                        changed = true;
+                    }
+                }
+                if changed { guard.flush() } else { Ok(()) }
+            }
+        }
+    }
+
+    /// Profile name -> upstream model id -> the prompt limit saved for it.
+    pub fn load_model_limits(
+        &self,
+    ) -> Result<HashMap<String, HashMap<String, ModelLimit>>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT profile, model, prompt_limit, source, learned_at FROM model_limits",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows: Vec<(String, String, i64, String, i64)> = stmt
+                    .query_map([], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                    })
+                    .map_err(|e| e.to_string())?
+                    .filter_map(Result::ok)
+                    .collect();
+                let mut limits: HashMap<String, HashMap<String, ModelLimit>> = HashMap::new();
+                for (profile, model, limit, source, learned_at) in rows {
+                    let Some(source) = LimitSource::parse(&source) else {
+                        tracing::warn!(
+                            profile,
+                            model,
+                            "stored prompt limit has an unknown source: {source}"
+                        );
+                        continue;
+                    };
+                    let entry = ModelLimit {
+                        limit: db_u64(limit),
+                        source,
+                        learned_at: db_u64(learned_at),
+                    };
+                    limits.entry(profile).or_default().insert(model, entry);
+                }
+                Ok(limits)
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                Ok(guard.state.model_limits.clone())
+            }
+        }
+    }
+
+    /// Replaces the saved prompt limit of `model` on `profile`.
+    pub fn save_model_limit(
+        &self,
+        profile: &str,
+        model: &str,
+        limit: &ModelLimit,
+    ) -> Result<(), String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                guard
+                    .execute(
+                        "INSERT INTO model_limits (profile, model, prompt_limit, source, learned_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(profile, model) DO UPDATE SET
+                             prompt_limit = excluded.prompt_limit, source = excluded.source,
+                             learned_at = excluded.learned_at",
+                        rusqlite::params![
+                            profile,
+                            model,
+                            db_i64(limit.limit),
+                            limit.source.as_str(),
+                            db_i64(limit.learned_at)
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                guard
+                    .state
+                    .model_limits
+                    .entry(profile.to_string())
+                    .or_default()
+                    .insert(model.to_string(), *limit);
+                guard.flush()
+            }
+        }
+    }
+
+    /// Profile name -> the stored body fields its upstream rejects.
+    pub fn load_unsupported_body_fields(&self) -> Result<HashMap<String, Vec<String>>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT profile, field FROM unsupported_body_fields ORDER BY learned_at",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows: Vec<(String, String)> = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(Result::ok)
+                    .collect();
+                let mut fields: HashMap<String, Vec<String>> = HashMap::new();
+                for (profile, field) in rows {
+                    fields.entry(profile).or_default().push(field);
+                }
+                Ok(fields)
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                Ok(guard.state.unsupported_body_fields.clone())
+            }
+        }
+    }
+
+    /// Adds `field` to the rejected body fields of `profile`. Saving a known field is a no-op.
+    pub fn save_unsupported_body_field(
+        &self,
+        profile: &str,
+        field: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                guard
+                    .execute(
+                        "INSERT INTO unsupported_body_fields (profile, field, learned_at)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(profile, field) DO NOTHING",
+                        rusqlite::params![profile, field, db_i64(now_ms)],
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                let fields = guard
+                    .state
+                    .unsupported_body_fields
+                    .entry(profile.to_string())
+                    .or_default();
+                if fields.iter().any(|known| known == field) {
+                    return Ok(());
+                }
+                fields.push(field.to_string());
+                guard.flush()
+            }
+        }
+    }
 }
 
 impl JsonStore {
@@ -676,6 +974,120 @@ mod tests {
         let usage = store.usage().unwrap();
         assert_eq!(usage.total_requests, 1);
         assert_eq!(usage.recent[0].cache_write_tokens, 1);
+    }
+
+    fn catalog_round_trip(kind: &str, file: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        let path_str = path.to_str().unwrap();
+        {
+            let store = Store::open(kind, Some(path_str)).unwrap();
+            store
+                .save_model_catalog("copilot", &[serde_json::json!({"id": "old"})])
+                .unwrap();
+            store
+                .save_model_catalog("copilot", &[serde_json::json!({"id": "claude-opus-5.5"})])
+                .unwrap();
+        }
+        let store = Store::open(kind, Some(path_str)).unwrap();
+        let catalogs = store.load_model_catalogs().unwrap();
+        assert_eq!(catalogs.len(), 1);
+        assert_eq!(
+            catalogs["copilot"],
+            [serde_json::json!({"id": "claude-opus-5.5"})]
+        );
+    }
+
+    #[test]
+    fn sqlite_model_catalog_survives_reopen_and_overwrites() {
+        catalog_round_trip("sqlite", "t.db");
+    }
+
+    #[test]
+    fn json_model_catalog_survives_reopen_and_overwrites() {
+        catalog_round_trip("json", "s.json");
+    }
+
+    #[test]
+    fn json_store_without_catalogs_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        std::fs::write(&path, r#"{"totals":{"requests":3,"errors":0,"tokens_in":0,"tokens_out":0,"cache_read_tokens":0,"cache_write_tokens":0},"recent":[],"api_keys":[]}"#).unwrap();
+        let store = Store::open("json", Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(store.usage().unwrap().total_requests, 3);
+        assert!(store.load_model_catalogs().unwrap().is_empty());
+    }
+
+    fn limits_seed_without_replacing_learned(kind: &str, file: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        let path_str = path.to_str().unwrap();
+        let learned = ModelLimit {
+            limit: 150_000,
+            source: LimitSource::Learned,
+            learned_at: 5,
+        };
+        {
+            let store = Store::open(kind, Some(path_str)).unwrap();
+            store
+                .seed_model_limits("copilot", &[("a", 100), ("b", 200)], 1)
+                .unwrap();
+            store.save_model_limit("copilot", "b", &learned).unwrap();
+        }
+        let store = Store::open(kind, Some(path_str)).unwrap();
+        store
+            .seed_model_limits("copilot", &[("a", 300), ("b", 400)], 2)
+            .unwrap();
+        let limits = &store.load_model_limits().unwrap()["copilot"];
+        assert_eq!(limits["b"], learned);
+        assert_eq!(limits["a"].limit, 300);
+        assert_eq!(limits["a"].source, LimitSource::Seeded);
+        assert_eq!(limits["a"].learned_at, 2);
+    }
+
+    #[test]
+    fn sqlite_seeded_limits_never_replace_learned_ones() {
+        limits_seed_without_replacing_learned("sqlite", "t.db");
+    }
+
+    #[test]
+    fn json_seeded_limits_never_replace_learned_ones() {
+        limits_seed_without_replacing_learned("json", "s.json");
+    }
+
+    fn body_fields_round_trip(kind: &str, file: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        let path_str = path.to_str().unwrap();
+        {
+            let store = Store::open(kind, Some(path_str)).unwrap();
+            store
+                .save_unsupported_body_field("copilot", "context_management", 1)
+                .unwrap();
+            store
+                .save_unsupported_body_field("copilot", "messages.*.output_config", 2)
+                .unwrap();
+            store
+                .save_unsupported_body_field("copilot", "context_management", 3)
+                .unwrap();
+        }
+        let store = Store::open(kind, Some(path_str)).unwrap();
+        let fields = store.load_unsupported_body_fields().unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(
+            fields["copilot"],
+            ["context_management", "messages.*.output_config"]
+        );
+    }
+
+    #[test]
+    fn sqlite_unsupported_body_fields_survive_reopen_once_each() {
+        body_fields_round_trip("sqlite", "t.db");
+    }
+
+    #[test]
+    fn json_unsupported_body_fields_survive_reopen_once_each() {
+        body_fields_round_trip("json", "s.json");
     }
 
     #[test]

@@ -1,13 +1,20 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 use crate::schemas::copilot_endpoints::CopilotEndpoints;
+use crate::schemas::copilot_quota_snapshot::CopilotQuotaSnapshot;
 
-/// Body of `GET copilot_internal/user`, the Flow B entitlement and base-URL lookup.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+/// Body of `GET copilot_internal/user`, the Flow B entitlement and base-URL
+/// lookup, and the source of the Copilot quota.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct CopilotUserResponse {
     pub chat_enabled: Option<bool>,
     pub can_signup_for_limited: Option<bool>,
     pub endpoints: Option<CopilotEndpoints>,
+    pub quota_snapshots: Option<HashMap<String, CopilotQuotaSnapshot>>,
+    pub quota_reset_date_utc: Option<String>,
+    pub quota_reset_date: Option<String>,
 }
 
 impl CopilotUserResponse {

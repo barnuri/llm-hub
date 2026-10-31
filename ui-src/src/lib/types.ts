@@ -118,6 +118,25 @@ export interface ErrorsReport {
 
 export type ErrorsRange = "1d" | "7d" | "30d" | "all";
 
+export type AutoTurn = "routed" | "reused" | "default";
+
+export interface AutoDecision {
+  readonly ts_ms: number;
+  readonly session: string | null;
+  readonly profile: string;
+  readonly auto_pick: string;
+  readonly model: string;
+  readonly swap_reason: string | null;
+  readonly complexity: "low" | "medium" | "high" | null;
+  readonly selection_reason: string | null;
+  readonly turn: AutoTurn;
+  readonly estimated_prompt_tokens: number;
+}
+
+export interface AutoDecisionsResponse {
+  readonly decisions: readonly AutoDecision[];
+}
+
 export interface ApiKeyRow {
   readonly name: string;
   readonly masked: string;

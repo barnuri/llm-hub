@@ -36,7 +36,8 @@ pub fn respawn_if_requested() -> Result<bool, String> {
     if !RESTART_REQUESTED.load(Ordering::SeqCst) || is_supervised() {
         return Ok(false);
     }
-    let exe = std::env::current_exe().map_err(|e| format!("cannot resolve current exe: {e}"))?;
+    let exe = crate::utils::exe::current_exe_resolved()
+        .map_err(|e| format!("cannot resolve current exe: {e}"))?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     Command::new(exe)
         .args(args)

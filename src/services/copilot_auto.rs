@@ -6,11 +6,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{AUTHORIZATION, HeaderValue};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::schemas::copilot_auto_response::CopilotAutoResponse;
+use crate::schemas::model_context;
+use crate::services::copilot_auto_decisions::AutoDecisionLog;
+use crate::services::model_limits::{ModelLimit, ModelLimits};
 
 const AUTO_PATH: &str = "auto";
 const HEADER_API_VERSION: &str = "x-github-api-version";
@@ -22,13 +25,17 @@ const MAX_CONVERSATIONS: usize = 256;
 const CHAT_ENDPOINT: &str = "/chat/completions";
 const RESPONSES_ENDPOINT: &str = "/responses";
 const MESSAGES_ENDPOINT: &str = "/v1/messages";
+const CLAUDE_ID_PREFIX: &str = "claude-";
 const TEXT_PART_TYPES: [&str; 2] = ["text", "input_text"];
 const TOOL_RESULT_PART_TYPE: &str = "tool_result";
-const COMPLEXITY_FAMILIES: [(&str, &str); 3] = [
-    ("low complexity", "haiku"),
-    ("medium complexity", "sonnet"),
-    ("high complexity", "opus"),
+/// The phrase in Auto's `selection_reason`, the complexity level, and the model family.
+const COMPLEXITY_FAMILIES: [(&str, &str, &str); 3] = [
+    ("low complexity", "low", "haiku"),
+    ("medium complexity", "medium", "sonnet"),
+    ("high complexity", "high", "opus"),
 ];
+const MAX_SELECTION_REASON_CHARS: usize = 300;
+const PROMPT_BYTES_PER_TOKEN: usize = 4;
 const ROLE_USER: &str = "user";
 const ROLES_SYSTEM: [&str; 2] = ["system", "developer"];
 
@@ -39,6 +46,51 @@ type ConversationSlot = tokio::sync::Mutex<Option<Conversation>>;
 /// conversation keeps its model between the turns the schedule lets it re-route.
 pub struct CopilotAutoRouter {
     conversations: Mutex<ConversationCache>,
+    decisions: AutoDecisionLog,
+    limits: Arc<ModelLimits>,
+}
+
+/// The outcome of routing one `<profile>/auto` request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AutoRoute {
+    /// The upstream model id the request is sent to.
+    pub model: String,
+    pub session_token: Option<String>,
+    /// Auto's own upstream model id, or the default model when Auto chose nothing.
+    pub auto_pick: String,
+    /// Why `model` differs from `auto_pick`, when it does.
+    pub swap_reason: Option<String>,
+    pub complexity: Option<&'static str>,
+    pub selection_reason: Option<String>,
+    pub turn: AutoTurn,
+    pub estimated_prompt_tokens: u64,
+}
+
+/// How a turn got its model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoTurn {
+    /// `/auto` answered on this turn.
+    Routed,
+    /// A cached conversation decision served the turn.
+    Reused,
+    /// The router fell back to the default model.
+    Default,
+}
+
+/// Why the Auto pick cannot serve the request as is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwapReason {
+    Endpoint(&'static str),
+    Vision,
+    PromptTooLarge { estimated: u64, limit: u64 },
+}
+
+/// The request facts routing needs: the upstream path, the parsed body and its raw size.
+struct AutoInput<'a> {
+    path: &'a str,
+    body: &'a Value,
+    prompt_bytes: usize,
 }
 
 /// Bounded map of conversation slots, evicted oldest-first.
@@ -58,7 +110,9 @@ struct Conversation {
     anchor_scores: HashMap<String, f64>,
     skip_window: u32,
     schedule: Option<Schedule>,
+    complexity: Option<&'static str>,
     family_hint: Option<&'static str>,
+    selection_reason: Option<String>,
 }
 
 /// The `multi_turn` object of an `/auto` response.
@@ -81,6 +135,7 @@ struct ModelTraits {
     endpoints: Option<Vec<String>>,
     price: Option<f64>,
     vision: Option<bool>,
+    max_prompt_tokens: Option<u64>,
     in_auto_pool: bool,
     usable: bool,
 }
@@ -123,23 +178,65 @@ impl std::fmt::Debug for CopilotAutoRouter {
             .map_or(0, |cache| cache.slots.len());
         f.debug_struct("CopilotAutoRouter")
             .field("conversations", &conversations)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for AutoRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AutoRoute")
+            .field("model", &self.model)
+            .field("has_session_token", &self.session_token.is_some())
+            .field("auto_pick", &self.auto_pick)
+            .field("swap_reason", &self.swap_reason)
+            .field("complexity", &self.complexity)
+            .field("selection_reason", &self.selection_reason)
+            .field("turn", &self.turn)
+            .field("estimated_prompt_tokens", &self.estimated_prompt_tokens)
             .finish()
     }
 }
 
+impl std::fmt::Display for SwapReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SwapReason::Endpoint(endpoint) => write!(f, "does not serve {endpoint}"),
+            SwapReason::Vision => f.write_str("does not accept images"),
+            SwapReason::PromptTooLarge { estimated, limit } => write!(
+                f,
+                "allows {limit} prompt tokens, below the estimated {estimated}"
+            ),
+        }
+    }
+}
+
 impl CopilotAutoRouter {
-    /// Creates a router with an empty conversation cache.
+    /// Creates a router with an empty conversation cache and only the seeded prompt limits.
     pub fn new() -> CopilotAutoRouter {
+        CopilotAutoRouter::with_limits(Arc::new(ModelLimits::default()))
+    }
+
+    /// Creates a router that checks prompt fit against `limits`.
+    pub fn with_limits(limits: Arc<ModelLimits>) -> CopilotAutoRouter {
         CopilotAutoRouter {
             conversations: Mutex::new(ConversationCache::default()),
+            decisions: AutoDecisionLog::default(),
+            limits,
         }
     }
 
-    /// Returns the upstream model id for this request and the Copilot session
-    /// token to send with it. `path` is the upstream path, which sets the body
-    /// shape and the endpoint the model must support. `catalog` holds the
-    /// profile's raw `/models` entries. When `/auto` fails and the conversation
-    /// has no cached decision, the request goes to `default_model` with no token.
+    /// The log the proxy records each routed request into.
+    pub fn decisions(&self) -> &AutoDecisionLog {
+        &self.decisions
+    }
+
+    /// Routes this request and returns the upstream model id, the Copilot
+    /// session token to send with it, and what Auto decided. `path` is the
+    /// upstream path, which sets the body shape and the endpoint the model must
+    /// support. `prompt_bytes` is the raw request size, used to skip models whose
+    /// prompt window is too small. `catalog` holds the profile's raw `/models`
+    /// entries. When `/auto` fails and the conversation has no cached decision,
+    /// the request goes to `default_model` with no token.
     #[allow(clippy::too_many_arguments)]
     pub async fn route(
         &self,
@@ -149,38 +246,36 @@ impl CopilotAutoRouter {
         api_base: &str,
         path: &str,
         body: &Value,
+        prompt_bytes: usize,
         catalog: &[Value],
         default_model: &str,
-    ) -> (String, Option<String>) {
+    ) -> AutoRoute {
         let upstream = Upstream {
             client,
             profile,
             bearer,
             api_base,
         };
-        self.route_at(
-            &upstream,
+        let input = AutoInput {
             path,
             body,
-            catalog,
-            default_model,
-            unix_now_secs(),
-        )
-        .await
+            prompt_bytes,
+        };
+        self.route_at(&upstream, &input, catalog, default_model, unix_now_secs())
+            .await
     }
 
     async fn route_at(
         &self,
         upstream: &Upstream<'_>,
-        path: &str,
-        body: &Value,
+        input: &AutoInput<'_>,
         catalog: &[Value],
         default_model: &str,
         now_secs: u64,
-    ) -> (String, Option<String>) {
-        let fallback = || (default_model.to_string(), None);
-        let Some(turn) = Turn::parse(upstream.profile, path, body) else {
-            return fallback();
+    ) -> AutoRoute {
+        let estimated = estimated_prompt_tokens(input.prompt_bytes);
+        let Some(turn) = Turn::parse(upstream.profile, input.path, input.body) else {
+            return AutoRoute::default_model(default_model, estimated);
         };
         let slot = self.slot(turn.key);
         let mut state = slot.lock().await;
@@ -189,6 +284,7 @@ impl CopilotAutoRouter {
             (Some(conversation), Some(_)) => conversation.route_kind(turn.user_turns, now_secs),
             (_, None) => None,
         };
+        let mut routed = false;
         if let (Some(kind), Some(prompt)) = (kind, turn.prompt.as_deref()) {
             let request = auto_request_body(
                 prompt,
@@ -196,13 +292,15 @@ impl CopilotAutoRouter {
                 state.as_ref().filter(|_| kind == RouteKind::Check),
             );
             match fetch_decision(upstream, &request).await {
-                Ok(decision) => apply_decision(
-                    &mut state,
-                    kind,
-                    decision,
-                    turn.user_turns,
-                    upstream.profile,
-                ),
+                Ok(decision) => {
+                    routed = apply_decision(
+                        &mut state,
+                        kind,
+                        decision,
+                        turn.user_turns,
+                        upstream.profile,
+                    );
+                }
                 Err(e) => tracing::warn!(
                     "profile {}: Copilot Auto routing failed, so the request uses the cached or default model: {e}",
                     upstream.profile
@@ -210,26 +308,49 @@ impl CopilotAutoRouter {
             }
         }
         let Some(conversation) = state.as_ref() else {
-            return fallback();
+            return AutoRoute::default_model(default_model, estimated);
         };
-        let Some(model) = compatible_model(
+        let pick = &conversation.model.id;
+        let limits = self.limits.for_profile(upstream.profile);
+        let Some((model, swap)) = compatible_model(
             &conversation.model,
             turn.endpoint,
             turn.has_image,
             catalog,
             conversation.family_hint,
+            Fit {
+                estimated_tokens: estimated,
+                limits: &limits,
+            },
         ) else {
             tracing::warn!(
-                "profile {}: no Copilot model serves {} for the Auto pick {}, so the request uses the default model",
+                "profile {}: no Copilot model serves {} for the Auto pick {pick}, so the request uses the default model",
                 upstream.profile,
                 turn.endpoint,
-                conversation.model.id
             );
-            return fallback();
+            return AutoRoute {
+                auto_pick: pick.clone(),
+                complexity: conversation.complexity,
+                selection_reason: conversation.selection_reason.clone(),
+                ..AutoRoute::default_model(default_model, estimated)
+            };
         };
         let token =
             (now_secs < conversation.expires_at).then(|| conversation.session_token.clone());
-        (model, token)
+        AutoRoute {
+            model,
+            session_token: token,
+            auto_pick: pick.clone(),
+            swap_reason: swap.map(|reason| format!("Auto pick {pick} {reason}")),
+            complexity: conversation.complexity,
+            selection_reason: conversation.selection_reason.clone(),
+            turn: if routed {
+                AutoTurn::Routed
+            } else {
+                AutoTurn::Reused
+            },
+            estimated_prompt_tokens: estimated,
+        }
     }
 
     fn slot(&self, key: ConversationKey) -> Arc<ConversationSlot> {
@@ -259,6 +380,28 @@ impl Default for CopilotAutoRouter {
     }
 }
 
+impl AutoRoute {
+    fn default_model(default_model: &str, estimated_prompt_tokens: u64) -> AutoRoute {
+        AutoRoute {
+            model: default_model.to_string(),
+            session_token: None,
+            auto_pick: default_model.to_string(),
+            swap_reason: None,
+            complexity: None,
+            selection_reason: None,
+            turn: AutoTurn::Default,
+            estimated_prompt_tokens,
+        }
+    }
+}
+
+/// Roughly one token per four request bytes. JSON punctuation and tool schemas
+/// make it overestimate English text slightly, and CJK text is underestimated, so
+/// it only rules out prompt windows that are clearly too small.
+fn estimated_prompt_tokens(prompt_bytes: usize) -> u64 {
+    u64::try_from(prompt_bytes / PROMPT_BYTES_PER_TOKEN).unwrap_or(u64::MAX)
+}
+
 /// Where and as whom `/auto` is called.
 struct Upstream<'a> {
     client: &'a reqwest::Client,
@@ -270,7 +413,7 @@ struct Upstream<'a> {
 impl Conversation {
     fn anchored(decision: CopilotAutoResponse, model: ModelTraits, turn: usize) -> Conversation {
         let schedule = parse_schedule(decision.multi_turn.as_ref());
-        let family_hint = complexity_family(decision.selection_reason.as_deref());
+        let complexity = complexity(decision.selection_reason.as_deref());
         Conversation {
             model,
             session_token: decision.session_token,
@@ -280,7 +423,9 @@ impl Conversation {
             anchor_scores: decision.hydra_scores,
             skip_window: schedule.as_ref().map_or(0, |s| s.initial_skip),
             schedule,
-            family_hint,
+            complexity: complexity.map(|(level, _)| level),
+            family_hint: complexity.map(|(_, family)| family),
+            selection_reason: truncated_reason(decision.selection_reason),
         }
     }
 
@@ -336,22 +481,27 @@ impl Conversation {
                 .saturating_mul(schedule.backoff_coefficient)
                 .min(schedule.max_skip);
         }
+        let complexity = complexity(decision.selection_reason.as_deref());
+        self.complexity = complexity.map(|(level, _)| level);
+        self.family_hint = complexity.map(|(_, family)| family);
+        self.selection_reason = truncated_reason(decision.selection_reason);
         self.session_token = decision.session_token;
         self.expires_at = decision.expires_at;
         self.checked_turn = turn;
     }
 }
 
+/// Applies an `/auto` answer to the conversation; false when it named no model.
 fn apply_decision(
     state: &mut Option<Conversation>,
     kind: RouteKind,
     decision: CopilotAutoResponse,
     turn: usize,
     profile: &str,
-) {
+) -> bool {
     let Some(model) = ModelTraits::from_entry(&decision.selected_model) else {
         tracing::warn!("profile {profile}: the Copilot Auto response named no selected model");
-        return;
+        return false;
     };
     tracing::info!(
         "profile {profile}: Copilot Auto selected {} (discount {}): {}",
@@ -370,9 +520,10 @@ fn apply_decision(
         && !conversation.escalates(&decision, &model)
     {
         conversation.back_off(decision, turn);
-        return;
+        return true;
     }
     *state = Some(Conversation::anchored(decision, model, turn));
+    true
 }
 
 fn parse_schedule(multi_turn: Option<&Value>) -> Option<Schedule> {
@@ -435,33 +586,69 @@ async fn fetch_decision(
     Ok(decision)
 }
 
-/// The model that serves `endpoint`: the Auto pick when it supports it,
-/// otherwise the catalog model with the closest price that does. Without
-/// prices, it uses the model family that matches Auto's complexity verdict.
+/// The model that serves `endpoint` and the image and fits the estimated
+/// prompt, with the reason when it is not the Auto pick. A swap takes the
+/// catalog model with the closest price, or without prices the model family that
+/// matches Auto's complexity verdict. When no candidate's window fits, the
+/// largest window wins. A model with no known limit always fits.
 fn compatible_model(
     selected: &ModelTraits,
-    endpoint: &str,
+    endpoint: &'static str,
     has_image: bool,
     catalog: &[Value],
     family_hint: Option<&str>,
-) -> Option<String> {
+    fit: Fit<'_>,
+) -> Option<(String, Option<SwapReason>)> {
+    let estimated_tokens = fit.estimated_tokens;
     let models: Vec<ModelTraits> = catalog.iter().filter_map(ModelTraits::from_entry).collect();
     let listed = models.iter().find(|model| model.id == selected.id);
     let endpoints = selected
         .endpoints
         .as_ref()
         .or_else(|| listed.and_then(|model| model.endpoints.as_ref()));
-    let serves_endpoint = endpoints.is_none_or(|list| list.iter().any(|e| e == endpoint));
+    let serves_endpoint = endpoints.is_none_or(|list| serves(list, endpoint));
     let serves_image = !has_image || selected.vision != Some(false);
-    if serves_endpoint && serves_image {
-        return Some(selected.id.clone());
-    }
-    let candidates: Vec<&ModelTraits> = models
+    let pick_listed = selected
+        .max_prompt_tokens
+        .or_else(|| listed.and_then(|model| model.max_prompt_tokens));
+    let pick_limit = fit.limit(&selected.id, pick_listed, endpoint);
+    let pick_too_small = pick_limit.filter(|limit| *limit < estimated_tokens);
+    let reason = match (serves_endpoint, serves_image, pick_too_small) {
+        (false, _, _) => SwapReason::Endpoint(endpoint),
+        (true, false, _) => SwapReason::Vision,
+        (true, true, Some(limit)) => SwapReason::PromptTooLarge {
+            estimated: estimated_tokens,
+            limit,
+        },
+        (true, true, None) => return Some((selected.id.clone(), None)),
+    };
+    let compatible: Vec<&ModelTraits> = models
         .iter()
         .filter(|model| model.usable && model.id != selected.id)
         .filter(|model| model.supports(endpoint))
         .filter(|model| !has_image || model.vision == Some(true))
         .collect();
+    let candidates: Vec<&ModelTraits> = compatible
+        .iter()
+        .copied()
+        .filter(|model| fit.fits(model, endpoint))
+        .collect();
+    if candidates.is_empty() {
+        let pick_competes = matches!(reason, SwapReason::PromptTooLarge { .. });
+        let window = |model: &&ModelTraits| {
+            if model.id == selected.id {
+                pick_limit
+            } else {
+                fit.limit(&model.id, model.max_prompt_tokens, endpoint)
+            }
+        };
+        let largest = compatible
+            .into_iter()
+            .chain(pick_competes.then_some(selected))
+            .max_by_key(window)?;
+        let swap = (largest.id != selected.id).then_some(reason);
+        return Some((largest.id.clone(), swap));
+    }
     let pool: Vec<&ModelTraits> = if candidates.iter().any(|model| model.in_auto_pool) {
         candidates
             .into_iter()
@@ -473,22 +660,35 @@ fn compatible_model(
     let target = selected
         .price
         .or_else(|| listed.and_then(|model| model.price));
-    let Some(target) = target.filter(|_| pool.iter().any(|model| model.price.is_some())) else {
-        return newest_in_family(&pool, family_hint)
-            .or_else(|| pool.first().map(|model| model.id.clone()));
+    let swapped = match target.filter(|_| pool.iter().any(|model| model.price.is_some())) {
+        Some(target) => pool
+            .into_iter()
+            .min_by(|a, b| {
+                price_distance(a.price, target).total_cmp(&price_distance(b.price, target))
+            })
+            .map(|model| model.id.clone()),
+        None => newest_in_family(&pool, family_hint)
+            .or_else(|| pool.first().map(|model| model.id.clone())),
     };
-    pool.into_iter()
-        .min_by(|a, b| price_distance(a.price, target).total_cmp(&price_distance(b.price, target)))
-        .map(|model| model.id.clone())
+    swapped.map(|model| (model, Some(reason)))
 }
 
-/// Auto's `selection_reason` names the task complexity; map it to a model family.
-fn complexity_family(reason: Option<&str>) -> Option<&'static str> {
+/// Auto's `selection_reason` names the task complexity; map it to a level and a model family.
+fn complexity(reason: Option<&str>) -> Option<(&'static str, &'static str)> {
     let reason = reason?.to_ascii_lowercase();
     COMPLEXITY_FAMILIES
         .iter()
-        .find(|(complexity, _)| reason.contains(complexity))
-        .map(|(_, family)| *family)
+        .find(|(phrase, _, _)| reason.contains(phrase))
+        .map(|(_, level, family)| (*level, *family))
+}
+
+fn truncated_reason(mut reason: Option<String>) -> Option<String> {
+    if let Some(text) = reason.as_mut()
+        && let Some((cut, _)) = text.char_indices().nth(MAX_SELECTION_REASON_CHARS)
+    {
+        text.truncate(cut);
+    }
+    reason
 }
 
 /// The highest-versioned pool model whose id contains `family`.
@@ -542,6 +742,7 @@ impl ModelTraits {
             vision: entry
                 .pointer("/capabilities/supports/vision")
                 .and_then(Value::as_bool),
+            max_prompt_tokens: model_context::max_input_tokens_from_item(entry),
             in_auto_pool: billing.and_then(|b| b.get("auto_discount")).is_some(),
             usable,
         })
@@ -550,7 +751,41 @@ impl ModelTraits {
     fn supports(&self, endpoint: &str) -> bool {
         self.endpoints
             .as_ref()
-            .is_some_and(|list| list.iter().any(|e| e == endpoint))
+            .is_some_and(|list| serves(list, endpoint))
+    }
+}
+
+/// True when `endpoints` lists `endpoint`. The proxy bridges an Anthropic
+/// request to `/responses`, so a Responses model also serves `/v1/messages`.
+fn serves(endpoints: &[String], endpoint: &str) -> bool {
+    endpoints.iter().any(|listed| {
+        listed == endpoint || (endpoint == MESSAGES_ENDPOINT && listed == RESPONSES_ENDPOINT)
+    })
+}
+
+/// The estimated prompt size and the profile's learned or seeded prompt limits.
+#[derive(Clone, Copy)]
+struct Fit<'a> {
+    estimated_tokens: u64,
+    limits: &'a HashMap<String, ModelLimit>,
+}
+
+impl Fit<'_> {
+    /// The prompt window routing trusts for `id`: its learned or seeded limit,
+    /// else the `/models` one. Copilot's `/v1/messages` accepts far more than
+    /// `/models` lists for Claude, so there the listed limit is only a floor and
+    /// never rules a Claude model out.
+    fn limit(&self, id: &str, listed: Option<u64>, endpoint: &str) -> Option<u64> {
+        if let Some(known) = self.limits.get(id) {
+            return Some(known.limit);
+        }
+        let listed_is_floor = endpoint == MESSAGES_ENDPOINT && id.starts_with(CLAUDE_ID_PREFIX);
+        listed.filter(|_| !listed_is_floor)
+    }
+
+    fn fits(&self, model: &ModelTraits, endpoint: &str) -> bool {
+        self.limit(&model.id, model.max_prompt_tokens, endpoint)
+            .is_none_or(|limit| limit >= self.estimated_tokens)
     }
 }
 
@@ -752,6 +987,7 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::*;
+    use crate::services::model_limits::LimitSource;
 
     const PROFILE: &str = "copilot";
     const BEARER: &str = "gho_from_gh";
@@ -820,6 +1056,19 @@ mod tests {
         catalog: &[Value],
         now: u64,
     ) -> (String, Option<String>) {
+        let route = route_sized(router, server, upstream_path, body, 0, catalog, now).await;
+        (route.model, route.session_token)
+    }
+
+    async fn route_sized(
+        router: &CopilotAutoRouter,
+        server: &MockServer,
+        upstream_path: &str,
+        body: &Value,
+        prompt_bytes: usize,
+        catalog: &[Value],
+        now: u64,
+    ) -> AutoRoute {
         let client = reqwest::Client::new();
         let uri = server.uri();
         let upstream = Upstream {
@@ -828,8 +1077,13 @@ mod tests {
             bearer: BEARER,
             api_base: &uri,
         };
+        let input = AutoInput {
+            path: upstream_path,
+            body,
+            prompt_bytes,
+        };
         router
-            .route_at(&upstream, upstream_path, body, catalog, DEFAULT_MODEL, now)
+            .route_at(&upstream, &input, catalog, DEFAULT_MODEL, now)
             .await
     }
 
@@ -1104,7 +1358,7 @@ mod tests {
     #[tokio::test]
     async fn incompatible_pick_uses_the_closest_priced_compatible_model() {
         let server = MockServer::start().await;
-        let selected = priced("gpt-sol", &["/responses"], 200.0, 1000.0);
+        let selected = priced("gpt-sol", &["/chat/completions"], 200.0, 1000.0);
         Mock::given(method("POST"))
             .and(path("/auto"))
             .respond_with(auto_response(
@@ -1130,7 +1384,7 @@ mod tests {
                 1000.0,
             ),
             priced("claude-opus", &["/v1/messages"], 1000.0, 5000.0),
-            priced("gpt-terra", &["/responses"], 200.0, 1200.0),
+            priced("gpt-terra", &["/chat/completions"], 200.0, 1200.0),
         ];
         let body = json!({
             "model": "copilot/auto",
@@ -1284,17 +1538,27 @@ mod tests {
             unpriced("claude-sonnet-5", &["/v1/messages"]),
             unpriced("claude-sonnet-5-5", &["/v1/messages"]),
             unpriced("claude-opus-5-5", &["/v1/messages"]),
-            unpriced("gpt-6-luna", &["/responses"]),
+            unpriced("gpt-6-luna", &["/chat/completions"]),
         ];
         let selected = ModelTraits::from_entry(&catalog[4]).unwrap();
-        let family = complexity_family(Some(
+        let complexity = complexity(Some(
             "Auto selected GPT-6 Luna since the task has medium complexity.",
         ));
 
-        let model = compatible_model(&selected, "/v1/messages", false, &catalog, family);
+        let model = compatible_model(
+            &selected,
+            "/v1/messages",
+            false,
+            &catalog,
+            complexity.map(|(_, family)| family),
+            fit(0, &HashMap::new()),
+        );
 
-        assert_eq!(family, Some("sonnet"));
-        assert_eq!(model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(complexity, Some(("medium", "sonnet")));
+        assert_eq!(
+            model.map(|(id, _)| id).as_deref(),
+            Some("claude-sonnet-5-5")
+        );
     }
 
     #[test]
@@ -1393,9 +1657,414 @@ mod tests {
         seeing["capabilities"]["supports"] = json!({"vision": true});
         let catalog = [priced("blind", &["/chat/completions"], 1.0, 1.0), seeing];
 
-        let model = compatible_model(&selected, CHAT_ENDPOINT, true, &catalog, None);
+        let model = compatible_model(
+            &selected,
+            CHAT_ENDPOINT,
+            true,
+            &catalog,
+            None,
+            fit(0, &HashMap::new()),
+        );
 
-        assert_eq!(model.as_deref(), Some("sees"));
+        assert_eq!(model, Some(("sees".to_string(), Some(SwapReason::Vision))));
+    }
+
+    const CLAUDE_CODE_PROMPT_BYTES: usize = 440_000;
+
+    fn windowed(id: &str, endpoints: &[&str], price: f64, max_prompt_tokens: Option<u64>) -> Value {
+        let mut entry = priced(id, endpoints, price, price);
+        if let Some(limit) = max_prompt_tokens {
+            entry["capabilities"]["limits"] = json!({"max_prompt_tokens": limit});
+        }
+        entry
+    }
+
+    fn traits(entry: &Value) -> ModelTraits {
+        ModelTraits::from_entry(entry).unwrap()
+    }
+
+    /// Limits as if each was learned from a Copilot rejection.
+    fn learned(limits: &[(&str, u64)]) -> HashMap<String, ModelLimit> {
+        limits
+            .iter()
+            .map(|(id, limit)| {
+                let entry = ModelLimit {
+                    limit: *limit,
+                    source: LimitSource::Learned,
+                    learned_at: 0,
+                };
+                ((*id).to_string(), entry)
+            })
+            .collect()
+    }
+
+    fn fit(estimated_tokens: u64, limits: &HashMap<String, ModelLimit>) -> Fit<'_> {
+        Fit {
+            estimated_tokens,
+            limits,
+        }
+    }
+
+    #[test]
+    fn large_prompt_swaps_past_a_too_small_closest_model() {
+        let selected = windowed("gpt-sol", &["/chat/completions"], 10.0, Some(400_000));
+        let catalog = [
+            selected.clone(),
+            windowed("claude-haiku-5-5", &["/v1/messages"], 10.0, Some(100_000)),
+            windowed("claude-sonnet-5-5", &["/v1/messages"], 50.0, Some(200_000)),
+            windowed("claude-opus-5-5", &["/v1/messages"], 500.0, Some(200_000)),
+        ];
+        let estimated = estimated_prompt_tokens(CLAUDE_CODE_PROMPT_BYTES);
+        let limits = learned(&[
+            ("claude-haiku-5-5", 100_000),
+            ("claude-sonnet-5-5", 200_000),
+            ("claude-opus-5-5", 200_000),
+        ]);
+
+        let model = compatible_model(
+            &traits(&selected),
+            MESSAGES_ENDPOINT,
+            false,
+            &catalog,
+            None,
+            fit(estimated, &limits),
+        );
+
+        assert_eq!(estimated, 110_000);
+        assert_eq!(
+            model,
+            Some((
+                "claude-sonnet-5-5".to_string(),
+                Some(SwapReason::Endpoint(MESSAGES_ENDPOINT))
+            ))
+        );
+    }
+
+    #[test]
+    fn too_small_auto_pick_is_swapped_for_a_model_that_fits() {
+        let selected = windowed("claude-haiku-5-5", &["/v1/messages"], 10.0, Some(100_000));
+        let catalog = [
+            selected.clone(),
+            windowed("claude-sonnet-5-5", &["/v1/messages"], 50.0, Some(200_000)),
+        ];
+        let limits = learned(&[
+            ("claude-haiku-5-5", 100_000),
+            ("claude-sonnet-5-5", 200_000),
+        ]);
+
+        let model = compatible_model(
+            &traits(&selected),
+            MESSAGES_ENDPOINT,
+            false,
+            &catalog,
+            None,
+            fit(110_000, &limits),
+        );
+
+        assert_eq!(
+            model,
+            Some((
+                "claude-sonnet-5-5".to_string(),
+                Some(SwapReason::PromptTooLarge {
+                    estimated: 110_000,
+                    limit: 100_000
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn responses_only_pick_is_kept_and_chosen_as_a_swap_on_v1_messages() {
+        let selected = windowed("gpt-sol", &["/responses"], 10.0, None);
+        let chat_only = windowed("gemini-pro", &["/chat/completions"], 10.0, None);
+        let catalog = [
+            selected.clone(),
+            chat_only.clone(),
+            windowed("gpt-terra", &["/responses"], 10.0, None),
+        ];
+        let pick = |model: &Value| {
+            compatible_model(
+                &traits(model),
+                MESSAGES_ENDPOINT,
+                false,
+                &catalog,
+                None,
+                fit(0, &HashMap::new()),
+            )
+        };
+
+        assert_eq!(pick(&selected), Some(("gpt-sol".to_string(), None)));
+        assert_eq!(
+            pick(&chat_only),
+            Some((
+                "gpt-sol".to_string(),
+                Some(SwapReason::Endpoint(MESSAGES_ENDPOINT))
+            ))
+        );
+    }
+
+    #[test]
+    fn when_nothing_fits_the_largest_window_wins() {
+        let selected = windowed("gpt-sol", &["/chat/completions"], 10.0, None);
+        let catalog = [
+            selected.clone(),
+            windowed("claude-haiku-5-5", &["/v1/messages"], 10.0, Some(100_000)),
+            windowed("claude-sonnet-5-5", &["/v1/messages"], 50.0, Some(150_000)),
+            windowed("claude-opus-5-5", &["/v1/messages"], 500.0, Some(120_000)),
+        ];
+        let limits = learned(&[
+            ("claude-haiku-5-5", 100_000),
+            ("claude-sonnet-5-5", 150_000),
+            ("claude-opus-5-5", 120_000),
+        ]);
+
+        let model = compatible_model(
+            &traits(&selected),
+            MESSAGES_ENDPOINT,
+            false,
+            &catalog,
+            None,
+            fit(500_000, &limits),
+        );
+
+        assert_eq!(
+            model.map(|(id, _)| id).as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+    }
+
+    #[test]
+    fn too_small_pick_with_the_largest_window_is_kept() {
+        let selected = windowed("claude-sonnet-5-5", &["/v1/messages"], 50.0, Some(200_000));
+        let catalog = [
+            selected.clone(),
+            windowed("claude-haiku-5-5", &["/v1/messages"], 10.0, Some(100_000)),
+        ];
+        let limits = learned(&[
+            ("claude-sonnet-5-5", 200_000),
+            ("claude-haiku-5-5", 100_000),
+        ]);
+
+        let model = compatible_model(
+            &traits(&selected),
+            MESSAGES_ENDPOINT,
+            false,
+            &catalog,
+            None,
+            fit(500_000, &limits),
+        );
+
+        assert_eq!(model, Some(("claude-sonnet-5-5".to_string(), None)));
+    }
+
+    #[test]
+    fn unknown_prompt_limit_is_not_filtered() {
+        let selected = windowed("gpt-sol", &["/chat/completions"], 10.0, None);
+        let catalog = [
+            selected.clone(),
+            windowed("claude-haiku-5-5", &["/v1/messages"], 10.0, None),
+            windowed("claude-opus-5-5", &["/v1/messages"], 500.0, Some(1_000_000)),
+        ];
+
+        let model = compatible_model(
+            &traits(&selected),
+            MESSAGES_ENDPOINT,
+            false,
+            &catalog,
+            None,
+            fit(110_000, &learned(&[("claude-opus-5-5", 1_000_000)])),
+        );
+
+        assert_eq!(model.map(|(id, _)| id).as_deref(), Some("claude-haiku-5-5"));
+    }
+
+    #[test]
+    fn listed_limit_never_swaps_away_from_a_native_claude_pick() {
+        let selected = windowed("claude-haiku-5-5", &["/v1/messages"], 10.0, Some(100_000));
+        let catalog = [
+            selected.clone(),
+            windowed("claude-sonnet-5-5", &["/v1/messages"], 50.0, Some(200_000)),
+        ];
+
+        let model = compatible_model(
+            &traits(&selected),
+            MESSAGES_ENDPOINT,
+            false,
+            &catalog,
+            None,
+            fit(110_000, &HashMap::new()),
+        );
+
+        assert_eq!(model, Some(("claude-haiku-5-5".to_string(), None)));
+    }
+
+    #[test]
+    fn listed_limit_still_binds_off_v1_messages() {
+        let selected = windowed("gpt-small", &["/responses"], 10.0, Some(100_000));
+        let catalog = [
+            selected.clone(),
+            windowed("gpt-large", &["/responses"], 50.0, Some(400_000)),
+        ];
+
+        let model = compatible_model(
+            &traits(&selected),
+            RESPONSES_ENDPOINT,
+            false,
+            &catalog,
+            None,
+            fit(110_000, &HashMap::new()),
+        );
+
+        assert_eq!(model.map(|(id, _)| id).as_deref(), Some("gpt-large"));
+    }
+
+    #[test]
+    fn learned_limit_overrides_the_listed_one() {
+        let selected = windowed("claude-opus-5.5", &["/v1/messages"], 500.0, Some(200_000));
+        let catalog = [
+            selected.clone(),
+            windowed("gpt-large", &["/v1/messages"], 500.0, Some(400_000)),
+        ];
+
+        let roomy = compatible_model(
+            &traits(&selected),
+            MESSAGES_ENDPOINT,
+            false,
+            &catalog,
+            None,
+            fit(300_000, &learned(&[("claude-opus-5.5", 1_000_000)])),
+        );
+        let tight = compatible_model(
+            &traits(&selected),
+            MESSAGES_ENDPOINT,
+            false,
+            &catalog,
+            None,
+            fit(300_000, &learned(&[("claude-opus-5.5", 250_000)])),
+        );
+
+        assert_eq!(roomy, Some(("claude-opus-5.5".to_string(), None)));
+        assert_eq!(tight.map(|(id, _)| id).as_deref(), Some("gpt-large"));
+    }
+
+    #[test]
+    fn swap_reason_text_names_the_cause() {
+        let texts = [
+            SwapReason::Endpoint(MESSAGES_ENDPOINT),
+            SwapReason::Vision,
+            SwapReason::PromptTooLarge {
+                estimated: 110_000,
+                limit: 100_000,
+            },
+        ]
+        .map(|reason| reason.to_string());
+
+        assert_eq!(
+            texts,
+            [
+                "does not serve /v1/messages",
+                "does not accept images",
+                "allows 100000 prompt tokens, below the estimated 110000",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn route_reports_the_pick_the_swap_and_the_complexity() {
+        let server = MockServer::start().await;
+        let selected = windowed("claude-haiku-5-5", &["/v1/messages"], 10.0, Some(100_000));
+        Mock::given(method("POST"))
+            .and(path("/auto"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "session_token": "sess-1",
+                "expires_at": NOW + DAY_SECS,
+                "selected_model": selected,
+                "selection_reason": "Auto selected Haiku since the task has low complexity.",
+                "hydra_scores": {},
+                "discounted_costs": {},
+            })))
+            .mount(&server)
+            .await;
+        let catalog = [
+            selected.clone(),
+            windowed("claude-sonnet-5-5", &["/v1/messages"], 50.0, Some(200_000)),
+        ];
+        let body = json!({"messages": [{"role": "user", "content": "plan it"}]});
+        let limits = ModelLimits::default();
+        limits.learn(PROFILE, "claude-haiku-5-5", 100_000, 0);
+        let router = CopilotAutoRouter::with_limits(Arc::new(limits));
+
+        let route = route_sized(
+            &router,
+            &server,
+            UPSTREAM_MESSAGES_PATH,
+            &body,
+            CLAUDE_CODE_PROMPT_BYTES,
+            &catalog,
+            NOW,
+        )
+        .await;
+
+        assert_eq!(route.model, "claude-sonnet-5-5");
+        assert_eq!(route.auto_pick, "claude-haiku-5-5");
+        assert_eq!(
+            route.swap_reason.as_deref(),
+            Some(
+                "Auto pick claude-haiku-5-5 allows 100000 prompt tokens, below the estimated 110000"
+            )
+        );
+        assert_eq!(route.complexity, Some("low"));
+        assert_eq!(
+            route.selection_reason.as_deref(),
+            Some("Auto selected Haiku since the task has low complexity.")
+        );
+        assert_eq!(route.estimated_prompt_tokens, 110_000);
+        assert_eq!(route.turn, AutoTurn::Routed);
+    }
+
+    #[tokio::test]
+    async fn turn_is_routed_then_reused_and_default_when_auto_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auto"))
+            .and(body_partial_json(json!({"prompt": "fix the bug"})))
+            .respond_with(auto_response(
+                &chat_model("gpt-picked"),
+                "sess-1",
+                NOW + DAY_SECS,
+                &scores(0.5),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/auto"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let router = CopilotAutoRouter::new();
+        let mut turns = Vec::new();
+        for body in [
+            chat_body(&["fix the bug"]),
+            tool_follow_up(&["fix the bug"]),
+            chat_body(&["another conversation"]),
+        ] {
+            let route = route_sized(&router, &server, UPSTREAM_CHAT_PATH, &body, 0, &[], NOW).await;
+            turns.push(route.turn);
+        }
+
+        assert_eq!(
+            turns,
+            [AutoTurn::Routed, AutoTurn::Reused, AutoTurn::Default]
+        );
+    }
+
+    #[test]
+    fn selection_reason_is_capped() {
+        let long = "x".repeat(MAX_SELECTION_REASON_CHARS + 50);
+
+        let capped = truncated_reason(Some(long)).unwrap();
+
+        assert_eq!(capped.chars().count(), MAX_SELECTION_REASON_CHARS);
     }
 
     #[derive(Clone, Default)]

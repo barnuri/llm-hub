@@ -67,7 +67,7 @@ pub fn to_openai(body: Option<&Value>) -> Result<Value, AppError> {
 }
 
 /// `system` is either a string or a block list; non-text blocks are skipped.
-fn system_text(system: &Value) -> Option<String> {
+pub(crate) fn system_text(system: &Value) -> Option<String> {
     let text = match system {
         Value::String(text) => text.clone(),
         Value::Array(blocks) => join_text_blocks(blocks, "\n\n"),
@@ -181,7 +181,7 @@ fn tool_call(block: &Value) -> Value {
 }
 
 /// `tool_result.content` is a string or a block list; only text survives.
-fn tool_result_text(block: &Value) -> String {
+pub(crate) fn tool_result_text(block: &Value) -> String {
     match block.get("content") {
         Some(Value::String(text)) => text.clone(),
         Some(Value::Array(blocks)) => join_text_blocks(blocks, "\n"),
@@ -190,6 +190,15 @@ fn tool_result_text(block: &Value) -> String {
 }
 
 fn image_part(block: &Value) -> Result<Value, AppError> {
+    Ok(json!({ "type": "image_url", "image_url": { "url": image_url(block)? } }))
+}
+
+/// The image of an `image` block as a URL: a `data:` URL for a base64 source.
+///
+/// # Errors
+/// `AppError::BadRequest` when the block has no `source` object, or when the
+/// source type is neither `base64` nor `url`.
+pub(crate) fn image_url(block: &Value) -> Result<String, AppError> {
     let Some(source) = block.get("source").and_then(Value::as_object) else {
         return Err(AppError::BadRequest(
             "image block requires a \"source\" object".to_string(),
@@ -222,7 +231,7 @@ fn image_part(block: &Value) -> Result<Value, AppError> {
             )));
         }
     };
-    Ok(json!({ "type": "image_url", "image_url": { "url": url } }))
+    Ok(url)
 }
 
 /// Custom tools carry an `input_schema`; server tools (`web_search_*`,
@@ -259,7 +268,7 @@ fn translate_tools(tools: &[Value]) -> Vec<Value> {
 /// `OpenAI`-compatible servers (LM Studio) reject a `parameters` object without
 /// `properties`. Only the top level is normalized — nested schemas are the
 /// caller's shape and are copied through untouched.
-fn normalize_tool_parameters(schema: &Value) -> Value {
+pub(crate) fn normalize_tool_parameters(schema: &Value) -> Value {
     let Some(fields) = schema.as_object() else {
         return json!({ "type": "object", "properties": {} });
     };
@@ -299,7 +308,7 @@ fn copy_scalars(src: &Map<String, Value>, out: &mut Map<String, Value>) {
     }
 }
 
-fn join_text_blocks(blocks: &[Value], separator: &str) -> String {
+pub(crate) fn join_text_blocks(blocks: &[Value], separator: &str) -> String {
     blocks
         .iter()
         .filter(|block| block_type(block) == "text")
@@ -321,7 +330,7 @@ fn join_thinking_blocks(blocks: &[Value]) -> String {
         .join("\n\n")
 }
 
-fn block_type(block: &Value) -> &str {
+pub(crate) fn block_type(block: &Value) -> &str {
     block
         .get("type")
         .and_then(Value::as_str)

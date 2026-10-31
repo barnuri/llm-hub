@@ -2,7 +2,7 @@ use std::time::Duration;
 
 pub const MODELS_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MODELS_CACHE_TTL: Duration = Duration::from_mins(1);
-pub const DEFAULT_MAX_REPLAY_BYTES: usize = 2 * 1024 * 1024;
+pub const DEFAULT_MAX_REPLAY_BYTES: usize = 256 * 1024 * 1024;
 /// The `OpenAI` audio upload limit: multipart bodies are buffered up to this so
 /// their `model` field can be rewritten per attempt.
 pub const MAX_MULTIPART_BYTES: usize = 25 * 1024 * 1024;
@@ -58,6 +58,16 @@ pub const HEADER_SYSTEM_PROMPT_MODE: &str = "x-llm-hub-system-prompt-mode";
 pub const HEADER_REASONING_STRIP: &str = "x-llm-hub-reasoning-strip";
 /// Response-side diagnostic: which request transforms actually fired.
 pub const HEADER_TRANSFORMS: &str = "x-llm-hub-transforms";
+/// Response-side diagnostic on `<profile>/auto`: Auto's own pick, as a qualified id.
+pub const HEADER_AUTO_PICK: &str = "x-llm-hub-auto-pick";
+/// Response-side diagnostic on `<profile>/auto`: why the served model was chosen.
+pub const HEADER_AUTO_REASON: &str = "x-llm-hub-auto-reason";
+/// Cap for `x-llm-hub-auto-reason`, in characters; the value is ASCII only.
+pub const AUTO_REASON_HEADER_MAX_CHARS: usize = 200;
+/// `GET /api/copilot/auto/decisions` returns this many decisions without `limit`.
+pub const AUTO_DECISIONS_DEFAULT_LIMIT: usize = 50;
+/// The most decisions one `GET /api/copilot/auto/decisions` returns.
+pub const AUTO_DECISIONS_MAX_LIMIT: usize = 200;
 
 /// Cap for `x-llm-hub-system-prompt-mode: truncate`, in CHARACTERS (not bytes
 /// — see the UTF-8 note in transforms.rs).
@@ -131,6 +141,9 @@ pub const COPILOT_TOKEN_REFRESH_MARGIN: Duration = Duration::from_mins(5);
 pub const COPILOT_USER_TTL: Duration = Duration::from_hours(1);
 /// How long a failed `copilot_internal/user` lookup waits before it is retried.
 pub const COPILOT_USER_RETRY: Duration = Duration::from_mins(1);
+/// How long a Copilot quota snapshot is served before a refresh. The quota API
+/// lags GitHub's billing, so polling faster gains nothing.
+pub const COPILOT_USAGE_TTL: Duration = Duration::from_mins(1);
 /// Added to the device-flow poll `interval` so polls never arrive early.
 pub const COPILOT_DEVICE_POLL_MARGIN: Duration = Duration::from_secs(1);
 pub const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);

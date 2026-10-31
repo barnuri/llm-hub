@@ -11,7 +11,7 @@ const WINDOWS_RESTART_DELAY_PINGS: u32 = 3;
 /// current executable path and working directory (so `.env` is found) and
 /// sets `LLM_HUB_SERVICE=1` so auto-update knows a supervisor will restart us.
 pub fn install() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = crate::utils::exe::current_exe_resolved().map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(cwd.join("logs"))
         .map_err(|e| format!("cannot create logs dir: {e}"))?;

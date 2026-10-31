@@ -17,6 +17,10 @@ const HEADER_EDITOR_PLUGIN_VERSION: &str = "editor-plugin-version";
 const HEADER_INTEGRATION_ID: &str = "copilot-integration-id";
 const HEADER_OPENAI_INTENT: &str = "openai-intent";
 const HEADER_API_VERSION: &str = "x-github-api-version";
+const HEADER_INTERACTION_TYPE: &str = "x-interaction-type";
+/// The intent and interaction type Copilot expects on its native Anthropic
+/// endpoints, matching the `LiteLLM` Copilot messages transformation.
+const MESSAGES_PROXY_INTENT: &str = "messages-proxy";
 const INITIATOR_USER: &str = "user";
 pub const INITIATOR_AGENT: &str = "agent";
 
@@ -73,8 +77,9 @@ pub fn models_headers(flow: CopilotFlow) -> Vec<(HeaderName, HeaderValue)> {
 
 /// Headers for a Copilot inference call on `path`: the flow's fixed set plus
 /// `X-Initiator`, and `Copilot-Vision-Request` when the body holds an image.
-/// A body that is not JSON, or a path with no known shape, counts as a user
-/// turn without images.
+/// The native Anthropic paths swap `Openai-Intent` for `messages-proxy` and
+/// add `X-Interaction-Type`. A body that is not JSON, or a path with no known
+/// shape, counts as a user turn without images.
 #[must_use]
 pub fn request_headers(
     flow: CopilotFlow,
@@ -82,6 +87,17 @@ pub fn request_headers(
     body: &[u8],
 ) -> Vec<(HeaderName, HeaderValue)> {
     let mut headers = models_headers(flow);
+    if is_messages_proxy_path(path) {
+        for (name, value) in &mut headers {
+            if name.as_str() == HEADER_OPENAI_INTENT {
+                *value = HeaderValue::from_static(MESSAGES_PROXY_INTENT);
+            }
+        }
+        headers.push(static_header(
+            HEADER_INTERACTION_TYPE,
+            MESSAGES_PROXY_INTENT,
+        ));
+    }
     let parsed = serde_json::from_slice::<Value>(body).ok();
     let shape = BodyShape::from_path(path);
     let (is_agent, has_vision) = match (shape, parsed.as_ref()) {
@@ -98,6 +114,13 @@ pub fn request_headers(
         headers.push(static_header(HEADER_VISION_REQUEST, "true"));
     }
     headers
+}
+
+/// Whether `path` is Copilot's native Anthropic `/messages` or
+/// `/messages/count_tokens` endpoint.
+fn is_messages_proxy_path(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    path.ends_with("/messages") || path.ends_with("/messages/count_tokens")
 }
 
 fn static_header(name: &'static str, value: &'static str) -> (HeaderName, HeaderValue) {
@@ -247,6 +270,44 @@ mod tests {
             header(&headers, HEADER_OPENAI_INTENT),
             Some("conversation-edits")
         );
+    }
+
+    #[test]
+    fn messages_paths_send_messages_proxy_intent() {
+        for flow in [CopilotFlow::Opencode, CopilotFlow::Vscode] {
+            for path in [MESSAGES, "/v1/messages/count_tokens"] {
+                let headers = request_headers(flow, path, b"{}");
+                assert_eq!(
+                    header(&headers, HEADER_OPENAI_INTENT),
+                    Some("messages-proxy")
+                );
+                assert_eq!(
+                    header(&headers, HEADER_INTERACTION_TYPE),
+                    Some("messages-proxy")
+                );
+                let intents = headers
+                    .iter()
+                    .filter(|(name, _)| name.as_str() == HEADER_OPENAI_INTENT)
+                    .count();
+                assert_eq!(intents, 1);
+            }
+        }
+        let opencode = request_headers(CopilotFlow::Opencode, MESSAGES, b"{}");
+        assert_eq!(header(&opencode, HEADER_API_VERSION), None);
+    }
+
+    #[test]
+    fn other_paths_keep_generic_intent_without_interaction_type() {
+        for path in [CHAT, RESPONSES] {
+            let headers = request_headers(CopilotFlow::Opencode, path, b"{}");
+            assert_eq!(
+                header(&headers, HEADER_OPENAI_INTENT),
+                Some("conversation-edits")
+            );
+            assert_eq!(header(&headers, HEADER_INTERACTION_TYPE), None);
+        }
+        let models = models_headers(CopilotFlow::Opencode);
+        assert_eq!(header(&models, HEADER_INTERACTION_TYPE), None);
     }
 
     #[test]

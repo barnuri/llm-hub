@@ -5,6 +5,7 @@
 mod configs;
 mod consts;
 mod dependencies;
+mod launch;
 mod routes;
 mod schemas;
 mod services;
@@ -39,6 +40,9 @@ pub fn load_env_vars() -> HashMap<String, String> {
 
 #[tokio::main]
 async fn main() {
+    if run_launch_command().await {
+        return;
+    }
     let _tracing_guard = init_tracing();
 
     if run_cli_command().await {
@@ -72,6 +76,7 @@ async fn main() {
         }
     };
 
+    routes::models::restore_catalogs(&state);
     routes::models::spawn_background_refresh(state.clone());
     state.managed().spawn_idle_reaper();
     let managed = std::sync::Arc::clone(state.managed());
@@ -176,10 +181,45 @@ async fn wait_for_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// Handles `--version`, `update`, and `service` invocations.
-/// Returns true when a CLI command was handled and the process should exit.
+const HELP: &str = "llm-hub — one local endpoint for every LLM provider and coding agent
+
+usage: llm-hub [command] [args...]
+
+Server:
+  llm-hub                         run the hub in the foreground (same as `serve`)
+  llm-hub serve                   run the hub in the foreground
+  llm-hub service install         install or reload the background service (macOS LaunchAgent)
+  llm-hub service uninstall       remove the background service
+  llm-hub service status          show the background service status
+  llm-hub update                  update to the latest version (git pull + build for a source checkout)
+  llm-hub version                 print the version (also --version, -V)
+
+Coding agents on the hub ([model] is optional, e.g. copilot/claude-opus-5-5):
+  llm-hub claude [model] [args]       Claude Code
+  llm-hub codex [model] [args]        Codex CLI
+  llm-hub opencode [model] [args]     opencode
+  llm-hub copilot-cli [model] [args]  GitHub Copilot CLI
+  llm-hub pi [model] [args]           pi
+
+GitHub Copilot upstream:
+  llm-hub copilot login [--profile NAME]   sign in with the GitHub device flow
+  llm-hub copilot logout [--profile NAME]  remove the saved GitHub token
+
+Other:
+  llm-hub help                    show this help (also --help, -h)
+
+Environment: LLM_HUB_URL (default http://localhost:8888) and LLM_HUB_API_KEY for the agent commands.";
+
+/// Handles the non-server commands. Returns true when one was handled and the
+/// process should exit. An unknown command prints the help and exits with 2
+/// rather than starting a second server.
 async fn run_cli_command() -> bool {
     match std::env::args().nth(1).as_deref() {
+        None | Some("serve") => false,
+        Some("help" | "--help" | "-h") => {
+            println!("{HELP}");
+            true
+        }
         Some("--version" | "-V" | "version") => {
             println!("llm-hub v{VERSION}");
             true
@@ -202,8 +242,30 @@ async fn run_cli_command() -> bool {
             }
             true
         }
-        _ => false,
+        Some(unknown) => {
+            eprintln!("llm-hub: unknown command '{unknown}'\n\n{HELP}");
+            std::process::exit(2);
+        }
     }
+}
+
+/// `llm-hub <claude|codex|opencode|copilot-cli|pi> [model] [args...]` starts
+/// that harness on the hub. It runs before tracing starts, so no `logs/` dir
+/// appears in the project the harness opens.
+async fn run_launch_command() -> bool {
+    let mut args = std::env::args().skip(1);
+    let Some(harness) = args
+        .next()
+        .as_deref()
+        .and_then(launch::harness::Harness::from_command)
+    else {
+        return false;
+    };
+    if let Err(e) = launch::run(harness, args.collect()).await {
+        eprintln!("llm-hub {}: {e}", harness.command());
+        std::process::exit(1);
+    }
+    true
 }
 
 const COPILOT_USAGE: &str = "usage: llm-hub copilot <login|logout> [--profile NAME]";
@@ -269,11 +331,17 @@ fn run_service_command() {
 }
 
 fn build_router(state: AppState) -> Router {
-    let protected = Router::new()
+    let proxied = Router::new()
         .route("/v1/messages", post(routes::anthropic::messages))
+        .route("/v1/{*path}", any(routes::proxy::proxy))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            routes::models::await_first_catalog,
+        ));
+    let protected = Router::new()
+        .merge(proxied)
         .route("/v1/models", get(routes::models::list_models))
         .route("/v1/models/{*id}", get(routes::proxy::get_model_by_id))
-        .route("/v1/{*path}", any(routes::proxy::proxy))
         .route(
             "/api/profiles",
             get(routes::admin::list_profiles).post(routes::admin::upsert_profile),
@@ -290,6 +358,11 @@ fn build_router(state: AppState) -> Router {
             "/api/claude-code/settings",
             get(routes::claude_code::settings),
         )
+        .route(
+            "/api/copilot/auto/decisions",
+            get(routes::copilot::auto_decisions),
+        )
+        .route("/api/copilot/usage", get(routes::copilot::usage))
         .route("/api/fallbacks", post(routes::admin::set_default_fallbacks))
         .route("/api/restart", post(routes::admin::restart_server))
         .route("/api/stats", get(routes::admin::stats))
@@ -332,6 +405,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::services::copilot_auto::AutoTurn;
+    use crate::services::copilot_auto_decisions::AutoDecision;
     use crate::services::fake_gh_cli::FakeGhCli;
     use crate::services::gh_cli::GhOutcome;
     use crate::services::memory_credential_store::MemoryCredentialStore;
@@ -340,6 +415,10 @@ mod tests {
     const DISCOVERY_PATH: &str = "/v1/models?limit=1000";
 
     async fn serve_hub_with_auth() -> String {
+        serve_hub_with_auth_state().await.0
+    }
+
+    async fn serve_hub_with_auth_state() -> (String, AppState) {
         let vars: HashMap<String, String> = [
             ("LLM_HUB_PROFILES", "copilot"),
             ("LLM_HUB_COPILOT_BASE_URL", "http://127.0.0.1:9"),
@@ -360,8 +439,9 @@ mod tests {
         ]}));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, build_router(state)).await });
-        base
+        let router = build_router(state.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        (base, state)
     }
 
     #[tokio::test]
@@ -413,5 +493,90 @@ mod tests {
             "copilot/claude-opus-4-5"
         );
         assert_eq!(without_key.status().as_u16(), 401);
+    }
+
+    #[tokio::test]
+    async fn copilot_usage_route_is_protected() {
+        let base = serve_hub_with_auth().await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/copilot/usage?profile=copilot");
+
+        let with_key = client
+            .get(&url)
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap();
+        let without_key = client.get(&url).send().await.unwrap();
+
+        assert_eq!(with_key.status().as_u16(), 404);
+        assert_eq!(without_key.status().as_u16(), 401);
+    }
+
+    fn auto_decision(ts_ms: u64) -> AutoDecision {
+        AutoDecision {
+            ts_ms,
+            session: Some("session-1".to_string()),
+            profile: "copilot".to_string(),
+            auto_pick: "copilot/claude-haiku-5-5".to_string(),
+            model: "copilot/claude-haiku-5-5".to_string(),
+            swap_reason: None,
+            complexity: Some("low"),
+            selection_reason: None,
+            turn: AutoTurn::Routed,
+            estimated_prompt_tokens: 10,
+        }
+    }
+
+    async fn decision_count(client: &reqwest::Client, url: &str) -> usize {
+        let response = client
+            .get(url)
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        body["decisions"].as_array().unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn copilot_auto_decisions_route_is_protected() {
+        let (base, state) = serve_hub_with_auth_state().await;
+        state.copilot_auto().decisions().record(auto_decision(1));
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/copilot/auto/decisions?session=session-1&limit=1");
+
+        let with_key = client
+            .get(&url)
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap();
+        let without_key = client.get(&url).send().await.unwrap();
+
+        assert_eq!(with_key.status().as_u16(), 200);
+        let body: serde_json::Value = with_key.json().await.unwrap();
+        assert_eq!(body["decisions"][0]["session"], "session-1");
+        assert_eq!(body["decisions"][0]["turn"], "routed");
+        assert_eq!(without_key.status().as_u16(), 401);
+    }
+
+    #[tokio::test]
+    async fn copilot_auto_decisions_limit_is_clamped() {
+        let (base, state) = serve_hub_with_auth_state().await;
+        for ts_ms in 0..250 {
+            state
+                .copilot_auto()
+                .decisions()
+                .record(auto_decision(ts_ms));
+        }
+        let client = reqwest::Client::new();
+        let url = |query: &str| format!("{base}/api/copilot/auto/decisions{query}");
+
+        assert_eq!(decision_count(&client, &url("")).await, 50);
+        assert_eq!(decision_count(&client, &url("?limit=0")).await, 1);
+        assert_eq!(decision_count(&client, &url("?limit=1000")).await, 200);
+        assert_eq!(decision_count(&client, &url("?limit=7")).await, 7);
     }
 }

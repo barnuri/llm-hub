@@ -3,9 +3,12 @@ pub mod auth;
 pub mod body_transform;
 pub mod config_reload;
 pub mod copilot_auto;
+pub mod copilot_auto_decisions;
+pub mod copilot_body_fields;
 pub mod copilot_headers;
 pub mod copilot_login;
 pub mod copilot_sessions;
+pub mod copilot_usage;
 pub mod credential_store;
 pub mod env_writer;
 #[cfg(test)]
@@ -19,9 +22,11 @@ pub mod keyring_credential_store;
 pub mod managed_process;
 #[cfg(test)]
 pub mod memory_credential_store;
+pub mod model_limits;
 pub mod multipart_model;
 pub mod pricing;
 pub mod process_gh_cli;
+pub mod responses_item_ids;
 pub mod restart;
 pub mod service_manager;
 pub mod source_install;

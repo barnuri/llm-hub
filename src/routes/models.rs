@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Request, State};
+use axum::middleware::Next;
+use axum::response::Response;
 use futures_util::future::join_all;
 use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
@@ -13,6 +15,7 @@ use crate::schemas::model_context::{
     advertised_model_id, inferred_max_input_tokens, max_input_tokens_from_item,
 };
 use crate::schemas::upstream_model::UpstreamModel;
+use crate::services::model_limits::ModelLimit;
 use crate::services::upstream_auth;
 
 pub(crate) const MODELS_PATH: &str = "/models";
@@ -88,7 +91,7 @@ pub async fn refresh_models(state: &AppState) -> Value {
             Err(reason) => {
                 state.set_upstream_health(&profile.name, false);
                 tracing::warn!(profile = %profile.name, "models fetch failed: {reason}");
-                merged.extend(static_models(profile));
+                merged.extend(fallback_models(state, profile));
             }
         }
     }
@@ -121,22 +124,105 @@ async fn fetch_profile_models(
     if profile.copilot.is_none() {
         return Ok(usable
             .into_iter()
-            .map(|item| rewrite_model(profile, item))
+            .map(|item| rewrite_model(profile, item, None))
             .collect());
     }
-    state.set_upstream_models(&profile.name, upstream_catalog(profile, &usable));
-    state.set_copilot_catalog(&profile.name, usable.iter().copied().cloned().collect());
-    let lists_auto = usable
+    state.update_copilot_catalog(
+        &profile.name,
+        usable.iter().copied().cloned().collect(),
+        upstream_catalog(profile, &usable),
+    );
+    Ok(copilot_models(state, profile, &usable))
+}
+
+/// A failed fetch lists the profile's last Copilot catalog, so a restart with
+/// a slow upstream does not cache an empty list. Other profiles list their
+/// static models.
+fn fallback_models(state: &AppState, profile: &ProfileConfig) -> Vec<Value> {
+    let catalog = state.copilot_catalog(&profile.name);
+    if profile.copilot.is_none() || catalog.is_empty() {
+        return static_models(profile);
+    }
+    let items: Vec<&Value> = catalog.iter().collect();
+    copilot_models(state, profile, &items)
+}
+
+/// Rewrites Copilot catalog entries to `<profile>/<id>` and adds
+/// `<profile>/auto` when Copilot does not list it.
+fn copilot_models(state: &AppState, profile: &ProfileConfig, items: &[&Value]) -> Vec<Value> {
+    let lists_auto = items
         .iter()
         .any(|item| item.get("id").and_then(Value::as_str) == Some(COPILOT_AUTO_MODEL));
-    let mut models: Vec<Value> = usable
-        .into_iter()
-        .map(|item| rewrite_model(profile, item))
+    let limits = state.model_limits().for_profile(&profile.name);
+    let mut models: Vec<Value> = items
+        .iter()
+        .map(|item| rewrite_model(profile, item, Some(&limits)))
         .collect();
     if !lists_auto {
         models.push(copilot_auto_model(profile));
     }
-    Ok(models)
+    models
+}
+
+/// Loads the Copilot catalogs saved by earlier runs, so the first request after
+/// a restart already maps dashed Claude ids and picks native `/v1/messages`.
+/// Call before the server accepts requests.
+pub fn restore_catalogs(state: &AppState) {
+    let Some(store) = state.store() else {
+        return;
+    };
+    let mut stored = match store.load_model_catalogs() {
+        Ok(stored) => stored,
+        Err(e) => {
+            tracing::warn!("cannot load the saved model catalogs: {e}");
+            return;
+        }
+    };
+    let config = state.config();
+    for profile in config.profiles.iter().filter(|p| p.copilot.is_some()) {
+        let Some(entries) = stored.remove(&profile.name) else {
+            continue;
+        };
+        let items: Vec<&Value> = entries.iter().collect();
+        state.set_upstream_models(&profile.name, upstream_catalog(profile, &items));
+        state.set_copilot_catalog(&profile.name, entries);
+    }
+}
+
+/// Holds a proxied request while an enabled Copilot profile has no catalog
+/// and the first fan-out since startup is still running, so the request is
+/// not sent upstream with an unmapped id. Once that fan-out has finished this
+/// costs one atomic load.
+pub async fn await_first_catalog(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !state.first_refresh().initialized() && lacks_copilot_catalog(&state) {
+        let wait = tokio::time::timeout(MODELS_FANOUT_TIMEOUT, first_refresh(&state));
+        if wait.await.is_err() {
+            tracing::warn!("first model refresh is still running, sending the request anyway");
+        }
+    }
+    next.run(request).await
+}
+
+fn lacks_copilot_catalog(state: &AppState) -> bool {
+    state
+        .config()
+        .profiles
+        .iter()
+        .any(|p| p.enabled && p.copilot.is_some() && !state.has_upstream_models(&p.name))
+}
+
+/// The first fan-out since startup. Concurrent callers share one run.
+async fn first_refresh(state: &AppState) {
+    state
+        .first_refresh()
+        .get_or_init(|| async {
+            refresh_models(state).await;
+        })
+        .await;
 }
 
 /// `<profile>/auto`: Copilot's router picks the model, on every wire API.
@@ -233,10 +319,19 @@ fn is_copilot_model_usable(item: &Value) -> bool {
     !picker_disabled && !policy_disabled
 }
 
-fn rewrite_model(profile: &ProfileConfig, item: &Value) -> Value {
+/// `limits` holds a Copilot profile's learned or seeded prompt limits. They win
+/// over the upstream's listed window, which Copilot understates for Claude.
+fn rewrite_model(
+    profile: &ProfileConfig,
+    item: &Value,
+    limits: Option<&HashMap<String, ModelLimit>>,
+) -> Value {
     let mut model = item.clone();
     let raw_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-    let upstream_tokens = max_input_tokens_from_item(item);
+    let upstream_tokens = limits
+        .and_then(|limits| limits.get(raw_id))
+        .map(|known| known.limit)
+        .or_else(|| max_input_tokens_from_item(item));
     let bare = advertised_bare_id(profile, raw_id);
     let qualified = format!("{}/{}", profile.name, bare);
     let advertised = advertised_model_id(&qualified, upstream_tokens);
@@ -311,9 +406,10 @@ fn annotate_context(
 /// Spawned from main: keeps the cache warm so client startups never fan out.
 pub fn spawn_background_refresh(state: AppState) {
     tokio::spawn(async move {
+        first_refresh(&state).await;
         loop {
-            refresh_models(&state).await;
             tokio::time::sleep(MODELS_CACHE_TTL).await;
+            refresh_models(&state).await;
         }
     });
 }
@@ -326,21 +422,27 @@ mod tests {
     use crate::services::fake_gh_cli::FakeGhCli;
     use crate::services::gh_cli::GhOutcome;
     use crate::services::memory_credential_store::MemoryCredentialStore;
+    use crate::services::store::Store;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const DEAD_BASE_URL: &str = "http://127.0.0.1:9";
 
     fn state_from(vars: &[(&str, &str)]) -> AppState {
+        state_with_store(vars, None)
+    }
+
+    fn state_with_store(vars: &[(&str, &str)], store: Option<Store>) -> AppState {
         let vars: HashMap<String, String> = vars
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
         AppState::with_seams(
             HubConfig::from_map(&vars).unwrap(),
-            None,
+            store,
             Arc::new(MemoryCredentialStore::default()),
             Arc::new(FakeGhCli::new(GhOutcome::Token("gho_test".to_string()))),
         )
@@ -348,12 +450,240 @@ mod tests {
     }
 
     fn copilot_state(github_api_url: &str) -> AppState {
-        state_from(&[
-            ("LLM_HUB_PROFILES", "copilot"),
-            ("LLM_HUB_COPILOT_BASE_URL", DEAD_BASE_URL),
-            ("LLM_HUB_COPILOT_AUTH", CopilotFlow::Opencode.auth_value()),
-            ("LLM_HUB_COPILOT_GITHUB_API_URL", github_api_url),
-        ])
+        copilot_state_with_store(github_api_url, None)
+    }
+
+    fn copilot_state_with_store(github_api_url: &str, store: Option<Store>) -> AppState {
+        state_with_store(
+            &[
+                ("LLM_HUB_PROFILES", "copilot"),
+                ("LLM_HUB_COPILOT_BASE_URL", DEAD_BASE_URL),
+                ("LLM_HUB_COPILOT_AUTH", CopilotFlow::Opencode.auth_value()),
+                ("LLM_HUB_COPILOT_GITHUB_API_URL", github_api_url),
+            ],
+            store,
+        )
+    }
+
+    fn sqlite_store(path: &std::path::Path) -> Store {
+        Store::open("sqlite", Some(path.to_str().unwrap())).unwrap()
+    }
+
+    /// A GitHub API and a Copilot API whose `/models` lists `models`, served
+    /// after `delay`, at most `expected` times when given.
+    async fn copilot_upstream(
+        models: Value,
+        delay: Duration,
+        expected: Option<u64>,
+    ) -> (MockServer, MockServer) {
+        let github = MockServer::start().await;
+        let copilot = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "chat_enabled": true,
+                "endpoints": {"api": copilot.uri()},
+            })))
+            .mount(&github)
+            .await;
+        mount_models(&copilot, models, delay, expected).await;
+        (github, copilot)
+    }
+
+    async fn mount_models(
+        copilot: &MockServer,
+        models: Value,
+        delay: Duration,
+        expected: Option<u64>,
+    ) {
+        let mock = Mock::given(method("GET"))
+            .and(path(MODELS_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "data": models }))
+                    .set_delay(delay),
+            );
+        match expected {
+            Some(times) => mock.expect(times).mount(copilot).await,
+            None => mock.mount(copilot).await,
+        }
+    }
+
+    fn opus_catalog() -> Value {
+        json!([{"id": "claude-opus-5.5", "supported_endpoints": ["/v1/messages"]}])
+    }
+
+    fn stored_ids(state: &AppState) -> Vec<String> {
+        state.store().unwrap().load_model_catalogs().unwrap()["copilot"]
+            .iter()
+            .filter_map(|entry| entry["id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Serves a route behind [`await_first_catalog`] that answers with the
+    /// upstream id `claude-opus-5-5` maps to when the handler runs.
+    async fn serve_mapping_probe(state: AppState) -> String {
+        async fn probe(State(state): State<AppState>) -> String {
+            state
+                .upstream_model("copilot", "claude-opus-5-5")
+                .map_or_else(|| "unmapped".to_string(), |m| m.upstream_id)
+        }
+        let router = axum::Router::new()
+            .route("/probe", axum::routing::post(probe))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                await_first_catalog,
+            ))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/probe", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        base
+    }
+
+    #[tokio::test]
+    async fn copilot_models_advertise_the_learned_or_seeded_prompt_limit() {
+        let listed = |id: &str| {
+            json!({"id": id, "supported_endpoints": ["/v1/messages"],
+                   "capabilities": {"limits": {"max_prompt_tokens": 136_000}}})
+        };
+        let models = json!([
+            listed("claude-opus-5.5"),
+            listed("claude-haiku-4.5"),
+            listed("gpt-9")
+        ]);
+        let (github, _copilot) = copilot_upstream(models, Duration::ZERO, None).await;
+        let state = copilot_state(&github.uri());
+        state
+            .model_limits()
+            .learn("copilot", "claude-haiku-4.5", 180_000, 0);
+
+        let payload = refresh_models(&state).await;
+
+        let window = |id: &str| {
+            let model = payload["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id)
+                .unwrap_or_else(|| panic!("{id} missing from {payload}"));
+            assert_eq!(model["context_window"], model["max_input_tokens"]);
+            model["max_input_tokens"].as_u64()
+        };
+        assert_eq!(window("copilot/claude-opus-5-5[1m]"), Some(1_000_000));
+        assert_eq!(window("copilot/claude-haiku-4-5"), Some(180_000));
+        assert_eq!(window("copilot/gpt-9"), Some(136_000));
+    }
+
+    #[tokio::test]
+    async fn restart_restores_saved_catalog_before_any_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hub.db");
+        let (github, _copilot) = copilot_upstream(opus_catalog(), Duration::ZERO, None).await;
+        let first_run = copilot_state_with_store(&github.uri(), Some(sqlite_store(&db)));
+        refresh_models(&first_run).await;
+        drop(first_run);
+
+        let restarted = copilot_state_with_store(DEAD_BASE_URL, Some(sqlite_store(&db)));
+        restore_catalogs(&restarted);
+
+        assert_eq!(
+            restarted.upstream_model("copilot", "claude-opus-5-5"),
+            Some(UpstreamModel {
+                upstream_id: "claude-opus-5.5".to_string(),
+                native_messages: true,
+            })
+        );
+        assert_eq!(
+            restarted.copilot_catalog("copilot")[0]["id"],
+            "claude-opus-5.5"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_fetch_after_restart_lists_the_restored_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = sqlite_store(&dir.path().join("hub.db"));
+        let saved = [
+            json!({"id": "claude-opus-5.5", "supported_endpoints": ["/v1/messages"]}),
+            json!({"id": "claude-haiku-4.5", "supported_endpoints": ["/v1/messages"]}),
+        ];
+        store.save_model_catalog("copilot", &saved).unwrap();
+        let restarted = copilot_state_with_store(DEAD_BASE_URL, Some(store));
+        restore_catalogs(&restarted);
+
+        let payload = enabled_models(&restarted).await;
+
+        let listed = ids(&payload);
+        assert_eq!(listed.len(), 3, "unexpected list {payload}");
+        assert!(
+            listed
+                .iter()
+                .any(|id| id.starts_with("copilot/claude-opus-5-5"))
+        );
+        assert!(listed.contains(&"copilot/claude-haiku-4-5"));
+        assert!(listed.contains(&"copilot/auto"));
+        assert_eq!(restarted.model_cache().unwrap().payload, payload);
+    }
+
+    #[tokio::test]
+    async fn refresh_writes_the_store_only_when_the_catalog_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (github, copilot) = copilot_upstream(opus_catalog(), Duration::ZERO, None).await;
+        let state = copilot_state_with_store(
+            &github.uri(),
+            Some(sqlite_store(&dir.path().join("hub.db"))),
+        );
+        refresh_models(&state).await;
+        assert_eq!(stored_ids(&state), ["claude-opus-5.5"]);
+        let sentinel = [json!({"id": "sentinel"})];
+        state
+            .store()
+            .unwrap()
+            .save_model_catalog("copilot", &sentinel)
+            .unwrap();
+
+        refresh_models(&state).await;
+        assert_eq!(stored_ids(&state), ["sentinel"]);
+
+        copilot.reset().await;
+        let changed = json!([{"id": "claude-opus-5.5"}, {"id": "gpt-5.5"}]);
+        mount_models(&copilot, changed, Duration::ZERO, None).await;
+        refresh_models(&state).await;
+        assert_eq!(stored_ids(&state), ["claude-opus-5.5", "gpt-5.5"]);
+        assert!(state.upstream_model("copilot", "gpt-5.5").is_some());
+    }
+
+    #[tokio::test]
+    async fn missing_catalog_holds_requests_on_one_shared_fetch() {
+        let delay = Duration::from_millis(200);
+        let (github, _copilot) = copilot_upstream(opus_catalog(), delay, Some(1)).await;
+        let url = serve_mapping_probe(copilot_state(&github.uri())).await;
+        let client = reqwest::Client::new();
+
+        let (first, second) = tokio::join!(client.post(&url).send(), client.post(&url).send());
+
+        assert_eq!(first.unwrap().text().await.unwrap(), "claude-opus-5.5");
+        assert_eq!(second.unwrap().text().await.unwrap(), "claude-opus-5.5");
+    }
+
+    #[tokio::test]
+    async fn restored_catalog_lets_requests_through_without_a_fetch() {
+        let (github, _copilot) = copilot_upstream(opus_catalog(), Duration::ZERO, Some(0)).await;
+        let state = copilot_state(&github.uri());
+        let entry = UpstreamModel {
+            upstream_id: "claude-opus-5.5".to_string(),
+            native_messages: true,
+        };
+        state.set_upstream_models(
+            "copilot",
+            HashMap::from([("claude-opus-5-5".to_string(), entry)]),
+        );
+        let url = serve_mapping_probe(state).await;
+
+        let response = reqwest::Client::new().post(&url).send().await.unwrap();
+
+        assert_eq!(response.text().await.unwrap(), "claude-opus-5.5");
     }
 
     fn copilot_profile() -> ProfileConfig {
@@ -502,7 +832,7 @@ mod tests {
     fn rewrite_model_adds_display_name_and_description() {
         let mut labelled = profile("llmgw", &[]);
         labelled.display_name = Some("Gateway".to_string());
-        let out = rewrite_model(&labelled, &json!({"id": "gpt-4.1"}));
+        let out = rewrite_model(&labelled, &json!({"id": "gpt-4.1"}), None);
         assert_eq!(out["display_name"], "gpt-4.1 · Gateway");
         assert_eq!(out["description"], "via llm-hub profile Gateway");
     }
@@ -577,7 +907,7 @@ mod tests {
             "max_input_tokens": CONTEXT_TOKENS_1M,
             "context_length": CONTEXT_TOKENS_1M,
         });
-        let out = rewrite_model(&profile("llmgw", &[]), &item);
+        let out = rewrite_model(&profile("llmgw", &[]), &item, None);
         assert_eq!(out["id"], "llmgw/bedrock/anthropic.claude-opus-5[1m]");
         assert_eq!(out["max_input_tokens"], CONTEXT_TOKENS_1M);
         assert_eq!(out["context_window"], CONTEXT_TOKENS_1M);
@@ -590,7 +920,7 @@ mod tests {
             "object": "model",
             "max_input_tokens": 200_000,
         });
-        let out = rewrite_model(&profile("llmgw", &[]), &item);
+        let out = rewrite_model(&profile("llmgw", &[]), &item, None);
         assert_eq!(out["id"], "llmgw/bedrock/anthropic.claude-opus-5");
         assert_eq!(out["max_input_tokens"], 200_000);
     }
@@ -598,7 +928,7 @@ mod tests {
     #[test]
     fn rewrite_local_model_keeps_plain_id() {
         let item = json!({"id": "meta/muse-glimmer", "object": "model"});
-        let out = rewrite_model(&profile("llama_swap", &[]), &item);
+        let out = rewrite_model(&profile("llama_swap", &[]), &item, None);
         assert_eq!(out["id"], "llama_swap/meta/muse-glimmer");
         assert!(out.get("max_input_tokens").is_none());
     }
