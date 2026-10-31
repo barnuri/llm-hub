@@ -100,6 +100,8 @@ export interface UsageRow {
   readonly cache_write_tokens: number;
   readonly cost_usd: number;
   readonly error?: string | null;
+  /** Caller signature: User-Agent plus harness markers. */
+  readonly client?: string | null;
 }
 
 export interface UsageReport {

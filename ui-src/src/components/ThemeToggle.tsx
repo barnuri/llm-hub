@@ -1,11 +1,15 @@
 import { useEffect, useLayoutEffect, useState } from "react";
 
-import { Icon } from "./Icon";
+import { Segmented, type SegmentedOption } from "./Segmented";
 
 type Theme = "light" | "dark";
 
 const STORAGE_KEY = "llm-hub-theme";
 const LIGHT_QUERY = "(prefers-color-scheme: light)";
+const THEME_OPTIONS: readonly SegmentedOption<Theme>[] = [
+  { value: "dark", label: "Dark" },
+  { value: "light", label: "Light" },
+];
 
 function storedTheme(): Theme | null {
   try {
@@ -48,21 +52,10 @@ export function ThemeToggle() {
     return () => query.removeEventListener("change", onChange);
   }, []);
 
-  const next: Theme = theme === "dark" ? "light" : "dark";
-  const toggle = () => {
-    storeTheme(next);
-    setChosen(next);
+  const choose = (value: Theme) => {
+    storeTheme(value);
+    setChosen(value);
   };
 
-  return (
-    <button
-      type="button"
-      className="btn ghost icon"
-      onClick={toggle}
-      aria-label={`Switch to ${next} theme`}
-      title={`Switch to ${next} theme`}
-    >
-      <Icon name={theme === "dark" ? "sun" : "moon"} />
-    </button>
-  );
+  return <Segmented label="Theme" options={THEME_OPTIONS} value={theme} onChange={choose} />;
 }

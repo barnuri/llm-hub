@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { Icon, type IconName } from "./components/Icon";
+import { Icon } from "./components/Icon";
 import { Modal } from "./components/Modal";
 import { Pill } from "./components/Pill";
-import { Segmented, type SegmentedOption } from "./components/Segmented";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { Toasts, type ToastItem } from "./components/Toasts";
 import { api, saveKey, UnauthorizedError } from "./lib/api";
-import { navigate, setQueryParam, useRoute } from "./lib/router";
-import type { HubMeta } from "./lib/types";
+import { formatNumber } from "./lib/format";
+import { navigate, useRoute } from "./lib/router";
+import type { ErrorsReport, HubMeta } from "./lib/types";
 import { KeysScreen } from "./screens/KeysScreen";
 import { ModelsScreen } from "./screens/ModelsScreen";
 import { ProfilesScreen } from "./screens/ProfilesScreen";
@@ -17,54 +17,40 @@ import { StatsScreen } from "./screens/StatsScreen";
 import { ErrorsScreen } from "./screens/ErrorsScreen";
 import { InsightsScreen } from "./screens/InsightsScreen";
 import { AutoScreen } from "./screens/AutoScreen";
-import { UsageScreen } from "./screens/UsageScreen";
+import { type OverviewPeriod, UsageScreen } from "./screens/UsageScreen";
 
 interface Page {
   readonly id: string;
   readonly label: string;
-  readonly icon: IconName;
-  readonly periods?: readonly SegmentedOption<string>[];
 }
 
-interface NavGroup {
-  readonly title: string;
+interface NavTab {
+  readonly label: string;
   readonly pages: readonly Page[];
 }
 
-const OVERVIEW_PERIODS: readonly SegmentedOption<string>[] = [
-  { value: "1d", label: "Today" },
-  { value: "7d", label: "7 days" },
+const SETTINGS_PAGES: readonly Page[] = [
+  { id: "keys", label: "API keys" },
+  { id: "setup", label: "Setup" },
 ];
 
-const NAV_GROUPS: readonly NavGroup[] = [
-  {
-    title: "Monitor",
-    pages: [
-      { id: "overview", label: "Overview", icon: "overview", periods: OVERVIEW_PERIODS },
-      { id: "insights", label: "Insights", icon: "insights" },
-      { id: "errors", label: "Errors", icon: "errors" },
-      { id: "stats", label: "Stats", icon: "stats" },
-      { id: "auto", label: "Copilot Auto", icon: "auto" },
-    ],
-  },
-  {
-    title: "Configure",
-    pages: [
-      { id: "models", label: "Models", icon: "models" },
-      { id: "profiles", label: "Profiles", icon: "profiles" },
-      { id: "keys", label: "API keys", icon: "keys" },
-      { id: "setup", label: "Setup", icon: "setup" },
-    ],
-  },
+const NAV_TABS: readonly NavTab[] = [
+  { label: "Overview", pages: [{ id: "overview", label: "Overview" }] },
+  { label: "Insights", pages: [{ id: "insights", label: "Insights" }] },
+  { label: "Errors", pages: [{ id: "errors", label: "Errors" }] },
+  { label: "Stats", pages: [{ id: "stats", label: "Stats" }] },
+  { label: "Models", pages: [{ id: "models", label: "Models" }] },
+  { label: "Copilot Auto", pages: [{ id: "auto", label: "Copilot Auto" }] },
+  { label: "Profiles", pages: [{ id: "profiles", label: "Profiles" }] },
+  { label: "Settings", pages: SETTINGS_PAGES },
 ];
 
-const PAGES: readonly Page[] = NAV_GROUPS.flatMap((group) => group.pages);
-const DEFAULT_PAGE: Page = PAGES[0] ?? { id: "overview", label: "Overview", icon: "overview" };
+const PAGES: readonly Page[] = NAV_TABS.flatMap((navTab) => navTab.pages);
+const DEFAULT_PAGE: Page = PAGES[0] ?? { id: "overview", label: "Overview" };
+const ROUTE_ALIASES: Readonly<Record<string, string>> = { usage: "overview", settings: "keys" };
 
-function periodOf(page: Page, requested: string | null): string | null {
-  const periods = page.periods ?? [];
-  const match = periods.find((option) => option.value === requested);
-  return (match ?? periods[0])?.value ?? null;
+function overviewPeriod(requested: string | null): OverviewPeriod {
+  return requested === "7d" ? "7d" : "1d";
 }
 
 interface ModelsResponse {
@@ -74,10 +60,11 @@ interface ModelsResponse {
 export function App() {
   const route = useRoute();
   const routeTab = route.path.split("/")[0] ?? "";
-  const normalizedTab = routeTab === "usage" ? "overview" : routeTab;
+  const normalizedTab = ROUTE_ALIASES[routeTab] ?? routeTab;
   const page = PAGES.find((candidate) => candidate.id === normalizedTab) ?? DEFAULT_PAGE;
   const tab = page.id;
-  const period = periodOf(page, route.query.get("range"));
+  const isSettings = SETTINGS_PAGES.some((candidate) => candidate.id === tab);
+  const [errorsToday, setErrorsToday] = useState<number | null>(null);
   const [meta, setMeta] = useState<HubMeta | null>(null);
   const [models, setModels] = useState<readonly string[]>([]);
   const [toasts, setToasts] = useState<readonly ToastItem[]>([]);
@@ -113,6 +100,31 @@ export function App() {
   }, [handleError]);
 
   useEffect(loadAll, [loadAll]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadErrorCount = async () => {
+      try {
+        const report = await api<ErrorsReport>("/api/errors?range=1d");
+        if (!cancelled) {
+          setErrorsToday(report.total_errors);
+        }
+      } catch (err) {
+        if (cancelled) {
+          return;
+        }
+        // Persistence off answers 400 here; the tab then shows no count.
+        setErrorsToday(null);
+        if (err instanceof UnauthorizedError) {
+          setAskKey(true);
+        }
+      }
+    };
+    void loadErrorCount();
+    return () => {
+      cancelled = true;
+    };
+  }, [tab]);
 
   const copy = useCallback(
     (text: string) => {
@@ -164,86 +176,108 @@ export function App() {
   return (
     <>
       <div className="app">
-        <nav className="side" aria-label="Main">
-          <div className="side-brand">
-            <span className="brand-mark">
-              <Icon name="logo" />
-            </span>
+        <header className="topbar">
+          <div className="brand">
+            <span className="brand-mark" aria-hidden="true" />
             llm-hub
             <span className="version">{meta ? `v${meta.version}` : ""}</span>
           </div>
-          {NAV_GROUPS.map((group) => (
-            <div key={group.title} className="nav-group">
-              <div className="nav-group-title">{group.title}</div>
-              {group.pages.map((item) => (
+          <nav className="topnav" aria-label="Main">
+            {NAV_TABS.map((navTab) => {
+              const target = navTab.pages[0] ?? DEFAULT_PAGE;
+              const active = navTab.pages.some((candidate) => candidate.id === tab);
+              return (
                 <button
-                  key={item.id}
+                  key={navTab.label}
                   type="button"
-                  className={tab === item.id ? "nav-item active" : "nav-item"}
-                  aria-current={tab === item.id ? "page" : undefined}
-                  onClick={() => navigate(`/${item.id}`)}
+                  className={active ? "topnav-item active" : "topnav-item"}
+                  aria-current={active ? "page" : undefined}
+                  onClick={() => navigate(`/${target.id}`)}
                 >
-                  <Icon name={item.icon} className="nav-icon" />
-                  {item.label}
+                  {navTab.label}
+                  {target.id === "errors" && errorsToday !== null && errorsToday > 0 ? (
+                    <Pill tone="danger" title="Errors today">
+                      {formatNumber(errorsToday)}
+                      <span className="sr-only"> today</span>
+                    </Pill>
+                  ) : null}
                 </button>
-              ))}
-            </div>
-          ))}
-          <div className="nav-group side-upstreams">
-            <div className="nav-group-title">Upstreams</div>
+              );
+            })}
+          </nav>
+          <div className="topbar-actions">
+            {meta ? (
+              <>
+                <Pill tone={meta.auth_enabled ? "ok" : "neutral"} dot>
+                  {meta.auth_enabled ? "auth on" : "auth off"}
+                </Pill>
+                <Pill tone={meta.persistent ? "ok" : "warn"} dot>
+                  {meta.persistent ? "persistent" : "in-memory"}
+                </Pill>
+              </>
+            ) : null}
+            <ThemeToggle />
+            {meta ? (
+              <button type="button" className="btn small danger" onClick={() => setConfirmRestart(true)}>
+                <Icon name="restart" />
+                Restart
+              </button>
+            ) : null}
+          </div>
+        </header>
+
+        <div className="shell-body">
+          <aside className="side" aria-label="Upstreams">
+            <div className="side-title">Upstreams</div>
             <ul className="upstream-list">
               {(meta?.profiles ?? []).map((profile) => {
                 const led = profile.healthy === true ? "up" : profile.healthy === false ? "down" : "off";
                 const health = led === "up" ? "healthy" : led === "down" ? "unhealthy" : "unknown";
                 return (
-                  <li key={profile.name} className="upstream" title={`${profile.label}: ${health}`}>
-                    <span className={`led ${led}`} aria-hidden="true"></span>
-                    {profile.label}
-                    <span className="sr-only">({health})</span>
+                  <li key={profile.name}>
+                    <button
+                      type="button"
+                      className="upstream"
+                      title={`${profile.label}: ${health}`}
+                      onClick={() => navigate("/profiles")}
+                    >
+                      <span className={`led ${led}`} aria-hidden="true"></span>
+                      <span className="upstream-name">{profile.label}</span>
+                      <span className="sr-only">({health})</span>
+                    </button>
                   </li>
                 );
               })}
             </ul>
             {meta && meta.profiles.length === 0 ? <div className="upstream-empty">No profiles yet</div> : null}
-          </div>
-        </nav>
-
-        <div className="main">
-          <header className="header">
-            <h1 className="page-title">{page.label}</h1>
-            <div className="header-actions">
-              {page.periods && period ? (
-                <Segmented
-                  label="Period"
-                  options={page.periods}
-                  value={period}
-                  onChange={(value) => setQueryParam("range", value)}
-                />
-              ) : null}
-              {meta ? (
-                <>
-                  <Pill tone={meta.auth_enabled ? "ok" : "neutral"} dot>
-                    {meta.auth_enabled ? "auth on" : "auth off"}
-                  </Pill>
-                  <Pill tone={meta.persistent ? "ok" : "warn"} dot>
-                    {meta.persistent ? "persistent" : "in-memory"}
-                  </Pill>
-                  <button type="button" className="btn small danger" onClick={() => setConfirmRestart(true)}>
-                    <Icon name="restart" />
-                    Restart
-                  </button>
-                </>
-              ) : null}
-              <ThemeToggle />
-            </div>
-          </header>
+          </aside>
 
           <main className="content">
+            {tab === "overview" ? null : (
+              <div className="page-head">
+                <h1 className="page-title">{isSettings ? "Settings" : page.label}</h1>
+              </div>
+            )}
+            {isSettings ? (
+              <nav className="subtabs" aria-label="Settings">
+                {SETTINGS_PAGES.map((candidate) => (
+                  <button
+                    key={candidate.id}
+                    type="button"
+                    className={candidate.id === tab ? "subtab active" : "subtab"}
+                    aria-current={candidate.id === tab ? "page" : undefined}
+                    onClick={() => navigate(`/${candidate.id}`)}
+                  >
+                    {candidate.label}
+                  </button>
+                ))}
+              </nav>
+            ) : null}
             {tab === "models" ? (
               <ModelsScreen models={models} profiles={meta?.profiles ?? []} onCopy={copy} />
             ) : null}
             {tab === "stats" ? <StatsScreen onError={(message) => toast(message, true)} /> : null}
-            {tab === "overview" ? <UsageScreen period={period === "7d" ? "7d" : "1d"} /> : null}
+            {tab === "overview" ? <UsageScreen period={overviewPeriod(route.query.get("range"))} /> : null}
             {tab === "errors" ? <ErrorsScreen /> : null}
             {tab === "auto" ? <AutoScreen /> : null}
             {tab === "insights" ? <InsightsScreen onCopy={copy} /> : null}
