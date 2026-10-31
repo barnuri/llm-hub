@@ -4,14 +4,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::configs::{ProfileConfig, env_name};
 
 const PREFIX: &str = "LLM_HUB_";
-/// Profile keys only an operator may set (they run a program); upsert keeps
-/// them as written and never writes them itself.
-const OPERATOR_ONLY_KEYS: [&str; 3] = ["COMMAND", "IDLE_SECS", "START_TIMEOUT_SECS"];
+/// Profile keys only an operator may set (they run a program or pick the
+/// upstream credential); upsert keeps them as written and never writes them itself.
+const OPERATOR_ONLY_KEYS: [&str; 9] = [
+    "COMMAND",
+    "IDLE_SECS",
+    "START_TIMEOUT_SECS",
+    "AUTH",
+    "GITHUB_TOKEN_SOURCE",
+    "GH_PATH",
+    "GH_USER",
+    "GITHUB_DOMAIN",
+    "GITHUB_API_URL",
+];
 
 /// Rewrites the env file with a profile added/updated. Unrelated lines,
 /// comments, and ordering are preserved; the write is temp-file + atomic
 /// rename in the same directory (rename across filesystems is not atomic).
-/// Operator-only lines (`COMMAND`, `IDLE_SECS`, `START_TIMEOUT_SECS`) survive.
+/// Operator-only lines (`OPERATOR_ONLY_KEYS`) survive.
 pub fn upsert_profile(
     path: &Path,
     profile: &ProfileConfig,
@@ -153,6 +163,7 @@ mod tests {
             pricing: TokenRates::default(),
             model_prices: HashMap::default(),
             managed: None,
+            copilot: None,
         }
     }
 
@@ -212,6 +223,40 @@ mod tests {
             1
         );
         assert!(!content.contains("COMMANDX"));
+        assert!(!content.contains("https://old"));
+    }
+
+    #[test]
+    fn upsert_keeps_copilot_auth_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(
+            &path,
+            "LLM_HUB_GROQ_BASE_URL=https://old\nLLM_HUB_GROQ_AUTH=github-copilot\nLLM_HUB_GROQ_GITHUB_TOKEN_SOURCE=gh\nLLM_HUB_GROQ_GH_PATH=/opt/bin/ghx\n",
+        )
+        .unwrap();
+
+        upsert_profile(&path, &sample_profile(), &["groq".to_string()]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content
+                .matches("LLM_HUB_GROQ_AUTH=github-copilot\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            content
+                .matches("LLM_HUB_GROQ_GITHUB_TOKEN_SOURCE=gh\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            content
+                .matches("LLM_HUB_GROQ_GH_PATH=/opt/bin/ghx\n")
+                .count(),
+            1
+        );
         assert!(!content.contains("https://old"));
     }
 

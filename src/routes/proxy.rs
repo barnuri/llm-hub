@@ -8,6 +8,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::Value;
 
+use crate::configs::ProfileConfig;
 use crate::consts::{
     ANTHROPIC_UPSTREAM_PATH, ERROR_REASON_MAX_CHARS, ERROR_STATUS_MIN, HEADER_ATTEMPTS,
     HEADER_SERVED_MODEL, HEADER_TRANSFORMS, MAX_MULTIPART_BYTES, MAX_TRANSFORM_BUFFER_BYTES,
@@ -23,7 +24,13 @@ use crate::services::harness::client_signature;
 use crate::services::multipart_model;
 use crate::services::stats::{RequestOutcome, ScrapedUsage, scrape_usage};
 use crate::services::transforms::{self, RouteKind, TransformPlan};
+use crate::services::upstream_auth;
 use crate::utils::headers::{filter_request_headers, filter_response_headers};
+
+/// Copilot serves Claude models on the Anthropic Messages API at this path.
+const NATIVE_MESSAGES_PATH: &str = "/v1/messages";
+const HEADER_ANTHROPIC_VERSION: &str = "anthropic-version";
+const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Catch-all /v1/* passthrough with header-driven fallbacks.
 pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Response, AppError> {
@@ -113,48 +120,8 @@ pub(crate) async fn attempt_loop(
     route: RouteKind,
 ) -> Result<Response, AppError> {
     let config = state.config();
-    let mut json_body: Option<Value> = if body.is_empty() {
-        None
-    } else {
-        serde_json::from_slice(&body).ok()
-    };
-
-    // Translate first so everything downstream sees exactly one body shape.
-    if route == RouteKind::Anthropic {
-        json_body = Some(anthropic::request::to_openai(json_body.as_ref())?);
-    }
-
-    let boundary = multipart_boundary(headers);
-    let primary = requested_model(json_body.as_ref(), &body, boundary.as_deref());
-
-    let Some(primary) = primary else {
-        // No model in the body (e.g. GET without body): need a profile from the path? Reject clearly.
-        return Err(AppError::BadRequest(
-            "request body must contain a \"model\" field shaped <profile>/<model>".to_string(),
-        ));
-    };
-
-    let primary_id = parse_model_or_400(&config, &primary)?;
-    inject_stream_usage(&mut json_body);
-
-    // The single request-side transform seam. It runs once, before the chain is
-    // built, so every attempt sends byte-identical bytes.
-    let plan = transforms::apply_request(
-        &mut json_body,
-        headers,
-        config.stream_role_inject,
-        config.copilot_models(),
-    );
-    // Whenever the hub reads the response body itself it must be handed
-    // uncompressed bytes; passthrough requests keep the caller's header.
-    let force_identity_encoding = route == RouteKind::Anthropic || plan.wants_response_transform();
-
-    // The Anthropic route always targets the upstream's chat-completions
-    // endpoint, whatever the client-facing path was.
-    let upstream_path = match route {
-        RouteKind::OpenAi => path_and_query,
-        RouteKind::Anthropic => ANTHROPIC_UPSTREAM_PATH,
-    };
+    let (bodies, primary_id) =
+        AttemptBodies::prepare(&config, path_and_query, headers, &body, route)?;
 
     let mut chain: Vec<ModelId> = vec![primary_id];
     for fallback in fallback_chain(headers, &config.default_fallbacks) {
@@ -171,18 +138,17 @@ pub(crate) async fn attempt_loop(
     let last_index = chain.len() - 1;
 
     for (index, model_id) in chain.iter().enumerate() {
-        let attempt_body =
-            body_for_attempt(json_body.as_ref(), &body, boundary.as_deref(), model_id);
+        let attempt = bodies.for_model(state, model_id);
         let started = Instant::now();
         let result = send_attempt(
             state,
             &method,
-            upstream_path,
-            headers,
-            attempt_body,
+            attempt.path,
+            attempt.headers,
+            attempt.body,
             model_id,
             attempt_timeout,
-            force_identity_encoding,
+            attempt.force_identity_encoding,
         )
         .await;
 
@@ -199,8 +165,8 @@ pub(crate) async fn attempt_loop(
                         model_id,
                         &attempts_trail,
                         started,
-                        route,
-                        &plan,
+                        attempt.route,
+                        attempt.plan,
                         client,
                     )
                     .await);
@@ -227,6 +193,153 @@ pub(crate) async fn attempt_loop(
         }
     }
     unreachable!("attempt loop always returns on the last attempt");
+}
+
+/// The request in the forms an attempt can send it: translated and
+/// transformed for a chat-completions upstream, or the caller's own Anthropic
+/// body for an upstream that serves the model on `/v1/messages` natively.
+struct AttemptBodies<'a> {
+    original: &'a Bytes,
+    json_body: Option<Value>,
+    boundary: Option<String>,
+    headers: &'a HeaderMap,
+    upstream_path: &'a str,
+    force_identity_encoding: bool,
+    route: RouteKind,
+    plan: TransformPlan,
+    /// The untranslated Anthropic body and its headers; `None` off the
+    /// Anthropic route.
+    native: Option<(Value, HeaderMap)>,
+    /// A native response is already in the client's shape.
+    passthrough_plan: TransformPlan,
+}
+
+/// What one attempt sends, and how its response is delivered.
+struct Attempt<'a> {
+    path: UpstreamPath<'a>,
+    headers: &'a HeaderMap,
+    body: Bytes,
+    force_identity_encoding: bool,
+    route: RouteKind,
+    plan: &'a TransformPlan,
+}
+
+impl<'a> AttemptBodies<'a> {
+    /// Parses, translates and transforms the request once, before the chain
+    /// runs, and returns it with the primary model.
+    fn prepare(
+        config: &crate::configs::HubConfig,
+        path_and_query: &'a str,
+        headers: &'a HeaderMap,
+        body: &'a Bytes,
+        route: RouteKind,
+    ) -> Result<(AttemptBodies<'a>, ModelId), AppError> {
+        let mut json_body: Option<Value> = if body.is_empty() {
+            None
+        } else {
+            serde_json::from_slice(body).ok()
+        };
+
+        // A native `/v1/messages` attempt sends the client's own Anthropic body,
+        // so keep it before translation replaces it.
+        let native = json_body
+            .clone()
+            .filter(|_| route == RouteKind::Anthropic)
+            .map(|anthropic_body| (anthropic_body, with_anthropic_version(headers)));
+
+        // Translate first so everything downstream sees exactly one body shape.
+        if route == RouteKind::Anthropic {
+            json_body = Some(anthropic::request::to_openai(json_body.as_ref())?);
+        }
+
+        let boundary = multipart_boundary(headers);
+        let primary = requested_model(json_body.as_ref(), body, boundary.as_deref());
+
+        let Some(primary) = primary else {
+            // No model in the body (e.g. GET without body): need a profile from the path? Reject clearly.
+            return Err(AppError::BadRequest(
+                "request body must contain a \"model\" field shaped <profile>/<model>".to_string(),
+            ));
+        };
+
+        let primary_id = parse_model_or_400(config, &primary)?;
+        inject_stream_usage(&mut json_body);
+
+        // The single request-side transform seam. It runs once, before the chain is
+        // built, so every attempt sends byte-identical bytes.
+        let plan = transforms::apply_request(
+            &mut json_body,
+            headers,
+            config.stream_role_inject,
+            config.copilot_models(),
+        );
+        // Whenever the hub reads the response body itself it must be handed
+        // uncompressed bytes; passthrough requests keep the caller's header.
+        let force_identity_encoding =
+            route == RouteKind::Anthropic || plan.wants_response_transform();
+
+        // The Anthropic route always targets the upstream's chat-completions
+        // endpoint, whatever the client-facing path was.
+        let upstream_path = match route {
+            RouteKind::OpenAi => path_and_query,
+            RouteKind::Anthropic => ANTHROPIC_UPSTREAM_PATH,
+        };
+
+        let bodies = AttemptBodies {
+            original: body,
+            json_body,
+            boundary,
+            headers,
+            upstream_path,
+            force_identity_encoding,
+            route,
+            plan,
+            native,
+            passthrough_plan: TransformPlan::default(),
+        };
+        Ok((bodies, primary_id))
+    }
+
+    fn for_model(&self, state: &AppState, model_id: &ModelId) -> Attempt<'_> {
+        let catalog = state.upstream_model(&model_id.profile, &model_id.model);
+        // Copilot lists Claude ids dotted, the hub advertises them dashed; an
+        // id missing from the catalog is sent as the client wrote it.
+        let sent_id = ModelId {
+            profile: model_id.profile.clone(),
+            model: catalog
+                .as_ref()
+                .map_or_else(|| model_id.model.clone(), |m| m.upstream_id.clone()),
+        };
+        let native = self
+            .native
+            .as_ref()
+            .filter(|_| catalog.is_some_and(|m| m.native_messages));
+        match native {
+            // The request transforms only ever touched the translated body,
+            // and the response, error bodies included, goes back untouched.
+            Some((anthropic_body, native_headers)) => Attempt {
+                path: UpstreamPath::Verbatim(NATIVE_MESSAGES_PATH),
+                headers: native_headers,
+                body: body_for_attempt(Some(anthropic_body), self.original, None, &sent_id),
+                force_identity_encoding: false,
+                route: RouteKind::OpenAi,
+                plan: &self.passthrough_plan,
+            },
+            None => Attempt {
+                path: UpstreamPath::Strip(self.upstream_path),
+                headers: self.headers,
+                body: body_for_attempt(
+                    self.json_body.as_ref(),
+                    self.original,
+                    self.boundary.as_deref(),
+                    &sent_id,
+                ),
+                force_identity_encoding: self.force_identity_encoding,
+                route: self.route,
+                plan: &self.plan,
+            },
+        }
+    }
 }
 
 /// Renders the winning upstream response for the client-facing API shape.
@@ -293,7 +406,7 @@ async fn attempt_single(
     let response = send_attempt(
         state,
         &method,
-        path_and_query,
+        UpstreamPath::Strip(path_and_query),
         headers,
         body,
         model_id,
@@ -395,7 +508,7 @@ fn body_for_attempt(
 async fn send_attempt(
     state: &AppState,
     method: &Method,
-    path_and_query: &str,
+    upstream_path: UpstreamPath<'_>,
     headers: &HeaderMap,
     body: Bytes,
     model_id: &ModelId,
@@ -412,36 +525,124 @@ async fn send_attempt(
     let client = state.client(&profile.name).ok_or("no client for profile")?;
     state.managed().ensure_running(profile).await?;
 
-    let upstream_path = path_and_query.strip_prefix("/v1").unwrap_or(path_and_query);
-    let url = format!("{}{}", profile.base_url, upstream_path);
-
-    let mut forwarded = filter_request_headers(headers);
-    if force_identity_encoding {
-        forwarded.insert("accept-encoding", HeaderValue::from_static("identity"));
-    }
-    let mut request = client
-        .request(method.clone(), url)
-        .headers(to_reqwest_headers(&forwarded));
-    if !profile.api_key.is_empty() {
-        request = request.bearer_auth(&profile.api_key);
-    }
-    for (name, value) in &profile.extra_headers {
-        request = request.header(name, value);
-    }
-    if !body.is_empty() {
-        request = request.body(body);
-    }
-
-    let effective_timeout = attempt_timeout.or(profile.timeout_ms.map(Duration::from_millis));
-    let send = request.send();
-    let response = match effective_timeout {
-        Some(timeout) => tokio::time::timeout(timeout, send)
-            .await
-            .map_err(|_| "timeout".to_string())?,
-        None => send.await,
+    let upstream = UpstreamRequest {
+        state,
+        client: &client,
+        profile,
+        method,
+        upstream_path: upstream_path.as_str(),
+        headers,
+        force_identity_encoding,
+        timeout: attempt_timeout.or(profile.timeout_ms.map(Duration::from_millis)),
     };
-    state.managed().touch(&profile.name);
-    response.map_err(|e| format!("connect error: {e}"))
+    let (response, copilot_bearer) = upstream.send(body.clone()).await?;
+    let rejected = upstream_auth::invalidate_if_unauthorized(
+        state,
+        &profile.name,
+        response.status(),
+        copilot_bearer.as_deref(),
+    )
+    .await;
+    if !rejected {
+        return Ok(response);
+    }
+    upstream.send(body).await.map(|(retried, _)| retried)
+}
+
+/// The path an attempt is sent to, appended to the profile's base URL.
+#[derive(Clone, Copy)]
+enum UpstreamPath<'a> {
+    /// A client-facing `/v1/...` path; upstream bases already end at the API
+    /// root, so the `/v1` is dropped.
+    Strip(&'a str),
+    /// An upstream path that keeps its `/v1`, such as Copilot's `/v1/messages`.
+    Verbatim(&'static str),
+}
+
+impl<'a> UpstreamPath<'a> {
+    fn as_str(self) -> &'a str {
+        match self {
+            UpstreamPath::Strip(path) => path.strip_prefix("/v1").unwrap_or(path),
+            UpstreamPath::Verbatim(path) => path,
+        }
+    }
+}
+
+/// The `/v1/messages` route strips the caller's `anthropic-*` headers before
+/// the attempt loop, but the Anthropic API requires a version, so a native
+/// attempt sends the default one when the caller's is gone.
+fn with_anthropic_version(headers: &HeaderMap) -> HeaderMap {
+    let mut native = headers.clone();
+    if !native.contains_key(HEADER_ANTHROPIC_VERSION) {
+        native.insert(
+            HEADER_ANTHROPIC_VERSION,
+            HeaderValue::from_static(DEFAULT_ANTHROPIC_VERSION),
+        );
+    }
+    native
+}
+
+/// One upstream call of `send_attempt`, kept whole so a Copilot 401 can be
+/// re-sent with fresh credentials.
+struct UpstreamRequest<'a> {
+    state: &'a AppState,
+    client: &'a reqwest::Client,
+    profile: &'a ProfileConfig,
+    method: &'a Method,
+    upstream_path: &'a str,
+    headers: &'a HeaderMap,
+    force_identity_encoding: bool,
+    timeout: Option<Duration>,
+}
+
+impl UpstreamRequest<'_> {
+    /// Returns the response and the Copilot bearer it was sent with. The
+    /// timeout covers the credential lookup as well as the upstream call.
+    async fn send(&self, body: Bytes) -> Result<(reqwest::Response, Option<String>), String> {
+        let send = self.resolve_and_send(body);
+        let result = match self.timeout {
+            Some(timeout) => tokio::time::timeout(timeout, send)
+                .await
+                .map_err(|_| "timeout".to_string())?,
+            None => send.await,
+        };
+        self.state.managed().touch(&self.profile.name);
+        result
+    }
+
+    async fn resolve_and_send(
+        &self,
+        body: Bytes,
+    ) -> Result<(reqwest::Response, Option<String>), String> {
+        let mut forwarded = filter_request_headers(self.headers);
+        if self.force_identity_encoding {
+            forwarded.insert("accept-encoding", HeaderValue::from_static("identity"));
+        }
+        let (base, copilot_bearer) = upstream_auth::resolve(
+            self.state,
+            self.client,
+            self.profile,
+            self.upstream_path,
+            &body,
+            &mut forwarded,
+        )
+        .await?;
+        let mut request = self
+            .client
+            .request(self.method.clone(), format!("{base}{}", self.upstream_path))
+            .headers(to_reqwest_headers(&forwarded));
+        for (name, value) in &self.profile.extra_headers {
+            request = request.header(name, value);
+        }
+        if !body.is_empty() {
+            request = request.body(body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("connect error: {e}"))?;
+        Ok((response, copilot_bearer))
+    }
 }
 
 /// Streams the upstream response through, observing a rolling tail for usage
@@ -901,16 +1102,24 @@ async fn passthrough_oversized(
         .map_err(AppError::UpstreamUnavailable)?;
 
     let upstream_path = path_and_query.strip_prefix("/v1").unwrap_or(path_and_query);
-    let url = format!("{}{}", profile.base_url, upstream_path);
+    let mut forwarded = filter_request_headers(headers);
+    let (base, copilot_bearer) = upstream_auth::resolve(
+        state,
+        &client,
+        profile,
+        upstream_path,
+        &buffered,
+        &mut forwarded,
+    )
+    .await
+    .map_err(AppError::UpstreamUnavailable)?;
+    let url = format!("{base}{upstream_path}");
 
     let combined = futures_util::stream::iter(vec![Ok::<Bytes, axum::Error>(buffered)]).chain(rest);
     let mut request = client
         .request(method, url)
-        .headers(to_reqwest_headers(&filter_request_headers(headers)))
+        .headers(to_reqwest_headers(&forwarded))
         .body(reqwest::Body::wrap_stream(combined));
-    if !profile.api_key.is_empty() {
-        request = request.bearer_auth(&profile.api_key);
-    }
     for (name, value) in &profile.extra_headers {
         request = request.header(name, value);
     }
@@ -919,6 +1128,14 @@ async fn passthrough_oversized(
         .send()
         .await
         .map_err(|e| AppError::UpstreamUnavailable(e.to_string()))?;
+    // A streamed body cannot be replayed, so a rejected Copilot session is only dropped.
+    upstream_auth::invalidate_if_unauthorized(
+        state,
+        &profile.name,
+        response.status(),
+        copilot_bearer.as_deref(),
+    )
+    .await;
     let started = Instant::now();
     Ok(build_response(
         state,
@@ -1190,6 +1407,395 @@ mod tests {
         // The clock starts at the real first byte, not at the first ping.
         let ttft = summary.ttft_ms.unwrap();
         assert!(ttft >= SILENCE_MS, "ttft {ttft}ms measured from a ping");
+    }
+
+    mod copilot_routing {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        use super::*;
+        use crate::configs::{CopilotFlow, HubConfig};
+        use crate::consts::HEADER_FALLBACKS;
+        use crate::schemas::upstream_model::UpstreamModel;
+        use crate::services::credential_store::CredentialStore;
+        use crate::services::fake_gh_cli::FakeGhCli;
+        use crate::services::gh_cli::GhOutcome;
+        use crate::services::memory_credential_store::MemoryCredentialStore;
+
+        const PROFILE: &str = "copilot";
+        const NATIVE_ID: &str = "claude-opus-4-5";
+        const NATIVE_UPSTREAM_ID: &str = "claude-opus-4.5";
+        const TRANSLATED_ID: &str = "claude-sonnet-4-5";
+        const TRANSLATED_UPSTREAM_ID: &str = "claude-sonnet-4.5";
+        const PLAIN_ID: &str = "gpt-4.1";
+        const UPSTREAM_CHAT_PATH: &str = "/chat/completions";
+        const CALLER_ANTHROPIC_VERSION: &str = "2023-01-01";
+
+        struct Copilot {
+            state: AppState,
+            upstream: MockServer,
+            // Kept alive for the session lookup.
+            _github: MockServer,
+        }
+
+        async fn copilot() -> Copilot {
+            let github = MockServer::start().await;
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/copilot_internal/user"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "chat_enabled": true,
+                    "endpoints": {"api": upstream.uri()},
+                })))
+                .mount(&github)
+                .await;
+            let vars: HashMap<String, String> = [
+                ("LLM_HUB_PROFILES", PROFILE.to_string()),
+                ("LLM_HUB_COPILOT_BASE_URL", "http://127.0.0.1:9".to_string()),
+                (
+                    "LLM_HUB_COPILOT_AUTH",
+                    CopilotFlow::Opencode.auth_value().to_string(),
+                ),
+                ("LLM_HUB_COPILOT_GITHUB_API_URL", github.uri()),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect();
+            let store = MemoryCredentialStore::default();
+            store
+                .set(
+                    &CopilotFlow::Opencode.credential_account("github.com"),
+                    "gho_login",
+                )
+                .unwrap();
+            let gh = FakeGhCli::new(GhOutcome::Token("gho_gh".to_string()));
+            let state = AppState::with_seams(
+                HubConfig::from_map(&vars).unwrap(),
+                None,
+                Arc::new(store),
+                Arc::new(gh),
+            )
+            .unwrap();
+            state.set_upstream_models(
+                PROFILE,
+                HashMap::from([
+                    (NATIVE_ID.to_string(), entry(NATIVE_UPSTREAM_ID, true)),
+                    (
+                        TRANSLATED_ID.to_string(),
+                        entry(TRANSLATED_UPSTREAM_ID, false),
+                    ),
+                    (PLAIN_ID.to_string(), entry(PLAIN_ID, false)),
+                ]),
+            );
+            Copilot {
+                state,
+                upstream,
+                _github: github,
+            }
+        }
+
+        fn entry(upstream_id: &str, native_messages: bool) -> UpstreamModel {
+            UpstreamModel {
+                upstream_id: upstream_id.to_string(),
+                native_messages,
+            }
+        }
+
+        fn anthropic_body(model: &str, stream: bool) -> Value {
+            json!({
+                "model": format!("{PROFILE}/{model}"),
+                "max_tokens": 64,
+                "stream": stream,
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+        }
+
+        fn client_headers() -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            headers
+        }
+
+        fn with_caller_version(mut headers: HeaderMap) -> HeaderMap {
+            headers.insert(
+                HEADER_ANTHROPIC_VERSION,
+                HeaderValue::from_static(CALLER_ANTHROPIC_VERSION),
+            );
+            headers
+        }
+
+        fn chat_completion() -> ResponseTemplate {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "translated"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+            }))
+        }
+
+        async fn send(
+            copilot: &Copilot,
+            headers: &HeaderMap,
+            body: &Value,
+            route: RouteKind,
+        ) -> (u16, Bytes) {
+            let path = match route {
+                RouteKind::Anthropic => NATIVE_MESSAGES_PATH,
+                RouteKind::OpenAi => "/v1/chat/completions",
+            };
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                path,
+                headers,
+                Bytes::from(body.to_string()),
+                route,
+            )
+            .await
+            .unwrap();
+            let status = response.status().as_u16();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, bytes)
+        }
+
+        async fn requests_to(copilot: &Copilot, wanted: &str) -> Vec<Request> {
+            copilot
+                .upstream
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|request| request.url.path() == wanted)
+                .collect()
+        }
+
+        fn sent_json(request: &Request) -> Value {
+            serde_json::from_slice(&request.body).unwrap()
+        }
+
+        #[tokio::test]
+        async fn native_claude_model_gets_the_original_body_dotted_on_v1_messages() {
+            let copilot = copilot().await;
+            let reply = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"native"}],"usage":{"input_tokens":3,"output_tokens":1}}"#;
+            Mock::given(method("POST"))
+                .and(path(NATIVE_MESSAGES_PATH))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(reply.as_bytes(), "application/json"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+            let body = anthropic_body(NATIVE_ID, false);
+
+            let (status, bytes) = send(
+                &copilot,
+                &with_caller_version(client_headers()),
+                &body,
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert_eq!(bytes, reply.as_bytes());
+            let sent = requests_to(&copilot, NATIVE_MESSAGES_PATH).await;
+            assert_eq!(sent.len(), 1);
+            let mut expected = body.clone();
+            expected["model"] = json!(NATIVE_UPSTREAM_ID);
+            assert_eq!(sent_json(&sent[0]), expected);
+            assert_eq!(
+                sent[0].headers.get(HEADER_ANTHROPIC_VERSION).unwrap(),
+                CALLER_ANTHROPIC_VERSION
+            );
+            assert!(requests_to(&copilot, UPSTREAM_CHAT_PATH).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn native_attempt_sends_the_default_version_when_the_caller_sent_none() {
+            let copilot = copilot().await;
+            Mock::given(method("POST"))
+                .and(path(NATIVE_MESSAGES_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .mount(&copilot.upstream)
+                .await;
+
+            send(
+                &copilot,
+                &client_headers(),
+                &anthropic_body(NATIVE_ID, false),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            let sent = requests_to(&copilot, NATIVE_MESSAGES_PATH).await;
+            assert_eq!(
+                sent[0].headers.get(HEADER_ANTHROPIC_VERSION).unwrap(),
+                DEFAULT_ANTHROPIC_VERSION
+            );
+        }
+
+        #[tokio::test]
+        async fn native_stream_passes_through_untouched() {
+            let copilot = copilot().await;
+            let frames = "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+            Mock::given(method("POST"))
+                .and(path(NATIVE_MESSAGES_PATH))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(frames.as_bytes(), "text/event-stream"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, bytes) = send(
+                &copilot,
+                &client_headers(),
+                &anthropic_body(NATIVE_ID, true),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert_eq!(bytes, frames.as_bytes());
+            let sent = sent_json(&requests_to(&copilot, NATIVE_MESSAGES_PATH).await[0]);
+            assert!(sent.get("stream_options").is_none(), "{sent}");
+        }
+
+        #[tokio::test]
+        async fn native_error_body_is_forwarded_unmodified() {
+            let copilot = copilot().await;
+            let error = r#"{"type":"error","error":{"type":"invalid_request_error","message":"thinking is not supported"}}"#;
+            Mock::given(method("POST"))
+                .and(path(NATIVE_MESSAGES_PATH))
+                .respond_with(
+                    ResponseTemplate::new(400).set_body_raw(error.as_bytes(), "application/json"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, bytes) = send(
+                &copilot,
+                &client_headers(),
+                &anthropic_body(NATIVE_ID, false),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 400);
+            assert_eq!(bytes, error.as_bytes());
+        }
+
+        #[tokio::test]
+        async fn claude_model_without_native_messages_is_translated_to_chat_completions() {
+            let copilot = copilot().await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, bytes) = send(
+                &copilot,
+                &client_headers(),
+                &anthropic_body(TRANSLATED_ID, false),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(reply["type"], "message", "{reply}");
+            let sent = requests_to(&copilot, UPSTREAM_CHAT_PATH).await;
+            assert_eq!(sent_json(&sent[0])["model"], TRANSLATED_UPSTREAM_ID);
+            assert!(requests_to(&copilot, NATIVE_MESSAGES_PATH).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn openai_route_sends_the_dashed_id_dotted_and_unknown_ids_unchanged() {
+            let copilot = copilot().await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+            let chat = |model: &str| {
+                json!({
+                    "model": format!("{PROFILE}/{model}"),
+                    "messages": [{"role": "user", "content": "hi"}],
+                })
+            };
+
+            send(
+                &copilot,
+                &client_headers(),
+                &chat(NATIVE_ID),
+                RouteKind::OpenAi,
+            )
+            .await;
+            send(
+                &copilot,
+                &client_headers(),
+                &chat(NATIVE_UPSTREAM_ID),
+                RouteKind::OpenAi,
+            )
+            .await;
+
+            let models: Vec<Value> = requests_to(&copilot, UPSTREAM_CHAT_PATH)
+                .await
+                .iter()
+                .map(|request| sent_json(request)["model"].clone())
+                .collect();
+            assert_eq!(
+                models,
+                vec![json!(NATIVE_UPSTREAM_ID), json!(NATIVE_UPSTREAM_ID)]
+            );
+        }
+
+        #[tokio::test]
+        async fn native_429_falls_back_to_a_translated_attempt() {
+            let copilot = copilot().await;
+            Mock::given(method("POST"))
+                .and(path(NATIVE_MESSAGES_PATH))
+                .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+                    "type": "error",
+                    "error": {"type": "rate_limit_error", "message": "slow down"},
+                })))
+                .mount(&copilot.upstream)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+            let mut headers = client_headers();
+            headers.insert(
+                HEADER_FALLBACKS,
+                HeaderValue::from_str(&format!("{PROFILE}/{PLAIN_ID}")).unwrap(),
+            );
+
+            let (status, bytes) = send(
+                &copilot,
+                &headers,
+                &anthropic_body(NATIVE_ID, false),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(reply["type"], "message", "{reply}");
+            assert_eq!(reply["content"][0]["text"], "translated", "{reply}");
+            assert_eq!(requests_to(&copilot, NATIVE_MESSAGES_PATH).await.len(), 1);
+            let chat = requests_to(&copilot, UPSTREAM_CHAT_PATH).await;
+            assert_eq!(sent_json(&chat[0])["model"], PLAIN_ID);
+        }
     }
 
     #[tokio::test]

@@ -104,3 +104,33 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CONTEXT_TOKENS_1M: u64 = 1_000_000;
 /// Suffix Claude Code appends to treat a gateway model id as 1M context.
 pub const CONTEXT_1M_SUFFIX: &str = "[1m]";
+
+/// `LLM_HUB_<NAME>_AUTH` value for the direct GitHub OAuth bearer flow.
+pub const COPILOT_AUTH_OPENCODE: &str = "github-copilot";
+/// `LLM_HUB_<NAME>_AUTH` value for the VS Code Copilot token-exchange flow.
+pub const COPILOT_AUTH_VSCODE: &str = "github-copilot-vscode";
+/// Public OAuth App client id opencode uses for Copilot device login.
+pub const COPILOT_OPENCODE_CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
+/// Public GitHub App client id of the VS Code Copilot extension.
+pub const COPILOT_VSCODE_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+pub const GITHUB_OAUTH_SCOPE: &str = "read:user";
+pub const DEFAULT_GITHUB_DOMAIN: &str = "github.com";
+pub const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
+pub const DEFAULT_GH_PATH: &str = "gh";
+/// OS credential store service name for GitHub tokens from `copilot login`.
+pub const CREDENTIAL_SERVICE: &str = "llm-hub";
+pub const COPILOT_EDITOR_VERSION: &str = "vscode/1.107.0";
+pub const COPILOT_EDITOR_PLUGIN_VERSION: &str = "copilot-chat/0.35.0";
+pub const COPILOT_VSCODE_USER_AGENT: &str = "GitHubCopilotChat/0.35.0";
+pub const COPILOT_VSCODE_API_VERSION: &str = "2025-04-01";
+pub const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
+pub const COPILOT_OPENAI_INTENT: &str = "conversation-edits";
+/// A Copilot token is refreshed this long before its `expires_at`.
+pub const COPILOT_TOKEN_REFRESH_MARGIN: Duration = Duration::from_mins(5);
+/// How long a successful `copilot_internal/user` lookup is reused.
+pub const COPILOT_USER_TTL: Duration = Duration::from_hours(1);
+/// How long a failed `copilot_internal/user` lookup waits before it is retried.
+pub const COPILOT_USER_RETRY: Duration = Duration::from_mins(1);
+/// Added to the device-flow poll `interval` so polls never arrive early.
+pub const COPILOT_DEVICE_POLL_MARGIN: Duration = Duration::from_secs(1);
+pub const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);

@@ -11,6 +11,7 @@ dashmap = "6.2.1"
 dotenvy = "0.15.7"
 futures-util = "0.3.34"
 hdrhistogram = "7.6.0"
+keyring = "4.2.0"
 mime_guess = "2.0.5"
 rand = "0.10.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }

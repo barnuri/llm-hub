@@ -1,8 +1,14 @@
+pub mod copilot_auth;
+pub mod copilot_flow;
+pub mod github_token_source;
 pub mod hub_config;
 pub mod managed_command;
 pub mod profile_config;
 pub mod token_rates;
 
+pub use copilot_auth::CopilotAuth;
+pub use copilot_flow::CopilotFlow;
+pub use github_token_source::GithubTokenSource;
 pub use hub_config::{HubConfig, env_name, mask_key};
 pub use managed_command::ManagedCommand;
 pub use profile_config::ProfileConfig;

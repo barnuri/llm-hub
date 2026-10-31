@@ -195,8 +195,60 @@ async fn run_cli_command() -> bool {
             run_service_command();
             true
         }
+        Some("copilot") => {
+            if let Err(e) = run_copilot_command().await {
+                eprintln!("copilot: {e}");
+                std::process::exit(1);
+            }
+            true
+        }
         _ => false,
     }
+}
+
+const COPILOT_USAGE: &str = "usage: llm-hub copilot <login|logout> [--profile NAME]";
+
+/// `llm-hub copilot login|logout [--profile NAME]`.
+async fn run_copilot_command() -> Result<(), String> {
+    use std::sync::Arc;
+
+    use crate::services::copilot_login;
+    use crate::services::credential_store::CredentialStore;
+    use crate::services::keyring_credential_store::KeyringCredentialStore;
+    use crate::services::process_gh_cli::ProcessGhCli;
+
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let (action, requested) = match args.as_slice() {
+        [action] => (action.as_str(), None),
+        [action, flag, name] if flag == "--profile" => (action.as_str(), Some(name.as_str())),
+        _ => return Err(COPILOT_USAGE.to_string()),
+    };
+    if action != "login" && action != "logout" {
+        return Err(COPILOT_USAGE.to_string());
+    }
+    let config = HubConfig::from_map(&load_env_vars()).map_err(|e| format!("config error: {e}"))?;
+    let (profile, auth) = copilot_login::select_profile(&config, requested)?;
+    let account = auth.flow.credential_account(&auth.github_domain);
+    let credentials: Arc<dyn CredentialStore> = Arc::new(KeyringCredentialStore);
+    if action == "logout" {
+        if copilot_login::logout(auth, credentials).await? {
+            println!(
+                "Removed the login for profile {profile} (account {account}) from the OS credential store"
+            );
+        } else {
+            println!("No login was stored for profile {profile} (account {account})");
+        }
+        return Ok(());
+    }
+    let client = reqwest::Client::builder()
+        .user_agent(format!("llm-hub/{VERSION}"))
+        .build()
+        .map_err(|e| e.to_string())?;
+    copilot_login::login(&client, profile, auth, credentials, Arc::new(ProcessGhCli)).await?;
+    println!(
+        "Stored the login for profile {profile} in the OS credential store (account {account})"
+    );
+    Ok(())
 }
 
 fn run_service_command() {
@@ -234,6 +286,10 @@ fn build_router(state: AppState) -> Router {
             "/api/profiles/{name}/test",
             post(routes::admin::test_profile),
         )
+        .route(
+            "/api/claude-code/settings",
+            get(routes::claude_code::settings),
+        )
         .route("/api/fallbacks", post(routes::admin::set_default_fallbacks))
         .route("/api/restart", post(routes::admin::restart_server))
         .route("/api/stats", get(routes::admin::stats))
@@ -267,4 +323,95 @@ fn open_store(config: &HubConfig) -> Result<Option<Store>, String> {
         return Ok(None);
     }
     Store::open(&config.store_kind, config.store_path.as_deref()).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::services::fake_gh_cli::FakeGhCli;
+    use crate::services::gh_cli::GhOutcome;
+    use crate::services::memory_credential_store::MemoryCredentialStore;
+
+    const MASTER_KEY: &str = "hub-master-key";
+    const DISCOVERY_PATH: &str = "/v1/models?limit=1000";
+
+    async fn serve_hub_with_auth() -> String {
+        let vars: HashMap<String, String> = [
+            ("LLM_HUB_PROFILES", "copilot"),
+            ("LLM_HUB_COPILOT_BASE_URL", "http://127.0.0.1:9"),
+            ("LLM_HUB_MASTER_KEY", MASTER_KEY),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let state = AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            None,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
+        )
+        .unwrap();
+        state.set_model_cache(json!({"object": "list", "data": [
+            {"id": "copilot/claude-opus-4-5", "owned_by": "copilot"},
+        ]}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, build_router(state)).await });
+        base
+    }
+
+    #[tokio::test]
+    async fn claude_code_discovery_request_accepts_either_credential_header() {
+        let base = serve_hub_with_auth().await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}{DISCOVERY_PATH}");
+
+        let with_api_key = client
+            .get(&url)
+            .header("x-api-key", MASTER_KEY)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .unwrap();
+        let with_bearer = client
+            .get(&url)
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap();
+        let without_key = client.get(&url).send().await.unwrap();
+
+        assert_eq!(with_api_key.status().as_u16(), 200);
+        let body: serde_json::Value = with_api_key.json().await.unwrap();
+        assert_eq!(body["data"][0]["id"], "copilot/claude-opus-4-5");
+        assert_eq!(with_bearer.status().as_u16(), 200);
+        assert_eq!(without_key.status().as_u16(), 401);
+    }
+
+    #[tokio::test]
+    async fn claude_code_settings_route_is_protected() {
+        let base = serve_hub_with_auth().await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/claude-code/settings");
+
+        let with_key = client
+            .get(&url)
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap();
+        let without_key = client.get(&url).send().await.unwrap();
+
+        assert_eq!(with_key.status().as_u16(), 200);
+        let body: serde_json::Value = with_key.json().await.unwrap();
+        assert_eq!(
+            body["modelPicker"]["options"][0]["model"],
+            "copilot/claude-opus-4-5"
+        );
+        assert_eq!(without_key.status().as_u16(), 401);
+    }
 }

@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::configs::{ProfileConfig, mask_key};
 use crate::consts::{DEFAULT_INSIGHTS_MIN_REQUESTS, DEFAULT_INSIGHTS_RANGE, ENV_FILE, VERSION};
 use crate::dependencies::state::AppState;
+use crate::routes::models::MODELS_PATH;
 use crate::schemas::api_key_input::ApiKeyInput;
 use crate::schemas::api_key_record::ApiKeyRecord;
 use crate::schemas::app_error::AppError;
@@ -23,6 +24,7 @@ use crate::services::env_writer;
 use crate::services::insights;
 use crate::services::stats::RequestOutcome;
 use crate::services::store::{StatsFilter, hash_key, now_ms};
+use crate::services::upstream_auth;
 use crate::utils::hex::to_hex;
 use crate::utils::time::elapsed_ms;
 
@@ -75,6 +77,13 @@ pub async fn upsert_profile(
     }
 
     let existing = config.profile(&name);
+    let uses_copilot_auth = existing.is_some_and(|p| p.copilot.is_some());
+    if uses_copilot_auth && input.api_key.as_deref().is_some_and(|k| !k.is_empty()) {
+        return Err(AppError::BadRequest(format!(
+            "profile {name} uses LLM_HUB_{}_AUTH, so it takes no API key",
+            crate::configs::env_name(&name)
+        )));
+    }
     let api_key = match input.api_key.filter(|k| !k.is_empty()) {
         Some(key) => key,
         None => existing.map(|p| p.api_key.clone()).unwrap_or_default(),
@@ -95,6 +104,7 @@ pub async fn upsert_profile(
         pricing: existing.map(|p| p.pricing).unwrap_or_default(),
         model_prices: existing.map(|p| p.model_prices.clone()).unwrap_or_default(),
         managed: existing.and_then(|p| p.managed.clone()),
+        copilot: existing.and_then(|p| p.copilot.clone()),
     };
     if !profile.base_url.starts_with("http://") && !profile.base_url.starts_with("https://") {
         return Err(AppError::BadRequest(
@@ -161,15 +171,9 @@ pub async fn test_profile(
         .client(&name)
         .ok_or_else(|| AppError::Internal("no client".into()))?;
 
-    let mut request = client.get(format!("{}/models", profile.base_url));
-    if !profile.api_key.is_empty() {
-        request = request.bearer_auth(&profile.api_key);
-    }
-    for (header_name, value) in &profile.extra_headers {
-        request = request.header(header_name, value);
-    }
     let started = std::time::Instant::now();
-    match tokio::time::timeout(crate::consts::MODELS_FANOUT_TIMEOUT, request.send()).await {
+    let probe = probe_models(&state, &client, profile);
+    match tokio::time::timeout(crate::consts::MODELS_FANOUT_TIMEOUT, probe).await {
         Ok(Ok(response)) => {
             let healthy = response.status().is_success();
             state.set_upstream_health(&name, healthy);
@@ -181,13 +185,36 @@ pub async fn test_profile(
         }
         Ok(Err(e)) => {
             state.set_upstream_health(&name, false);
-            Ok(Json(json!({ "ok": false, "error": e.to_string() })))
+            Ok(Json(json!({ "ok": false, "error": e })))
         }
         Err(_) => {
             state.set_upstream_health(&name, false);
             Ok(Json(json!({ "ok": false, "error": "timeout" })))
         }
     }
+}
+
+async fn probe_models(
+    state: &AppState,
+    client: &reqwest::Client,
+    profile: &ProfileConfig,
+) -> Result<reqwest::Response, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    let (base, copilot_bearer) =
+        upstream_auth::resolve(state, client, profile, MODELS_PATH, &[], &mut headers).await?;
+    let mut request = client.get(format!("{base}{MODELS_PATH}")).headers(headers);
+    for (header_name, value) in &profile.extra_headers {
+        request = request.header(header_name, value);
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
+    upstream_auth::invalidate_if_unauthorized(
+        state,
+        &profile.name,
+        response.status(),
+        copilot_bearer.as_deref(),
+    )
+    .await;
+    Ok(response)
 }
 
 /// Triggers a graceful restart: supervised installs are restarted by their

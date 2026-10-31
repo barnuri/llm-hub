@@ -302,6 +302,194 @@ the `.env` parser keeps the backslashes. `~/` expands to `%USERPROFILE%` when
 LLM_HUB_WHISPER_COMMAND='"C:\Program Files\whisper.cpp\whisper-server.exe" --model C:\models\ggml-large-v3.bin --host 127.0.0.1 --port 11440 --inference-path /v1/audio/transcriptions --convert'
 ```
 
+## GitHub Copilot upstream
+
+A Copilot subscription can serve as an ordinary profile, so `copilot/<model>`
+shows up in `/v1/models` and works in fallback chains. There are two ways to
+connect: a local [copilot-api](https://github.com/ericc-ch/copilot-api) proxy,
+or native auth in the hub.
+
+Warning: heavy automated use of Copilot outside its own clients can trigger
+GitHub's abuse detection and suspend your Copilot access. The copilot-api
+README gives the same warning, and it applies to both ways.
+
+### Through copilot-api
+
+copilot-api is a local server that speaks the OpenAI API to Copilot. Log in
+once, then point a plain profile at it:
+
+```sh
+npx copilot-api@latest auth   # one time, copilot-api stores its own token
+```
+
+```sh
+LLM_HUB_COPILOT_API_BASE_URL=http://127.0.0.1:4141/v1
+LLM_HUB_COPILOT_API_COMMAND='/usr/bin/env PATH=/opt/homebrew/bin:/usr/bin:/bin npx copilot-api@latest start --port 4141'
+LLM_HUB_COPILOT_API_START_TIMEOUT_SECS=180
+LLM_HUB_COPILOT_API_MODELS=gpt-4.1,claude-sonnet-4.5
+```
+
+`COMMAND` is optional. With it, the hub starts copilot-api on the first request
+and stops it when idle, the same as in [Local speech-to-text](#local-speech-to-text).
+The `PATH` prefix lets `npx` run under the service's minimal `PATH`. The first
+`npx` run downloads the package, so give `START_TIMEOUT_SECS` some headroom.
+`MODELS` keeps a static list in `/v1/models` while the server is stopped.
+Without `COMMAND`, run `npx copilot-api@latest start --port 4141` yourself.
+
+### Native auth
+
+Set `AUTH` on a profile and the hub talks to Copilot itself. `BASE_URL` stays
+required, but it is only a fallback for when Copilot reports no API endpoint of
+its own. Do not set `API_KEY` on a profile that has `AUTH`: that is a config
+error.
+
+| `AUTH` | Flow | GitHub token |
+|---|---|---|
+| `github-copilot` | The GitHub token is the bearer for every Copilot request (opencode's flow). The hub reads the API base and the entitlement from `copilot_internal/user` | `gh`, else `llm-hub copilot login` |
+| `github-copilot-vscode` | The hub exchanges the GitHub token for a short-lived Copilot token at `copilot_internal/v2/token` and refreshes it before expiry. It sends the VS Code `Editor-*` and `vscode-chat` headers (the copilot-api flow) | `llm-hub copilot login` only |
+
+`GITHUB_TOKEN_SOURCE` picks where the GitHub token comes from:
+
+- `auto` (the default for `github-copilot`) uses `gh auth token` when `gh` is
+  installed and logged in. Otherwise it uses the token from
+  `llm-hub copilot login`. A missing `gh` is not an error.
+- `gh` uses only `gh`.
+- `login` uses only the `llm-hub copilot login` token. It is the default, and
+  the only allowed value, for `github-copilot-vscode`: the token exchange
+  rejects `gh` tokens with a 403.
+
+When a Copilot request gets a 401, the hub drops its cached token, gets a new
+one, and retries the request once.
+
+**With gh.** After `gh auth login`, this is the whole profile:
+
+```sh
+LLM_HUB_COPILOT_BASE_URL=https://api.githubcopilot.com
+LLM_HUB_COPILOT_AUTH=github-copilot
+```
+
+An installed service runs with launchd's or systemd's minimal `PATH`, which
+does not include Homebrew. Set `GH_PATH` to the absolute path of `gh` there
+(`LLM_HUB_COPILOT_GH_PATH=/opt/homebrew/bin/gh`). `GH_USER` picks one of
+several logged-in accounts (`gh auth token --user <login>`). If `GH_TOKEN` (for
+github.com) or `GH_ENTERPRISE_TOKEN` (for other hosts) is set in the hub
+process environment, the hub uses it and does not run `gh`. Set those in the
+service environment only. Never put them in `.env`.
+
+**Without gh.** Log in once with the GitHub device flow:
+
+```sh
+cd ~/somewhere   # the directory with your .env
+llm-hub copilot login --profile copilot
+```
+
+The command reads `.env` from the current directory to find the profile, so run
+it where the hub runs. `--profile` can be left out when only one profile has
+`AUTH`. The command prints a code and a URL, checks your Copilot entitlement
+after you approve, and stores the token in the OS credential store under
+service `llm-hub`, account `<AUTH>:<domain>` (for example
+`github-copilot:github.com`). The token is never written to a file or to `.env`.
+`llm-hub copilot logout --profile copilot` removes it. Profiles that share the
+same `AUTH` value and domain share one login.
+
+`github-copilot-vscode` works the same way, but only with this login. Give it its
+own profile name, here `copilot_vscode`:
+
+```sh
+LLM_HUB_COPILOT_VSCODE_BASE_URL=https://api.githubcopilot.com
+LLM_HUB_COPILOT_VSCODE_AUTH=github-copilot-vscode
+```
+
+Run `llm-hub copilot login --profile copilot_vscode` once. Its models route as
+`copilot_vscode/<model>`.
+
+The two `AUTH` values use different OAuth client ids, so each needs its own
+`copilot login`.
+
+**Credential store per OS:**
+
+- **macOS:** the login Keychain. The LaunchAgent runs as the logged-in user, so
+  it can read the item. On first access, macOS may ask whether `llm-hub` may
+  use the item. Choose **Always Allow**. Requests to the profile fail until you
+  answer the prompt. A rebuilt or auto-updated binary is likely to prompt
+  again (not yet verified).
+- **Linux:** a Secret Service provider, for example gnome-keyring, must run in
+  the user session. On a host without one, use `gh`.
+- **Windows:** Credential Manager.
+
+**GitHub Enterprise.** `GITHUB_DOMAIN` sets the GitHub host for the device
+login, for `gh auth token --hostname`, and for the credential account
+(`LLM_HUB_COPILOT_GITHUB_DOMAIN=acme.ghe.com`). The REST base defaults to
+`https://api.<domain>`. Set `GITHUB_API_URL` when it differs, for example on
+GitHub Enterprise Server.
+
+**Headers.** `github-copilot` sends a small header set: `Authorization`,
+`User-Agent`, `Openai-Intent`, `X-Initiator`, and `Copilot-Vision-Request` when
+the request has an image. It omits `Copilot-Integration-Id` and
+`X-GitHub-Api-Version` on purpose. With a `gh` token, Copilot answers 400 "IDE
+authentication failed: IDE token is malformed" when either header is present.
+`X-Initiator` is `agent` for tool-loop follow-ups and `user` for a new user
+turn, so follow-ups do not use premium requests. A `HEADERS` entry with the
+same name overrides the hub's value.
+
+The hub drops Copilot models that Copilot itself hides (`model_picker_enabled:
+false`) or that your policy disables. Models that Copilot serves only through
+the Responses API (for example gpt-5 and later, except gpt-5-mini) work on
+`/v1/responses`. They do not work on `/v1/chat/completions` or on `/v1/messages`.
+
+### Claude Code on Copilot models
+
+Claude Code can list hub models in its `/model` picker. Its gateway model
+discovery reads `GET /v1/models`, but it keeps only ids that contain `claude`
+or `anthropic`. Copilot names Claude models with dots (`claude-opus-4.5`),
+which Claude Code does not recognise. So a native Copilot profile advertises
+them with dashes (`copilot/claude-opus-4-5`) and sends the dotted id upstream.
+Dotted ids still work in requests. Profiles through copilot-api keep the
+dotted ids.
+
+A `/v1/messages` request for a Copilot Claude model goes to Copilot's own
+`/v1/messages` unchanged, with no OpenAI translation, so thinking blocks and
+tool use pass through as sent. The [limits](#anthropic-messages-endpoint)
+of the translated route do not apply to those models.
+
+Discovery does not show non-Claude models. `GET /api/claude-code/settings`
+returns a `modelPicker` list with every hub model, for `claude --settings`.
+
+A launcher script, saved for example as `~/.local/bin/claude-copilot`, puts
+it together:
+
+```sh
+#!/usr/bin/env bash
+set -euo pipefail
+hub=http://127.0.0.1:8888
+export ANTHROPIC_BASE_URL="$hub"
+export ANTHROPIC_AUTH_TOKEN="${LLM_HUB_API_KEY:-placeholder}"
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+export ANTHROPIC_DEFAULT_OPUS_MODEL=copilot/claude-opus-4-5
+export ANTHROPIC_DEFAULT_SONNET_MODEL=copilot/claude-sonnet-4-5
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=copilot/claude-haiku-4-5
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=128000
+settings="$(curl -fsS --max-time 3 "$hub/api/claude-code/settings" || true)"
+exec claude ${settings:+--settings "$settings"} "$@"
+```
+
+- `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` turns discovery on. Claude
+  Code skips discovery when it has no credential, so the token must be
+  non-empty even while hub auth is off. With hub auth on, use a real hub key.
+- Pick the `ANTHROPIC_DEFAULT_*_MODEL` ids from your own `/v1/models` list.
+- Claude Code assumes 1M context for recent Opus and Sonnet models. Copilot's
+  prompt limit is likely lower. Set `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to the
+  smallest `max_input_tokens` of the pinned models.
+- `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` stops pre-release
+  `anthropic-beta` values that Copilot may reject.
+- Discovery times out after 3 s. The hub serves the cached model list at once
+  and refreshes it in the background, so discovery does not wait on upstreams.
+
+In Claude Code, `/model` then lists the Copilot Claude models from discovery
+and every other hub model from `--settings`. A discovered model may collapse
+into its built-in alias row, for example `opus`.
+
 ## Environment reference
 
 | Variable | Default | Purpose |
@@ -322,6 +510,12 @@ LLM_HUB_WHISPER_COMMAND='"C:\Program Files\whisper.cpp\whisper-server.exe" --mod
 | `LLM_HUB_<NAME>_COMMAND` | — | Local server the hub starts on demand for this profile (program + args, no shell; POSIX shell quoting, or Windows command-line rules on Windows; leading `~/` expands to `$HOME`, or `%USERPROFILE%` without `HOME`). Operator-set only: the admin API can neither set nor write it |
 | `LLM_HUB_<NAME>_IDLE_SECS` | `900` | Stop the managed process after this many seconds without a request; `0` = never |
 | `LLM_HUB_<NAME>_START_TIMEOUT_SECS` | `120` | How long the managed process may take to accept connections on the `BASE_URL` port |
+| `LLM_HUB_<NAME>_AUTH` | unset | Native [Copilot auth](#native-auth): `github-copilot` or `github-copilot-vscode`. Not allowed together with `API_KEY`. Operator-set only |
+| `LLM_HUB_<NAME>_GITHUB_TOKEN_SOURCE` | `auto` (`github-copilot`), `login` (`github-copilot-vscode`) | `auto` (gh, else `copilot login`), `gh` or `login`. `github-copilot-vscode` accepts only `login` |
+| `LLM_HUB_<NAME>_GH_PATH` | `gh` on `PATH` | gh binary. Use an absolute path under launchd or systemd |
+| `LLM_HUB_<NAME>_GH_USER` | unset | Passed as `gh auth token --user`. Letters, digits and `-` only |
+| `LLM_HUB_<NAME>_GITHUB_DOMAIN` | `github.com` | GitHub host for the device login, `gh --hostname` and the credential account |
+| `LLM_HUB_<NAME>_GITHUB_API_URL` | `https://api.github.com`, or `https://api.<domain>` | REST base for `copilot_internal/*`. Must be http(s) |
 | `LLM_HUB_INPUT_USD_PER_1M` / `OUTPUT_…` | `0` | Global default rates when a profile has none |
 | `LLM_HUB_BIND` / `LLM_HUB_PORT` | `127.0.0.1` / `8410` | Listen address |
 | `LLM_HUB_MASTER_KEY` | unset | Require this key on `/v1/*` and `/api/*`; unset = no auth |

@@ -23,13 +23,20 @@ pub fn has_1m_suffix(raw: &str) -> bool {
 
 /// Read a context window from an upstream `/v1/models` entry. llama-swap
 /// has no top-level field for it; its per-model `metadata:` config block is
-/// surfaced as `meta.llamaswap`, so that is checked as a fallback.
+/// surfaced as `meta.llamaswap`, so that is checked as a fallback, and so is
+/// Copilot's `capabilities.limits.max_prompt_tokens`.
 pub fn max_input_tokens_from_item(item: &Value) -> Option<u64> {
-    context_tokens_in(item).or_else(|| {
-        item.get("meta")
-            .and_then(|meta| meta.get("llamaswap"))
-            .and_then(context_tokens_in)
-    })
+    context_tokens_in(item)
+        .or_else(|| {
+            item.get("meta")
+                .and_then(|meta| meta.get("llamaswap"))
+                .and_then(context_tokens_in)
+        })
+        .or_else(|| {
+            item.pointer("/capabilities/limits/max_prompt_tokens")
+                .and_then(Value::as_u64)
+                .filter(|tokens| *tokens > 0)
+        })
 }
 
 fn context_tokens_in(obj: &Value) -> Option<u64> {
@@ -83,6 +90,24 @@ mod tests {
             "meta": { "llamaswap": { "context_length": 262_144 } }
         });
         assert_eq!(max_input_tokens_from_item(&item), Some(131_072));
+    }
+
+    #[test]
+    fn copilot_capabilities_max_prompt_tokens_read_as_fallback() {
+        let item = serde_json::json!({
+            "id": "claude-opus-4.5",
+            "capabilities": { "limits": { "max_prompt_tokens": 128_000, "max_output_tokens": 16_000 } }
+        });
+        assert_eq!(max_input_tokens_from_item(&item), Some(128_000));
+    }
+
+    #[test]
+    fn top_level_context_wins_over_copilot_capabilities() {
+        let item = serde_json::json!({
+            "context_length": 200_000,
+            "capabilities": { "limits": { "max_prompt_tokens": 128_000 } }
+        });
+        assert_eq!(max_input_tokens_from_item(&item), Some(200_000));
     }
 
     #[test]

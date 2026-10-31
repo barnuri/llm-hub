@@ -107,6 +107,7 @@ mod tests {
                 pricing: TokenRates::default(),
                 model_prices: HashMap::default(),
                 managed: None,
+                copilot: None,
             }],
             master_key: None,
             default_fallbacks: vec![],

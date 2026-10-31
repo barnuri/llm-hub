@@ -16,6 +16,8 @@ pub struct ProfileConfig {
     pub model_prices: std::collections::HashMap<String, crate::configs::TokenRates>,
     /// Local server llm-hub starts on demand; env-only, never set through the admin API.
     pub managed: Option<crate::configs::ManagedCommand>,
+    /// Native GitHub Copilot auth; env-only, never set through the admin API.
+    pub copilot: Option<crate::configs::CopilotAuth>,
 }
 
 impl ProfileConfig {

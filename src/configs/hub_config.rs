@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::copilot_auth::CopilotAuth;
 use super::managed_command::ManagedCommand;
 use super::profile_config::ProfileConfig;
 use crate::consts::{
@@ -206,12 +207,19 @@ impl HubConfig {
         )?;
         let (pricing, model_prices) =
             crate::configs::token_rates::profile_rates_from_env(name, &get)?;
+        let api_key = get("API_KEY").unwrap_or_default();
+        let copilot = CopilotAuth::from_env(&upper, &get)?;
+        if copilot.is_some() && !api_key.is_empty() {
+            return Err(format!(
+                "LLM_HUB_{upper}_AUTH and LLM_HUB_{upper}_API_KEY cannot both be set: AUTH supplies the upstream credential"
+            ));
+        }
 
         Ok(ProfileConfig {
             name: name.to_string(),
             display_name,
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: get("API_KEY").unwrap_or_default(),
+            api_key,
             extra_headers,
             timeout_ms,
             enabled: get("ENABLED").is_none_or(|v| is_truthy(&v)),
@@ -224,6 +232,7 @@ impl HubConfig {
             pricing,
             model_prices,
             managed,
+            copilot,
         })
     }
 }
@@ -423,6 +432,49 @@ mod tests {
         vars.insert("LLM_HUB_GROQ_START_TIMEOUT_SECS".into(), "x".into());
         let err = HubConfig::from_map(&vars).unwrap_err();
         assert!(err.contains("LLM_HUB_GROQ_START_TIMEOUT_SECS"), "{err}");
+    }
+
+    #[test]
+    fn copilot_auth_parsed_for_both_flows() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_PROFILES".into(), "openai, copilot, vscode".into());
+        vars.insert(
+            "LLM_HUB_COPILOT_BASE_URL".into(),
+            "https://api.githubcopilot.com".into(),
+        );
+        vars.insert("LLM_HUB_COPILOT_AUTH".into(), "github-copilot".into());
+        vars.insert("LLM_HUB_COPILOT_GH_PATH".into(), "/opt/bin/ghx".into());
+        vars.insert(
+            "LLM_HUB_VSCODE_BASE_URL".into(),
+            "https://api.githubcopilot.com".into(),
+        );
+        vars.insert("LLM_HUB_VSCODE_AUTH".into(), "github-copilot-vscode".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+
+        let copilot = cfg.profile("copilot").unwrap().copilot.clone().unwrap();
+        assert_eq!(copilot.flow, crate::configs::CopilotFlow::Opencode);
+        assert_eq!(copilot.gh_path, "/opt/bin/ghx");
+        let vscode = cfg.profile("vscode").unwrap().copilot.clone().unwrap();
+        assert_eq!(vscode.flow, crate::configs::CopilotFlow::Vscode);
+        assert_eq!(cfg.profile("openai").unwrap().copilot, None);
+    }
+
+    #[test]
+    fn copilot_auth_with_api_key_rejected() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_GROQ_AUTH".into(), "github-copilot".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_GROQ_AUTH"), "{err}");
+        assert!(err.contains("LLM_HUB_GROQ_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn copilot_auth_error_propagates() {
+        let mut vars = base_vars();
+        vars.remove("LLM_HUB_GROQ_API_KEY");
+        vars.insert("LLM_HUB_GROQ_AUTH".into(), "copilot".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_GROQ_AUTH"), "{err}");
     }
 
     #[test]
