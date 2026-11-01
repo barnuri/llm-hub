@@ -122,7 +122,7 @@ function quotaReset(quota: CopilotQuota): string | null {
 }
 
 function formatClock(date: Date): string {
-  return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 }
 
 function hoverReadout(stacks: UpstreamStacks, index: number | null, bucket: SeriesBucket): string | null {

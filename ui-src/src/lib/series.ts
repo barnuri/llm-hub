@@ -29,7 +29,7 @@ const REST_KEY = "__rest__";
 export function formatBucket(tsMs: number, bucket: SeriesBucket): string {
   const date = new Date(tsMs);
   if (bucket === "hour") {
-    return date.toLocaleTimeString(undefined, { hour: "numeric" });
+    return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
   }
   return date.toLocaleDateString(undefined, { weekday: "short", day: "numeric" });
 }

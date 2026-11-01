@@ -1,14 +1,23 @@
+// Local time zone, always 24-hour: the backend sends UTC, and an en-US browser would show 12-hour.
+const TIME_FORMAT = new Intl.DateTimeFormat(undefined, {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hourCycle: "h23",
+});
+const DAY_FORMAT = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+
 export function formatTime(tsMs: number): string {
-  return new Date(tsMs).toLocaleTimeString();
+  return TIME_FORMAT.format(tsMs);
 }
 
 /** Time only for today, otherwise short date plus time, so older rows are not ambiguous. */
 export function formatDateTime(tsMs: number): string {
   const date = new Date(tsMs);
   if (date.toDateString() === new Date().toDateString()) {
-    return date.toLocaleTimeString();
+    return TIME_FORMAT.format(date);
   }
-  return `${date.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${date.toLocaleTimeString()}`;
+  return `${DAY_FORMAT.format(date)}, ${TIME_FORMAT.format(date)}`;
 }
 
 export function formatDate(tsMs: number): string {
