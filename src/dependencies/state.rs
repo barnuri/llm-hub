@@ -33,6 +33,7 @@ struct Inner {
     /// SHA-256 hex hashes of enabled hub api keys, refreshed on CRUD.
     api_key_hashes: ArcSwap<HashSet<String>>,
     model_cache: ArcSwap<Option<Arc<CachedModels>>>,
+    model_usage: ArcSwap<HashMap<String, u64>>,
     /// profile name -> reachable, updated on every models fan-out.
     upstream_health: DashMap<String, bool>,
     /// Copilot profile name -> advertised bare model id -> upstream entry.
@@ -93,6 +94,7 @@ impl AppState {
             store,
             api_key_hashes: ArcSwap::from_pointee(HashSet::new()),
             model_cache: ArcSwap::from_pointee(None),
+            model_usage: ArcSwap::from_pointee(HashMap::new()),
             upstream_health: DashMap::new(),
             upstream_models: DashMap::new(),
             copilot_catalogs: DashMap::new(),
@@ -135,6 +137,14 @@ impl AppState {
 
     pub fn client(&self, profile: &str) -> Option<reqwest::Client> {
         self.0.clients.load().get(profile).cloned()
+    }
+
+    pub(crate) fn model_usage(&self) -> Arc<HashMap<String, u64>> {
+        self.0.model_usage.load_full()
+    }
+
+    pub(crate) fn set_model_usage(&self, usage: HashMap<String, u64>) {
+        self.0.model_usage.store(Arc::new(usage));
     }
 
     pub fn stats(&self) -> &StatsRegistry {

@@ -326,6 +326,40 @@ impl Store {
         }
     }
 
+    pub(crate) fn model_request_counts(
+        &self,
+        since_ms: u64,
+    ) -> Result<HashMap<String, u64>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut stmt = guard
+                    .prepare("SELECT model, COUNT(*) FROM requests WHERE ts_ms >= ? GROUP BY model")
+                    .map_err(|error| error.to_string())?;
+                let rows = stmt
+                    .query_map([db_i64(since_ms)], |row| {
+                        Ok((row.get::<_, String>(0)?, db_u64(row.get::<_, i64>(1)?)))
+                    })
+                    .map_err(|error| error.to_string())?;
+                rows.collect::<Result<HashMap<_, _>, _>>()
+                    .map_err(|error| error.to_string())
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                let mut counts = HashMap::new();
+                for row in guard
+                    .state
+                    .recent
+                    .iter()
+                    .filter(|row| row.ts_ms >= since_ms)
+                {
+                    *counts.entry(row.model.clone()).or_insert(0) += 1;
+                }
+                Ok(counts)
+            }
+        }
+    }
+
     /// Aggregate filtered request history into the same shape as live stats.
     pub fn stats(&self, filter: &StatsFilter) -> Result<StatsSnapshot, String> {
         let outcomes = self.filtered_outcomes(filter)?;
@@ -868,6 +902,31 @@ mod tests {
             ts_ms: 0,
             error: None,
             client: None,
+        }
+    }
+
+    #[test]
+    fn model_counts_include_only_requests_within_window() {
+        for kind in ["sqlite", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("counts");
+            let store = Store::open(kind, Some(path.to_str().unwrap())).unwrap();
+            let mut outcome = sample_outcome();
+            store.record(&outcome).unwrap();
+            store.record(&outcome).unwrap();
+            outcome.model_key = "other/model".into();
+            store.record(&outcome).unwrap();
+            assert_eq!(
+                store.model_request_counts(0).unwrap(),
+                HashMap::from([("openai/gpt-4o".into(), 2), ("other/model".into(), 1)])
+            );
+            let an_hour = 3_600_000;
+            assert!(
+                store
+                    .model_request_counts(now_ms() + an_hour)
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 

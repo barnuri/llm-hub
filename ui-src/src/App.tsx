@@ -8,7 +8,7 @@ import { Toasts, type ToastItem } from "./components/Toasts";
 import { api, saveKey, UnauthorizedError } from "./lib/api";
 import { formatNumber } from "./lib/format";
 import { navigate, useRoute } from "./lib/router";
-import type { ErrorsReport, HubMeta } from "./lib/types";
+import type { ErrorsReport, HubMeta, HubModel } from "./lib/types";
 import { KeysScreen } from "./screens/KeysScreen";
 import { ModelsScreen } from "./screens/ModelsScreen";
 import { ProfilesScreen } from "./screens/ProfilesScreen";
@@ -54,7 +54,7 @@ function overviewPeriod(requested: string | null): OverviewPeriod {
 }
 
 interface ModelsResponse {
-  readonly data: ReadonlyArray<{ readonly id: string }>;
+  readonly data: readonly HubModel[];
 }
 
 export function App() {
@@ -66,7 +66,8 @@ export function App() {
   const isSettings = SETTINGS_PAGES.some((candidate) => candidate.id === tab);
   const [errorsToday, setErrorsToday] = useState<number | null>(null);
   const [meta, setMeta] = useState<HubMeta | null>(null);
-  const [models, setModels] = useState<readonly string[]>([]);
+  const [modelEntries, setModelEntries] = useState<readonly HubModel[]>([]);
+  const models = modelEntries.map((model) => model.id);
   const [toasts, setToasts] = useState<readonly ToastItem[]>([]);
   const [askKey, setAskKey] = useState(false);
   const [confirmRestart, setConfirmRestart] = useState(false);
@@ -95,7 +96,7 @@ export function App() {
   const loadAll = useCallback(() => {
     api<HubMeta>("/api/profiles").then(setMeta).catch(handleError);
     api<ModelsResponse>("/v1/models")
-      .then((body) => setModels(body.data.map((m) => m.id).sort()))
+      .then((body) => setModelEntries(body.data))
       .catch(handleError);
   }, [handleError]);
 
@@ -274,12 +275,12 @@ export function App() {
               </nav>
             ) : null}
             {tab === "models" ? (
-              <ModelsScreen models={models} profiles={meta?.profiles ?? []} onCopy={copy} />
+              <ModelsScreen models={modelEntries} profiles={meta?.profiles ?? []} onCopy={copy} />
             ) : null}
             {tab === "stats" ? <StatsScreen onError={(message) => toast(message, true)} /> : null}
             {tab === "overview" ? <UsageScreen period={overviewPeriod(route.query.get("range"))} /> : null}
             {tab === "errors" ? <ErrorsScreen /> : null}
-            {tab === "auto" ? <AutoScreen /> : null}
+            {tab === "auto" ? <AutoScreen models={modelEntries} /> : null}
             {tab === "insights" ? <InsightsScreen onCopy={copy} /> : null}
             {tab === "profiles" ? (
               <ProfilesScreen meta={meta} models={models} onChanged={loadAll} onToast={toast} />

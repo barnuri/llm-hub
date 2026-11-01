@@ -5,13 +5,13 @@ import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
 import { formatNumber } from "../lib/format";
 import { setQueryParam, useRoute } from "../lib/router";
-import type { ProfileRow } from "../lib/types";
+import type { HubModel, ProfileRow } from "../lib/types";
 import "../styles/screens/models.css";
 
 const COPIED_MS = 1500;
 
 interface ModelsScreenProps {
-  readonly models: readonly string[];
+  readonly models: readonly HubModel[];
   readonly profiles: readonly ProfileRow[];
   readonly onCopy: (id: string) => void;
 }
@@ -54,7 +54,7 @@ export function ModelsScreen({ models, profiles, onCopy }: ModelsScreenProps) {
 
   const modelCounts = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const id of models) {
+    for (const { id } of models) {
       const profile = profileOf(id);
       if (profile !== "") {
         counts.set(profile, (counts.get(profile) ?? 0) + 1);
@@ -70,8 +70,8 @@ export function ModelsScreen({ models, profiles, onCopy }: ModelsScreenProps) {
   const filtered = useMemo(
     () =>
       models
-        .filter((id) => activeProfile === "" || id.startsWith(`${activeProfile}/`))
-        .filter((id) => id.toLowerCase().includes(query.toLowerCase())),
+        .filter(({ id }) => activeProfile === "" || id.startsWith(`${activeProfile}/`))
+        .filter(({ id, description }) => `${id} ${description ?? ""}`.toLowerCase().includes(query.toLowerCase())),
     [models, query, activeProfile],
   );
 
@@ -171,7 +171,7 @@ export function ModelsScreen({ models, profiles, onCopy }: ModelsScreenProps) {
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map((id) => {
+                  {filtered.map(({ id, auto_tier, description }) => {
                     const profile = profileOf(id);
                     const copied = copiedId === id;
                     return (
@@ -181,6 +181,7 @@ export function ModelsScreen({ models, profiles, onCopy }: ModelsScreenProps) {
                             <span className="model-profile-part">{profile}/</span>
                             {id.slice(profile.length + 1)}
                           </span>
+                          {auto_tier && description ? <p className="model-description dim">{description}</p> : null}
                         </td>
                         <td className="dim">{labelFor(profile)}</td>
                         <td className="models-actions">

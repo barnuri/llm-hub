@@ -45,6 +45,7 @@ pub async fn list_models(
 ) -> Json<Value> {
     let mut payload = enabled_models(&state).await;
     ProfileFilter::from_request(query.profiles.as_deref(), &headers).retain_models(&mut payload);
+    crate::services::model_picker::sort_models(&mut payload, &state);
     if headers.contains_key(ANTHROPIC_VERSION_HEADER) {
         add_anthropic_list_fields(&mut payload);
     }
@@ -163,29 +164,25 @@ fn fallback_models(state: &AppState, profile: &ProfileConfig) -> Vec<Value> {
     copilot_models(state, profile, &items)
 }
 
-/// Rewrites Copilot catalog entries to `<profile>/<id>` and adds
-/// `<profile>/auto` plus one `<profile>/auto-<tier>` per Auto tier, each only
-/// when Copilot does not list that id itself.
 fn copilot_models(state: &AppState, profile: &ProfileConfig, items: &[&Value]) -> Vec<Value> {
-    let lists = |id: &str| {
-        items
-            .iter()
-            .any(|item| item.get("id").and_then(Value::as_str) == Some(id))
-    };
     let limits = state.model_limits().for_profile(&profile.name);
     let mut models: Vec<Value> = items
         .iter()
+        .filter(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .and_then(AutoTier::from_model)
+                .is_none()
+        })
         .map(|item| rewrite_model(profile, item, Some(&limits)))
         .collect();
-    let auto_ids = std::iter::once((COPILOT_AUTO_MODEL.to_string(), AutoTier::default())).chain(
-        AutoTier::ALL
-            .into_iter()
-            .map(|tier| (tier.model_id(), tier)),
-    );
-    for (id, tier) in auto_ids {
-        if !lists(&id) {
-            models.push(copilot_auto_model(profile, &id, tier));
-        }
+    for tier in AutoTier::ALL {
+        let id = if tier == AutoTier::default() {
+            COPILOT_AUTO_MODEL.to_string()
+        } else {
+            tier.model_id()
+        };
+        models.push(copilot_auto_model(profile, &id, tier));
     }
     models
 }
@@ -248,7 +245,6 @@ async fn first_refresh(state: &AppState) {
         .await;
 }
 
-/// `<profile>/<bare_id>` on `tier`: Copilot's router picks the model, on every wire API.
 fn copilot_auto_model(profile: &ProfileConfig, bare_id: &str, tier: AutoTier) -> Value {
     json!({
         "id": format!("{}/{bare_id}", profile.name),
@@ -256,11 +252,8 @@ fn copilot_auto_model(profile: &ProfileConfig, bare_id: &str, tier: AutoTier) ->
         "type": "model",
         "owned_by": profile.name,
         "display_name": format!("Auto ({}) · {}", tier.label(), profile.label()),
-        "description": format!(
-            "Copilot Auto picks the model per conversation on the {} tier, via llm-hub profile {}",
-            tier.as_str(),
-            profile.label()
-        ),
+        "description": tier.description(),
+        "auto_tier": tier.as_str(),
         "supported_endpoints": COPILOT_AUTO_ENDPOINTS,
     })
 }
@@ -439,9 +432,11 @@ fn annotate_context(
 /// Spawned from main: keeps the cache warm so client startups never fan out.
 pub fn spawn_background_refresh(state: AppState) {
     tokio::spawn(async move {
+        crate::services::model_picker::refresh_usage(&state).await;
         first_refresh(&state).await;
         loop {
             tokio::time::sleep(MODELS_CACHE_TTL).await;
+            crate::services::model_picker::refresh_usage(&state).await;
             refresh_models(&state).await;
         }
     });
@@ -648,7 +643,7 @@ mod tests {
         let payload = enabled_models(&restarted).await;
 
         let listed = ids(&payload);
-        assert_eq!(listed.len(), 7, "unexpected list {payload}");
+        assert_eq!(listed.len(), 6, "unexpected list {payload}");
         assert!(
             listed
                 .iter()
@@ -809,10 +804,32 @@ mod tests {
         );
     }
 
+    fn assert_canonical_auto_descriptions(payload: &Value) {
+        let descriptions: Vec<&str> = payload["data"].as_array().unwrap()[2..]
+            .iter()
+            .map(|model| model["description"].as_str().unwrap())
+            .collect();
+        let unique: std::collections::HashSet<_> = descriptions.iter().collect();
+        assert_eq!(unique.len(), 4);
+        assert!(
+            descriptions
+                .iter()
+                .all(|text| !text.contains("conversation"))
+        );
+        assert_eq!(
+            AutoTier::from_model("auto-balance"),
+            Some(AutoTier::Balance)
+        );
+    }
+
     #[tokio::test]
     async fn copilot_listing_its_own_auto_ids_is_not_duplicated() {
         let catalog = json!([
             {"id": "auto", "name": "Copilot Auto"},
+            {"id": "auto-balance", "description": "repeated conversation text"},
+            {"id": "auto-balanced"},
+            {"id": "auto-eco"},
+            {"id": "auto-max"},
             {"id": "auto-fast", "name": "Copilot Auto Fast"},
         ]);
         let (github, _copilot) = copilot_upstream(catalog, Duration::ZERO, None).await;
@@ -823,11 +840,10 @@ mod tests {
         assert_eq!(
             ids(&payload),
             [
-                "copilot/auto",
-                "copilot/auto-fast",
                 "copilot/auto-efficiency",
-                "copilot/auto-balance",
+                "copilot/auto",
                 "copilot/auto-intelligence",
+                "copilot/auto-fast",
             ]
         );
     }
@@ -861,9 +877,8 @@ mod tests {
             [
                 "copilot/claude-opus-4-5",
                 "copilot/gpt-4.1",
-                "copilot/auto",
                 "copilot/auto-efficiency",
-                "copilot/auto-balance",
+                "copilot/auto",
                 "copilot/auto-intelligence",
                 "copilot/auto-fast",
             ]
@@ -876,13 +891,13 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "Auto (Balance) · copilot",
                 "Auto (Efficiency) · copilot",
                 "Auto (Balance) · copilot",
                 "Auto (Intelligence) · copilot",
                 "Auto (Fast) · copilot",
             ]
         );
+        assert_canonical_auto_descriptions(&payload);
         let auto = &payload["data"][2];
         assert_eq!(auto["type"], "model");
         assert_eq!(
@@ -1041,7 +1056,7 @@ mod tests {
 
         assert_eq!(
             ids(&payload),
-            ["copilot/auto", "local/qwen", "ivrit/whisper"]
+            ["copilot/auto", "ivrit/whisper", "local/qwen"]
         );
     }
 

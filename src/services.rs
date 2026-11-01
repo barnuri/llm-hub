@@ -24,6 +24,7 @@ pub mod managed_process;
 #[cfg(test)]
 pub mod memory_credential_store;
 pub mod model_limits;
+pub(crate) mod model_picker;
 pub mod multipart_model;
 pub mod pricing;
 pub mod process_gh_cli;

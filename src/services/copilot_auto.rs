@@ -287,6 +287,23 @@ impl AutoTier {
         }
     }
 
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            AutoTier::Efficiency => {
+                "Prioritizes cost. Use for straightforward tasks, quick edits, and simple questions."
+            }
+            AutoTier::Balance => {
+                "Balances cost, quality, and latency. Use for everyday coding and debugging."
+            }
+            AutoTier::Intelligence => {
+                "Prioritizes quality. Use for complex bugs, architecture decisions, and tasks that need deeper reasoning."
+            }
+            AutoTier::Fast => {
+                "Additional hub routing tier. Official Copilot guidance covers Efficiency, Balance, and Intelligence."
+            }
+        }
+    }
+
     /// The bare model id that selects this tier, e.g. `auto-balance`.
     pub fn model_id(self) -> String {
         format!("{AUTO_MODEL}{AUTO_TIER_SEPARATOR}{}", self.as_str())

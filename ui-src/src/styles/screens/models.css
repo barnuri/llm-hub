@@ -80,6 +80,13 @@
   color: var(--text);
 }
 
+.models .model-description {
+  margin: 4px 0 0;
+  max-width: 65ch;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .models .model-profile-part {
   color: var(--muted);
 }

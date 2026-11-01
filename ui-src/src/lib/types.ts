@@ -1,3 +1,10 @@
+export interface HubModel {
+  readonly id: string;
+  readonly display_name?: string;
+  readonly description?: string;
+  readonly auto_tier?: AutoTier;
+}
+
 export interface ProfileRow {
   readonly name: string;
   /** Optional UI label; falls back to `name` when absent. */

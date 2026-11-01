@@ -188,16 +188,14 @@ mod tests {
 
     #[test]
     fn settings_come_before_the_passed_arguments() {
+        let settings = r#"{"modelPicker":{"replaceBuiltInOptions":true,"options":[{"model":"copilot/auto"},{"model":"copilot/opus[1m]"}]}}"#;
         let spec = spec_of(
             LaunchArgs::from_strs(&["-p", "hi"]),
-            Some("{\"modelPicker\":{}}".to_string()),
+            Some(settings.to_string()),
         );
 
         assert_eq!(spec.env_value("ANTHROPIC_MODEL"), None);
-        assert_eq!(
-            spec.argv(),
-            ["--settings", "{\"modelPicker\":{}}", "-p", "hi"]
-        );
+        assert_eq!(spec.argv(), ["--settings", settings, "-p", "hi"]);
     }
 
     #[test]

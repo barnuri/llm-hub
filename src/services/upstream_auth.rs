@@ -498,9 +498,8 @@ mod tests {
             [
                 "copilot/gpt-4.1",
                 "copilot/gemini-2.5-pro",
-                "copilot/auto",
                 "copilot/auto-efficiency",
-                "copilot/auto-balance",
+                "copilot/auto",
                 "copilot/auto-intelligence",
                 "copilot/auto-fast"
             ]

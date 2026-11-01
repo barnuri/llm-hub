@@ -141,6 +141,18 @@ impl StatsRegistry {
         record_entry(&self.overall, outcome);
     }
 
+    pub(crate) fn model_request_counts(&self) -> HashMap<String, u64> {
+        self.by_model
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().requests.load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
     pub fn snapshot(&self, range: &str, persistent: bool) -> StatsSnapshot {
         let profiles = snapshot_map(&self.by_profile);
         let models = snapshot_map(&self.by_model);

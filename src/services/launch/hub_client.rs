@@ -156,10 +156,11 @@ mod tests {
     #[tokio::test]
     async fn settings_and_models_send_the_bearer() {
         let server = MockServer::start().await;
+        let settings = r#"{"modelPicker":{"replaceBuiltInOptions":true,"options":[{"model":"copilot/auto"},{"model":"copilot/opus[1m]"}]}}"#;
         Mock::given(method("GET"))
             .and(path("/api/claude-code/settings"))
             .and(header("authorization", "Bearer key-1"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("{\"modelPicker\":{}}"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(settings))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -172,10 +173,7 @@ mod tests {
             .await;
         let client = client_for(&server.uri());
 
-        assert_eq!(
-            client.claude_settings().await.as_deref(),
-            Some("{\"modelPicker\":{}}")
-        );
+        assert_eq!(client.claude_settings().await.as_deref(), Some(settings));
         assert_eq!(
             client.models().await,
             [HubModel::new("copilot/auto", Some(128_000))]

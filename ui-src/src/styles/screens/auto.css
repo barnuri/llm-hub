@@ -7,6 +7,30 @@
   margin: -6px 0 12px;
 }
 
+.auto-tier-guide {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 24px;
+}
+
+.auto-tier-row {
+  min-width: 0;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.auto-tier-name {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.auto-tier-row p {
+  margin: 4px 0 0;
+  max-width: 65ch;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
 .auto-kpis {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -132,6 +156,9 @@
   }
 
   .auto-mix {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .auto-tier-guide {
     grid-template-columns: minmax(0, 1fr);
   }
 }

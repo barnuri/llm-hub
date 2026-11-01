@@ -7,7 +7,7 @@ import { Pill, type PillTone } from "../components/Pill";
 import { api } from "../lib/api";
 import { formatDateTime, formatNumber } from "../lib/format";
 import { setQueryParam, useRoute } from "../lib/router";
-import type { AutoDecision, AutoDecisionsResponse, AutoTurn } from "../lib/types";
+import type { AutoDecision, AutoDecisionsResponse, AutoTurn, HubModel } from "../lib/types";
 import "../styles/screens/auto.css";
 
 const REFRESH_MS = 5000;
@@ -71,7 +71,7 @@ function mixRows(rows: readonly AutoDecision[], keyOf: (row: AutoDecision) => st
   }));
 }
 
-export function AutoScreen() {
+export function AutoScreen({ models }: { readonly models: readonly HubModel[] }) {
   const route = useRoute();
   const session = route.query.get("session") ?? "";
   const [decisions, setDecisions] = useState<readonly AutoDecision[] | null>(null);
@@ -142,6 +142,21 @@ export function AutoScreen() {
           </Pill>
         )}
       </div>
+
+      <p className="note">
+        Auto usually reuses a model during a conversation. A scheduled complexity check or token refresh can select a new model.
+        The hub can also substitute a model when the selected one cannot handle a request. <a href="https://docs.github.com/en/copilot/concepts/models/auto-model-selection" target="_blank" rel="noreferrer">Copilot tier guidance</a>
+      </p>
+      <Panel title="Auto tiers" sub="Choose a routing preference">
+        <div className="auto-tier-guide">
+          {models.filter((model) => model.auto_tier !== undefined).map((model) => (
+            <article className="auto-tier-row" key={model.id}>
+              <div className="auto-tier-name">{model.display_name ?? model.id}</div>
+              <p>{model.description}</p>
+            </article>
+          ))}
+        </div>
+      </Panel>
 
       <div className="auto-kpis">
         <KpiCard

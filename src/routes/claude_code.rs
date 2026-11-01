@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
@@ -8,10 +6,7 @@ use serde_json::{Value, json};
 use crate::dependencies::state::AppState;
 use crate::routes::models::{ProfilesQuery, enabled_models};
 use crate::schemas::launch::profile_filter::ProfileFilter;
-use crate::services::store::{StatsFilter, now_ms};
-
-const USAGE_WINDOW_MS: u64 = 30 * 86_400_000;
-const USAGE_RANGE_LABEL: &str = "30d";
+use crate::services::model_picker::sort_models;
 
 /// `claude --settings` input listing every hub model, since gateway
 /// discovery only keeps ids that mention `claude` or `anthropic`.
@@ -24,51 +19,15 @@ pub async fn settings(
 ) -> Json<Value> {
     let mut payload = enabled_models(&state).await;
     ProfileFilter::from_request(query.profiles.as_deref(), &headers).retain_models(&mut payload);
-    let usage = model_usage(&state);
-    let mut models: Vec<&Value> = payload
+    sort_models(&mut payload, &state);
+    let models: Vec<&Value> = payload
         .get("data")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .collect();
-    models.sort_by_key(|model| picker_rank(model, &usage));
     let options: Vec<Value> = models.into_iter().filter_map(picker_option).collect();
-    Json(json!({ "modelPicker": { "options": options } }))
-}
-
-/// Requests per qualified model id: the stored last 30 days when the hub
-/// persists stats, otherwise the counts since this process started.
-fn model_usage(state: &AppState) -> HashMap<String, u64> {
-    let stored = state.store().and_then(|store| {
-        store
-            .stats(&StatsFilter {
-                since_ms: Some(now_ms().saturating_sub(USAGE_WINDOW_MS)),
-                profile: None,
-                model: None,
-                range_label: USAGE_RANGE_LABEL.to_string(),
-            })
-            .ok()
-    });
-    let snapshot = stored.unwrap_or_else(|| state.stats().snapshot("live", false));
-    snapshot
-        .models
-        .into_iter()
-        .map(|row| (row.key, row.requests))
-        .collect()
-}
-
-/// Sort key: Auto models first, then the most-used models. The sort is stable,
-/// so equal keys keep the listing order.
-fn picker_rank(model: &Value, usage: &HashMap<String, u64>) -> (bool, std::cmp::Reverse<u64>) {
-    let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
-    let is_auto = id
-        .split_once('/')
-        .is_some_and(|(_, bare)| bare == "auto" || bare.starts_with("auto-"));
-    let requests = usage.get(id).copied().unwrap_or(0);
-    (
-        !is_auto,
-        std::cmp::Reverse(if is_auto { 0 } else { requests }),
-    )
+    Json(json!({ "modelPicker": { "replaceBuiltInOptions": true, "options": options } }))
 }
 
 fn picker_option(model: &Value) -> Option<Value> {
@@ -145,7 +104,7 @@ mod tests {
 
         assert_eq!(
             picker_models(&settings),
-            ["copilot/auto", "ivrit/whisper", "copilot/gpt-4.1"]
+            ["copilot/auto", "copilot/gpt-4.1", "ivrit/whisper"]
         );
     }
 
@@ -192,7 +151,7 @@ mod tests {
 
         assert_eq!(
             settings,
-            json!({"modelPicker": {"options": [
+            json!({"modelPicker": {"replaceBuiltInOptions": true, "options": [
                 {
                     "model": "copilot/claude-opus-4-5",
                     "label": "claude-opus-4-5 · copilot",
@@ -203,32 +162,47 @@ mod tests {
         );
     }
 
-    #[test]
-    fn picker_puts_auto_first_then_most_used() {
-        let models = [
-            json!({"id": "copilot/gpt-6-luna"}),
-            json!({"id": "copilot/claude-opus-5-5"}),
-            json!({"id": "copilot/auto"}),
-            json!({"id": "local/qwen"}),
-            json!({"id": "copilot/auto-intelligence"}),
-        ];
-        let usage = HashMap::from([
-            ("copilot/claude-opus-5-5".to_string(), 40),
-            ("local/qwen".to_string(), 7),
+    #[tokio::test]
+    async fn picker_reads_cached_counts_and_preserves_context_ids() {
+        let state = state_from(&[
+            ("LLM_HUB_PROFILES", "copilot"),
+            ("LLM_HUB_COPILOT_BASE_URL", "http://127.0.0.1:9"),
         ]);
-        let mut ordered: Vec<&Value> = models.iter().collect();
-
-        ordered.sort_by_key(|model| picker_rank(model, &usage));
-
-        let ids: Vec<&str> = ordered.iter().filter_map(|m| m["id"].as_str()).collect();
+        state.set_model_cache(json!({"data": [
+            {"id": "copilot/auto-intelligence", "owned_by": "copilot"},
+            {"id": "copilot/auto", "owned_by": "copilot"},
+            {"id": "copilot/opus[1m]", "owned_by": "copilot"},
+            {"id": "copilot/unused", "owned_by": "copilot"},
+        ]}));
+        let outcome = crate::services::stats::RequestOutcome {
+            profile: "copilot".into(),
+            model_key: "copilot/opus".into(),
+            status: 200,
+            ts_ms: 0,
+            latency_ms: 1,
+            ttft_ms: None,
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            error: None,
+            client: None,
+        };
+        state.stats().record(&outcome);
+        let Json(settings) = super::settings(
+            State(state),
+            Query(ProfilesQuery::default()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(settings["modelPicker"]["replaceBuiltInOptions"], true);
         assert_eq!(
-            ids,
+            picker_models(&settings),
             [
                 "copilot/auto",
                 "copilot/auto-intelligence",
-                "copilot/claude-opus-5-5",
-                "local/qwen",
-                "copilot/gpt-6-luna"
+                "copilot/opus[1m]",
+                "copilot/unused"
             ]
         );
     }
