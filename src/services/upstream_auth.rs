@@ -63,7 +63,7 @@ fn insert_copilot_headers(
     body: &[u8],
     headers: &mut HeaderMap,
 ) {
-    let path = path.split_once('?').map_or(path, |(bare, _)| bare);
+    let path = crate::services::copilot_auto::bare_path(path);
     let copilot_headers = if body.is_empty() {
         copilot_headers::models_headers(auth.flow)
     } else {

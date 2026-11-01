@@ -1,3 +1,4 @@
+use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,16 +15,15 @@ use crate::consts::{
 };
 use crate::schemas::copilot_token_response::CopilotTokenResponse;
 use crate::schemas::copilot_user_response::CopilotUserResponse;
+use crate::services::copilot_headers::{
+    ACCEPT_JSON, HEADER_API_VERSION, HEADER_EDITOR_PLUGIN_VERSION, HEADER_EDITOR_VERSION,
+};
 use crate::services::credential_store::CredentialStore;
 use crate::services::gh_cli::GhCli;
 use crate::services::github_token_resolver;
 
 const EXCHANGE_PATH: &str = "copilot_internal/v2/token";
 const USER_PATH: &str = "copilot_internal/user";
-const ACCEPT_JSON: &str = "application/json";
-const HEADER_EDITOR_VERSION: &str = "editor-version";
-const HEADER_EDITOR_PLUGIN_VERSION: &str = "editor-plugin-version";
-const HEADER_API_VERSION: &str = "x-github-api-version";
 const LOCALHOST: &str = "localhost";
 const COPILOT_API_HOST: &str = "githubcopilot.com";
 const GHE_DOMAIN_SUFFIX: &str = ".ghe.com";
@@ -35,6 +35,16 @@ pub struct CopilotSessionCache {
     credentials: Arc<dyn CredentialStore>,
     gh: Arc<dyn GhCli>,
     entries: DashMap<String, Arc<SessionEntry>>,
+}
+
+/// Prints only the cached profile names; credentials and bearers stay out of logs.
+impl fmt::Debug for CopilotSessionCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let profiles: Vec<String> = self.entries.iter().map(|e| e.key().clone()).collect();
+        f.debug_struct("CopilotSessionCache")
+            .field("profiles", &profiles)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One profile's slot. The async mutex makes concurrent requests share one acquire.
@@ -472,6 +482,24 @@ mod tests {
         let expected = (COPILOT_TOKEN.to_string(), Some(BUSINESS_API.to_string()));
         assert_eq!(first, expected);
         assert_eq!(second, expected);
+    }
+
+    #[tokio::test]
+    async fn debug_lists_profiles_without_secrets() {
+        let server = MockServer::start().await;
+        mount_exchange(&server, token_body(NOW + 1800, 1500), 1).await;
+        let auth = vscode_auth(&server);
+        let cache = vscode_cache(&auth);
+        cache
+            .get_at(&reqwest::Client::new(), PROFILE, &auth, NOW)
+            .await
+            .unwrap();
+
+        let printed = format!("{cache:?}");
+
+        assert!(printed.contains(PROFILE));
+        assert!(!printed.contains(COPILOT_TOKEN));
+        assert!(!printed.contains(LOGIN_TOKEN));
     }
 
     #[tokio::test]

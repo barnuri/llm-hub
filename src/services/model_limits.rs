@@ -1,6 +1,5 @@
-//! The prompt limit each Copilot model really enforces. Copilot's `/models`
-//! understates it for Claude on `/v1/messages`, so the hub seeds measured values
-//! and learns the rest from the upstream's own rejections. It never probes.
+//! The prompt limit each Copilot model enforces: seeded with measured values,
+//! then learned from the upstream's own rejections, never probed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
@@ -76,9 +75,8 @@ impl ModelLimits {
         ("claude-haiku-4.5", 200_000),
     ];
 
-    /// Seeds every Copilot profile in the store, then loads every saved limit.
-    /// A seed never replaces a learned limit. Call at startup only: it reads and
-    /// writes the store.
+    /// Seeds every Copilot profile (a seed never replaces a learned limit), then
+    /// loads every saved limit. Call at startup only.
     pub fn load<'a>(
         store: Option<&Store>,
         copilot_profiles: impl IntoIterator<Item = &'a str>,

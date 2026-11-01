@@ -35,7 +35,6 @@ struct DecisionsBody {
 
 /// `GET /api/copilot/auto/decisions?session=<id>&limit=N`: recent Copilot Auto
 /// decisions, newest first, for one Claude Code session or for all of them.
-/// `limit` defaults to 50 and is clamped to 1..=200.
 pub async fn auto_decisions(
     State(state): State<AppState>,
     Query(query): Query<DecisionsQuery>,

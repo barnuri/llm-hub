@@ -1,6 +1,5 @@
-//! Anthropic request fields that Copilot's `/v1/messages` rejects with
-//! "<path>: Extra inputs are not permitted". The hub learns each one from the
-//! rejection and strips it from later requests to the same profile.
+//! Anthropic request fields Copilot's `/v1/messages` rejects as "Extra inputs are
+//! not permitted", learned from each rejection and stripped from later requests.
 
 use std::collections::HashMap;
 use std::sync::Arc;

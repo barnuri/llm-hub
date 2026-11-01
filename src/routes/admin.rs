@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::configs::{ProfileConfig, mask_key};
 use crate::consts::{DEFAULT_INSIGHTS_MIN_REQUESTS, DEFAULT_INSIGHTS_RANGE, ENV_FILE, VERSION};
 use crate::dependencies::state::AppState;
-use crate::routes::models::MODELS_PATH;
+use crate::routes::models::send_models_request;
 use crate::schemas::api_key_input::ApiKeyInput;
 use crate::schemas::api_key_record::ApiKeyRecord;
 use crate::schemas::app_error::AppError;
@@ -24,7 +24,6 @@ use crate::services::env_writer;
 use crate::services::insights;
 use crate::services::stats::RequestOutcome;
 use crate::services::store::{StatsFilter, hash_key, now_ms};
-use crate::services::upstream_auth;
 use crate::utils::hex::to_hex;
 use crate::utils::time::elapsed_ms;
 
@@ -172,7 +171,7 @@ pub async fn test_profile(
         .ok_or_else(|| AppError::Internal("no client".into()))?;
 
     let started = std::time::Instant::now();
-    let probe = probe_models(&state, &client, profile);
+    let probe = send_models_request(&state, &client, profile);
     match tokio::time::timeout(crate::consts::MODELS_FANOUT_TIMEOUT, probe).await {
         Ok(Ok(response)) => {
             let healthy = response.status().is_success();
@@ -192,29 +191,6 @@ pub async fn test_profile(
             Ok(Json(json!({ "ok": false, "error": "timeout" })))
         }
     }
-}
-
-async fn probe_models(
-    state: &AppState,
-    client: &reqwest::Client,
-    profile: &ProfileConfig,
-) -> Result<reqwest::Response, String> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    let (base, copilot_bearer) =
-        upstream_auth::resolve(state, client, profile, MODELS_PATH, &[], &mut headers).await?;
-    let mut request = client.get(format!("{base}{MODELS_PATH}")).headers(headers);
-    for (header_name, value) in &profile.extra_headers {
-        request = request.header(header_name, value);
-    }
-    let response = request.send().await.map_err(|e| e.to_string())?;
-    upstream_auth::invalidate_if_unauthorized(
-        state,
-        &profile.name,
-        response.status(),
-        copilot_bearer.as_deref(),
-    )
-    .await;
-    Ok(response)
 }
 
 /// Triggers a graceful restart: supervised installs are restarted by their
@@ -582,4 +558,147 @@ async fn insights_catalog(
             enabled && profile.is_none_or(|wanted| wanted == model_profile)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::configs::{CopilotFlow, HubConfig};
+    use crate::consts::COPILOT_INTEGRATION_ID;
+    use crate::routes::models::MODELS_PATH;
+    use crate::services::copilot_headers::HEADER_API_VERSION;
+    use crate::services::credential_store::CredentialStore;
+    use crate::services::fake_gh_cli::FakeGhCli;
+    use crate::services::gh_cli::GhOutcome;
+    use crate::services::memory_credential_store::MemoryCredentialStore;
+
+    const DEAD_BASE_URL: &str = "http://127.0.0.1:9";
+    const LOGIN_TOKEN: &str = "gho_from_login";
+    const FIRST_COPILOT_TOKEN: &str = "tid=first";
+    const SECOND_COPILOT_TOKEN: &str = "tid=second";
+    const EXCHANGE_PATH: &str = "/copilot_internal/v2/token";
+    const STATIC_KEY: &str = "sk-static";
+
+    fn state_for(vars: &[(&str, &str)]) -> AppState {
+        let vars: HashMap<String, String> = vars
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        let store = MemoryCredentialStore::default();
+        store
+            .set(
+                &CopilotFlow::Vscode.credential_account("github.com"),
+                LOGIN_TOKEN,
+            )
+            .unwrap();
+        let gh = FakeGhCli::new(GhOutcome::Failed("gh not used".into()));
+        AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            None,
+            Arc::new(store),
+            Arc::new(gh),
+        )
+        .unwrap()
+    }
+
+    fn token_response(token: &str, copilot: &MockServer) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "token": token,
+            "expires_at": 4_000_000_000_u64,
+            "refresh_in": 1500,
+            "endpoints": {"api": copilot.uri()},
+        }))
+    }
+
+    async fn probe(state: &AppState, name: &str) -> Value {
+        let Json(body) = test_profile(State(state.clone()), UrlPath(name.to_string()))
+            .await
+            .unwrap();
+        body
+    }
+
+    #[tokio::test]
+    async fn test_profile_sends_the_static_api_key() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(MODELS_PATH))
+            .and(header(
+                "authorization",
+                format!("Bearer {STATIC_KEY}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let state = state_for(&[
+            ("LLM_HUB_PROFILES", "openai"),
+            ("LLM_HUB_OPENAI_BASE_URL", &upstream.uri()),
+            ("LLM_HUB_OPENAI_API_KEY", STATIC_KEY),
+        ]);
+
+        let body = probe(&state, "openai").await;
+
+        assert_eq!(body["ok"], true, "{body}");
+        assert_eq!(state.upstream_health().get("openai").copied(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_profile_sends_copilot_auth_and_drops_the_session_on_401() {
+        let github = MockServer::start().await;
+        let copilot = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(EXCHANGE_PATH))
+            .respond_with(token_response(FIRST_COPILOT_TOKEN, &copilot))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(EXCHANGE_PATH))
+            .respond_with(token_response(SECOND_COPILOT_TOKEN, &copilot))
+            .expect(1)
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(MODELS_PATH))
+            .and(header(
+                "authorization",
+                format!("Bearer {FIRST_COPILOT_TOKEN}").as_str(),
+            ))
+            .and(header("copilot-integration-id", COPILOT_INTEGRATION_ID))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&copilot)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(MODELS_PATH))
+            .and(header(
+                "authorization",
+                format!("Bearer {SECOND_COPILOT_TOKEN}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+            .expect(1)
+            .mount(&copilot)
+            .await;
+        let state = state_for(&[
+            ("LLM_HUB_PROFILES", "copilot"),
+            ("LLM_HUB_COPILOT_BASE_URL", DEAD_BASE_URL),
+            ("LLM_HUB_COPILOT_AUTH", CopilotFlow::Vscode.auth_value()),
+            ("LLM_HUB_COPILOT_GITHUB_API_URL", &github.uri()),
+        ]);
+
+        let rejected = probe(&state, "copilot").await;
+        let retried = probe(&state, "copilot").await;
+
+        assert_eq!(rejected["status"], 401, "{rejected}");
+        assert_eq!(retried["ok"], true, "{retried}");
+        let received = copilot.received_requests().await.unwrap();
+        assert!(received[0].headers.contains_key(HEADER_API_VERSION));
+    }
 }

@@ -1,12 +1,5 @@
-//! Anthropic Messages reply -> `OpenAI` chat completion, for Copilot Claude
-//! models that answer `/chat/completions` in their native shape.
-//!
-//! Newer Copilot Claude models (Opus 4.7 and later) can answer an `OpenAI`
-//! request with Anthropic content blocks and `stop_reason` and no `choices`
-//! array (`LiteLLM` issue 29391). The repair is content-detected, so a reply
-//! that is already `OpenAI`-shaped passes through byte for byte: a buffered
-//! body is checked once it is complete, and a stream is checked on its first
-//! `data:` frame and then either rewritten frame by frame or left alone.
+//! Anthropic Messages reply -> `OpenAI` chat completion, for Copilot Claude models that
+//! answer `/chat/completions` in their native shape. An `OpenAI` reply passes through.
 
 use std::collections::HashMap;
 
@@ -33,15 +26,16 @@ const ANTHROPIC_EVENTS: [&str; 8] = [
 
 /// Rewrites one upstream reply into `OpenAI` shape when it turns out to be an
 /// Anthropic one. Fed chunk by chunk, like a response transform.
+#[derive(Debug)]
 pub enum NativeReplyRepair {
-    /// A non-SSE body, held until the end (or until it exceeds the transform
-    /// buffer cap, at which point it is forwarded untouched).
+    /// A non-SSE body, held until the end, or forwarded untouched past the buffer cap.
     Body(BufferedReply),
     /// An SSE body, rewritten one frame at a time.
     Stream(Box<NativeReplyStream>),
 }
 
 impl NativeReplyRepair {
+    /// A repair for an SSE body when `is_sse`, else for a buffered one.
     #[must_use]
     pub fn new(is_sse: bool) -> Self {
         if is_sse {
@@ -69,7 +63,7 @@ impl NativeReplyRepair {
 }
 
 /// A whole non-SSE reply, converted at the end when it is Anthropic-shaped.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct BufferedReply {
     buf: Vec<u8>,
     /// Set once the body outgrew the cap; everything after streams through.
@@ -95,9 +89,8 @@ impl BufferedReply {
     }
 }
 
-/// Converts an Anthropic message body into an `OpenAI` chat completion.
-/// Returns `None` for anything else, including a body that already carries
-/// `choices`, so the caller forwards it unchanged.
+/// Converts an Anthropic message body into an `OpenAI` chat completion. Returns `None` for
+/// anything else, including a body that already carries `choices`.
 #[must_use]
 pub fn to_chat_completion(body: &[u8]) -> Option<Vec<u8>> {
     let message: Value = serde_json::from_slice(body).ok()?;
@@ -177,10 +170,8 @@ fn is_anthropic_message(value: &Value) -> bool {
             || value.get("content").is_some_and(Value::is_array))
 }
 
-/// Anthropic `stop_reason` -> `OpenAI` `finish_reason`. A message carrying
-/// tool calls always reports `tool_calls`, since that is what drives an
-/// `OpenAI` client's tool loop. With no reason at all, an empty reply is
-/// reported as cut off (`length`), the way `LiteLLM` does.
+/// Anthropic `stop_reason` -> `OpenAI` `finish_reason`. Tool calls always report `tool_calls`
+/// (they drive the client's tool loop); an empty reply with no reason reports `length`.
 fn finish_reason(stop_reason: Option<&str>, saw_tool_call: bool, saw_text: bool) -> &'static str {
     if saw_tool_call {
         return "tool_calls";
@@ -195,9 +186,8 @@ fn finish_reason(stop_reason: Option<&str>, saw_tool_call: bool, saw_text: bool)
     }
 }
 
-/// Anthropic usage -> `OpenAI` usage. `OpenAI`'s `prompt_tokens` counts cached
-/// tokens too, so cache reads and writes are added back in; cache writes keep
-/// their Anthropic name as well, which is where the stats scraper reads them.
+/// Anthropic usage -> `OpenAI` usage, with cache reads and writes added to `prompt_tokens`.
+/// Cache writes keep their Anthropic name too, which is where the stats scraper reads them.
 fn openai_usage(usage: &Map<String, Value>) -> Value {
     let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     let cache_read = field("cache_read_input_tokens");
@@ -248,7 +238,17 @@ pub struct NativeReplyStream {
     done: bool,
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+impl std::fmt::Debug for NativeReplyStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeReplyStream")
+            .field("mode", &self.mode)
+            .field("model", &self.model)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// No `data:` frame yet, so the shape is still unknown.
     #[default]

@@ -8,6 +8,7 @@ use tokio::time::Instant;
 
 use crate::configs::{CopilotAuth, GithubTokenSource, HubConfig, env_name};
 use crate::consts::{COPILOT_DEVICE_POLL_MARGIN, GITHUB_OAUTH_SCOPE, VERSION};
+use crate::services::copilot_headers::ACCEPT_JSON;
 use crate::services::copilot_sessions::CopilotSessionCache;
 use crate::services::credential_store::CredentialStore;
 use crate::services::gh_cli::GhCli;
@@ -15,7 +16,6 @@ use crate::services::gh_cli::GhCli;
 const DEVICE_CODE_PATH: &str = "login/device/code";
 const ACCESS_TOKEN_PATH: &str = "login/oauth/access_token";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
-const ACCEPT_JSON: &str = "application/json";
 const ERROR_AUTHORIZATION_PENDING: &str = "authorization_pending";
 const ERROR_SLOW_DOWN: &str = "slow_down";
 const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);

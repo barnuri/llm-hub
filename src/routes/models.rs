@@ -17,17 +17,18 @@ use crate::schemas::model_context::{
     advertised_model_id, inferred_max_input_tokens, max_input_tokens_from_item,
 };
 use crate::schemas::upstream_model::UpstreamModel;
-use crate::services::copilot_auto::{AUTO_MODEL, AutoTier};
+use crate::services::copilot_auto::{
+    AUTO_MODEL, AutoTier, CHAT_ENDPOINT, MESSAGES_ENDPOINT, RESPONSES_ENDPOINT,
+};
 use crate::services::model_limits::ModelLimit;
 use crate::services::upstream_auth;
 
 pub(crate) const MODELS_PATH: &str = "/models";
 /// The bare model id a Copilot profile advertises for Copilot Auto routing.
 pub(crate) const COPILOT_AUTO_MODEL: &str = AUTO_MODEL;
-const COPILOT_AUTO_ENDPOINTS: [&str; 3] = ["/chat/completions", "/responses", "/v1/messages"];
+const COPILOT_AUTO_ENDPOINTS: [&str; 3] = [CHAT_ENDPOINT, RESPONSES_ENDPOINT, MESSAGES_ENDPOINT];
 const COPILOT_POLICY_DISABLED: &str = "disabled";
 const CLAUDE_ID_PREFIX: &str = "claude-";
-const NATIVE_MESSAGES_ENDPOINT: &str = "/v1/messages";
 const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
 
 /// `?profiles=a,b` limits a model list to those profiles, like the
@@ -191,7 +192,6 @@ fn copilot_models(state: &AppState, profile: &ProfileConfig, items: &[&Value]) -
 
 /// Loads the Copilot catalogs saved by earlier runs, so the first request after
 /// a restart already maps dashed Claude ids and picks native `/v1/messages`.
-/// Call before the server accepts requests.
 pub fn restore_catalogs(state: &AppState) {
     let Some(store) = state.store() else {
         return;
@@ -214,10 +214,8 @@ pub fn restore_catalogs(state: &AppState) {
     }
 }
 
-/// Holds a proxied request while an enabled Copilot profile has no catalog
-/// and the first fan-out since startup is still running, so the request is
-/// not sent upstream with an unmapped id. Once that fan-out has finished this
-/// costs one atomic load.
+/// Holds a proxied request until the first fan-out maps Copilot ids, when a
+/// Copilot profile has no catalog yet.
 pub async fn await_first_catalog(
     State(state): State<AppState>,
     request: Request,
@@ -279,7 +277,7 @@ fn upstream_catalog(profile: &ProfileConfig, items: &[&Value]) -> HashMap<String
                 .is_some_and(|endpoints| {
                     endpoints
                         .iter()
-                        .any(|e| e.as_str() == Some(NATIVE_MESSAGES_ENDPOINT))
+                        .any(|e| e.as_str() == Some(MESSAGES_ENDPOINT))
                 });
             let entry = UpstreamModel {
                 upstream_id: upstream_id.to_string(),
@@ -314,6 +312,20 @@ async fn fetch_models_body(
     client: &reqwest::Client,
     profile: &ProfileConfig,
 ) -> Result<Value, String> {
+    let response = send_models_request(state, client, profile).await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("status {status}"));
+    }
+    response.json().await.map_err(|e| e.to_string())
+}
+
+/// Sends the profile's authenticated `GET /models` and drops a Copilot session the upstream rejects.
+pub(crate) async fn send_models_request(
+    state: &AppState,
+    client: &reqwest::Client,
+    profile: &ProfileConfig,
+) -> Result<reqwest::Response, String> {
     let mut headers = HeaderMap::new();
     let (base, copilot_bearer) =
         upstream_auth::resolve(state, client, profile, MODELS_PATH, &[], &mut headers).await?;
@@ -321,20 +333,15 @@ async fn fetch_models_body(
     for (name, value) in &profile.extra_headers {
         request = request.header(name, value);
     }
-
     let response = request.send().await.map_err(|e| e.to_string())?;
-    let status = response.status();
     upstream_auth::invalidate_if_unauthorized(
         state,
         &profile.name,
-        status,
+        response.status(),
         copilot_bearer.as_deref(),
     )
     .await;
-    if !status.is_success() {
-        return Err(format!("status {status}"));
-    }
-    response.json().await.map_err(|e| e.to_string())
+    Ok(response)
 }
 
 /// Copilot lists models its own clients hide or the account's policy disables.

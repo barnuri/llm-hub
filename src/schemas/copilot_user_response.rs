@@ -5,8 +5,8 @@ use serde::Deserialize;
 use crate::schemas::copilot_endpoints::CopilotEndpoints;
 use crate::schemas::copilot_quota_snapshot::CopilotQuotaSnapshot;
 
-/// Body of `GET copilot_internal/user`, the Flow B entitlement and base-URL
-/// lookup, and the source of the Copilot quota.
+/// Body of `GET copilot_internal/user`: the opencode flow's entitlement and
+/// base-URL lookup, and the source of the Copilot quota.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct CopilotUserResponse {
     pub chat_enabled: Option<bool>,

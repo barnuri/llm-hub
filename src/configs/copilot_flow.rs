@@ -14,6 +14,7 @@ pub enum CopilotFlow {
 }
 
 impl CopilotFlow {
+    /// Parses an `LLM_HUB_<NAME>_AUTH` value. `None` when it is unknown.
     #[must_use]
     pub fn from_auth_value(value: &str) -> Option<CopilotFlow> {
         match value {
@@ -23,6 +24,7 @@ impl CopilotFlow {
         }
     }
 
+    /// The `LLM_HUB_<NAME>_AUTH` value that selects this flow.
     #[must_use]
     pub fn auth_value(self) -> &'static str {
         match self {
@@ -46,6 +48,7 @@ impl CopilotFlow {
         format!("{}:{domain}", self.auth_value())
     }
 
+    /// Where this flow reads its GitHub token when the profile sets no source.
     #[must_use]
     pub fn default_token_source(self) -> GithubTokenSource {
         match self {

@@ -16,10 +16,8 @@ use crate::schemas::anthropic_error::AnthropicError;
 use crate::schemas::app_error::AppError;
 use crate::services::transforms::RouteKind;
 
-/// Anthropic-only request headers. Stripped here rather than in
-/// `utils::headers` so the `/v1/{*path}` passthrough — which may legitimately
-/// front a real Anthropic-shaped upstream — keeps forwarding them.
-/// `anthropic-beta` stays: the attempt loop sends it on native attempts only.
+/// Anthropic-only request headers, stripped here so the `/v1/{*path}` passthrough keeps
+/// them. `anthropic-beta` stays: the attempt loop sends it on native attempts only.
 const ANTHROPIC_REQUEST_HEADERS: [&str; 2] = [
     "anthropic-version",
     "anthropic-dangerous-direct-browser-access",

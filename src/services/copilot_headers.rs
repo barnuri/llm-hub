@@ -12,11 +12,13 @@ use crate::consts::{
 
 pub const HEADER_X_INITIATOR: &str = "x-initiator";
 pub const HEADER_VISION_REQUEST: &str = "copilot-vision-request";
-const HEADER_EDITOR_VERSION: &str = "editor-version";
-const HEADER_EDITOR_PLUGIN_VERSION: &str = "editor-plugin-version";
+pub const HEADER_EDITOR_VERSION: &str = "editor-version";
+pub const HEADER_EDITOR_PLUGIN_VERSION: &str = "editor-plugin-version";
 const HEADER_INTEGRATION_ID: &str = "copilot-integration-id";
 const HEADER_OPENAI_INTENT: &str = "openai-intent";
-const HEADER_API_VERSION: &str = "x-github-api-version";
+pub const HEADER_API_VERSION: &str = "x-github-api-version";
+/// The `Accept` value for GitHub's JSON endpoints (token exchange, user lookup, device login).
+pub const ACCEPT_JSON: &str = "application/json";
 const HEADER_INTERACTION_TYPE: &str = "x-interaction-type";
 /// The intent and interaction type Copilot expects on its native Anthropic
 /// endpoints, matching the `LiteLLM` Copilot messages transformation.

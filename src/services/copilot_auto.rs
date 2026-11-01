@@ -19,15 +19,18 @@ const AUTO_PATH: &str = "auto";
 /// The bare model id of Copilot Auto on its default tier; `auto-<tier>` names a tier.
 pub const AUTO_MODEL: &str = "auto";
 const AUTO_TIER_SEPARATOR: char = '-';
-const HEADER_API_VERSION: &str = "x-github-api-version";
+use crate::services::copilot_headers::HEADER_API_VERSION;
 /// `/auto` rejects every other version with "invalid apiVersion".
 const AUTO_API_VERSION: &str = "2026-08-01";
 const AUTO_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_REFRESH_MARGIN_SECS: u64 = 5 * 60;
 const MAX_CONVERSATIONS: usize = 256;
-const CHAT_ENDPOINT: &str = "/chat/completions";
-const RESPONSES_ENDPOINT: &str = "/responses";
-const MESSAGES_ENDPOINT: &str = "/v1/messages";
+/// Copilot's chat-completions path, as sent upstream and as `supported_endpoints` lists it.
+pub const CHAT_ENDPOINT: &str = "/chat/completions";
+/// Copilot's Responses API path, as sent upstream and as `supported_endpoints` lists it.
+pub const RESPONSES_ENDPOINT: &str = "/responses";
+/// Copilot serves Claude models on the Anthropic Messages API at this path.
+pub const MESSAGES_ENDPOINT: &str = "/v1/messages";
 const CLAUDE_ID_PREFIX: &str = "claude-";
 const TEXT_PART_TYPES: [&str; 2] = ["text", "input_text"];
 const TOOL_RESULT_PART_TYPE: &str = "tool_result";
@@ -69,9 +72,8 @@ pub struct AutoRoute {
     pub estimated_prompt_tokens: u64,
 }
 
-/// A Copilot Auto tier, sent as the `tier` field of the `/auto` body. The
-/// names match VS Code's `autoModeTiers.ts`; `fast` is the tier VS Code keeps
-/// for inline chat.
+/// A Copilot Auto tier, sent as the `tier` field of the `/auto` body.
+/// `fast` is the tier VS Code keeps for inline chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AutoTier {
@@ -102,12 +104,19 @@ enum SwapReason {
     PromptTooLarge { estimated: u64, limit: u64 },
 }
 
-/// The request facts routing needs: the upstream path, the parsed body and its raw size.
-struct AutoInput<'a> {
-    tier: AutoTier,
-    path: &'a str,
-    body: &'a Value,
-    prompt_bytes: usize,
+/// The request facts routing needs.
+#[derive(Debug, Clone, Copy)]
+pub struct AutoInput<'a> {
+    pub tier: AutoTier,
+    /// The upstream path, which sets the body shape and the endpoint the model must serve.
+    pub path: &'a str,
+    pub body: &'a Value,
+    /// The raw request size, used to skip models whose prompt window is too small.
+    pub prompt_bytes: usize,
+    /// The profile's raw `/models` entries.
+    pub catalog: &'a [Value],
+    /// The model used when `/auto` fails and the conversation has no cached decision.
+    pub default_model: &'a str,
 }
 
 /// Bounded map of conversation slots, evicted oldest-first.
@@ -236,9 +245,8 @@ impl AutoTier {
         AutoTier::Fast,
     ];
 
-    /// The tier of an advertised bare model id: `auto` is the default tier,
-    /// `auto-<tier>` names one, and the retired names `eco`, `balanced` and
-    /// `max` still work. Any other id is not Auto.
+    /// The tier of a bare id: `auto` is the default, `auto-<tier>` names one, and the
+    /// retired `eco`, `balanced` and `max` still work. Any other id is not Auto.
     pub fn from_model(bare_id: &str) -> Option<AutoTier> {
         if bare_id == AUTO_MODEL {
             return Some(AutoTier::default());
@@ -305,55 +313,21 @@ impl CopilotAutoRouter {
         &self.decisions
     }
 
-    /// Routes this request on `tier` and returns the upstream model id, the
-    /// Copilot session token to send with it, and what Auto decided. Each tier
-    /// keeps its own conversation decision. `path` is the
-    /// upstream path, which sets the body shape and the endpoint the model must
-    /// support. `prompt_bytes` is the raw request size, used to skip models whose
-    /// prompt window is too small. `catalog` holds the profile's raw `/models`
-    /// entries. When `/auto` fails and the conversation has no cached decision,
-    /// the request goes to `default_model` with no token.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn route(
-        &self,
-        client: &reqwest::Client,
-        profile: &str,
-        bearer: &str,
-        api_base: &str,
-        tier: AutoTier,
-        path: &str,
-        body: &Value,
-        prompt_bytes: usize,
-        catalog: &[Value],
-        default_model: &str,
-    ) -> AutoRoute {
-        let upstream = Upstream {
-            client,
-            profile,
-            bearer,
-            api_base,
-        };
-        let input = AutoInput {
-            tier,
-            path,
-            body,
-            prompt_bytes,
-        };
-        self.route_at(&upstream, &input, catalog, default_model, unix_now_secs())
-            .await
+    /// Routes `input` on its tier and returns the upstream model id, its session token and
+    /// what Auto decided. Each tier keeps its own conversation decision.
+    pub async fn route(&self, upstream: &AutoUpstream<'_>, input: &AutoInput<'_>) -> AutoRoute {
+        self.route_at(upstream, input, unix_now_secs()).await
     }
 
     async fn route_at(
         &self,
-        upstream: &Upstream<'_>,
+        upstream: &AutoUpstream<'_>,
         input: &AutoInput<'_>,
-        catalog: &[Value],
-        default_model: &str,
         now_secs: u64,
     ) -> AutoRoute {
         let estimated = estimated_prompt_tokens(input.prompt_bytes);
         let Some(turn) = Turn::parse(upstream.profile, input.tier, input.path, input.body) else {
-            return AutoRoute::default_model(default_model, estimated);
+            return AutoRoute::default_model(input.default_model, estimated);
         };
         let slot = self.slot(turn.key);
         let mut state = slot.lock().await;
@@ -387,7 +361,7 @@ impl CopilotAutoRouter {
             }
         }
         let Some(conversation) = state.as_ref() else {
-            return AutoRoute::default_model(default_model, estimated);
+            return AutoRoute::default_model(input.default_model, estimated);
         };
         let pick = &conversation.model.id;
         let limits = self.limits.for_profile(upstream.profile);
@@ -395,7 +369,7 @@ impl CopilotAutoRouter {
             &conversation.model,
             turn.endpoint,
             turn.has_image,
-            catalog,
+            input.catalog,
             conversation.family_hint,
             Fit {
                 estimated_tokens: estimated,
@@ -411,7 +385,7 @@ impl CopilotAutoRouter {
                 auto_pick: pick.clone(),
                 complexity: conversation.complexity,
                 selection_reason: conversation.selection_reason.clone(),
-                ..AutoRoute::default_model(default_model, estimated)
+                ..AutoRoute::default_model(input.default_model, estimated)
             };
         };
         let token =
@@ -474,19 +448,32 @@ impl AutoRoute {
     }
 }
 
-/// Roughly one token per four request bytes. JSON punctuation and tool schemas
-/// make it overestimate English text slightly, and CJK text is underestimated, so
-/// it only rules out prompt windows that are clearly too small.
+/// Roughly one token per four request bytes: too rough for anything but ruling
+/// out prompt windows that are clearly too small.
 fn estimated_prompt_tokens(prompt_bytes: usize) -> u64 {
     u64::try_from(prompt_bytes / PROMPT_BYTES_PER_TOKEN).unwrap_or(u64::MAX)
 }
 
 /// Where and as whom `/auto` is called.
-struct Upstream<'a> {
-    client: &'a reqwest::Client,
-    profile: &'a str,
-    bearer: &'a str,
-    api_base: &'a str,
+pub struct AutoUpstream<'a> {
+    pub client: &'a reqwest::Client,
+    pub profile: &'a str,
+    pub bearer: &'a str,
+    pub api_base: &'a str,
+}
+
+impl std::fmt::Debug for AutoUpstream<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AutoUpstream")
+            .field("profile", &self.profile)
+            .field("api_base", &self.api_base)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The request path without its query string.
+pub fn bare_path(path: &str) -> &str {
+    path.split_once('?').map_or(path, |(bare, _)| bare)
 }
 
 impl Conversation {
@@ -522,9 +509,8 @@ impl Conversation {
         (turns_since_check > skip_window).then_some(RouteKind::Check)
     }
 
-    /// Whether the new task-type scores moved away from the anchor by at least
-    /// the schedule's threshold, measured in each task type's sigma. Without
-    /// comparable scores, a different model counts as escalation.
+    /// Whether the task-type scores moved from the anchor by the schedule's threshold, in
+    /// sigmas. Without comparable scores, a different model counts as escalation.
     fn escalates(&self, decision: &CopilotAutoResponse, model: &ModelTraits) -> bool {
         let Some(schedule) = self.schedule.as_ref() else {
             return model.id != self.model.id;
@@ -637,7 +623,7 @@ fn auto_request_body(
 }
 
 async fn fetch_decision(
-    upstream: &Upstream<'_>,
+    upstream: &AutoUpstream<'_>,
     request: &Value,
 ) -> Result<CopilotAutoResponse, String> {
     let url = format!("{}/{AUTO_PATH}", upstream.api_base.trim_end_matches('/'));
@@ -671,11 +657,8 @@ async fn fetch_decision(
     Ok(decision)
 }
 
-/// The model that serves `endpoint` and the image and fits the estimated
-/// prompt, with the reason when it is not the Auto pick. A swap takes the
-/// catalog model with the closest price, or without prices the model family that
-/// matches Auto's complexity verdict. When no candidate's window fits, the
-/// largest window wins. A model with no known limit always fits.
+/// The model that serves `endpoint` and the image and fits the prompt (an unknown limit fits).
+/// A swap goes by closest price, else Auto's complexity family; if none fits, the largest window.
 fn compatible_model(
     selected: &ModelTraits,
     endpoint: &'static str,
@@ -856,10 +839,8 @@ struct Fit<'a> {
 }
 
 impl Fit<'_> {
-    /// The prompt window routing trusts for `id`: its learned or seeded limit,
-    /// else the `/models` one. Copilot's `/v1/messages` accepts far more than
-    /// `/models` lists for Claude, so there the listed limit is only a floor and
-    /// never rules a Claude model out.
+    /// The learned or seeded limit for `id`, else the `/models` one. On `/v1/messages`
+    /// Copilot accepts far more than it lists for Claude, so that listing never counts.
     fn limit(&self, id: &str, listed: Option<u64>, endpoint: &str) -> Option<u64> {
         if let Some(known) = self.limits.get(id) {
             return Some(known.limit);
@@ -891,8 +872,7 @@ fn billing_price(billing: &Value) -> Option<f64> {
 
 impl BodyShape {
     fn from_path(path: &str) -> Option<BodyShape> {
-        let path = path.split_once('?').map_or(path, |(bare, _)| bare);
-        let path = path.trim_end_matches('/');
+        let path = bare_path(path).trim_end_matches('/');
         if path.ends_with("chat/completions") {
             Some(BodyShape::ChatCompletions)
         } else if path.ends_with("responses") {
@@ -1047,9 +1027,8 @@ fn content_has_image(content: &Value, image_type: &str) -> bool {
     })
 }
 
-/// Stable across the turns of one conversation: the profile, the tier, the
-/// system prompt and the first user message, each length-prefixed so the parts
-/// cannot run together. A tier switch starts a new decision.
+/// Hashes the profile, tier, system prompt and first user message, each length-prefixed,
+/// so the key is stable across a conversation's turns and a tier switch starts afresh.
 fn conversation_key(
     profile: &str,
     tier: AutoTier,
@@ -1162,7 +1141,7 @@ mod tests {
     ) -> AutoRoute {
         let client = reqwest::Client::new();
         let uri = server.uri();
-        let upstream = Upstream {
+        let upstream = AutoUpstream {
             client: &client,
             profile: PROFILE,
             bearer: BEARER,
@@ -1173,10 +1152,10 @@ mod tests {
             path: upstream_path,
             body,
             prompt_bytes,
+            catalog,
+            default_model: DEFAULT_MODEL,
         };
-        router
-            .route_at(&upstream, &input, catalog, DEFAULT_MODEL, now)
-            .await
+        router.route_at(&upstream, &input, now).await
     }
 
     fn auto_bodies(requests: &[Request]) -> Vec<Value> {
@@ -1641,7 +1620,7 @@ mod tests {
     ) -> AutoRoute {
         let client = reqwest::Client::new();
         let uri = server.uri();
-        let upstream = Upstream {
+        let upstream = AutoUpstream {
             client: &client,
             profile: PROFILE,
             bearer: BEARER,
@@ -1652,10 +1631,10 @@ mod tests {
             path: UPSTREAM_CHAT_PATH,
             body,
             prompt_bytes: 0,
+            catalog: &[],
+            default_model: DEFAULT_MODEL,
         };
-        router
-            .route_at(&upstream, &input, &[], DEFAULT_MODEL, NOW)
-            .await
+        router.route_at(&upstream, &input, NOW).await
     }
 
     #[tokio::test]

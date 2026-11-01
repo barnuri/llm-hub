@@ -1,5 +1,6 @@
 use std::io::ErrorKind;
 use std::process::Stdio;
+use std::time::Duration;
 
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
@@ -29,7 +30,7 @@ impl GhCli for ProcessGhCli {
             if let Some(token) = env_token(host, |name| std::env::var(name).ok()) {
                 return GhOutcome::Token(token);
             }
-            run_gh(gh_path, host, user).await
+            run_gh(gh_path, host, user, GH_TOKEN_TIMEOUT).await
         }
         .boxed()
     }
@@ -44,7 +45,7 @@ fn env_token(host: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<Stri
     lookup(name).filter(|token| !token.is_empty())
 }
 
-async fn run_gh(gh_path: &str, host: &str, user: Option<&str>) -> GhOutcome {
+async fn run_gh(gh_path: &str, host: &str, user: Option<&str>, limit: Duration) -> GhOutcome {
     let mut command = Command::new(gh_path);
     command.args(["auth", "token", "--hostname", host]);
     if let Some(user) = user {
@@ -61,13 +62,13 @@ async fn run_gh(gh_path: &str, host: &str, user: Option<&str>) -> GhOutcome {
         Err(e) if e.kind() == ErrorKind::NotFound => return GhOutcome::NotInstalled,
         Err(e) => return GhOutcome::Failed(format!("{gh_path} could not start: {e}")),
     };
-    let output = match tokio::time::timeout(GH_TOKEN_TIMEOUT, child.wait_with_output()).await {
+    let output = match tokio::time::timeout(limit, child.wait_with_output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => return GhOutcome::Failed(format!("{gh_path} could not be read: {e}")),
         Err(_) => {
             return GhOutcome::Failed(format!(
-                "{gh_path} auth token did not finish within {} s",
-                GH_TOKEN_TIMEOUT.as_secs()
+                "{gh_path} auth token did not finish within {} ms",
+                limit.as_millis()
             ));
         }
     };
@@ -150,7 +151,13 @@ mod tests {
     async fn run_gh_with_missing_binary_is_not_installed() {
         let missing = std::env::temp_dir().join("llm-hub-missing-gh").join("gh");
 
-        let outcome = run_gh(missing.to_str().unwrap(), "github.com", None).await;
+        let outcome = run_gh(
+            missing.to_str().unwrap(),
+            "github.com",
+            None,
+            GH_TOKEN_TIMEOUT,
+        )
+        .await;
 
         assert_eq!(outcome, GhOutcome::NotInstalled);
     }
@@ -171,7 +178,7 @@ mod tests {
 
         #[tokio::test]
         async fn run_gh_with_false_binary_fails() {
-            let outcome = run_gh("/usr/bin/false", "github.com", None).await;
+            let outcome = run_gh("/usr/bin/false", "github.com", None, GH_TOKEN_TIMEOUT).await;
 
             assert!(matches!(outcome, GhOutcome::Failed(_)), "{outcome:?}");
         }
@@ -181,7 +188,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let gh = write_script(&dir, "printf '  gho_token\\n'");
 
-            let outcome = run_gh(gh.to_str().unwrap(), "github.com", None).await;
+            let outcome = run_gh(gh.to_str().unwrap(), "github.com", None, GH_TOKEN_TIMEOUT).await;
 
             assert_eq!(outcome, GhOutcome::Token("gho_token".to_string()));
         }
@@ -191,7 +198,13 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let gh = write_script(&dir, "echo \"$@\" >&2; exit 4");
 
-            let outcome = run_gh(gh.to_str().unwrap(), "ghe.example.com", Some("octocat")).await;
+            let outcome = run_gh(
+                gh.to_str().unwrap(),
+                "ghe.example.com",
+                Some("octocat"),
+                GH_TOKEN_TIMEOUT,
+            )
+            .await;
 
             let GhOutcome::Failed(reason) = outcome else {
                 panic!("expected Failed, got {outcome:?}");
@@ -207,12 +220,53 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let gh = write_script(&dir, "echo 'not a token'");
 
-            let outcome = run_gh(gh.to_str().unwrap(), "github.com", None).await;
+            let outcome = run_gh(gh.to_str().unwrap(), "github.com", None, GH_TOKEN_TIMEOUT).await;
 
             let GhOutcome::Failed(reason) = outcome else {
                 panic!("expected Failed, got {outcome:?}");
             };
             assert!(!reason.contains("not a token"), "{reason}");
+        }
+
+        #[tokio::test]
+        async fn run_gh_that_never_exits_times_out_and_is_killed() {
+            let dir = tempfile::tempdir().unwrap();
+            let pid_file = dir.path().join("pid");
+            let gh = write_script(
+                &dir,
+                &format!("echo $$ > {}; exec sleep 30", pid_file.display()),
+            );
+
+            let outcome = run_gh(
+                gh.to_str().unwrap(),
+                "github.com",
+                None,
+                Duration::from_secs(1),
+            )
+            .await;
+
+            let GhOutcome::Failed(reason) = outcome else {
+                panic!("expected Failed, got {outcome:?}");
+            };
+            assert!(reason.contains("did not finish within 1000 ms"), "{reason}");
+            let pid = std::fs::read_to_string(&pid_file).unwrap();
+            assert!(!process_alive(pid.trim()).await, "gh {pid} still running");
+        }
+
+        // kill_on_drop kills without waiting, so poll until the pid is gone or only a zombie.
+        async fn process_alive(pid: &str) -> bool {
+            for _ in 0..50 {
+                let probe = std::process::Command::new("ps")
+                    .args(["-o", "stat=", "-p", pid])
+                    .output()
+                    .unwrap();
+                let stat = String::from_utf8_lossy(&probe.stdout);
+                if stat.trim().is_empty() || stat.trim_start().starts_with('Z') {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            true
         }
     }
 }

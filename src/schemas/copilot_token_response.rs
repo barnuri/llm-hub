@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::schemas::copilot_endpoints::CopilotEndpoints;
 
-/// Body of `GET copilot_internal/v2/token`, the Flow A token exchange.
+/// Body of `GET copilot_internal/v2/token`, the VS Code flow's token exchange.
 #[derive(Clone, Deserialize)]
 pub struct CopilotTokenResponse {
     /// Short-lived Copilot bearer token. Never log or format it.

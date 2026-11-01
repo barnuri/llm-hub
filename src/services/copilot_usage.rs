@@ -119,11 +119,8 @@ impl UsageEntry {
     }
 }
 
-/// Returns `profile`'s quota. A snapshot older than [`COPILOT_USAGE_TTL`] is
-/// still returned at once, and a refresh starts in the background. Without
-/// any snapshot the call waits for the fetch. The fetch runs in its own task,
-/// so it fills the cache even when the caller gives up. `None` when no
-/// snapshot exists and the fetch failed.
+/// Returns `profile`'s quota and refreshes a stale snapshot in the background.
+/// Returns `None` when no snapshot exists and the fetch failed.
 pub async fn usage(
     state: &AppState,
     client: &reqwest::Client,

@@ -12,6 +12,7 @@ use crate::services::tool_names::NameMap;
 
 const STREAM_ERROR_STATUS: u16 = 500;
 
+/// Translates one Copilot `/responses` SSE body into Anthropic Messages SSE, chunk by chunk.
 pub struct ResponsesStream {
     frames: SseFrames,
     served_model: String,
@@ -22,14 +23,25 @@ pub struct ResponsesStream {
     saw_tool_use: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+impl std::fmt::Debug for ResponsesStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponsesStream")
+            .field("served_model", &self.served_model)
+            .field("phase", &self.phase)
+            .field("next_index", &self.next_index)
+            .field("open", &self.open)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Pending,
     Open,
     Finished,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum OpenBlock {
     Thinking(u32),
     Text(u32),

@@ -25,7 +25,10 @@ use crate::services::anthropic;
 use crate::services::anthropic::native_reply::NativeReplyRepair;
 use crate::services::anthropic::responses_stream::ResponsesStream;
 use crate::services::body_transform::BodyTransform;
-use crate::services::copilot_auto::AutoTier;
+use crate::services::copilot_auto::{
+    AutoInput, AutoTier, AutoUpstream, CHAT_ENDPOINT, MESSAGES_ENDPOINT, RESPONSES_ENDPOINT,
+    bare_path,
+};
 use crate::services::copilot_auto_decisions::{AutoDecision, TieredDecision};
 use crate::services::copilot_body_fields::BodyField;
 use crate::services::fallback::{RetryPolicy, fallback_chain, per_attempt_timeout_ms};
@@ -39,8 +42,6 @@ use crate::services::transforms::{self, RouteKind, TransformPlan};
 use crate::services::upstream_auth;
 use crate::utils::headers::{filter_request_headers, filter_response_headers};
 
-/// Copilot serves Claude models on the Anthropic Messages API at this path.
-const NATIVE_MESSAGES_PATH: &str = "/v1/messages";
 const NATIVE_COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 const HEADER_ANTHROPIC_VERSION: &str = "anthropic-version";
 /// Forwarded on native `/v1/messages` attempts only.
@@ -55,10 +56,6 @@ const CLAUDE_CODE_SESSION_ID_MAX_LEN: usize = 128;
 const IDENTITY_ENCODING: &str = "identity";
 /// Copilot's Claude model ids, as sent upstream.
 const CLAUDE_MODEL_PREFIX: &str = "claude";
-/// Copilot's Responses API path, as sent upstream.
-const UPSTREAM_RESPONSES_PATH: &str = "/responses";
-/// Copilot's chat-completions endpoint, as `supported_endpoints` lists it.
-const CHAT_COMPLETIONS_ENDPOINT: &str = "/chat/completions";
 static NO_BODY: Value = Value::Null;
 
 /// Catch-all /v1/* passthrough with header-driven fallbacks.
@@ -171,14 +168,15 @@ pub(crate) async fn attempt_loop(
         let model_id = auto.as_ref().map_or(requested, |pick| &pick.model_id);
         let attempt = bodies.for_model(state, model_id);
         let started = Instant::now();
-        let sender = AttemptSender {
+        let session_token = auto.as_ref().and_then(|pick| pick.session_token.as_deref());
+        let sender = AttemptSender::for_attempt(
             state,
-            method: &method,
-            attempt: &attempt,
+            &method,
+            &attempt,
             model_id,
             attempt_timeout,
-            session_token: auto.as_ref().and_then(|pick| pick.session_token.as_deref()),
-        };
+            session_token,
+        );
         let result = match sender.send(attempt.body.clone()).await {
             Ok(response) if attempt.native_messages => {
                 retry_without_rejected_fields(&bodies, &sender, response).await
@@ -235,9 +233,8 @@ pub(crate) async fn attempt_loop(
     unreachable!("attempt loop always returns on the last attempt");
 }
 
-/// The request in the forms an attempt can send it: translated and
-/// transformed for a chat-completions upstream, or the caller's own Anthropic
-/// body for an upstream that serves the model on `/v1/messages` natively.
+/// The request in each form an attempt can send: translated for a chat-completions
+/// upstream, or the caller's own Anthropic body for a native `/v1/messages` model.
 struct AttemptBodies<'a> {
     original: &'a Bytes,
     json_body: Option<Value>,
@@ -415,7 +412,7 @@ impl<'a> AttemptBodies<'a> {
             // The request transforms only ever touched the translated body,
             // and the response, error bodies included, goes back untouched.
             Some((anthropic_body, native_headers)) => Attempt {
-                path: UpstreamPath::Verbatim(NATIVE_MESSAGES_PATH),
+                path: UpstreamPath::Verbatim(MESSAGES_ENDPOINT),
                 headers: native_headers,
                 body: json_for_attempt(
                     anthropic_body,
@@ -460,7 +457,7 @@ impl<'a> AttemptBodies<'a> {
     ) -> Attempt<'_> {
         let (responses_body, names) = anthropic::responses_request::to_responses(anthropic_body);
         Attempt {
-            path: UpstreamPath::Verbatim(UPSTREAM_RESPONSES_PATH),
+            path: UpstreamPath::Verbatim(RESPONSES_ENDPOINT),
             headers: &self.headers,
             body: json_for_attempt(&responses_body, self.original, sent_id, &[]),
             force_identity_encoding: true,
@@ -478,7 +475,7 @@ impl<'a> AttemptBodies<'a> {
     /// offers its own body for `/v1/messages`, which a Claude pick serves natively.
     fn auto_input(&self) -> (&str, &Value) {
         match &self.native {
-            Some((anthropic_body, _)) => (NATIVE_MESSAGES_PATH, anthropic_body),
+            Some((anthropic_body, _)) => (MESSAGES_ENDPOINT, anthropic_body),
             None => (
                 UpstreamPath::Strip(self.upstream_path).as_str(),
                 self.json_body.as_ref().unwrap_or(&NO_BODY),
@@ -502,9 +499,8 @@ struct AutoPick {
     reason: String,
 }
 
-/// Resolves `<profile>/auto` (the default tier) or `<profile>/auto-<tier>` on a
-/// Copilot profile through Copilot Auto and records the outcome in the router's
-/// decision log. Any other model returns `None` before any lookup.
+/// Resolves a Copilot `<profile>/auto[-<tier>]` through Copilot Auto and logs the decision.
+/// Any other model returns `None` before any lookup.
 async fn resolve_auto(
     state: &AppState,
     bodies: &AttemptBodies<'_>,
@@ -529,21 +525,21 @@ async fn resolve_auto(
     let api_base = api_base.unwrap_or_else(|| profile.base_url.clone());
     let (path, body) = bodies.auto_input();
     let catalog = state.copilot_catalog(&profile.name);
-    let route = state
-        .copilot_auto()
-        .route(
-            &client,
-            &profile.name,
-            &bearer,
-            &api_base,
-            tier,
-            path,
-            body,
-            bodies.original.len(),
-            &catalog,
-            default_auto_model(&catalog, path),
-        )
-        .await;
+    let upstream = AutoUpstream {
+        client: &client,
+        profile: &profile.name,
+        bearer: &bearer,
+        api_base: &api_base,
+    };
+    let input = AutoInput {
+        tier,
+        path,
+        body,
+        prompt_bytes: bodies.original.len(),
+        catalog: &catalog,
+        default_model: default_auto_model(&catalog, path),
+    };
+    let route = state.copilot_auto().route(&upstream, &input).await;
     let model_id = ModelId {
         profile: profile.name.clone(),
         model: advertised_bare_id(profile, &route.model),
@@ -584,9 +580,8 @@ async fn resolve_auto(
     })
 }
 
-/// The caller's Claude Code session id, kept only when it is
-/// `[A-Za-z0-9._-]{1,128}`, so the log and the decisions API never echo
-/// arbitrary header bytes.
+/// The caller's Claude Code session id, kept only when it is `[A-Za-z0-9._-]{1,128}`,
+/// so the log and the decisions API never echo arbitrary header bytes.
 fn claude_code_session_id(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(HEADER_CLAUDE_CODE_SESSION_ID)?.as_bytes();
     let valid = (1..=CLAUDE_CODE_SESSION_ID_MAX_LEN).contains(&value.len())
@@ -608,7 +603,7 @@ fn header_safe(text: &str, max_chars: usize) -> String {
 /// The model a failed Auto route falls back to: the first catalog model that
 /// serves the endpoint of `path`.
 fn default_auto_model<'c>(catalog: &'c [Value], path: &str) -> &'c str {
-    let endpoint = path.split_once('?').map_or(path, |(bare, _)| bare);
+    let endpoint = bare_path(path);
     catalog
         .iter()
         .filter(|entry| {
@@ -683,19 +678,20 @@ async fn attempt_single(
     let started = Instant::now();
     let trail = vec![model_id.qualified()];
     let upstream_path = UpstreamPath::Strip(path_and_query);
-    let response = send_attempt(
+    let sender = AttemptSender {
         state,
-        &method,
-        upstream_path,
+        method: &method,
+        path: upstream_path,
         headers,
-        body,
         model_id,
         attempt_timeout,
-        false,
-        None,
-    )
-    .await
-    .map_err(AppError::UpstreamUnavailable)?;
+        force_identity_encoding: false,
+        session_token: None,
+    };
+    let response = sender
+        .send(body)
+        .await
+        .map_err(AppError::UpstreamUnavailable)?;
     Ok(build_response(
         state,
         response,
@@ -789,45 +785,89 @@ fn json_for_attempt(
     Bytes::from(serde_json::to_vec(&attempt).unwrap_or_else(|_| original.to_vec()))
 }
 
-/// Sends one attempt's body, or a replacement for it, through `send_attempt`.
+/// Sends one attempt's body, or a replacement for it, to the attempt's upstream.
 struct AttemptSender<'a> {
     state: &'a AppState,
     method: &'a Method,
-    attempt: &'a Attempt<'a>,
+    path: UpstreamPath<'a>,
+    headers: &'a HeaderMap,
     model_id: &'a ModelId,
     attempt_timeout: Option<Duration>,
+    /// Set whenever the hub reads the reply itself: `reqwest` has no decoders, so the
+    /// caller's `accept-encoding` is replaced (not appended to) with `identity`.
+    force_identity_encoding: bool,
     session_token: Option<&'a str>,
 }
 
-impl AttemptSender<'_> {
+impl<'a> AttemptSender<'a> {
+    fn for_attempt(
+        state: &'a AppState,
+        method: &'a Method,
+        attempt: &Attempt<'a>,
+        model_id: &'a ModelId,
+        attempt_timeout: Option<Duration>,
+        session_token: Option<&'a str>,
+    ) -> Self {
+        AttemptSender {
+            state,
+            method,
+            path: attempt.path,
+            headers: attempt.headers,
+            model_id,
+            attempt_timeout,
+            force_identity_encoding: attempt.force_identity_encoding,
+            session_token,
+        }
+    }
+
     async fn send(&self, body: Bytes) -> Result<reqwest::Response, String> {
-        send_attempt(
-            self.state,
-            self.method,
-            self.attempt.path,
-            self.attempt.headers,
-            body,
-            self.model_id,
-            self.attempt_timeout,
-            self.attempt.force_identity_encoding,
-            self.session_token,
+        let state = self.state;
+        let config = state.config();
+        let profile = config
+            .profile(&self.model_id.profile)
+            .ok_or_else(|| format!("unknown profile: {}", self.model_id.profile))?;
+        if !profile.enabled {
+            return Err(format!("profile disabled: {}", profile.name));
+        }
+        let client = state.client(&profile.name).ok_or("no client for profile")?;
+        state.managed().ensure_running(profile).await?;
+
+        let upstream = UpstreamRequest {
+            state,
+            client: &client,
+            profile,
+            method: self.method,
+            upstream_path: self.path.as_str(),
+            headers: self.headers,
+            force_identity_encoding: self.force_identity_encoding,
+            timeout: self
+                .attempt_timeout
+                .or(profile.timeout_ms.map(Duration::from_millis)),
+            session_token: self.session_token,
+        };
+        let (response, copilot_bearer) = upstream.send(body.clone()).await?;
+        let rejected = upstream_auth::invalidate_if_unauthorized(
+            state,
+            &profile.name,
+            response.status(),
+            copilot_bearer.as_deref(),
         )
-        .await
+        .await;
+        if !rejected {
+            return Ok(response);
+        }
+        upstream.send(body).await.map(|(retried, _)| retried)
     }
 }
 
-/// Copilot rejects some Anthropic fields with "<path>: Extra inputs are not
-/// permitted". Learns them, so later requests never send them, and retries once
+/// Learns the fields a Copilot "Extra inputs are not permitted" 400 names and retries once
 /// without them. Any other response comes back unchanged.
 async fn retry_without_rejected_fields(
     bodies: &AttemptBodies<'_>,
     sender: &AttemptSender<'_>,
     response: reqwest::Response,
 ) -> Result<reqwest::Response, String> {
-    let compressed = response
-        .headers()
-        .get(reqwest::header::CONTENT_ENCODING)
-        .is_some_and(|encoding| encoding != IDENTITY_ENCODING);
+    let compressed = is_compressed(response.headers());
     let large = response
         .content_length()
         .is_some_and(|length| length > MAX_REJECTION_BYTES);
@@ -874,70 +914,10 @@ fn rebuilt_response(
     reqwest::Response::from(rebuilt)
 }
 
-/// `force_identity_encoding` is set whenever the hub itself has to read the
-/// response body (the Anthropic route, and any request whose plan carries a
-/// response-side transform). `reqwest` is built without the `gzip`/`brotli`
-/// features and the caller's `accept-encoding` is forwarded as-is, so without
-/// this the hub would be handed compressed bytes it cannot decode. The header
-/// is *replaced* rather than added — appending would leave the caller's `gzip`
-/// in place next to it and the upstream would still be free to compress.
-/// Passthrough requests keep the caller's header untouched.
-// One argument over the lint's threshold; a parameter struct for a single
-// private call site would obscure more than it clarifies.
-#[allow(clippy::too_many_arguments)]
-async fn send_attempt(
-    state: &AppState,
-    method: &Method,
-    upstream_path: UpstreamPath<'_>,
-    headers: &HeaderMap,
-    body: Bytes,
-    model_id: &ModelId,
-    attempt_timeout: Option<Duration>,
-    force_identity_encoding: bool,
-    session_token: Option<&str>,
-) -> Result<reqwest::Response, String> {
-    let config = state.config();
-    let profile = config
-        .profile(&model_id.profile)
-        .ok_or_else(|| format!("unknown profile: {}", model_id.profile))?;
-    if !profile.enabled {
-        return Err(format!("profile disabled: {}", profile.name));
-    }
-    let client = state.client(&profile.name).ok_or("no client for profile")?;
-    state.managed().ensure_running(profile).await?;
-
-    let upstream = UpstreamRequest {
-        state,
-        client: &client,
-        profile,
-        method,
-        upstream_path: upstream_path.as_str(),
-        headers,
-        force_identity_encoding,
-        timeout: attempt_timeout.or(profile.timeout_ms.map(Duration::from_millis)),
-        session_token,
-    };
-    let (response, copilot_bearer) = upstream.send(body.clone()).await?;
-    let rejected = upstream_auth::invalidate_if_unauthorized(
-        state,
-        &profile.name,
-        response.status(),
-        copilot_bearer.as_deref(),
-    )
-    .await;
-    if !rejected {
-        return Ok(response);
-    }
-    upstream.send(body).await.map(|(retried, _)| retried)
-}
-
 /// True for a Copilot Claude model sent to `/chat/completions`. Newer ones can
 /// answer there in Anthropic shape, which [`repair_native_reply`] converts.
 fn may_reply_natively(state: &AppState, upstream_path: &str, sent_id: &ModelId) -> bool {
-    let bare_path = upstream_path
-        .split_once('?')
-        .map_or(upstream_path, |(path, _)| path);
-    bare_path == ANTHROPIC_UPSTREAM_PATH
+    bare_path(upstream_path) == ANTHROPIC_UPSTREAM_PATH
         && sent_id.model.starts_with(CLAUDE_MODEL_PREFIX)
         && state
             .config()
@@ -945,9 +925,8 @@ fn may_reply_natively(state: &AppState, upstream_path: &str, sent_id: &ModelId) 
             .is_some_and(|profile| profile.copilot.is_some())
 }
 
-/// Puts an Anthropic-shaped success reply into `OpenAI` chat-completion shape
-/// (frame by frame for a stream) before anything else reads it. An
-/// `OpenAI`-shaped reply, an error, or a compressed body is left alone.
+/// Puts an Anthropic-shaped success reply into `OpenAI` chat-completion shape before
+/// anything reads it. An `OpenAI` reply, an error or a compressed body is left alone.
 fn repair_native_reply(response: reqwest::Response) -> reqwest::Response {
     if !is_rewritable(&response) {
         return response;
@@ -963,11 +942,7 @@ fn streams_copilot_responses(
     json_body: Option<&Value>,
     sent_id: &ModelId,
 ) -> bool {
-    let upstream_path = path.as_str();
-    let bare_path = upstream_path
-        .split_once('?')
-        .map_or(upstream_path, |(path, _)| path);
-    bare_path == UPSTREAM_RESPONSES_PATH
+    bare_path(path.as_str()) == RESPONSES_ENDPOINT
         && json_body
             .and_then(|body| body.get("stream"))
             .and_then(Value::as_bool)
@@ -1000,14 +975,11 @@ fn serves_only_responses(state: &AppState, sent_id: &ModelId) -> bool {
         return false;
     };
     let serves = |wanted: &str| endpoints.iter().any(|e| e.as_str() == Some(wanted));
-    serves(UPSTREAM_RESPONSES_PATH)
-        && !serves(CHAT_COMPLETIONS_ENDPOINT)
-        && !serves(NATIVE_MESSAGES_PATH)
+    serves(RESPONSES_ENDPOINT) && !serves(CHAT_ENDPOINT) && !serves(MESSAGES_ENDPOINT)
 }
 
-/// Puts a successful Copilot `/responses` reply into Anthropic Messages shape:
-/// a stream frame by frame once its item ids are pinned, a JSON body whole. An
-/// error or a compressed body is left alone, so prompt-limit learning reads it.
+/// Puts a successful Copilot `/responses` reply into Anthropic Messages shape. An error or
+/// a compressed body is left alone, so prompt-limit learning still reads it.
 async fn anthropic_from_responses(
     response: reqwest::Response,
     served_model: &str,
@@ -1020,9 +992,7 @@ async fn anthropic_from_responses(
         let translator = ResponsesStream::new(served_model.to_string(), names.clone());
         return rewrite_body(stabilize_item_ids(response), translator);
     }
-    let (status, version) = (response.status(), response.version());
-    let mut headers = response.headers().clone();
-    headers.remove(reqwest::header::CONTENT_LENGTH);
+    let (status, version, headers) = parts_for_rewrite(&response);
     let (raw, overflowed) = read_upstream_capped(response, MAX_TRANSFORM_BUFFER_BYTES).await;
     if overflowed {
         let body = anthropic::response::error_body(
@@ -1037,11 +1007,14 @@ async fn anthropic_from_responses(
 
 /// A successful, uncompressed reply, whose bytes the hub can rewrite.
 fn is_rewritable(response: &reqwest::Response) -> bool {
-    let compressed = response
-        .headers()
+    response.status().is_success() && !is_compressed(response.headers())
+}
+
+/// True when the body is encoded; `reqwest` has no decoders, so the hub sees raw bytes.
+fn is_compressed(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
         .get(reqwest::header::CONTENT_ENCODING)
-        .is_some_and(|encoding| encoding != IDENTITY_ENCODING);
-    response.status().is_success() && !compressed
+        .is_some_and(|encoding| encoding != IDENTITY_ENCODING)
 }
 
 /// A chunk-by-chunk rewrite of an upstream body, run before `deliver` reads it.
@@ -1085,9 +1058,7 @@ impl UpstreamRewrite for ResponsesItemIds {
 /// Rebuilds `response` with its body streamed through `rewrite`; status,
 /// version and headers carry over, except the now-wrong `content-length`.
 fn rewrite_body(response: reqwest::Response, rewrite: impl UpstreamRewrite) -> reqwest::Response {
-    let (status, version) = (response.status(), response.version());
-    let mut headers = response.headers().clone();
-    headers.remove(reqwest::header::CONTENT_LENGTH);
+    let (status, version, headers) = parts_for_rewrite(&response);
     let rewritten = futures_util::stream::unfold(
         Some((response.bytes_stream(), rewrite)),
         |step| async move {
@@ -1109,11 +1080,19 @@ fn rewrite_body(response: reqwest::Response, rewrite: impl UpstreamRewrite) -> r
             }
         },
     );
-    let mut rebuilt = Response::new(reqwest::Body::wrap_stream(rewritten));
-    *rebuilt.status_mut() = status;
-    *rebuilt.version_mut() = version;
-    *rebuilt.headers_mut() = headers;
-    reqwest::Response::from(rebuilt)
+    rebuilt_response(
+        status,
+        version,
+        headers,
+        reqwest::Body::wrap_stream(rewritten),
+    )
+}
+
+/// The status, version and headers a rewritten body keeps; `content-length` no longer holds.
+fn parts_for_rewrite(response: &reqwest::Response) -> (StatusCode, reqwest::Version, HeaderMap) {
+    let mut headers = response.headers().clone();
+    headers.remove(reqwest::header::CONTENT_LENGTH);
+    (response.status(), response.version(), headers)
 }
 
 /// Copilot serves Anthropic token counting at `/v1/messages/count_tokens`, so a
@@ -1122,10 +1101,7 @@ fn native_count_tokens_path(
     client_path: &str,
     catalog: Option<&UpstreamModel>,
 ) -> Option<UpstreamPath<'static>> {
-    let bare_path = client_path
-        .split_once('?')
-        .map_or(client_path, |(path, _)| path);
-    let is_count_tokens = bare_path == NATIVE_COUNT_TOKENS_PATH;
+    let is_count_tokens = bare_path(client_path) == NATIVE_COUNT_TOKENS_PATH;
     (is_count_tokens && catalog.is_some_and(|model| model.native_messages))
         .then_some(UpstreamPath::Verbatim(NATIVE_COUNT_TOKENS_PATH))
 }
@@ -1149,9 +1125,8 @@ impl<'a> UpstreamPath<'a> {
     }
 }
 
-/// The `/v1/messages` route strips the caller's `anthropic-*` headers before
-/// the attempt loop, but the Anthropic API requires a version, so a native
-/// attempt sends the default one when the caller's is gone.
+/// The `/v1/messages` route strips the caller's `anthropic-version`, but the Anthropic API
+/// requires one, so a native attempt sends the default.
 fn with_anthropic_version(headers: &HeaderMap) -> HeaderMap {
     let mut native = headers.clone();
     if !native.contains_key(HEADER_ANTHROPIC_VERSION) {
@@ -1163,7 +1138,7 @@ fn with_anthropic_version(headers: &HeaderMap) -> HeaderMap {
     native
 }
 
-/// One upstream call of `send_attempt`, kept whole so a Copilot 401 can be
+/// One upstream call of `AttemptSender::send`, kept whole so a Copilot 401 can be
 /// re-sent with fresh credentials.
 struct UpstreamRequest<'a> {
     state: &'a AppState,
@@ -1243,7 +1218,7 @@ impl UpstreamRequest<'_> {
 /// with no copy and no framing. `Some` rewrites frame by frame, and its
 /// `finish()` output is emitted as a final chunk so the client is always left
 /// with a well-formed body, even when the upstream is cut mid-stream.
-// One argument over the lint's threshold, same trade-off as `send_attempt`.
+// One argument over the lint's threshold; each is a separate per-response input.
 #[allow(clippy::too_many_arguments)]
 fn build_response(
     state: &AppState,
@@ -1265,10 +1240,8 @@ fn build_response(
         .flatten();
     let mut response_headers = filter_response_headers(&headermap_from_reqwest(upstream.headers()));
     if transform.is_some() {
-        // The body is rewritten, so the upstream's encoding no longer
-        // describes it. `send_attempt` asked for `identity` in this case, but
-        // strip the header regardless rather than trust the upstream to honour
-        // it.
+        // The rewritten body has no encoding. The attempt asked for `identity`,
+        // but the header is stripped rather than trusting the upstream to honour it.
         response_headers.remove("content-encoding");
     }
     insert_header(
@@ -1522,7 +1495,7 @@ fn is_event_stream(response: &reqwest::Response) -> bool {
 /// frame-at-a-time translator instead — and it is bounded by
 /// `MAX_TRANSFORM_BUFFER_BYTES`. Every other route keeps the byte-for-byte
 /// streaming path in `build_response`.
-// One argument over the lint's threshold, same trade-off as `send_attempt`.
+// One argument over the lint's threshold; each is a separate per-response input.
 #[allow(clippy::too_many_arguments)]
 async fn build_anthropic_response(
     state: &AppState,
@@ -1635,9 +1608,8 @@ async fn build_anthropic_response(
     })
 }
 
-/// The upstream model id a Copilot 400 on `upstream_path` may teach a prompt
-/// limit for, read before the body streams. A compressed body is skipped: the
-/// hub sees its raw bytes.
+/// The upstream model id a Copilot 400 on `upstream_path` may teach a prompt limit for,
+/// read before the body streams. A compressed body is skipped.
 fn prompt_limit_model(
     state: &AppState,
     status: StatusCode,
@@ -1648,10 +1620,7 @@ fn prompt_limit_model(
     if status != StatusCode::BAD_REQUEST {
         return None;
     }
-    let compressed = headers
-        .get(reqwest::header::CONTENT_ENCODING)
-        .is_some_and(|encoding| encoding != IDENTITY_ENCODING);
-    if compressed {
+    if is_compressed(headers) {
         return None;
     }
     state
@@ -1664,17 +1633,14 @@ fn prompt_limit_model(
     teaches_stored_limit(upstream_path, &upstream_id).then_some(upstream_id)
 }
 
-/// True when a rejection on `upstream_path` speaks for the limit stored for
-/// `upstream_id`. A Claude limit describes native `/v1/messages`, so only that
-/// endpoint and its `count_tokens` teach it; any other model learns from `/responses`.
+/// True when a rejection on `upstream_path` speaks for `upstream_id`'s stored limit: native
+/// `/v1/messages` and `count_tokens` for Claude, `/responses` for any other model.
 fn teaches_stored_limit(upstream_path: &str, upstream_id: &str) -> bool {
-    let bare_path = upstream_path
-        .split_once('?')
-        .map_or(upstream_path, |(path, _)| path);
+    let path = bare_path(upstream_path);
     if upstream_id.starts_with(CLAUDE_MODEL_PREFIX) {
-        bare_path == NATIVE_MESSAGES_PATH || bare_path == NATIVE_COUNT_TOKENS_PATH
+        path == MESSAGES_ENDPOINT || path == NATIVE_COUNT_TOKENS_PATH
     } else {
-        bare_path == UPSTREAM_RESPONSES_PATH
+        path == RESPONSES_ENDPOINT
     }
 }
 
@@ -2226,7 +2192,7 @@ mod tests {
             route: RouteKind,
         ) -> (u16, Bytes) {
             let path = match route {
-                RouteKind::Anthropic => NATIVE_MESSAGES_PATH,
+                RouteKind::Anthropic => MESSAGES_ENDPOINT,
                 RouteKind::OpenAi => "/v1/chat/completions",
             };
             let response = attempt_loop(
@@ -2254,7 +2220,7 @@ mod tests {
             route: RouteKind,
         ) -> HeaderMap {
             let path = match route {
-                RouteKind::Anthropic => NATIVE_MESSAGES_PATH,
+                RouteKind::Anthropic => MESSAGES_ENDPOINT,
                 RouteKind::OpenAi => "/v1/chat/completions",
             };
             attempt_loop(
@@ -2295,7 +2261,7 @@ mod tests {
             let copilot = copilot().await;
             let reply = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"native"}],"usage":{"input_tokens":3,"output_tokens":1}}"#;
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .respond_with(
                     ResponseTemplate::new(200).set_body_raw(reply.as_bytes(), "application/json"),
                 )
@@ -2313,7 +2279,7 @@ mod tests {
 
             assert_eq!(status, 200);
             assert_eq!(bytes, reply.as_bytes());
-            let sent = requests_to(&copilot, NATIVE_MESSAGES_PATH).await;
+            let sent = requests_to(&copilot, MESSAGES_ENDPOINT).await;
             assert_eq!(sent.len(), 1);
             let mut expected = body.clone();
             expected["model"] = json!(NATIVE_UPSTREAM_ID);
@@ -2329,7 +2295,7 @@ mod tests {
         async fn native_attempt_sends_the_default_version_when_the_caller_sent_none() {
             let copilot = copilot().await;
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
                 .mount(&copilot.upstream)
                 .await;
@@ -2342,7 +2308,7 @@ mod tests {
             )
             .await;
 
-            let sent = requests_to(&copilot, NATIVE_MESSAGES_PATH).await;
+            let sent = requests_to(&copilot, MESSAGES_ENDPOINT).await;
             assert_eq!(
                 sent[0].headers.get(HEADER_ANTHROPIC_VERSION).unwrap(),
                 DEFAULT_ANTHROPIC_VERSION
@@ -2354,7 +2320,7 @@ mod tests {
             let copilot = copilot().await;
             let frames = "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .respond_with(
                     ResponseTemplate::new(200).set_body_raw(frames.as_bytes(), "text/event-stream"),
                 )
@@ -2371,7 +2337,7 @@ mod tests {
 
             assert_eq!(status, 200);
             assert_eq!(bytes, frames.as_bytes());
-            let sent = sent_json(&requests_to(&copilot, NATIVE_MESSAGES_PATH).await[0]);
+            let sent = sent_json(&requests_to(&copilot, MESSAGES_ENDPOINT).await[0]);
             assert!(sent.get("stream_options").is_none(), "{sent}");
         }
 
@@ -2392,7 +2358,7 @@ mod tests {
         async fn native_prompt_too_long_rejection_teaches_the_limit() {
             let copilot = copilot().await;
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .respond_with(prompt_too_long())
                 .mount(&copilot.upstream)
                 .await;
@@ -2444,7 +2410,7 @@ mod tests {
         async fn responses_rejection_teaches_a_non_claude_limit() {
             let copilot = copilot().await;
             Mock::given(method("POST"))
-                .and(path(UPSTREAM_RESPONSES_PATH))
+                .and(path(RESPONSES_ENDPOINT))
                 .respond_with(prompt_too_long())
                 .mount(&copilot.upstream)
                 .await;
@@ -2481,7 +2447,7 @@ mod tests {
             let copilot = copilot().await;
             let error = r#"{"type":"error","error":{"type":"invalid_request_error","message":"thinking is not supported"}}"#;
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .respond_with(
                     ResponseTemplate::new(400).set_body_raw(error.as_bytes(), "application/json"),
                 )
@@ -2520,7 +2486,7 @@ mod tests {
 
         async fn mount_native_ok(copilot: &Copilot) {
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
                 .with_priority(10)
                 .mount(&copilot.upstream)
@@ -2531,7 +2497,7 @@ mod tests {
         async fn rejected_top_level_field_is_learned_retried_and_never_sent_again() {
             let copilot = copilot().await;
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .and(has_context_management)
                 .respond_with(extra_input("context_management"))
                 .with_priority(1)
@@ -2545,7 +2511,7 @@ mod tests {
             let (second, _) = send(&copilot, &client_headers(), &body, RouteKind::Anthropic).await;
 
             assert_eq!((first, second), (200, 200));
-            let sent = requests_to(&copilot, NATIVE_MESSAGES_PATH).await;
+            let sent = requests_to(&copilot, MESSAGES_ENDPOINT).await;
             let carried: Vec<bool> = sent.iter().map(has_context_management).collect();
             assert_eq!(carried, [true, false, false]);
             assert_eq!(
@@ -2563,7 +2529,7 @@ mod tests {
             let copilot = copilot().await;
             // Copilot compresses whenever the request allows it; the hub cannot decode that.
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .and(has_context_management)
                 .and(asks_for_compression)
                 .respond_with(
@@ -2573,7 +2539,7 @@ mod tests {
                 .mount(&copilot.upstream)
                 .await;
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .and(has_context_management)
                 .respond_with(
                     extra_input("context_management").insert_header("transfer-encoding", "chunked"),
@@ -2590,7 +2556,7 @@ mod tests {
             let (status, _) = send(&copilot, &headers, &body, RouteKind::Anthropic).await;
 
             assert_eq!(status, 200);
-            let sent = requests_to(&copilot, NATIVE_MESSAGES_PATH).await;
+            let sent = requests_to(&copilot, MESSAGES_ENDPOINT).await;
             let carried: Vec<bool> = sent.iter().map(has_context_management).collect();
             assert_eq!(carried, [true, false]);
             assert_eq!(
@@ -2607,7 +2573,7 @@ mod tests {
         async fn rejected_message_field_is_stripped_from_every_message() {
             let copilot = copilot().await;
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .and(has_output_config)
                 .respond_with(extra_input("messages.1.output_config"))
                 .with_priority(1)
@@ -2623,7 +2589,7 @@ mod tests {
             let (status, _) = send(&copilot, &client_headers(), &body, RouteKind::Anthropic).await;
 
             assert_eq!(status, 200);
-            let sent = requests_to(&copilot, NATIVE_MESSAGES_PATH).await;
+            let sent = requests_to(&copilot, MESSAGES_ENDPOINT).await;
             assert_eq!(sent.len(), 2);
             assert!(!has_output_config(&sent[1]), "{}", sent_json(&sent[1]));
             assert_eq!(sent_json(&sent[1])["messages"].as_array().unwrap().len(), 2);
@@ -2634,7 +2600,7 @@ mod tests {
             let copilot = copilot().await;
             let error = r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: Field required"}}"#;
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .respond_with(
                     ResponseTemplate::new(400).set_body_raw(error.as_bytes(), "application/json"),
                 )
@@ -2651,7 +2617,7 @@ mod tests {
 
             assert_eq!(status, 400);
             assert_eq!(bytes, error.as_bytes());
-            assert_eq!(requests_to(&copilot, NATIVE_MESSAGES_PATH).await.len(), 1);
+            assert_eq!(requests_to(&copilot, MESSAGES_ENDPOINT).await.len(), 1);
             assert!(copilot.state.unsupported_body_fields(PROFILE).is_empty());
         }
 
@@ -2689,7 +2655,7 @@ mod tests {
             )
             .await;
 
-            let native = requests_to(&copilot, NATIVE_MESSAGES_PATH).await;
+            let native = requests_to(&copilot, MESSAGES_ENDPOINT).await;
             assert_eq!(
                 native[0].headers.get(HEADER_ANTHROPIC_BETA).unwrap(),
                 "context-management-2025-06-27"
@@ -2748,7 +2714,7 @@ mod tests {
             assert_eq!(reply["type"], "message", "{reply}");
             let sent = requests_to(&copilot, UPSTREAM_CHAT_PATH).await;
             assert_eq!(sent_json(&sent[0])["model"], TRANSLATED_UPSTREAM_ID);
-            assert!(requests_to(&copilot, NATIVE_MESSAGES_PATH).await.is_empty());
+            assert!(requests_to(&copilot, MESSAGES_ENDPOINT).await.is_empty());
         }
 
         #[tokio::test]
@@ -3027,7 +2993,7 @@ mod tests {
         async fn native_429_falls_back_to_a_translated_attempt() {
             let copilot = copilot().await;
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .respond_with(ResponseTemplate::new(429).set_body_json(json!({
                     "type": "error",
                     "error": {"type": "rate_limit_error", "message": "slow down"},
@@ -3057,7 +3023,7 @@ mod tests {
             let reply: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(reply["type"], "message", "{reply}");
             assert_eq!(reply["content"][0]["text"], "translated", "{reply}");
-            assert_eq!(requests_to(&copilot, NATIVE_MESSAGES_PATH).await.len(), 1);
+            assert_eq!(requests_to(&copilot, MESSAGES_ENDPOINT).await.len(), 1);
             let chat = requests_to(&copilot, UPSTREAM_CHAT_PATH).await;
             assert_eq!(sent_json(&chat[0])["model"], PLAIN_ID);
         }
@@ -3065,7 +3031,6 @@ mod tests {
         const AUTO_SESSION: &str = "auto-session";
         const RESPONSES_ONLY_ID: &str = "gpt-5.5";
         const CHAT_ONLY_ID: &str = "gemini-3-pro";
-        const UPSTREAM_RESPONSES_PATH: &str = "/responses";
 
         /// Lists the catalog Auto routes over and answers `/auto` with `selected`.
         async fn mount_auto(copilot: &Copilot, selected: &str) {
@@ -3108,7 +3073,7 @@ mod tests {
             let copilot = copilot().await;
             mount_auto(&copilot, NATIVE_UPSTREAM_ID).await;
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "id": "msg_1", "type": "message", "role": "assistant",
                     "content": [{"type": "text", "text": "native"}],
@@ -3126,7 +3091,7 @@ mod tests {
             .await;
 
             assert_eq!(status, 200);
-            let sent = requests_to(&copilot, NATIVE_MESSAGES_PATH).await;
+            let sent = requests_to(&copilot, MESSAGES_ENDPOINT).await;
             assert_eq!(sent_json(&sent[0])["model"], NATIVE_UPSTREAM_ID);
             assert_eq!(session_tokens(&sent[0]), [AUTO_SESSION]);
         }
@@ -3136,7 +3101,7 @@ mod tests {
             let copilot = copilot().await;
             mount_auto(&copilot, RESPONSES_ONLY_ID).await;
             Mock::given(method("POST"))
-                .and(path(UPSTREAM_RESPONSES_PATH))
+                .and(path(RESPONSES_ENDPOINT))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "resp_1"})))
                 .mount(&copilot.upstream)
                 .await;
@@ -3157,7 +3122,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(response.status(), StatusCode::OK);
-            let sent = requests_to(&copilot, UPSTREAM_RESPONSES_PATH).await;
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
             assert_eq!(sent_json(&sent[0])["model"], RESPONSES_ONLY_ID);
             assert_eq!(session_tokens(&sent[0]), [AUTO_SESSION]);
         }
@@ -3206,7 +3171,7 @@ mod tests {
 
         async fn mount_native_reply(copilot: &Copilot) {
             Mock::given(method("POST"))
-                .and(path(NATIVE_MESSAGES_PATH))
+                .and(path(MESSAGES_ENDPOINT))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "id": "msg_1", "type": "message", "role": "assistant",
                     "content": [{"type": "text", "text": "native"}],
@@ -3281,7 +3246,7 @@ mod tests {
             assert_eq!(header(&headers, HEADER_AUTO_TIER), Some("intelligence"));
             let auto = requests_to(&copilot, "/auto").await;
             assert_eq!(sent_json(&auto[0])["tier"], "intelligence");
-            let sent = requests_to(&copilot, NATIVE_MESSAGES_PATH).await;
+            let sent = requests_to(&copilot, MESSAGES_ENDPOINT).await;
             assert_eq!(sent_json(&sent[0])["model"], NATIVE_UPSTREAM_ID);
             let decisions = copilot.state.copilot_auto().decisions().recent(None, 10);
             assert_eq!(decisions[0].tier, AutoTier::Intelligence);
@@ -3332,10 +3297,10 @@ mod tests {
             let served = format!("{PROFILE}/{RESPONSES_ONLY_ID}");
             assert_eq!(header(&headers, HEADER_SERVED_MODEL), Some(served.as_str()));
             assert_eq!(header(&headers, HEADER_AUTO_REASON), Some("test pick"));
-            let sent = requests_to(&copilot, UPSTREAM_RESPONSES_PATH).await;
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
             assert_eq!(sent_json(&sent[0])["model"], RESPONSES_ONLY_ID);
             assert_eq!(session_tokens(&sent[0]), [AUTO_SESSION]);
-            assert!(requests_to(&copilot, NATIVE_MESSAGES_PATH).await.is_empty());
+            assert!(requests_to(&copilot, MESSAGES_ENDPOINT).await.is_empty());
         }
 
         fn list_responses_only_model(copilot: &Copilot) {
@@ -3347,7 +3312,7 @@ mod tests {
 
         async fn mount_responses_reply(copilot: &Copilot, reply: &Value) {
             Mock::given(method("POST"))
-                .and(path(UPSTREAM_RESPONSES_PATH))
+                .and(path(RESPONSES_ENDPOINT))
                 .respond_with(ResponseTemplate::new(200).set_body_json(reply))
                 .mount(&copilot.upstream)
                 .await;
@@ -3403,7 +3368,7 @@ mod tests {
                     "usage": {"input_tokens": 9, "output_tokens": 2},
                 })
             );
-            let sent = requests_to(&copilot, UPSTREAM_RESPONSES_PATH).await;
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
             assert_eq!(
                 sent_json(&sent[0]),
                 json!({
@@ -3440,7 +3405,7 @@ mod tests {
             .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
             .concat();
             Mock::given(method("POST"))
-                .and(path(UPSTREAM_RESPONSES_PATH))
+                .and(path(RESPONSES_ENDPOINT))
                 .respond_with(
                     ResponseTemplate::new(200).set_body_raw(upstream, "text/event-stream"),
                 )
@@ -3491,7 +3456,7 @@ mod tests {
                 events[5].1["usage"],
                 json!({"input_tokens": 4, "output_tokens": 2})
             );
-            let sent = requests_to(&copilot, UPSTREAM_RESPONSES_PATH).await;
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
             assert_eq!(sent_json(&sent[0])["stream"], true);
         }
 
@@ -3500,7 +3465,7 @@ mod tests {
             let copilot = copilot().await;
             list_responses_only_model(&copilot);
             Mock::given(method("POST"))
-                .and(path(UPSTREAM_RESPONSES_PATH))
+                .and(path(RESPONSES_ENDPOINT))
                 .and(|request: &Request| {
                     sent_json(request)["input"].as_array().is_some_and(|items| {
                         items
@@ -3544,7 +3509,7 @@ mod tests {
                 json!([{"type": "text", "text": "sunny in Oslo"}])
             );
             assert_eq!(answer["stop_reason"], "end_turn");
-            let sent = requests_to(&copilot, UPSTREAM_RESPONSES_PATH).await;
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
             assert_eq!(sent.len(), 2);
             assert_eq!(
                 sent_json(&sent[1])["input"],
@@ -3564,7 +3529,7 @@ mod tests {
             list_responses_only_model(&copilot);
             let error = json!({"error": {"message": "bad input", "code": "invalid"}});
             Mock::given(method("POST"))
-                .and(path(UPSTREAM_RESPONSES_PATH))
+                .and(path(RESPONSES_ENDPOINT))
                 .respond_with(ResponseTemplate::new(400).set_body_json(&error))
                 .mount(&copilot.upstream)
                 .await;
