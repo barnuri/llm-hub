@@ -22,6 +22,7 @@ use crate::schemas::insights::pick_candidate::PickCandidate;
 use crate::schemas::insights::use_case_pick::UseCasePick;
 use crate::schemas::model_context::{max_input_tokens_from_item, strip_1m_suffix};
 use crate::services::harness::classify;
+use crate::services::pricing::split_cached_input;
 use crate::services::stats::{RequestOutcome, tokens_per_sec};
 use crate::utils::time::utc_iso8601;
 
@@ -401,7 +402,15 @@ fn model_insight(calls: &[&RequestOutcome], min_requests: u64) -> ModelInsight {
         .filter_map(|call| prefill_tokens_per_sec(call))
         .collect();
     let tokens_in: u64 = successes.iter().map(|call| call.tokens_in).sum();
-    let cache_read: u64 = successes.iter().map(|call| call.cache_read_tokens).sum();
+    let (uncached_in, cached_in) = successes
+        .iter()
+        .map(|call| split_cached_input(call.tokens_in, call.cache_read_tokens))
+        .fold(
+            (0, 0),
+            |(uncached, cached), (call_uncached, call_cached)| {
+                (uncached + call_uncached, cached + call_cached)
+            },
+        );
 
     let health = health(
         requests,
@@ -427,7 +436,7 @@ fn model_insight(calls: &[&RequestOutcome], min_requests: u64) -> ModelInsight {
         latency_p50_ms: percentile(&latencies, MEDIAN).map(round_ms),
         decode_tokens_per_sec_p50: percentile(&decode, MEDIAN),
         prefill_tokens_per_sec_p50: percentile(&prefill, MEDIAN),
-        cache_hit_rate_pct: ratio_pct(cache_read, tokens_in),
+        cache_hit_rate_pct: ratio_pct(cached_in, uncached_in + cached_in),
         tokens_in,
         tokens_out: successes.iter().map(|call| call.tokens_out).sum(),
         top_errors: top_errors(calls),
@@ -721,7 +730,7 @@ fn top_errors(calls: &[&RequestOutcome]) -> Vec<ErrorCount> {
 /// Uncached prompt tokens processed per second before the first token.
 fn prefill_tokens_per_sec(call: &RequestOutcome) -> Option<f64> {
     let ttft = call.ttft_ms.filter(|ttft| *ttft > 0)?;
-    let fresh = call.tokens_in.saturating_sub(call.cache_read_tokens);
+    let (fresh, _) = split_cached_input(call.tokens_in, call.cache_read_tokens);
     (fresh > 0).then(|| to_f64(fresh) * 1000.0 / to_f64(ttft))
 }
 
@@ -833,6 +842,23 @@ mod tests {
             }]
         );
         assert_eq!((a.last_success_ms, a.last_error_ms), (Some(2), Some(3)));
+    }
+
+    #[test]
+    fn cache_hit_rate_counts_subset_and_separate_cache_reads() {
+        let mut openai = ok("p/a", 1000, 2000);
+        openai.cache_read_tokens = 500;
+        let mut anthropic = ok("p/a", 1000, 2000);
+        anthropic.tokens_in = 200;
+        anthropic.cache_read_tokens = 800;
+        let outcomes = timed(vec![openai, anthropic]);
+
+        let report = build_report(&outcomes, &HashMap::new(), "7d", 1, NOW_MS);
+        let a = insight(&report, "p/a");
+
+        // Uncached 500 + 200, cached 500 + 800.
+        assert!((a.cache_hit_rate_pct - 65.0).abs() < 1e-9);
+        assert_eq!(a.prefill_tokens_per_sec_p50, Some(200.0));
     }
 
     #[test]

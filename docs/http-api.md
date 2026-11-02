@@ -31,6 +31,9 @@ Routes marked "key" need a key only when [hub auth](#hub-authentication) is on.
 | GET | `/api/claude-code/settings` | `claude --settings` JSON with a picker entry for every hub model. | key |
 | GET | `/api/copilot/usage` | Copilot quota. See [Usage API](github-copilot.md#usage-api). | key |
 | GET | `/api/copilot/auto/decisions` | Recent Copilot Auto decisions. See [Seeing the pick](copilot-auto.md#seeing-the-pick). | key |
+| GET | `/api/smart-auto/current` | A worker's current Smart Auto selection. Query: `worker` or `session`. See [Smart Auto](smart-auto.md#current-selection-and-history). | key |
+| GET | `/api/smart-auto/history` | Smart Auto selection events after `since_seq`. Query: `workflow`, `worker`, `since_seq`, `limit`. See [Smart Auto](smart-auto.md#current-selection-and-history). | key |
+| GET | `/api/smart-auto/decisions` | Recent Smart Auto routes. Query: `limit`. See [Smart Auto](smart-auto.md#current-selection-and-history). | key |
 | GET | `/api/stats` | Request stats. Query: `range` (`live` default, `1d`, `7d`, `30d`, `all`), `profile`, `model`. | key |
 | GET | `/api/usage` | Usage history with costs. Needs persistence. | key |
 | GET | `/api/errors` | Failed requests. Query: `range` (default `7d`). Needs persistence. | key |
@@ -59,6 +62,7 @@ Routes marked "key" need a key only when [hub auth](#hub-authentication) is on.
 | `X-LLM-Hub-Attempts` | response | Each attempt with its status. |
 | `X-LLM-Hub-Transforms` | response | The transforms that fired. Absent when none fired. |
 | `X-LLM-Hub-Auto-Pick`, `X-LLM-Hub-Auto-Reason` | response | See [Seeing the pick](copilot-auto.md#seeing-the-pick). |
+| `X-LLM-Hub-Smart-Auto-*` | request and response | Smart Auto policy, worker identity and the route. Stripped before the upstream. See [Smart Auto](smart-auto.md#request-headers). |
 
 ## Hub authentication
 

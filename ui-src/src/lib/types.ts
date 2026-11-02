@@ -260,3 +260,44 @@ export interface CopilotUsageReport {
   readonly fetchedAt: string;
   readonly quotas: readonly CopilotQuota[];
 }
+
+/** Where one Smart Auto dispatch stands; a dispatch emits selected, started, then one terminal state. */
+export type SelectionState = "selected" | "started" | "completed" | "rejected" | "cancelled";
+
+export type SelectionStage = "solver" | "judge" | "critic" | "repair";
+
+export type SelectionRole = "planning" | "investigation" | "implementation" | "validation" | "conversation";
+
+export type SelectionEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** One row of `GET /api/smart-auto/history`. Scope keys are salted hashes; no prompt or response text is present. */
+export interface SelectionEvent {
+  readonly seq: number;
+  readonly ts_ms: number;
+  readonly workflow: string | null;
+  readonly worker: string | null;
+  readonly attempt: string | null;
+  readonly turn: string | null;
+  readonly selector: string | null;
+  readonly tier: string | null;
+  readonly role: SelectionRole | null;
+  readonly stage: SelectionStage;
+  readonly model: string;
+  readonly state: SelectionState;
+  readonly reason: string | null;
+  readonly policy_version: number;
+  readonly requested_effort: SelectionEffort | null;
+  readonly selected_effort: SelectionEffort | null;
+  readonly sent_effort: SelectionEffort | null;
+  readonly confirmed_effort: SelectionEffort | null;
+  readonly status: number | null;
+  readonly latency_ms: number | null;
+  readonly tokens_in: number | null;
+  readonly tokens_out: number | null;
+  readonly cache_read_tokens: number | null;
+  readonly cache_write_tokens: number | null;
+}
+
+export interface SelectionHistoryResponse {
+  readonly events: readonly SelectionEvent[];
+}

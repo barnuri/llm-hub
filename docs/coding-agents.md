@@ -17,6 +17,10 @@ Five commands start a coding agent (a harness) against the hub. The table of com
   shell runs in between.
 - **Environment.** The harness inherits your environment. Set any other harness variable
   yourself, for example `COPILOT_OFFLINE`.
+- **Smart Auto.** `--smart-auto-tier`, `--smart-auto-min-context`, `--smart-auto-min-input`,
+  `--smart-auto-include`, `--smart-auto-exclude` and `--smart-auto-role` go before the harness
+  name. Without a model, `llm-hub claude` uses `hub/smart-auto-balance`. See
+  [Smart Auto](smart-auto.md#launch-flags).
 
 ## llm-hub claude
 

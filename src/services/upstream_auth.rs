@@ -487,11 +487,13 @@ mod tests {
 
         let payload = refresh_models(&state).await;
 
+        // Smart Auto `hub/*` entries are appended after the profile lists; this test covers the Copilot list.
         let ids: Vec<&str> = payload["data"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|model| model["id"].as_str())
+            .filter(|id| id.starts_with("copilot/"))
             .collect();
         assert_eq!(
             ids,

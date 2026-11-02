@@ -1,0 +1,93 @@
+.smart-auto-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: -6px 0 12px;
+}
+
+.smart-auto-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  margin-bottom: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--border);
+}
+
+.smart-auto-kpis > .kpi {
+  min-width: 0;
+  border: 0;
+  border-radius: 0;
+}
+
+.smart-auto-kpis .kpi-row {
+  flex-wrap: wrap;
+}
+
+.smart-auto-kpis .kpi-value {
+  overflow-wrap: anywhere;
+}
+
+.smart-auto-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 14px;
+  margin-bottom: 12px;
+}
+
+.smart-auto-filter {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.smart-auto-filter .input {
+  max-width: 100%;
+  min-width: 150px;
+  height: 30px;
+}
+
+.smart-auto-table .table td,
+.smart-auto-table .table th {
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.smart-auto-table .table-scroll {
+  max-width: 100%;
+}
+
+.smart-auto-table .smart-auto-reason {
+  min-width: 180px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.smart-auto-table tr.turn-start td {
+  border-top: 1px solid var(--border-strong);
+}
+
+.smart-auto-table tr.failed td {
+  background: var(--danger-soft);
+}
+
+.smart-auto-table .table-empty {
+  padding: 18px 10px;
+  color: var(--muted);
+  text-align: center;
+  white-space: normal;
+}
+
+@media (max-width: 720px) {
+  .smart-auto-kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

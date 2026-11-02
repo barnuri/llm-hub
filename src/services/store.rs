@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::schemas::api_key_record::ApiKeyRecord;
+use crate::schemas::selection_event::SelectionEvent;
 use crate::schemas::usage_report::UsageReport;
 use crate::schemas::usage_row::UsageRow;
 use rusqlite::Connection;
@@ -18,6 +19,13 @@ use crate::services::stats::{RequestOutcome, StatsSnapshot, snapshot_from_outcom
 const DEFAULT_SQLITE_PATH: &str = "llm-hub.db";
 const DEFAULT_JSON_PATH: &str = "llm-hub-stats.json";
 const USAGE_RECENT_LIMIT: usize = 200;
+/// Selection events kept by count; the oldest are dropped first.
+pub const SELECTION_RETENTION_EVENTS: usize = 10_000;
+/// Selection events older than this are dropped on the next save.
+const SELECTION_RETENTION_MS: u64 = 14 * MS_PER_DAY;
+const MS_PER_DAY: u64 = 86_400_000;
+/// The `install_settings` name that holds the salt of the scope keys.
+const INSTALL_SALT_NAME: &str = "selection_salt";
 
 /// Durable store behind `LLM_HUB_PERSISTENT=true`. Sqlite keeps a full request
 /// log; Json keeps a rolling recent window flushed on every write batch.
@@ -47,6 +55,12 @@ struct JsonState {
     /// Profile -> stored body fields its upstream rejects. Absent from older files.
     #[serde(default)]
     unsupported_body_fields: HashMap<String, Vec<String>>,
+    /// Smart Auto selection events, oldest first. Absent from older files.
+    #[serde(default)]
+    selection_events: Vec<SelectionEvent>,
+    /// The salt behind the selection scope keys. Absent from older files.
+    #[serde(default)]
+    install_salt: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -124,6 +138,16 @@ impl Store {
                 field TEXT NOT NULL,
                 learned_at INTEGER NOT NULL,
                 PRIMARY KEY (profile, field)
+            );
+            CREATE TABLE IF NOT EXISTS selection_events (
+                seq INTEGER PRIMARY KEY,
+                ts_ms INTEGER NOT NULL,
+                event TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_selection_events_ts ON selection_events(ts_ms);
+            CREATE TABLE IF NOT EXISTS install_settings (
+                name TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );",
         )
         .map_err(|e| format!("sqlite schema init failed: {e}"))?;
@@ -801,6 +825,134 @@ impl Store {
             }
         }
     }
+    /// The salt of the selection scope keys. Stores `fresh` when none is saved yet, and returns the saved salt.
+    pub fn install_salt(&self, fresh: &str) -> Result<String, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                guard
+                    .execute(
+                        "INSERT INTO install_settings (name, value) VALUES (?1, ?2)
+                         ON CONFLICT(name) DO NOTHING",
+                        rusqlite::params![INSTALL_SALT_NAME, fresh],
+                    )
+                    .map_err(|e| e.to_string())?;
+                guard
+                    .query_row(
+                        "SELECT value FROM install_settings WHERE name = ?1",
+                        rusqlite::params![INSTALL_SALT_NAME],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                if let Some(saved) = &guard.state.install_salt {
+                    return Ok(saved.clone());
+                }
+                guard.state.install_salt = Some(fresh.to_string());
+                guard.flush()?;
+                Ok(fresh.to_string())
+            }
+        }
+    }
+
+    /// Saves `events`, then drops events older than the retention age and keeps only the newest `max_events`.
+    pub fn save_selection_events(
+        &self,
+        events: &[SelectionEvent],
+        now_ms: u64,
+        max_events: usize,
+    ) -> Result<(), String> {
+        let cutoff = now_ms.saturating_sub(SELECTION_RETENTION_MS);
+        match self {
+            Store::Sqlite(conn) => {
+                let mut guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let tx = guard.transaction().map_err(|e| e.to_string())?;
+                {
+                    let mut insert = tx
+                        .prepare(
+                            "INSERT OR REPLACE INTO selection_events (seq, ts_ms, event)
+                             VALUES (?1, ?2, ?3)",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    for event in events {
+                        let json = serde_json::to_string(event).map_err(|e| e.to_string())?;
+                        insert
+                            .execute(rusqlite::params![
+                                db_i64(event.seq),
+                                db_i64(event.ts_ms),
+                                json
+                            ])
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                tx.execute(
+                    "DELETE FROM selection_events WHERE ts_ms < ?1",
+                    rusqlite::params![db_i64(cutoff)],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "DELETE FROM selection_events WHERE seq <= COALESCE(
+                         (SELECT seq FROM selection_events ORDER BY seq DESC LIMIT 1 OFFSET ?1), 0)",
+                    rusqlite::params![i64::try_from(max_events).unwrap_or(i64::MAX)],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                let stored = &mut guard.state.selection_events;
+                stored.extend_from_slice(events);
+                stored.retain(|event| event.ts_ms >= cutoff);
+                let excess = stored.len().saturating_sub(max_events);
+                if excess > 0 {
+                    stored.drain(..excess);
+                }
+                guard.flush()
+            }
+        }
+    }
+
+    /// The newest `limit` selection events, oldest first.
+    pub fn load_selection_events(&self, limit: usize) -> Result<Vec<SelectionEvent>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT event FROM (
+                             SELECT seq, event FROM selection_events ORDER BY seq DESC LIMIT ?1
+                         ) ORDER BY seq",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows: Vec<String> = stmt
+                    .query_map(
+                        rusqlite::params![i64::try_from(limit).unwrap_or(i64::MAX)],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .map_err(|e| e.to_string())?
+                    .filter_map(Result::ok)
+                    .collect();
+                Ok(rows
+                    .iter()
+                    .filter_map(|json| {
+                        serde_json::from_str::<SelectionEvent>(json)
+                            .inspect_err(|e| {
+                                tracing::warn!("stored selection event is unreadable: {e}");
+                            })
+                            .ok()
+                    })
+                    .collect())
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                let stored = &guard.state.selection_events;
+                let skip = stored.len().saturating_sub(limit);
+                Ok(stored[skip..].to_vec())
+            }
+        }
+    }
 }
 
 impl JsonStore {
@@ -1152,5 +1304,148 @@ mod tests {
     #[test]
     fn unknown_store_kind_errors() {
         assert!(Store::open("postgres", None).is_err());
+    }
+
+    fn selection_event(seq: u64, ts_ms: u64) -> SelectionEvent {
+        use crate::schemas::selection_stage::SelectionStage;
+        use crate::schemas::selection_state::SelectionState;
+
+        SelectionEvent {
+            seq,
+            ts_ms,
+            ..SelectionEvent::new(
+                SelectionStage::Solver,
+                SelectionState::Selected,
+                "copilot/m",
+            )
+        }
+    }
+
+    fn seqs(events: &[SelectionEvent]) -> Vec<u64> {
+        events.iter().map(|event| event.seq).collect()
+    }
+
+    fn selection_events_keep_the_newest_by_count(kind: &str, file: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        let path_str = path.to_str().unwrap();
+        let now = 10 * MS_PER_DAY;
+        let events: Vec<SelectionEvent> = (1..=5).map(|seq| selection_event(seq, now)).collect();
+        {
+            let store = Store::open(kind, Some(path_str)).unwrap();
+            store.save_selection_events(&events[..3], now, 3).unwrap();
+            store.save_selection_events(&events[3..], now, 3).unwrap();
+        }
+        let store = Store::open(kind, Some(path_str)).unwrap();
+
+        assert_eq!(seqs(&store.load_selection_events(10).unwrap()), [3, 4, 5]);
+        assert_eq!(seqs(&store.load_selection_events(2).unwrap()), [4, 5]);
+    }
+
+    #[test]
+    fn sqlite_selection_events_keep_the_newest_by_count() {
+        selection_events_keep_the_newest_by_count("sqlite", "t.db");
+    }
+
+    #[test]
+    fn json_selection_events_keep_the_newest_by_count() {
+        selection_events_keep_the_newest_by_count("json", "s.json");
+    }
+
+    fn selection_events_expire_by_age(kind: &str, file: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        let store = Store::open(kind, Some(path.to_str().unwrap())).unwrap();
+        let now = 100 * MS_PER_DAY;
+        let expired = now - SELECTION_RETENTION_MS - 1;
+
+        store
+            .save_selection_events(
+                &[selection_event(1, expired), selection_event(2, now)],
+                now,
+                SELECTION_RETENTION_EVENTS,
+            )
+            .unwrap();
+
+        assert_eq!(seqs(&store.load_selection_events(10).unwrap()), [2]);
+    }
+
+    #[test]
+    fn sqlite_selection_events_expire_by_age() {
+        selection_events_expire_by_age("sqlite", "t.db");
+    }
+
+    #[test]
+    fn json_selection_events_expire_by_age() {
+        selection_events_expire_by_age("json", "s.json");
+    }
+
+    #[test]
+    fn sqlite_database_from_before_selection_events_gains_the_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_ms INTEGER NOT NULL,
+                    model TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    status INTEGER NOT NULL,
+                    latency_ms INTEGER NOT NULL,
+                    tokens_in INTEGER NOT NULL,
+                    tokens_out INTEGER NOT NULL,
+                    ttft_ms INTEGER
+                );",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        assert!(store.load_selection_events(10).unwrap().is_empty());
+        store
+            .save_selection_events(&[selection_event(1, 5)], 5, 10)
+            .unwrap();
+
+        assert_eq!(seqs(&store.load_selection_events(10).unwrap()), [1]);
+    }
+
+    #[test]
+    fn json_store_without_selection_fields_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.json");
+        std::fs::write(
+            &path,
+            r#"{"totals":{"requests":0,"errors":0,"tokens_in":0,"tokens_out":0,"cache_read_tokens":0,"cache_write_tokens":0},"recent":[],"api_keys":[]}"#,
+        )
+        .unwrap();
+        let store = Store::open("json", Some(path.to_str().unwrap())).unwrap();
+
+        assert!(store.load_selection_events(10).unwrap().is_empty());
+        assert_eq!(store.install_salt("fresh").unwrap(), "fresh");
+    }
+
+    fn install_salt_survives_reopen(kind: &str, file: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        let path_str = path.to_str().unwrap();
+        {
+            let store = Store::open(kind, Some(path_str)).unwrap();
+            assert_eq!(store.install_salt("first").unwrap(), "first");
+        }
+        let store = Store::open(kind, Some(path_str)).unwrap();
+
+        assert_eq!(store.install_salt("second").unwrap(), "first");
+    }
+
+    #[test]
+    fn sqlite_install_salt_is_created_once() {
+        install_salt_survives_reopen("sqlite", "t.db");
+    }
+
+    #[test]
+    fn json_install_salt_is_created_once() {
+        install_salt_survives_reopen("json", "s.json");
     }
 }

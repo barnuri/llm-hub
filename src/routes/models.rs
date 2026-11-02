@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::Json;
 use axum::extract::{Query, Request, State};
@@ -10,26 +10,39 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::configs::ProfileConfig;
-use crate::consts::{MODELS_CACHE_TTL, MODELS_FANOUT_TIMEOUT};
+use crate::consts::{CONTEXT_TOKENS_1M, MODELS_CACHE_TTL, MODELS_FANOUT_TIMEOUT};
 use crate::dependencies::state::AppState;
+use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::profile_filter::ProfileFilter;
+use crate::schemas::limit_evidence::LimitEvidence;
 use crate::schemas::model_context::{
     advertised_model_id, inferred_max_input_tokens, max_input_tokens_from_item,
 };
+use crate::schemas::model_descriptor::ModelDescriptor;
+use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
+use crate::schemas::smart_auto_policy::SmartAutoPolicy;
 use crate::schemas::upstream_model::UpstreamModel;
 use crate::services::copilot_auto::{
     AUTO_MODEL, AutoTier, CHAT_ENDPOINT, MESSAGES_ENDPOINT, RESPONSES_ENDPOINT,
 };
+use crate::services::model_descriptors::ModelDescriptors;
 use crate::services::model_limits::ModelLimit;
+use crate::services::smart_auto_pool::SmartAutoPool;
 use crate::services::upstream_auth;
 
 pub(crate) const MODELS_PATH: &str = "/models";
 /// The bare model id a Copilot profile advertises for Copilot Auto routing.
 pub(crate) const COPILOT_AUTO_MODEL: &str = AUTO_MODEL;
 const COPILOT_AUTO_ENDPOINTS: [&str; 3] = [CHAT_ENDPOINT, RESPONSES_ENDPOINT, MESSAGES_ENDPOINT];
+/// The Smart Auto entry the model picker lists first and marks as recommended.
+pub(crate) const RECOMMENDED_MODEL: &str = "hub/smart-auto-balance";
 const COPILOT_POLICY_DISABLED: &str = "disabled";
 const CLAUDE_ID_PREFIX: &str = "claude-";
 const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
+/// Per-limit provenance object on each `/v1/models` entry.
+const LIMITS_FIELD: &str = "llm_hub_limits";
+/// Confidence is published to two decimals, so an `f32` like 0.6 does not print as 0.6000000238.
+const CONFIDENCE_SCALE: f64 = 100.0;
 
 /// `?profiles=a,b` limits a model list to those profiles, like the
 /// `x-llm-hub-profiles` header.
@@ -99,29 +112,40 @@ pub async fn refresh_models(state: &AppState) -> Value {
     let per_profile = join_all(fetches).await;
 
     let mut merged = Vec::new();
+    let mut descriptors = Vec::new();
     for (profile, result) in enabled.iter().zip(per_profile) {
-        match result {
-            Ok(models) => {
+        let listing = match result {
+            Ok(listing) => {
                 state.set_upstream_health(&profile.name, true);
-                merged.extend(models);
+                listing
             }
             Err(reason) => {
                 state.set_upstream_health(&profile.name, false);
                 tracing::warn!(profile = %profile.name, "models fetch failed: {reason}");
-                merged.extend(fallback_models(state, profile));
+                fallback_models(state, profile)
             }
-        }
+        };
+        merged.extend(listing.models);
+        descriptors.extend(listing.descriptors);
     }
 
+    state.set_model_descriptors(descriptors);
+    merged.extend(smart_auto_entries(&state.model_descriptors()));
     let payload = json!({ "object": "list", "data": merged });
     state.set_model_cache(payload.clone());
     payload
 }
 
+/// One profile's advertised `/v1/models` entries and the descriptors of its concrete models.
+struct ProfileListing {
+    models: Vec<Value>,
+    descriptors: Vec<ModelDescriptor>,
+}
+
 async fn fetch_profile_models(
     state: &AppState,
     profile: &ProfileConfig,
-) -> Result<Vec<Value>, String> {
+) -> Result<ProfileListing, String> {
     let client = state.client(&profile.name).ok_or("no client for profile")?;
     let body = tokio::time::timeout(
         MODELS_FANOUT_TIMEOUT,
@@ -139,10 +163,7 @@ async fn fetch_profile_models(
         .filter(|item| profile.copilot.is_none() || is_copilot_model_usable(item))
         .collect();
     if profile.copilot.is_none() {
-        return Ok(usable
-            .into_iter()
-            .map(|item| rewrite_model(profile, item, None))
-            .collect());
+        return Ok(describe_and_rewrite(profile, &usable, None));
     }
     state.update_copilot_catalog(
         &profile.name,
@@ -155,27 +176,73 @@ async fn fetch_profile_models(
 /// A failed fetch lists the profile's last Copilot catalog, so a restart with
 /// a slow upstream does not cache an empty list. Other profiles list their
 /// static models.
-fn fallback_models(state: &AppState, profile: &ProfileConfig) -> Vec<Value> {
+fn fallback_models(state: &AppState, profile: &ProfileConfig) -> ProfileListing {
     let catalog = state.copilot_catalog(&profile.name);
     if profile.copilot.is_none() || catalog.is_empty() {
-        return static_models(profile);
+        let items: Vec<Value> = profile
+            .static_models
+            .iter()
+            .map(|id| json!({ "id": id }))
+            .collect();
+        let items: Vec<&Value> = items.iter().collect();
+        return ProfileListing {
+            models: static_models(profile),
+            descriptors: ModelDescriptors::build(profile, &items, None),
+        };
     }
     let items: Vec<&Value> = catalog.iter().collect();
     copilot_models(state, profile, &items)
 }
 
-fn copilot_models(state: &AppState, profile: &ProfileConfig, items: &[&Value]) -> Vec<Value> {
-    let limits = state.model_limits().for_profile(&profile.name);
-    let mut models: Vec<Value> = items
+/// Upstream entries that are real models, not Copilot's own Auto selectors.
+fn concrete_copilot_items<'a>(items: &[&'a Value]) -> Vec<&'a Value> {
+    items
         .iter()
+        .copied()
         .filter(|item| {
             item.get("id")
                 .and_then(Value::as_str)
                 .and_then(AutoTier::from_model)
                 .is_none()
         })
-        .map(|item| rewrite_model(profile, item, Some(&limits)))
-        .collect();
+        .collect()
+}
+
+/// The learned and seeded limits are read here, so a limit learned since the last
+/// refresh reaches both the advertised window and the descriptor.
+fn concrete_copilot_listing(
+    state: &AppState,
+    profile: &ProfileConfig,
+    items: &[&Value],
+) -> ProfileListing {
+    let limits = state.model_limits().for_profile(&profile.name);
+    describe_and_rewrite(profile, &concrete_copilot_items(items), Some(&limits))
+}
+
+/// Describes each entry and rewrites it with that descriptor in one pass.
+fn describe_and_rewrite(
+    profile: &ProfileConfig,
+    items: &[&Value],
+    limits: Option<&HashMap<String, ModelLimit>>,
+) -> ProfileListing {
+    let mut models = Vec::with_capacity(items.len());
+    let mut descriptors = Vec::with_capacity(items.len());
+    for item in items {
+        let descriptor = ModelDescriptors::describe(profile, item, limits);
+        models.push(rewrite_model(profile, item, limits, descriptor.as_ref()));
+        descriptors.extend(descriptor);
+    }
+    ProfileListing {
+        models,
+        descriptors,
+    }
+}
+
+fn copilot_models(state: &AppState, profile: &ProfileConfig, items: &[&Value]) -> ProfileListing {
+    let ProfileListing {
+        mut models,
+        descriptors,
+    } = concrete_copilot_listing(state, profile, items);
     for tier in AutoTier::ALL {
         let id = if tier == AutoTier::default() {
             COPILOT_AUTO_MODEL.to_string()
@@ -184,7 +251,10 @@ fn copilot_models(state: &AppState, profile: &ProfileConfig, items: &[&Value]) -
         };
         models.push(copilot_auto_model(profile, &id, tier));
     }
-    models
+    ProfileListing {
+        models,
+        descriptors,
+    }
 }
 
 /// Loads the Copilot catalogs saved by earlier runs, so the first request after
@@ -201,14 +271,19 @@ pub fn restore_catalogs(state: &AppState) {
         }
     };
     let config = state.config();
+    let mut descriptors = Vec::new();
     for profile in config.profiles.iter().filter(|p| p.copilot.is_some()) {
         let Some(entries) = stored.remove(&profile.name) else {
             continue;
         };
         let items: Vec<&Value> = entries.iter().collect();
         state.set_upstream_models(&profile.name, upstream_catalog(profile, &items));
+        if profile.enabled {
+            descriptors.extend(concrete_copilot_listing(state, profile, &items).descriptors);
+        }
         state.set_copilot_catalog(&profile.name, entries);
     }
+    state.set_model_descriptors(descriptors);
 }
 
 /// Holds a proxied request until the first fan-out maps Copilot ids, when a
@@ -345,19 +420,17 @@ fn is_copilot_model_usable(item: &Value) -> bool {
     !picker_disabled && !policy_disabled
 }
 
-/// `limits` holds a Copilot profile's learned or seeded prompt limits. They win
-/// over the upstream's listed window, which Copilot understates for Claude.
+/// `limits` holds a Copilot profile's learned and seeded prompt limits; see
+/// [`advertised_prompt_limit`] for which source wins.
 fn rewrite_model(
     profile: &ProfileConfig,
     item: &Value,
     limits: Option<&HashMap<String, ModelLimit>>,
+    descriptor: Option<&ModelDescriptor>,
 ) -> Value {
     let mut model = item.clone();
     let raw_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-    let upstream_tokens = limits
-        .and_then(|limits| limits.get(raw_id))
-        .map(|known| known.limit)
-        .or_else(|| max_input_tokens_from_item(item));
+    let upstream_tokens = advertised_prompt_limit(raw_id, item, limits);
     let bare = advertised_bare_id(profile, raw_id);
     let qualified = format!("{}/{}", profile.name, bare);
     let advertised = advertised_model_id(&qualified, upstream_tokens);
@@ -366,8 +439,24 @@ fn rewrite_model(
         obj.insert("owned_by".into(), json!(profile.name));
         annotate_labels(obj, profile, &bare);
         annotate_context(obj, &advertised, upstream_tokens);
+        if let Some(descriptor) = descriptor {
+            annotate_limits(obj, descriptor);
+        }
     }
     model
+}
+
+/// Prompt limit to advertise: learned from a Copilot rejection, then the measured seed, then the
+/// listed `/models` value as a fallback, because Copilot `/models` understates most models.
+fn advertised_prompt_limit(
+    raw_id: &str,
+    item: &Value,
+    limits: Option<&HashMap<String, ModelLimit>>,
+) -> Option<u64> {
+    limits
+        .and_then(|limits| limits.get(raw_id))
+        .map(|known| known.limit)
+        .or_else(|| max_input_tokens_from_item(item))
 }
 
 fn static_models(profile: &ProfileConfig) -> Vec<Value> {
@@ -400,9 +489,10 @@ fn filter_enabled_models(payload: &mut Value, profiles: &[ProfileConfig]) {
         let Some(owner) = model.get("owned_by").and_then(Value::as_str) else {
             return false;
         };
-        profiles
-            .iter()
-            .any(|profile| profile.enabled && profile.name == owner)
+        owner == HubSelector::NAMESPACE
+            || profiles
+                .iter()
+                .any(|profile| profile.enabled && profile.name == owner)
     });
 }
 
@@ -429,6 +519,109 @@ fn annotate_context(
     obj.insert("context_window".into(), json!(tokens));
 }
 
+/// Adds `max_output_tokens` when the output limit is known, and `llm_hub_limits` with the
+/// provenance of each known limit. Unknown limits are left out rather than written as null.
+fn annotate_limits(obj: &mut serde_json::Map<String, Value>, descriptor: &ModelDescriptor) {
+    if let Some(output) = &descriptor.output {
+        obj.insert("max_output_tokens".into(), json!(output.value));
+    }
+    let provenance: serde_json::Map<String, Value> = [
+        ("input", &descriptor.input),
+        ("context", &descriptor.context),
+        ("output", &descriptor.output),
+        ("runtime_context", &descriptor.runtime_context),
+    ]
+    .into_iter()
+    .filter_map(|(name, evidence)| Some((name.to_string(), limit_provenance(evidence.as_ref()?))))
+    .collect();
+    if !provenance.is_empty() {
+        obj.insert(LIMITS_FIELD.into(), Value::Object(provenance));
+    }
+}
+
+fn limit_provenance(evidence: &LimitEvidence) -> Value {
+    let confidence = (f64::from(evidence.confidence) * CONFIDENCE_SCALE).round() / CONFIDENCE_SCALE;
+    let mut entry = json!({
+        "value": evidence.value,
+        "source": evidence.source,
+        "confidence": confidence,
+        "conflict": evidence.conflict,
+    });
+    if let Some(observed_at) = evidence.observed_at {
+        entry["observed_at"] = json!(observed_at);
+    }
+    entry
+}
+
+/// The virtual `hub/*` Smart Auto entries, each limited to the pool it can pick from.
+fn smart_auto_entries(snapshot: &ModelDescriptorSnapshot) -> Vec<Value> {
+    HubSelector::builtin_names()
+        .into_iter()
+        .filter_map(|name| {
+            let id = format!("{}/{name}", HubSelector::NAMESPACE);
+            let selector = HubSelector::parse(&id, &BTreeMap::new()).ok()??;
+            let pool = eligible_pool(snapshot, &selector.policy);
+            Some(smart_auto_entry(&id, &selector, &pool))
+        })
+        .collect()
+}
+
+/// The concrete models any client route could pick for this policy, sorted by qualified id.
+fn eligible_pool<'a>(
+    snapshot: &'a ModelDescriptorSnapshot,
+    policy: &SmartAutoPolicy,
+) -> Vec<&'a ModelDescriptor> {
+    let mut pool: BTreeMap<&str, &ModelDescriptor> = BTreeMap::new();
+    for endpoint in COPILOT_AUTO_ENDPOINTS {
+        for descriptor in SmartAutoPool::eligible(snapshot, policy, endpoint, 0) {
+            pool.entry(descriptor.qualified_id.as_str())
+                .or_insert(descriptor);
+        }
+    }
+    pool.into_values().collect()
+}
+
+/// One Smart Auto entry. Its limits are the smallest the pool guarantees, and unknown ones are left out.
+fn smart_auto_entry(id: &str, selector: &HubSelector, pool: &[&ModelDescriptor]) -> Value {
+    let tier = AutoTier::from(selector.tier).label();
+    let mut entry = json!({
+        "id": id,
+        "object": "model",
+        "owned_by": HubSelector::NAMESPACE,
+        "display_name": smart_auto_label(selector),
+        "description": format!("Smart Auto {tier} tier · via llm-hub"),
+        "recommended": id == RECOMMENDED_MODEL,
+    });
+    let limits = SmartAutoPool::advertised_limits(pool);
+    if let Some(obj) = entry.as_object_mut() {
+        if let Some(input) = limits.input {
+            obj.insert("max_input_tokens".into(), json!(input));
+        }
+        if let Some(context) = limits.context {
+            obj.insert("context_length".into(), json!(context));
+            obj.insert("context_window".into(), json!(context));
+        }
+        if let Some(output) = limits.output {
+            obj.insert("max_output_tokens".into(), json!(output));
+        }
+    }
+    entry
+}
+
+/// The picker name: the tier, then the one-million minimum a built-in preset adds.
+fn smart_auto_label(selector: &HubSelector) -> String {
+    let tier = AutoTier::from(selector.tier).label();
+    let policy = &selector.policy;
+    let minimum = if policy.min_input_tokens == Some(CONTEXT_TOKENS_1M) {
+        ", 1M input"
+    } else if policy.min_context_tokens == Some(CONTEXT_TOKENS_1M) {
+        ", 1M context"
+    } else {
+        ""
+    };
+    format!("Smart Auto ({tier}{minimum})")
+}
+
 /// Spawned from main: keeps the cache warm so client startups never fan out.
 pub fn spawn_background_refresh(state: AppState) {
     tokio::spawn(async move {
@@ -447,6 +640,9 @@ mod tests {
     use super::*;
     use crate::configs::{CopilotFlow, HubConfig, ProfileConfig, TokenRates};
     use crate::consts::CONTEXT_TOKENS_1M;
+    use crate::schemas::evidence_source::EvidenceSource;
+    use crate::schemas::limit_evidence::LimitEvidence;
+    use crate::schemas::model_context::LISTED_CONFIDENCE;
     use crate::services::fake_gh_cli::FakeGhCli;
     use crate::services::gh_cli::GhOutcome;
     use crate::services::memory_credential_store::MemoryCredentialStore;
@@ -604,6 +800,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copilot_models_publish_known_output_and_limit_provenance() {
+        let models = json!([
+            {"id": "claude-opus-5.5", "supported_endpoints": ["/v1/messages"],
+             "capabilities": {"limits": {"max_context_window_tokens": 328_000,
+                                         "max_output_tokens": 128_000,
+                                         "max_prompt_tokens": 200_000}}},
+            {"id": "gpt-9", "supported_endpoints": ["/responses"],
+             "capabilities": {"limits": {"max_prompt_tokens": 136_000}}}
+        ]);
+        let (github, _copilot) = copilot_upstream(models, Duration::ZERO, None).await;
+        let state = copilot_state(&github.uri());
+        state.model_limits().learn("copilot", "gpt-9", 180_000, 7);
+
+        let payload = refresh_models(&state).await;
+
+        let entry = |id: &str| {
+            payload["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id)
+                .unwrap_or_else(|| panic!("{id} missing from {payload}"))
+                .clone()
+        };
+        let opus = entry("copilot/claude-opus-5-5[1m]");
+        assert_eq!(opus["max_input_tokens"], CONTEXT_TOKENS_1M);
+        assert_eq!(opus["context_length"], CONTEXT_TOKENS_1M);
+        assert_eq!(opus["context_window"], CONTEXT_TOKENS_1M);
+        assert_eq!(opus["max_output_tokens"], 128_000);
+        assert_eq!(
+            opus[LIMITS_FIELD],
+            json!({
+                "input": {"value": CONTEXT_TOKENS_1M, "source": "seeded",
+                          "confidence": 0.85, "conflict": false},
+                "context": {"value": 328_000, "source": "listed",
+                            "confidence": LISTED_CONFIDENCE, "conflict": false},
+                "output": {"value": 128_000, "source": "listed",
+                           "confidence": LISTED_CONFIDENCE, "conflict": false},
+            })
+        );
+        let gpt = entry("copilot/gpt-9");
+        assert_eq!(gpt["max_input_tokens"], 180_000);
+        assert!(gpt.get("max_output_tokens").is_none(), "{gpt}");
+        let gpt_limits = gpt[LIMITS_FIELD].as_object().unwrap();
+        assert_eq!(
+            gpt_limits.keys().collect::<Vec<_>>(),
+            ["input"],
+            "unknown limits are omitted"
+        );
+        assert_eq!(gpt_limits["input"]["source"], "observed_rejection");
+        assert_eq!(gpt_limits["input"]["observed_at"], 7);
+        assert_eq!(gpt_limits["input"]["conflict"], true);
+        let auto = entry("copilot/auto");
+        assert!(auto.get(LIMITS_FIELD).is_none(), "{auto}");
+    }
+
+    #[test]
+    fn entry_without_known_limits_has_no_provenance_object() {
+        let item = json!({"id": "meta/muse-glimmer", "object": "model"});
+        let local = profile("llama_swap", &[]);
+        let descriptor = ModelDescriptors::describe(&local, &item, None);
+
+        let out = rewrite_model(&local, &item, None, descriptor.as_ref());
+
+        assert!(out.get(LIMITS_FIELD).is_none(), "{out}");
+        assert!(out.get("max_output_tokens").is_none(), "{out}");
+    }
+
+    #[tokio::test]
+    async fn refresh_builds_the_descriptor_snapshot_for_every_listed_model() {
+        let models = json!([
+            {"id": "claude-opus-5.5", "supported_endpoints": ["/v1/messages"]},
+            {"id": "auto", "supported_endpoints": ["/chat/completions"]}
+        ]);
+        let (github, _copilot) = copilot_upstream(models, Duration::ZERO, None).await;
+        let state = state_from(&[
+            ("LLM_HUB_PROFILES", "copilot,local"),
+            ("LLM_HUB_COPILOT_BASE_URL", DEAD_BASE_URL),
+            ("LLM_HUB_COPILOT_AUTH", CopilotFlow::Opencode.auth_value()),
+            ("LLM_HUB_COPILOT_GITHUB_API_URL", &github.uri()),
+            ("LLM_HUB_LOCAL_BASE_URL", DEAD_BASE_URL),
+            ("LLM_HUB_LOCAL_MODELS", "qwen"),
+        ]);
+        assert_eq!(state.model_descriptors().len(), 0);
+
+        refresh_models(&state).await;
+
+        let snapshot = state.model_descriptors();
+        let opus = snapshot.get("copilot/claude-opus-5-5[1m]").unwrap();
+        assert_eq!(opus.input.as_ref().unwrap().value, CONTEXT_TOKENS_1M);
+        assert_eq!(opus.endpoints, ["/v1/messages"]);
+        assert!(
+            snapshot.for_model("local", "qwen").is_some(),
+            "a dead profile's static models are described"
+        );
+        assert_eq!(
+            snapshot.get("copilot/auto"),
+            None,
+            "Auto selectors are not concrete models"
+        );
+        assert_eq!(snapshot.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn limit_learned_from_a_rejection_wins_after_the_next_refresh() {
+        let models = json!([{"id": "gpt-9", "supported_endpoints": ["/responses"],
+                              "capabilities": {"limits": {"max_prompt_tokens": 136_000}}}]);
+        let (github, _copilot) = copilot_upstream(models, Duration::ZERO, None).await;
+        let state = copilot_state(&github.uri());
+        refresh_models(&state).await;
+        let before = state.model_descriptors();
+        assert_eq!(
+            before.for_model("copilot", "gpt-9").unwrap().input,
+            Some(LimitEvidence::new(
+                136_000,
+                EvidenceSource::Listed,
+                "copilot:/v1/messages",
+                LISTED_CONFIDENCE
+            ))
+        );
+        let rejection = json!({"error": {"code": "model_max_prompt_tokens_exceeded",
+            "message": "prompt token count of 400000 exceeds the limit of 300000"}});
+
+        state.learn_prompt_limit("copilot", "gpt-9", rejection.to_string().as_bytes());
+        refresh_models(&state).await;
+
+        let input = state
+            .model_descriptors()
+            .for_model("copilot", "gpt-9")
+            .unwrap()
+            .input
+            .clone()
+            .unwrap();
+        assert_eq!(input.value, 300_000);
+        assert_eq!(input.source, EvidenceSource::ObservedRejection);
+        assert!(input.conflict);
+        assert_eq!(
+            before
+                .for_model("copilot", "gpt-9")
+                .unwrap()
+                .input
+                .as_ref()
+                .unwrap()
+                .value,
+            136_000,
+            "a reader keeps the snapshot it loaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_catalog_builds_descriptors_before_any_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = sqlite_store(&dir.path().join("hub.db"));
+        store
+            .save_model_catalog("copilot", &[opus_catalog()[0].clone()])
+            .unwrap();
+        let restarted = copilot_state_with_store(DEAD_BASE_URL, Some(store));
+
+        restore_catalogs(&restarted);
+
+        let snapshot = restarted.model_descriptors();
+        let opus = snapshot.for_model("copilot", "claude-opus-5-5").unwrap();
+        assert_eq!(opus.input.as_ref().unwrap().source, EvidenceSource::Seeded);
+        assert_eq!(snapshot.len(), 1);
+    }
+
+    #[tokio::test]
     async fn restart_restores_saved_catalog_before_any_fetch() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("hub.db");
@@ -642,7 +1005,7 @@ mod tests {
 
         let payload = enabled_models(&restarted).await;
 
-        let listed = ids(&payload);
+        let listed = profile_ids(&payload);
         assert_eq!(listed.len(), 6, "unexpected list {payload}");
         assert!(
             listed
@@ -727,6 +1090,24 @@ mod tests {
             .collect()
     }
 
+    /// The ids of the profile models, without the virtual `hub/*` Smart Auto entries.
+    fn profile_ids(payload: &Value) -> Vec<&str> {
+        ids(payload)
+            .into_iter()
+            .filter(|id| !id.starts_with("hub/"))
+            .collect()
+    }
+
+    /// The entries a profile advertises, without the virtual `hub/*` Smart Auto entries.
+    fn profile_entries(payload: &Value) -> Vec<&Value> {
+        payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|model| model["owned_by"] != HubSelector::NAMESPACE)
+            .collect()
+    }
+
     #[tokio::test]
     async fn cached_list_is_served_without_fan_out() {
         let upstream = MockServer::start().await;
@@ -774,7 +1155,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(ids(&payload), ["proxy/m"]);
+        assert_eq!(profile_ids(&payload), ["proxy/m"]);
     }
 
     #[test]
@@ -805,7 +1186,8 @@ mod tests {
     }
 
     fn assert_canonical_auto_descriptions(payload: &Value) {
-        let descriptions: Vec<&str> = payload["data"].as_array().unwrap()[2..]
+        let entries = profile_entries(payload);
+        let descriptions: Vec<&str> = entries[2..]
             .iter()
             .map(|model| model["description"].as_str().unwrap())
             .collect();
@@ -838,7 +1220,7 @@ mod tests {
         let payload = refresh_models(&state).await;
 
         assert_eq!(
-            ids(&payload),
+            profile_ids(&payload),
             [
                 "copilot/auto-efficiency",
                 "copilot/auto",
@@ -873,7 +1255,7 @@ mod tests {
         let payload = refresh_models(&state).await;
 
         assert_eq!(
-            ids(&payload),
+            profile_ids(&payload),
             [
                 "copilot/claude-opus-4-5",
                 "copilot/gpt-4.1",
@@ -884,7 +1266,8 @@ mod tests {
             ]
         );
         assert_eq!(state.copilot_catalog("copilot")[0]["id"], "claude-opus-4.5");
-        let labels: Vec<&str> = payload["data"].as_array().unwrap()[2..]
+        let entries = profile_entries(&payload);
+        let labels: Vec<&str> = entries[2..]
             .iter()
             .map(|model| model["display_name"].as_str().unwrap())
             .collect();
@@ -945,7 +1328,7 @@ mod tests {
     fn rewrite_model_adds_display_name_and_description() {
         let mut labelled = profile("llmgw", &[]);
         labelled.display_name = Some("Gateway".to_string());
-        let out = rewrite_model(&labelled, &json!({"id": "gpt-4.1"}), None);
+        let out = rewrite_model(&labelled, &json!({"id": "gpt-4.1"}), None, None);
         assert_eq!(out["display_name"], "gpt-4.1 · Gateway");
         assert_eq!(out["description"], "via llm-hub profile Gateway");
     }
@@ -1077,6 +1460,66 @@ mod tests {
         }
     }
 
+    fn chat_model(qualified_id: &str, input: u64, output: Option<u64>) -> ModelDescriptor {
+        let limit = |value: u64| {
+            LimitEvidence::new(
+                value,
+                crate::schemas::evidence_source::EvidenceSource::Listed,
+                "test",
+                0.9,
+            )
+        };
+        ModelDescriptor {
+            endpoints: vec!["/v1/messages".to_owned()],
+            context: Some(limit(input)),
+            input: Some(limit(input)),
+            output: output.map(limit),
+            ..ModelDescriptor::for_test(qualified_id)
+        }
+    }
+
+    #[test]
+    fn smart_auto_entries_advertise_the_minimum_of_their_pool() {
+        let snapshot = ModelDescriptorSnapshot::new(vec![
+            chat_model("copilot/big", CONTEXT_TOKENS_1M, Some(128_000)),
+            chat_model("copilot/small", 200_000, None),
+        ]);
+
+        let entries = smart_auto_entries(&snapshot);
+        let entry = |id: &str| {
+            entries
+                .iter()
+                .find(|model| model["id"] == id)
+                .unwrap_or_else(|| panic!("{id} missing"))
+        };
+
+        let balance = entry("hub/smart-auto-balance");
+        assert_eq!(balance["owned_by"], "hub");
+        assert_eq!(balance["recommended"], true);
+        assert_eq!(balance["display_name"], "Smart Auto (Balance)");
+        assert_eq!(balance["context_length"], 200_000);
+        assert_eq!(balance["max_input_tokens"], 200_000);
+        assert!(balance.get("max_output_tokens").is_none(), "{balance}");
+
+        let long = entry("hub/smart-auto-long-balance");
+        assert_eq!(long["recommended"], false);
+        assert_eq!(long["display_name"], "Smart Auto (Balance, 1M context)");
+        assert_eq!(long["context_length"], CONTEXT_TOKENS_1M);
+        assert_eq!(long["max_output_tokens"], 128_000);
+    }
+
+    #[test]
+    fn hub_entries_survive_the_enabled_profile_filter() {
+        let mut payload = json!({"data": [
+            {"id": "hub/smart-auto-balance", "owned_by": "hub"},
+            {"id": "off/m", "owned_by": "off"},
+        ]});
+
+        filter_enabled_models(&mut payload, &[profile("local", &[])]);
+
+        assert_eq!(ids(&payload), ["hub/smart-auto-balance"]);
+    }
+
     #[test]
     fn rewrite_claude_opus_advertises_1m_id_and_tokens() {
         let item = json!({
@@ -1085,7 +1528,7 @@ mod tests {
             "max_input_tokens": CONTEXT_TOKENS_1M,
             "context_length": CONTEXT_TOKENS_1M,
         });
-        let out = rewrite_model(&profile("llmgw", &[]), &item, None);
+        let out = rewrite_model(&profile("llmgw", &[]), &item, None, None);
         assert_eq!(out["id"], "llmgw/bedrock/anthropic.claude-opus-5[1m]");
         assert_eq!(out["max_input_tokens"], CONTEXT_TOKENS_1M);
         assert_eq!(out["context_window"], CONTEXT_TOKENS_1M);
@@ -1098,7 +1541,7 @@ mod tests {
             "object": "model",
             "max_input_tokens": 200_000,
         });
-        let out = rewrite_model(&profile("llmgw", &[]), &item, None);
+        let out = rewrite_model(&profile("llmgw", &[]), &item, None, None);
         assert_eq!(out["id"], "llmgw/bedrock/anthropic.claude-opus-5");
         assert_eq!(out["max_input_tokens"], 200_000);
     }
@@ -1106,7 +1549,7 @@ mod tests {
     #[test]
     fn rewrite_local_model_keeps_plain_id() {
         let item = json!({"id": "meta/muse-glimmer", "object": "model"});
-        let out = rewrite_model(&profile("llama_swap", &[]), &item, None);
+        let out = rewrite_model(&profile("llama_swap", &[]), &item, None, None);
         assert_eq!(out["id"], "llama_swap/meta/muse-glimmer");
         assert!(out.get("max_input_tokens").is_none());
     }

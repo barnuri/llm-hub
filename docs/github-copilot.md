@@ -124,11 +124,13 @@ do not use premium requests. A `HEADERS` entry with the same name overrides the 
 
 ## Limits learned from rejections
 
-Copilot's `/models` understates the prompt limit of Claude models on `/v1/messages`. The hub
-ships limits measured on 2026-10-31 and uses them in `/v1/models`.
+Copilot's `/models` understates the prompt limit of Claude models on `/v1/messages` and of GPT
+and Grok models on `/responses`. The hub ships limits measured with oversized probes (Claude on
+2026-10-31, GPT, Grok and MAI on 2026-11-01) and uses them in `/v1/models`.
 
 1. Copilot rejects a prompt that is too large with `model_max_prompt_tokens_exceeded`.
-2. The hub reads the real limit from the error ("N tokens > M maximum") and uses it from then on.
+2. The hub reads the real limit from the error ("N tokens > M maximum" for Claude, "exceeds the
+   limit of M" for GPT) and uses it from then on.
 3. With `LLM_HUB_PERSISTENT=true`, the store keeps learned limits across restarts.
 
 A seeded limit never replaces a learned one. The hub never sends probe requests.

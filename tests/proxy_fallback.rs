@@ -1,48 +1,15 @@
 //! Fallback loop: 429 fails over, 400 never retries, attempts trail reported.
 
 use std::collections::HashMap;
-use std::process::{Child, Command};
 use std::time::Duration;
 
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-struct HubProcess(Child);
+#[path = "support/hub.rs"]
+mod hub;
 
-impl Drop for HubProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let binary = env!("CARGO_BIN_EXE_llm-hub");
-    let dir = tempfile::tempdir().unwrap().keep();
-    let mut command = Command::new(binary);
-    command
-        .current_dir(&dir)
-        .env("LLM_HUB_PORT", port.to_string())
-        .env("LLM_HUB_AUTO_UPDATE", "0");
-    for (key, value) in vars {
-        command.env(key, value);
-    }
-    let child = command.spawn().expect("hub starts");
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
-    for _ in 0..50 {
-        if client.get(format!("{base}/healthz")).send().await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    (HubProcess(child), base)
-}
+use hub::{start_alpha_beta_hub, start_hub};
 
 fn chat_body(model: &str) -> serde_json::Value {
     serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
@@ -283,5 +250,420 @@ async fn multipart_over_upload_limit_is_rejected() {
     let response = post_transcription(&base, body.into_bytes()).await;
 
     assert_eq!(response.status(), 400);
+    drop(hub);
+}
+
+const SMART_AUTO_EXCLUDE: &str = "x-llm-hub-smart-auto-exclude";
+const SMART_AUTO_WORKER: &str = "x-llm-hub-smart-auto-worker";
+
+/// An upstream whose `/models` lists one chat model.
+async fn listing_upstream(model: &str) -> MockServer {
+    listing_upstream_entry(serde_json::json!({"id": model})).await
+}
+
+/// An upstream whose `/models` lists this one entry.
+async fn listing_upstream_entry(entry: serde_json::Value) -> MockServer {
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"object": "list", "data": [entry]})),
+        )
+        .mount(&upstream)
+        .await;
+    upstream
+}
+
+async fn chat_requests(upstream: &MockServer) -> Vec<wiremock::Request> {
+    upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/chat/completions")
+        .collect()
+}
+
+async fn error_message(response: reqwest::Response) -> String {
+    let body: serde_json::Value = response.json().await.unwrap();
+    body["error"]["message"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn hub_selector_resolves_to_a_concrete_eligible_model() {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ok_completion())
+        .mount(&alpha)
+        .await;
+    let (hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header(SMART_AUTO_WORKER, "run-1/node-1")
+        .json(&chat_body("hub/smart-auto-balance"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-llm-hub-model"], "alpha/m1");
+    let sent = chat_requests(&alpha).await;
+    assert_eq!(sent.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+    assert_eq!(body["model"], "m1");
+    assert!(
+        sent[0]
+            .headers
+            .keys()
+            .all(|name| !name.as_str().starts_with("x-llm-hub-smart-auto-")),
+        "Smart Auto headers reached the upstream: {:?}",
+        sent[0].headers
+    );
+    drop(hub);
+}
+
+#[tokio::test]
+async fn hub_selector_with_every_model_excluded_is_rejected_before_any_upstream_call() {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    let (hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header(SMART_AUTO_EXCLUDE, "alpha/*,beta/*")
+        .json(&chat_body("hub/smart-auto-balance"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 400);
+    let message = error_message(response).await;
+    assert!(
+        message.contains("smart_auto_no_eligible_model"),
+        "{message}"
+    );
+    assert!(message.contains("exclude alpha/*|beta/*"), "{message}");
+    assert!(chat_requests(&alpha).await.is_empty());
+    assert!(chat_requests(&beta).await.is_empty());
+    drop(hub);
+}
+
+#[tokio::test]
+async fn hub_fallback_excluded_by_header_is_never_tried() {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&alpha)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ok_completion())
+        .expect(0)
+        .mount(&beta)
+        .await;
+    let (hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("x-llm-hub-fallbacks", "beta/m2")
+        .header(SMART_AUTO_EXCLUDE, "beta/*")
+        .json(&chat_body("hub/smart-auto-balance"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 429);
+    assert_eq!(response.headers()["x-llm-hub-attempts"], "alpha/m1=429");
+    drop(hub);
+}
+
+#[tokio::test]
+async fn direct_model_ignores_smart_auto_headers() {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ok_completion())
+        .mount(&beta)
+        .await;
+    let (hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header(SMART_AUTO_EXCLUDE, "beta/*")
+        .header("x-llm-hub-smart-auto-tier", "not-a-tier")
+        .json(&chat_body("beta/m2"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-llm-hub-model"], "beta/m2");
+    let sent = chat_requests(&beta).await;
+    assert_eq!(sent.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+    assert_eq!(body["model"], "m2");
+    assert!(
+        sent[0]
+            .headers
+            .keys()
+            .all(|name| !name.as_str().starts_with("x-llm-hub-smart-auto-")),
+        "Smart Auto headers reached the upstream: {:?}",
+        sent[0].headers
+    );
+    assert!(chat_requests(&alpha).await.is_empty());
+    drop(hub);
+}
+
+#[tokio::test]
+async fn unknown_hub_model_is_rejected() {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    let (hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&chat_body("hub/foo"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 400);
+    let message = error_message(response).await;
+    assert!(message.contains("unknown hub model hub/foo"), "{message}");
+    assert!(chat_requests(&alpha).await.is_empty());
+    assert!(chat_requests(&beta).await.is_empty());
+    drop(hub);
+}
+
+#[tokio::test]
+async fn hub_selector_picks_only_from_the_profiles_the_caller_allows() {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ok_completion())
+        .mount(&beta)
+        .await;
+    let (hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("x-llm-hub-profiles", "hub,beta")
+        .header("x-llm-hub-fallbacks", "alpha/m1")
+        .json(&chat_body("hub/smart-auto-balance"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-llm-hub-model"], "beta/m2");
+    assert_eq!(chat_requests(&beta).await.len(), 1);
+    assert!(chat_requests(&alpha).await.is_empty());
+    drop(hub);
+}
+
+#[tokio::test]
+async fn hub_selector_skips_a_model_whose_input_limit_is_below_the_prompt() {
+    let alpha =
+        listing_upstream_entry(serde_json::json!({"id": "m1", "max_input_tokens": 1000})).await;
+    let beta = listing_upstream("m2").await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ok_completion())
+        .mount(&beta)
+        .await;
+    let (hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+    let mut body = chat_body("hub/smart-auto-balance");
+    body["messages"][0]["content"] = serde_json::Value::String("x".repeat(8_000));
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-llm-hub-model"], "beta/m2");
+    assert!(chat_requests(&alpha).await.is_empty());
+    drop(hub);
+}
+
+#[tokio::test]
+async fn smart_auto_sends_the_effort_the_routed_model_publishes() {
+    let alpha = listing_upstream_entry(serde_json::json!({
+        "id": "m1",
+        "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high"]}}
+    }))
+    .await;
+    let beta = listing_upstream("m2").await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ok_completion())
+        .mount(&alpha)
+        .await;
+    let (hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header(SMART_AUTO_EXCLUDE, "beta/*")
+        .json(&chat_body("hub/smart-auto-balance"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-llm-hub-model"], "alpha/m1");
+    assert_eq!(response.headers()["x-llm-hub-smart-auto-tier"], "balance");
+    assert_eq!(response.headers()["x-llm-hub-smart-auto-effort"], "medium");
+    let sent = chat_requests(&alpha).await;
+    assert_eq!(sent.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+    assert_eq!(body["reasoning_effort"], "medium");
+    drop(hub);
+}
+
+#[tokio::test]
+async fn a_tool_continuation_stays_on_the_routed_solver() {
+    const CLAUDE_SESSION: &str = "x-claude-code-session-id";
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    for upstream in [&alpha, &beta] {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ok_completion())
+            .mount(upstream)
+            .await;
+    }
+    let (hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header(CLAUDE_SESSION, "session-1")
+        .json(&chat_body("hub/smart-auto-balance"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let solver = first.headers()["x-llm-hub-model"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    // Reading the body completes the stream, and the stats task then commits the pin.
+    first.bytes().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let continuation = serde_json::json!({
+        "model": "hub/smart-auto-balance",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "read", "arguments": "{}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "file body"}
+        ]
+    });
+    let second = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header(CLAUDE_SESSION, "session-1")
+        .json(&continuation)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(second.status(), 200);
+    assert_eq!(second.headers()["x-llm-hub-model"], solver.as_str());
+    assert_eq!(
+        second.headers()["x-llm-hub-smart-auto-reason"],
+        "tool_continuation_replay"
+    );
+    drop(hub);
+}
+
+#[tokio::test]
+async fn smart_auto_dispatch_is_visible_in_the_selection_history() {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ok_completion())
+        .mount(&alpha)
+        .await;
+    // Balance reviews the answer with one judge on the other profile, so beta accepts it.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("<draft>"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-judge", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "{\"verdict\":\"accept\"}"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        })))
+        .mount(&beta)
+        .await;
+    let (hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+    let client = reqwest::Client::new();
+    let worker = "run-history/node-1";
+
+    let response = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header(SMART_AUTO_WORKER, worker)
+        .json(&chat_body("hub/smart-auto-balance"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+
+    let history_url = format!("{base}/api/smart-auto/history?worker={worker}");
+    let mut states = Vec::new();
+    for _ in 0..100 {
+        let history: serde_json::Value = client
+            .get(&history_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        states = history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                (
+                    event["state"].as_str().unwrap().to_string(),
+                    event["model"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        if states.len() == 5 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let expected = [
+        ("selected", "alpha/m1"),
+        ("started", "alpha/m1"),
+        ("started", "beta/m2"),
+        ("completed", "beta/m2"),
+        ("completed", "alpha/m1"),
+    ];
+    let expected: Vec<(String, String)> = expected
+        .iter()
+        .map(|(state, model)| (state.to_string(), model.to_string()))
+        .collect();
+    assert_eq!(states, expected);
     drop(hub);
 }

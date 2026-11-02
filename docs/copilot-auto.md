@@ -88,6 +88,10 @@ It is not verified whether the 10% discount still applies after a swap.
 - `GET /api/copilot/auto/decisions?session=<id>&limit=N` returns recent decisions, newest first.
   Claude Code sends its session id in `x-claude-code-session-id`, so `session` filters one Claude
   Code session. Without `session`, the route returns all sessions. `limit` defaults to 50, with a
-  range of 1 to 200. The hub keeps decisions in memory only.
+  range of 1 to 200. The hub keeps decisions in memory only. Each decision holds `effort`, the
+  reasoning effort sent to the picked model, or `null` when the model publishes no levels. The
+  caller's own level is kept when the model publishes it. Otherwise the level the tier and role
+  aim for is snapped to the levels the model publishes. See
+  [Reasoning effort](smart-auto.md#reasoning-effort).
 - The **Copilot Auto** tab in the UI shows the same decisions.
 - The harness-status-line shows `Auto -> <model> (<complexity>)`.

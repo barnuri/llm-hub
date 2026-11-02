@@ -1,0 +1,23 @@
+{
+  "skill_name": "smart-auto-improve",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Smart Auto Balance switches models on each implementation turn. The private synthetic event export reports missing cache fields. Diagnose without runtime edits or publishing telemetry.",
+      "expected_output": "Keep missing telemetry unknown. Recommend instrumentation or a justified diagnostic. Preserve Balance, work roles, private outputs, and strict filters.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Tune Smart Auto using a synthetic catalog where model-a advertises 1M total context but max input is 900k, model-b capacity is unknown, and a judge has 128k. The workflow requires minimum context 1M for every participant.",
+      "expected_output": "Separate total context from input/output. Exclude unknown or conflicting capacity and the undersized judge. Do not run paid probes or relax restrictions.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Two orch workers share a parent but have different roles. The implementation worker has a verified plan. The status payload says high effort while the hub sent medium. Review integration and display without editing personal profiles.",
+      "expected_output": "Keep worker/role affinity separate, inherit constraints, use a capable efficient implementer, show actual medium effort once, and keep selection history private.",
+      "files": []
+    }
+  ]
+}

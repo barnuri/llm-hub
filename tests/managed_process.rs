@@ -193,7 +193,15 @@ async fn concurrent_first_requests_share_one_start_and_shutdown_stops_it() {
         .json()
         .await
         .unwrap();
-    assert_eq!(models["data"][0]["id"], "whisper/whisper-large-v3");
+    // The picker sorts the recommended Smart Auto entry first, so find the managed model by id.
+    assert!(
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["id"] == "whisper/whisper-large-v3"),
+        "whisper model is listed: {models}"
+    );
     assert_eq!(
         spawn_count(&spawn_log),
         0,

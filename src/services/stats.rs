@@ -7,6 +7,7 @@ use hdrhistogram::Histogram;
 use serde::Serialize;
 
 use crate::consts::{STATS_MAX_MODEL_KEYS, STATS_OVERFLOW_KEY};
+use crate::services::pricing::split_cached_input;
 
 #[derive(Default)]
 pub struct EntryStats {
@@ -366,10 +367,12 @@ fn entry_snapshot(key: &str, stats: &EntryStats) -> EntrySnapshot {
 #[allow(clippy::cast_precision_loss)] // cache-hit % display; mantissa loss is fine
 fn overview_from_entry(stats: &EntryStats) -> OverviewSnapshot {
     let snap = entry_snapshot("overview", stats);
-    let cache_hit_rate_pct = if snap.tokens_in == 0 {
+    let (uncached_in, cached_in) = split_cached_input(snap.tokens_in, snap.cache_read_tokens);
+    let total_in = uncached_in + cached_in;
+    let cache_hit_rate_pct = if total_in == 0 {
         0.0
     } else {
-        (snap.cache_read_tokens as f64 / snap.tokens_in as f64) * 100.0
+        (cached_in as f64 / total_in as f64) * 100.0
     };
     OverviewSnapshot {
         requests: snap.requests,
@@ -448,6 +451,23 @@ pub fn scrape_usage(tail: &[u8]) -> ScrapedUsage {
 
 fn first_nonzero(a: u64, b: u64) -> u64 {
     if a > 0 { a } else { b }
+}
+
+/// Scrapes a streamed body from its bounded head and tail. A non-zero tail field wins, and the
+/// head fills fields only the first event reports, such as Anthropic `message_start` cache usage.
+#[must_use]
+pub fn scrape_stream_usage(head: &[u8], tail: &[u8]) -> ScrapedUsage {
+    let from_tail = scrape_usage(tail);
+    let from_head = scrape_usage(head);
+    ScrapedUsage {
+        tokens_in: first_nonzero(from_tail.tokens_in, from_head.tokens_in),
+        tokens_out: first_nonzero(from_tail.tokens_out, from_head.tokens_out),
+        cache_read_tokens: first_nonzero(from_tail.cache_read_tokens, from_head.cache_read_tokens),
+        cache_write_tokens: first_nonzero(
+            from_tail.cache_write_tokens,
+            from_head.cache_write_tokens,
+        ),
+    }
 }
 
 fn extract_int(text: &str, field: &str) -> u64 {
@@ -588,6 +608,36 @@ mod tests {
     #[test]
     fn no_usage_yields_zero() {
         assert_eq!(scrape_usage(b"data: [DONE]"), ScrapedUsage::default());
+    }
+
+    #[test]
+    fn scrape_stream_usage_fills_missing_tail_fields_from_head() {
+        let head = br#"data: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_creation_input_tokens":30,"cache_read_input_tokens":900,"output_tokens":1}}}"#;
+        let tail = br#"data: {"type":"message_delta","usage":{"output_tokens":4000}}"#;
+
+        assert_eq!(
+            scrape_stream_usage(head, tail),
+            ScrapedUsage {
+                tokens_in: 12,
+                tokens_out: 4000,
+                cache_read_tokens: 900,
+                cache_write_tokens: 30,
+            }
+        );
+        assert_eq!(scrape_stream_usage(b"", tail).cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn overview_cache_hit_rate_counts_separate_cache_reads() {
+        let registry = StatsRegistry::default();
+        let mut anthropic = outcome("anthropic", "anthropic/claude", 200);
+        anthropic.tokens_in = 20;
+        anthropic.cache_read_tokens = 80;
+        registry.record(&anthropic);
+
+        let overview = registry.snapshot("live", false).overview;
+
+        assert!((overview.cache_hit_rate_pct - 80.0).abs() < 1e-9);
     }
 
     #[test]

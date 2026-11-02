@@ -186,18 +186,23 @@ pub fn estimate_with_rates(
     cache_write: u64,
 ) -> f64 {
     let rates = rates.with_cache_defaults();
-    // OpenAI: cached tokens are a subset of prompt_tokens.
-    // Anthropic: cache_read is often reported separately from input_tokens.
-    let (uncached_in, cached_in) = if cache_read > tokens_in {
-        (tokens_in, cache_read)
-    } else {
-        (tokens_in.saturating_sub(cache_read), cache_read)
-    };
+    let (uncached_in, cached_in) = split_cached_input(tokens_in, cache_read);
     let input = uncached_in as f64 * rates.input_per_1m / PER_MILLION;
     let cached = cached_in as f64 * rates.cache_read_per_1m / PER_MILLION;
     let written = cache_write as f64 * rates.cache_write_per_1m / PER_MILLION;
     let output = tokens_out as f64 * rates.output_per_1m / PER_MILLION;
     input + cached + written + output
+}
+
+/// Splits reported input into `(uncached, cached)` prompt tokens. A cache read larger
+/// than the input was reported apart from it (Anthropic), not as a subset (`OpenAI`).
+#[must_use]
+pub fn split_cached_input(tokens_in: u64, cache_read: u64) -> (u64, u64) {
+    if cache_read > tokens_in {
+        (tokens_in, cache_read)
+    } else {
+        (tokens_in - cache_read, cache_read)
+    }
 }
 
 fn split_model_key(model_key: &str) -> (Option<&str>, Option<&str>) {
@@ -318,6 +323,14 @@ mod tests {
         let cost = estimate_with_rates(rates, 20, 10, 80, 5);
         let expected = (20.0 + 8.0 + 6.25 + 20.0) / PER_MILLION;
         assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn split_cached_input_handles_subset_and_separate_reports() {
+        assert_eq!(split_cached_input(100, 80), (20, 80));
+        assert_eq!(split_cached_input(20, 80), (20, 80));
+        assert_eq!(split_cached_input(100, 0), (100, 0));
+        assert_eq!(split_cached_input(0, 0), (0, 0));
     }
 
     #[test]

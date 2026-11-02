@@ -1,4 +1,6 @@
 use crate::consts::{CONTEXT_1M_SUFFIX, CONTEXT_TOKENS_1M};
+use crate::schemas::evidence_source::EvidenceSource;
+use crate::schemas::limit_evidence::LimitEvidence;
 use serde_json::Value;
 
 /// Drops a trailing `[1m]` / `[1M]` that Claude Code adds to declare a 1M window.
@@ -26,17 +28,43 @@ pub fn has_1m_suffix(raw: &str) -> bool {
 /// surfaced as `meta.llamaswap`, so that is checked as a fallback, and so is
 /// Copilot's `capabilities.limits.max_prompt_tokens`.
 pub fn max_input_tokens_from_item(item: &Value) -> Option<u64> {
-    context_tokens_in(item)
+    input_limit_evidence_from_item(item, "").map(|evidence| evidence.value)
+}
+
+/// Confidence in a value an upstream lists in `/models`, which it may not enforce.
+pub const LISTED_CONFIDENCE: f32 = 0.5;
+/// Confidence in a context size the local inference server allocated.
+pub const LOCAL_RUNTIME_CONFIDENCE: f32 = 0.9;
+
+/// [`max_input_tokens_from_item`] with its provenance: llama-swap `meta.llamaswap`
+/// is the local runtime allocation, every other field is a listed value.
+pub fn input_limit_evidence_from_item(item: &Value, scope: &str) -> Option<LimitEvidence> {
+    let listed = |value| (value, EvidenceSource::Listed, LISTED_CONFIDENCE);
+    let (value, source, confidence) = context_tokens_in(item)
+        .map(listed)
         .or_else(|| {
-            item.get("meta")
-                .and_then(|meta| meta.get("llamaswap"))
-                .and_then(context_tokens_in)
+            llama_swap_context_tokens(item).map(|value| {
+                (
+                    value,
+                    EvidenceSource::LocalRuntime,
+                    LOCAL_RUNTIME_CONFIDENCE,
+                )
+            })
         })
         .or_else(|| {
             item.pointer("/capabilities/limits/max_prompt_tokens")
                 .and_then(Value::as_u64)
                 .filter(|tokens| *tokens > 0)
-        })
+                .map(listed)
+        })?;
+    Some(LimitEvidence::new(value, source, scope, confidence))
+}
+
+/// The context size llama-swap reports from the model's `metadata:` config block.
+pub fn llama_swap_context_tokens(item: &Value) -> Option<u64> {
+    item.get("meta")
+        .and_then(|meta| meta.get("llamaswap"))
+        .and_then(context_tokens_in)
 }
 
 fn context_tokens_in(obj: &Value) -> Option<u64> {

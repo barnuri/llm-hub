@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::Value;
 
-use crate::configs::ProfileConfig;
+use crate::configs::{HubConfig, ProfileConfig};
 use crate::consts::{
     ANTHROPIC_UPSTREAM_PATH, AUTO_REASON_HEADER_MAX_CHARS, ERROR_REASON_MAX_CHARS,
     ERROR_STATUS_MIN, HEADER_ATTEMPTS, HEADER_AUTO_PICK, HEADER_AUTO_REASON, HEADER_SERVED_MODEL,
@@ -18,24 +18,53 @@ use crate::consts::{
 };
 use crate::dependencies::state::AppState;
 use crate::routes::models::{COPILOT_AUTO_MODEL, advertised_bare_id};
+use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::app_error::AppError;
+use crate::schemas::effort_level::EffortLevel;
+use crate::schemas::hub_selector::HubSelector;
+use crate::schemas::launch::profile_filter::ProfileFilter;
 use crate::schemas::model_id::ModelId;
+use crate::schemas::reply_protocol::ReplyProtocol;
+use crate::schemas::review_evidence::ReviewEvidence;
+use crate::schemas::review_request::ReviewRequest;
+use crate::schemas::route_reason::RouteReason;
+use crate::schemas::scope_kind::ScopeKind;
+use crate::schemas::selection_event::SelectionEvent;
+use crate::schemas::selection_stage::SelectionStage;
+use crate::schemas::selection_state::SelectionState;
+use crate::schemas::smart_auto_decision::SmartAutoDecision;
+use crate::schemas::smart_auto_headers::SmartAutoHeaders;
+use crate::schemas::smart_auto_policy::SmartAutoPolicy;
+use crate::schemas::smart_auto_tier::SmartAutoTier;
+use crate::schemas::stage_error::StageError;
+use crate::schemas::stage_reply::StageReply;
+use crate::schemas::turn_signals::TurnSignals;
 use crate::schemas::upstream_model::UpstreamModel;
+use crate::schemas::work_role::WorkRole;
 use crate::services::anthropic;
 use crate::services::anthropic::native_reply::NativeReplyRepair;
 use crate::services::anthropic::responses_stream::ResponsesStream;
 use crate::services::body_transform::BodyTransform;
+use crate::services::buffered_reply_stream::BufferedReplyStream;
 use crate::services::copilot_auto::{
     AutoInput, AutoTier, AutoUpstream, CHAT_ENDPOINT, MESSAGES_ENDPOINT, RESPONSES_ENDPOINT,
     bare_path,
 };
 use crate::services::copilot_auto_decisions::{AutoDecision, TieredDecision};
 use crate::services::copilot_body_fields::BodyField;
-use crate::services::fallback::{RetryPolicy, fallback_chain, per_attempt_timeout_ms};
+use crate::services::fallback::{
+    RetryPolicy, fallback_chain, per_attempt_timeout_ms, retain_eligible,
+};
 use crate::services::harness::client_signature;
 use crate::services::multipart_model;
 use crate::services::responses_item_ids::ResponsesItemIds;
-use crate::services::stats::{RequestOutcome, ScrapedUsage, scrape_usage};
+use crate::services::review_graph::ReviewGraph;
+use crate::services::review_orchestrator::ReviewOrchestrator;
+use crate::services::smart_auto_effort::SmartAutoEffort;
+use crate::services::smart_auto_pool::SmartAutoPool;
+use crate::services::smart_auto_router::SmartAutoRouter;
+use crate::services::stage_client::StageClient;
+use crate::services::stats::{RequestOutcome, ScrapedUsage, scrape_stream_usage, scrape_usage};
 use crate::services::store::now_ms;
 use crate::services::tool_names::NameMap;
 use crate::services::transforms::{self, RouteKind, TransformPlan};
@@ -56,7 +85,13 @@ const CLAUDE_CODE_SESSION_ID_MAX_LEN: usize = 128;
 const IDENTITY_ENCODING: &str = "identity";
 /// Copilot's Claude model ids, as sent upstream.
 const CLAUDE_MODEL_PREFIX: &str = "claude";
+/// First bytes of each response kept for usage that only the opening event reports.
+const USAGE_SCRAPE_HEAD_BYTES: usize = 16 * 1024;
+/// The client-facing chat route that review stages call on a concrete model.
+const STAGE_CHAT_PATH: &str = "/v1/chat/completions";
 static NO_BODY: Value = Value::Null;
+/// The status codes that count as a success for Smart Auto affinity.
+const SUCCESS_STATUS_RANGE: std::ops::Range<u16> = 200..300;
 
 /// Catch-all /v1/* passthrough with header-driven fallbacks.
 pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Response, AppError> {
@@ -137,6 +172,7 @@ pub async fn get_model_by_id(
 /// `AppError::BadRequest` when the body carries no usable `model` (or, on the
 /// Anthropic route, fails translation); `AppError::UpstreamUnavailable` when
 /// every attempt in the chain fails to produce a response.
+#[allow(clippy::too_many_lines)] // the attempt state machine reads top to bottom; splitting it would thread the same loop state through helpers
 pub(crate) async fn attempt_loop(
     state: &AppState,
     method: Method,
@@ -146,11 +182,22 @@ pub(crate) async fn attempt_loop(
     route: RouteKind,
 ) -> Result<Response, AppError> {
     let config = state.config();
-    let (bodies, primary_id) =
+    let (bodies, requested_id) =
         AttemptBodies::prepare(&config, path_and_query, headers, &body, route)?;
 
+    let fallbacks = fallback_chain(headers, &config.default_fallbacks);
+    let (primary_id, fallbacks, smart) =
+        match resolve_hub(state, &config, headers, &bodies, &requested_id, fallbacks)? {
+            HubResolution::Concrete {
+                primary,
+                fallbacks,
+                plan,
+            } => (primary, fallbacks, Some(plan)),
+            HubResolution::NotHub(fallbacks) => (requested_id, fallbacks, None),
+        };
+
     let mut chain: Vec<ModelId> = vec![primary_id];
-    for fallback in fallback_chain(headers, &config.default_fallbacks) {
+    for fallback in fallbacks {
         if let Some(id) = ModelId::parse(&fallback) {
             chain.push(id);
         }
@@ -159,14 +206,51 @@ pub(crate) async fn attempt_loop(
     let client = client_signature(headers);
     let retry_policy = RetryPolicy::from_headers(headers);
     let attempt_timeout = per_attempt_timeout_ms(headers).map(Duration::from_millis);
+    let client_body = bodies
+        .native
+        .as_ref()
+        .map(|(body, _)| body)
+        .or(bodies.json_body.as_ref());
+    let client_streams = client_body
+        .and_then(|body| body.get("stream"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let mut attempts_trail: Vec<String> = Vec::new();
     let last_index = chain.len() - 1;
+    // The selection template of the routed request. Every dispatch in the chain shares it.
+    let mut routed = smart.as_ref().map(|plan| plan.template.clone());
 
     for (index, requested) in chain.iter().enumerate() {
         let auto = resolve_auto(state, &bodies, requested).await;
+        if let Some(pick) = &auto {
+            routed = Some(pick.template.clone());
+        }
         let model_id = auto.as_ref().map_or(requested, |pick| &pick.model_id);
-        let attempt = bodies.for_model(state, model_id);
+        let mut attempt = bodies.for_model(state, model_id);
+        let effort = match (&smart, &auto) {
+            (Some(plan), _) => plan.effort_for(state, model_id),
+            (None, Some(pick)) => pick.effort,
+            (None, None) => None,
+        };
+        if let Some(level) = effort {
+            let body = std::mem::take(&mut attempt.body);
+            attempt.body =
+                SmartAutoEffort::apply_to_bytes(bare_path(attempt.path.as_str()), body, level);
+        }
+        // Selected is recorded before the dispatch, so the current selection shows it while the call is in flight.
+        let selection = routed.as_ref().map(|template| {
+            let event = selected_event(state, template, model_id, effort);
+            state.selection_log().record(event.clone());
+            event
+        });
+        let reviewing = smart
+            .as_ref()
+            .filter(|plan| plan.review.is_some() && review_applies(&attempt));
+        if reviewing.is_some() {
+            let body = std::mem::take(&mut attempt.body);
+            attempt.body = non_streaming(body);
+        }
         let started = Instant::now();
         let session_token = auto.as_ref().and_then(|pick| pick.session_token.as_deref());
         let sender = AttemptSender::for_attempt(
@@ -191,21 +275,64 @@ pub(crate) async fn attempt_loop(
                 attempts_trail.push(format!("{}={status}", model_id.qualified()));
                 let final_attempt =
                     index == last_index || !retry_policy.should_retry_status(status);
+                let succeeded = final_attempt && SUCCESS_STATUS_RANGE.contains(&status);
+                let transition = selection.as_ref().map(|event| {
+                    let next = if succeeded {
+                        SelectionState::Started
+                    } else {
+                        SelectionState::Rejected
+                    };
+                    record_transition(state, event, next, Some(status))
+                });
                 if final_attempt {
-                    let mut out = deliver(
-                        state,
-                        response,
-                        model_id,
-                        &attempts_trail,
-                        started,
-                        &attempt,
-                        client,
-                    )
-                    .await;
+                    let commit = smart
+                        .as_ref()
+                        .and_then(|plan| plan.commit(status, model_id));
+                    let mut out = match reviewing.filter(|_| succeeded) {
+                        Some(plan) => {
+                            review_deliver(
+                                state,
+                                response,
+                                model_id,
+                                &attempts_trail,
+                                started,
+                                bodies.route,
+                                plan,
+                                client_streams,
+                                client,
+                                commit,
+                                transition.filter(|_| succeeded),
+                            )
+                            .await?
+                        }
+                        None => {
+                            deliver(
+                                state,
+                                response,
+                                model_id,
+                                &attempts_trail,
+                                started,
+                                &attempt,
+                                client,
+                                commit,
+                                transition.filter(|_| succeeded),
+                            )
+                            .await
+                        }
+                    };
                     if let Some(pick) = &auto {
                         insert_header(out.headers_mut(), HEADER_AUTO_PICK, &pick.pick);
                         insert_header(out.headers_mut(), HEADER_AUTO_REASON, &pick.reason);
                         insert_header(out.headers_mut(), HEADER_AUTO_TIER, pick.tier.as_str());
+                    }
+                    if let Some(plan) = &smart {
+                        let headers = out.headers_mut();
+                        insert_header(headers, SmartAutoHeaders::TIER, plan.tier.as_str());
+                        insert_header(headers, SmartAutoHeaders::ROLE, plan.role.as_str());
+                        insert_header(headers, SmartAutoHeaders::REASON, plan.reason.as_str());
+                        if let Some(level) = effort {
+                            insert_header(headers, SmartAutoHeaders::EFFORT, level.as_str());
+                        }
                     }
                     return Ok(out);
                 }
@@ -219,6 +346,9 @@ pub(crate) async fn attempt_loop(
                 );
             }
             Err(reason) => {
+                if let Some(event) = &selection {
+                    record_transition(state, event, SelectionState::Rejected, None);
+                }
                 attempts_trail.push(format!("{}={reason}", model_id.qualified()));
                 record_failure(state, model_id, 0, started, reason, client.clone());
                 if index == last_index {
@@ -231,6 +361,295 @@ pub(crate) async fn attempt_loop(
         }
     }
     unreachable!("attempt loop always returns on the last attempt");
+}
+
+/// What a requested model routes as: a `hub/*` selector resolved to a concrete model, or any
+/// other model with its fallback chain unchanged.
+enum HubResolution {
+    Concrete {
+        primary: ModelId,
+        fallbacks: Vec<String>,
+        plan: Box<SmartAutoPlan>,
+    },
+    NotHub(Vec<String>),
+}
+
+/// The Smart Auto route of one request, kept until its response is sent.
+struct SmartAutoPlan {
+    /// The conversation's affinity key, `None` when the request names no anchor.
+    key: Option<AffinityKey>,
+    tier: SmartAutoTier,
+    role: WorkRole,
+    plan_backed: bool,
+    /// The user turn that the soft-switch budget counts.
+    turn: usize,
+    /// The effort the caller sent, which every model keeps when it supports it.
+    requested: Option<EffortLevel>,
+    /// The routed model, as a qualified id.
+    model: String,
+    /// The effort sent to the routed model.
+    effort: Option<EffortLevel>,
+    reason: RouteReason,
+    /// The selection event each dispatch of this route starts from.
+    template: SelectionEvent,
+    /// The review of this route's answers; `None` serves a single stream.
+    review: Option<ReviewGraph>,
+    /// The latest user text, which reviewers read as the task.
+    task: Option<String>,
+}
+
+/// What a successful routed answer commits to affinity.
+#[derive(Clone)]
+struct SmartAutoCommit {
+    key: AffinityKey,
+    model: String,
+    role: WorkRole,
+    plan_backed: bool,
+    turn: usize,
+}
+
+impl SmartAutoCommit {
+    /// Pins the committed model for its role and plan backing in the affinity table.
+    fn apply(&self, state: &AppState) {
+        state.smart_auto_affinity().commit(
+            &self.key,
+            &self.model,
+            self.role,
+            self.plan_backed,
+            self.turn,
+            Instant::now(),
+        );
+    }
+}
+
+impl SmartAutoPlan {
+    /// The effort for `model_id`: the routed effort on the routed model, else the same objective
+    /// snapped to that model's own published levels.
+    fn effort_for(&self, state: &AppState, model_id: &ModelId) -> Option<EffortLevel> {
+        if model_id.qualified() == self.model {
+            return self.effort;
+        }
+        let snapshot = state.model_descriptors();
+        let levels = snapshot
+            .for_model(&model_id.profile, &model_id.model)?
+            .effort_levels
+            .as_slice();
+        SmartAutoEffort::select(
+            self.tier,
+            self.role,
+            self.plan_backed,
+            self.requested,
+            levels,
+        )
+    }
+
+    /// The commit for an answer with `status` from `served`. Only a 2xx commits, and only once
+    /// the body has completed.
+    fn commit(&self, status: u16, served: &ModelId) -> Option<SmartAutoCommit> {
+        let key = self.key?;
+        if !SUCCESS_STATUS_RANGE.contains(&status) {
+            return None;
+        }
+        Some(SmartAutoCommit {
+            key,
+            model: served.qualified(),
+            role: self.role,
+            plan_backed: self.plan_backed,
+            turn: self.turn,
+        })
+    }
+}
+
+/// Resolves a `hub/*` primary to the pick from the eligible pool, and keeps only pool fallbacks,
+/// so deny wins on every attempt. In memory only; any other model costs one string compare.
+#[allow(clippy::too_many_lines)] // the hub resolution walks each selector form in one place
+fn resolve_hub(
+    state: &AppState,
+    config: &HubConfig,
+    headers: &HeaderMap,
+    bodies: &AttemptBodies<'_>,
+    requested: &ModelId,
+    fallbacks: Vec<String>,
+) -> Result<HubResolution, AppError> {
+    if requested.profile != HubSelector::NAMESPACE {
+        return Ok(HubResolution::NotHub(fallbacks));
+    }
+    let Some(selector) = HubSelector::parse(&requested.qualified(), &config.smart_auto_presets)?
+    else {
+        return Ok(HubResolution::NotHub(fallbacks));
+    };
+    let caller = SmartAutoHeaders::from_headers(headers)?;
+    let policy = selector.policy.merge(&caller.policy);
+    let endpoint = match bodies.route {
+        RouteKind::OpenAi => bare_path(bodies.upstream_path),
+        RouteKind::Anthropic => MESSAGES_ENDPOINT,
+    };
+    let (path, body) = bodies.auto_input();
+    let signals = TurnSignals::from_body(
+        path,
+        body,
+        bodies.original.len(),
+        claude_code_session_id(headers),
+    );
+    let profiles = concrete_profile_filter(headers);
+    let snapshot = state.model_descriptors();
+    let mut pool = SmartAutoPool::eligible(
+        &snapshot,
+        &policy,
+        endpoint,
+        signals.estimated_prompt_tokens,
+    );
+    if let Some(profiles) = &profiles {
+        pool.retain(|descriptor| profiles.allows(&descriptor.qualified_id));
+    }
+    let affinity_key = AffinityKey::new(&signals, &caller, &policy, endpoint);
+    let selector_name = requested.qualified();
+    let requested = SmartAutoEffort::requested(bare_path(path), body)?;
+    let usage = state.model_usage();
+    let anchor = affinity_key
+        .as_ref()
+        .map(|key| (state.smart_auto_affinity(), key));
+    let decision = SmartAutoRouter::route(
+        &pool,
+        &policy,
+        &signals,
+        anchor,
+        &usage,
+        requested,
+        Instant::now(),
+    )
+    .ok_or_else(|| no_eligible_model(&selector, &policy, profiles.as_ref(), endpoint))?;
+    let primary = ModelId::parse(&decision.model.qualified_id)
+        .ok_or_else(|| no_eligible_model(&selector, &policy, profiles.as_ref(), endpoint))?;
+    let tier = policy.tier.unwrap_or_default();
+    state.smart_auto_decisions().record(SmartAutoDecision {
+        ts_ms: now_ms(),
+        session: signals.session_id.clone(),
+        tier: tier.as_str(),
+        role: decision.role,
+        effort: decision.effort.map(EffortLevel::as_str),
+        model: decision.model.qualified_id.clone(),
+        reason: decision.reason.as_str(),
+    });
+    let log = state.selection_log();
+    let worker_raw = caller.worker.clone().or_else(|| signals.session_id.clone());
+    let worker = worker_raw
+        .as_deref()
+        .map(|raw| log.scope_key(ScopeKind::Worker, raw));
+    let template = SelectionEvent {
+        workflow: caller
+            .parent
+            .as_deref()
+            .map(|raw| log.scope_key(ScopeKind::Workflow, raw)),
+        turn: worker
+            .as_ref()
+            .map(|key| log.scope_key(ScopeKind::Turn, &format!("{key}:{}", signals.user_turns))),
+        worker,
+        selector: Some(selector_name),
+        tier: Some(tier.as_str().to_owned()),
+        role: Some(decision.role),
+        reason: Some(decision.reason.as_str().to_owned()),
+        requested_effort: requested,
+        ..SelectionEvent::new(
+            SelectionStage::Solver,
+            SelectionState::Selected,
+            decision.model.qualified_id.clone(),
+        )
+    };
+    let review = ReviewGraph::plan(
+        &ReviewRequest {
+            tier,
+            role: decision.role,
+            plan_backed: decision.plan_backed,
+            solver: &decision.model.qualified_id,
+            policy: &policy,
+            snapshot: snapshot.as_ref(),
+            endpoint,
+            evidence_tokens: signals.estimated_prompt_tokens,
+            admits: &|id: &str| profiles.as_ref().is_none_or(|filter| filter.allows(id)),
+        },
+        &|profile: &str| {
+            config
+                .profile(profile)
+                .is_some_and(|found| found.managed.is_some())
+        },
+    );
+    if review.is_none()
+        && endpoint == RESPONSES_ENDPOINT
+        && matches!(tier, SmartAutoTier::Balance | SmartAutoTier::Intelligence)
+    {
+        // A Responses caller is streamed unreviewed; history names the skip.
+        state.selection_log().record(SelectionEvent {
+            reason: Some("review_skipped: responses_route".to_owned()),
+            ..template.in_state(SelectionState::Selected)
+        });
+    }
+    let plan = SmartAutoPlan {
+        key: affinity_key,
+        tier,
+        role: decision.role,
+        plan_backed: decision.plan_backed,
+        turn: signals.user_turns,
+        requested,
+        model: decision.model.qualified_id.clone(),
+        effort: decision.effort,
+        reason: decision.reason,
+        template,
+        review,
+        task: signals.last_user_text.clone(),
+    };
+    Ok(HubResolution::Concrete {
+        primary,
+        fallbacks: retain_eligible(fallbacks, Some(&pool)),
+        plan: Box::new(plan),
+    })
+}
+
+/// The caller's `x-llm-hub-profiles` filter when it names a concrete profile. The `hub` name
+/// only lists the virtual models, so a filter of `hub` alone leaves the pool unrestricted.
+fn concrete_profile_filter(headers: &HeaderMap) -> Option<ProfileFilter> {
+    let profiles = ProfileFilter::from_request(None, headers);
+    profiles
+        .to_list()
+        .split(',')
+        .any(|name| !name.is_empty() && name != HubSelector::NAMESPACE)
+        .then_some(profiles)
+}
+
+/// The 400 for a `hub/*` request that no model can serve, naming every active restriction.
+fn no_eligible_model(
+    selector: &HubSelector,
+    policy: &SmartAutoPolicy,
+    profiles: Option<&ProfileFilter>,
+    endpoint: &str,
+) -> AppError {
+    let mut restrictions = vec![format!("tier {}", selector.tier.as_str())];
+    if let Some(profiles) = profiles {
+        restrictions.push(format!("profiles {}", profiles.to_list().replace(',', "|")));
+    }
+    for allow_list in &policy.include {
+        let globs: Vec<&str> = allow_list.iter().map(String::as_str).collect();
+        restrictions.push(format!("include {}", globs.join("|")));
+    }
+    if !policy.exclude.is_empty() {
+        let globs: Vec<&str> = policy.exclude.iter().map(String::as_str).collect();
+        restrictions.push(format!("exclude {}", globs.join("|")));
+    }
+    for (name, minimum) in [
+        ("min context", policy.min_context_tokens),
+        ("min input", policy.min_input_tokens),
+        ("min output", policy.min_output_tokens),
+    ] {
+        if let Some(minimum) = minimum {
+            restrictions.push(format!("{name} {minimum} tokens"));
+        }
+    }
+    AppError::BadRequest(format!(
+        "smart_auto_no_eligible_model: no model serves {namespace}/{name} on {endpoint} under: {}",
+        restrictions.join(", "),
+        namespace = HubSelector::NAMESPACE,
+        name = selector.name,
+    ))
 }
 
 /// The request in each form an attempt can send: translated for a chat-completions
@@ -497,6 +916,10 @@ struct AutoPick {
     pick: String,
     /// Header-safe: the swap reason, else Auto's selection reason, else `auto`.
     reason: String,
+    /// The effort sent with `model_id`.
+    effort: Option<EffortLevel>,
+    /// The selection event each dispatch of this pick starts from.
+    template: SelectionEvent,
 }
 
 /// Resolves a Copilot `<profile>/auto[-<tier>]` through Copilot Auto and logs the decision.
@@ -555,6 +978,26 @@ async fn resolve_auto(
         .or(route.selection_reason.as_deref())
         .unwrap_or("auto");
     let reason = header_safe(reason, AUTO_REASON_HEADER_MAX_CHARS);
+    let log = state.selection_log();
+    let template = SelectionEvent {
+        worker: claude_code_session_id(&bodies.headers)
+            .map(|raw| log.scope_key(ScopeKind::Worker, &raw)),
+        selector: Some(model_id.qualified()),
+        tier: Some(tier.as_str().to_owned()),
+        reason: Some(
+            if route.swap_reason.is_some() {
+                "swapped"
+            } else {
+                "auto_pick"
+            }
+            .to_owned(),
+        ),
+        ..SelectionEvent::new(
+            SelectionStage::Solver,
+            SelectionState::Selected,
+            model_id.qualified(),
+        )
+    };
     let decision = AutoDecision {
         ts_ms: now_ms(),
         session: claude_code_session_id(&bodies.headers),
@@ -566,6 +1009,7 @@ async fn resolve_auto(
         selection_reason: route.selection_reason,
         turn: route.turn,
         estimated_prompt_tokens: route.estimated_prompt_tokens,
+        effort: route.effort.map(|level| level.as_str().to_owned()),
     };
     state
         .copilot_auto()
@@ -577,6 +1021,8 @@ async fn resolve_auto(
         tier,
         pick: auto_pick,
         reason,
+        effort: route.effort,
+        template,
     })
 }
 
@@ -621,6 +1067,7 @@ fn default_auto_model<'c>(catalog: &'c [Value], path: &str) -> &'c str {
 /// The SSE decision is the upstream's content-type, not the request's `stream`
 /// flag: an upstream that answers a streaming request with a JSON error must be
 /// translated as a message, not fed to the SSE machinery.
+#[allow(clippy::too_many_arguments)] // nine inputs, each a separate piece of one delivery
 async fn deliver(
     state: &AppState,
     response: reqwest::Response,
@@ -629,6 +1076,8 @@ async fn deliver(
     started: Instant,
     attempt: &Attempt<'_>,
     client: Option<String>,
+    commit: Option<SmartAutoCommit>,
+    selection: Option<SelectionEvent>,
 ) -> Response {
     let (route, plan, upstream_path) = (attempt.route, attempt.plan, attempt.path.as_str());
     let is_sse = is_event_stream(&response);
@@ -645,6 +1094,8 @@ async fn deliver(
             started,
             plan,
             client,
+            commit,
+            selection,
         )
         .await
     } else {
@@ -658,12 +1109,202 @@ async fn deliver(
             started,
             transform,
             client,
+            commit,
+            selection,
         )
     };
     if let Some(applied) = plan.header_value() {
         insert_header(out.headers_mut(), HEADER_TRANSFORMS, &applied);
     }
     out
+}
+
+/// True when the attempt is a chat-completions call whose answer review can read.
+fn review_applies(attempt: &Attempt<'_>) -> bool {
+    !attempt.native_messages && attempt.path.as_str().ends_with(CHAT_ENDPOINT)
+}
+
+/// The same request body with streaming off, so review reads the whole answer before replying.
+fn non_streaming(body: Bytes) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("stream".to_owned(), Value::Bool(false));
+        object.remove("stream_options");
+    }
+    match serde_json::to_vec(&value) {
+        Ok(encoded) => Bytes::from(encoded),
+        Err(_) => body,
+    }
+}
+
+/// Buffers a chat-completions answer, reviews it through `ReviewOrchestrator`, and sends the final
+/// reply once: a JSON body, or SSE re-emitted in the client's protocol when the client streams.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the review path threads one request's state; a split would pass the same set again
+async fn review_deliver(
+    state: &AppState,
+    response: reqwest::Response,
+    solver: &ModelId,
+    attempts_trail: &[String],
+    started: Instant,
+    route: RouteKind,
+    plan: &SmartAutoPlan,
+    streams: bool,
+    client: Option<String>,
+    commit: Option<SmartAutoCommit>,
+    selection: Option<SelectionEvent>,
+) -> Result<Response, AppError> {
+    let Some(graph) = plan.review.as_ref() else {
+        return Err(AppError::UpstreamUnavailable(
+            "review was not planned for this route".to_owned(),
+        ));
+    };
+    let status = response.status().as_u16();
+    let cap = graph.budget.bytes_left();
+    let solve_reply = async {
+        let raw = StageClient::read_capped(response, cap).await?;
+        let completion: Value =
+            serde_json::from_slice(&raw).map_err(|e| StageError::Malformed(e.to_string()))?;
+        Ok::<StageReply, StageError>(StageReply {
+            completion,
+            bytes: raw.len() as u64,
+        })
+    };
+    let transport = StageClient::new(state.clone());
+    let evidence = ReviewEvidence {
+        task: plan.task.as_deref(),
+    };
+    let outcome = match ReviewOrchestrator::run(
+        solve_reply,
+        solver,
+        graph,
+        &transport,
+        evidence,
+        std::future::pending::<()>(),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let Some(event) = &selection {
+                record_transition(state, event, SelectionState::Rejected, Some(status));
+            }
+            return Err(AppError::UpstreamUnavailable(format!(
+                "review failed: {}",
+                error.reason()
+            )));
+        }
+    };
+    if outcome.aborted {
+        return Err(AppError::UpstreamUnavailable(
+            "review was aborted".to_owned(),
+        ));
+    }
+    if let Some(event) = &selection {
+        for stage in outcome
+            .stages
+            .iter()
+            .filter(|stage| stage.stage != SelectionStage::Solver)
+        {
+            state.selection_log().record(SelectionEvent {
+                stage: stage.stage,
+                model: stage.model.clone(),
+                reason: stage
+                    .reason
+                    .map(str::to_owned)
+                    .or_else(|| event.reason.clone()),
+                ..event.in_state(stage.state)
+            });
+        }
+        if outcome.review_failed == Some(ReviewOrchestrator::REASON_DRAFT_REJECTED) {
+            state.selection_log().record(SelectionEvent {
+                status: Some(status),
+                reason: Some(ReviewOrchestrator::REASON_DRAFT_REJECTED.to_owned()),
+                ..event.in_state(SelectionState::Rejected)
+            });
+        } else if let Some(reason) = outcome.review_failed {
+            state.selection_log().record(SelectionEvent {
+                reason: Some(format!("review_failed: {reason}")),
+                ..event.in_state(SelectionState::Completed)
+            });
+        }
+    }
+    if outcome.review_failed == Some(ReviewOrchestrator::REASON_DRAFT_REJECTED) {
+        return Err(AppError::UpstreamUnavailable(
+            "review rejected the draft".to_owned(),
+        ));
+    }
+
+    let usage = outcome.completion.get("usage");
+    let count = |pointer: &str| {
+        usage
+            .and_then(|usage| usage.pointer(pointer))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let request_stats = RequestOutcome {
+        profile: solver.profile.clone(),
+        model_key: outcome.served.qualified(),
+        status,
+        ts_ms: 0,
+        latency_ms: crate::utils::time::elapsed_ms(started),
+        ttft_ms: None,
+        tokens_in: count("/prompt_tokens"),
+        tokens_out: count("/completion_tokens"),
+        cache_read_tokens: count("/prompt_tokens_details/cached_tokens"),
+        cache_write_tokens: 0,
+        error: None,
+        client,
+    };
+    if let Some(commit) = commit {
+        commit.apply(state);
+    }
+    finish_selection(state, selection, &request_stats, true);
+    state.stats().record(&request_stats);
+    if let Some(store) = state.store()
+        && let Err(e) = store.record(&request_stats)
+    {
+        tracing::warn!("store record failed: {e}");
+    }
+
+    let served = outcome.served.clone();
+    let message = match route {
+        RouteKind::OpenAi => outcome.completion,
+        RouteKind::Anthropic => {
+            let raw = serde_json::to_vec(&outcome.completion)
+                .map_err(|e| AppError::UpstreamUnavailable(format!("review reply: {e}")))?;
+            let rendered = anthropic::response::to_anthropic(status, &raw, &served.qualified());
+            serde_json::from_slice::<Value>(&rendered)
+                .map_err(|e| AppError::UpstreamUnavailable(format!("review reply: {e}")))?
+        }
+    };
+    let (content_type, body) = if streams {
+        let protocol = match route {
+            RouteKind::OpenAi => ReplyProtocol::OpenAiChat,
+            RouteKind::Anthropic => ReplyProtocol::AnthropicMessage,
+        };
+        (
+            "text/event-stream",
+            BufferedReplyStream::render(protocol, &message)?,
+        )
+    } else {
+        let encoded = serde_json::to_vec(&message)
+            .map_err(|e| AppError::UpstreamUnavailable(format!("review reply: {e}")))?;
+        ("application/json", Bytes::from(encoded))
+    };
+    let mut out = Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .map_err(|e| AppError::UpstreamUnavailable(format!("review reply: {e}")))?;
+    insert_header(out.headers_mut(), HEADER_SERVED_MODEL, &served.qualified());
+    insert_header(
+        out.headers_mut(),
+        HEADER_ATTEMPTS,
+        &attempts_trail.join(", "),
+    );
+    Ok(out)
 }
 
 async fn attempt_single(
@@ -701,7 +1342,40 @@ async fn attempt_single(
         started,
         None,
         client_signature(headers),
+        None,
+        None,
     ))
+}
+
+/// Sends one non-streaming chat-completions body to the concrete model `sent_id` through its
+/// pooled client and existing auth. Review stages use it, so they never open a second path.
+pub(crate) async fn send_stage(
+    state: &AppState,
+    sent_id: &ModelId,
+    body: Bytes,
+) -> Result<reqwest::Response, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let method = Method::POST;
+    let sender = AttemptSender {
+        state,
+        method: &method,
+        path: UpstreamPath::Strip(STAGE_CHAT_PATH),
+        headers: &headers,
+        model_id: sent_id,
+        attempt_timeout: None,
+        force_identity_encoding: true,
+        session_token: None,
+    };
+    let response = sender.send(body).await?;
+    Ok(if may_reply_natively(state, STAGE_CHAT_PATH, sent_id) {
+        repair_native_reply(response)
+    } else {
+        response
+    })
 }
 
 fn parse_model_or_400(config: &crate::configs::HubConfig, raw: &str) -> Result<ModelId, AppError> {
@@ -1210,15 +1884,71 @@ impl UpstreamRequest<'_> {
     }
 }
 
-/// Streams the upstream response through, observing a rolling tail for usage
-/// scraping and recording stats when the stream ends.
-///
-/// `transform` is the only thing that decides whether the bytes are touched.
-/// `None` — every route but the Anthropic one — is byte-for-byte passthrough
-/// with no copy and no framing. `Some` rewrites frame by frame, and its
-/// `finish()` output is emitted as a final chunk so the client is always left
-/// with a well-formed body, even when the upstream is cut mid-stream.
-// One argument over the lint's threshold; each is a separate per-response input.
+/// The event a dispatch to `model_id` starts from: the route's template with this attempt's key and effort.
+fn selected_event(
+    state: &AppState,
+    template: &SelectionEvent,
+    model_id: &ModelId,
+    effort: Option<EffortLevel>,
+) -> SelectionEvent {
+    SelectionEvent {
+        attempt: Some(state.selection_log().attempt_key()),
+        model: model_id.qualified(),
+        selected_effort: effort,
+        sent_effort: effort,
+        ..template.clone()
+    }
+}
+
+/// Records `event` moved to `next`, with the upstream `status` when there is one, and returns the recorded event.
+fn record_transition(
+    state: &AppState,
+    event: &SelectionEvent,
+    next: SelectionState,
+    status: Option<u16>,
+) -> SelectionEvent {
+    let moved = SelectionEvent {
+        status,
+        ..event.in_state(next)
+    };
+    state.selection_log().record(moved.clone());
+    moved
+}
+
+/// Records how a delivered attempt ended: completed once the upstream body ended, cancelled when the stream stopped first.
+fn finish_selection(
+    state: &AppState,
+    selection: Option<SelectionEvent>,
+    outcome: &RequestOutcome,
+    completed: bool,
+) {
+    let Some(event) = selection else {
+        return;
+    };
+    let next = if completed {
+        SelectionState::Completed
+    } else {
+        SelectionState::Cancelled
+    };
+    state.selection_log().record(SelectionEvent {
+        status: Some(outcome.status),
+        latency_ms: Some(outcome.latency_ms),
+        tokens_in: reported(outcome.tokens_in),
+        tokens_out: reported(outcome.tokens_out),
+        cache_read_tokens: reported(outcome.cache_read_tokens),
+        cache_write_tokens: reported(outcome.cache_write_tokens),
+        ..event.in_state(next)
+    });
+}
+
+/// A count the upstream reported, or `None` when it reported none.
+fn reported(count: u64) -> Option<u64> {
+    (count > 0).then_some(count)
+}
+
+/// Streams the upstream response through, scraping usage from a rolling tail and recording stats at stream end.
+/// `transform` rewrites frames when `Some`; `None` passes bytes through untouched, and `finish()` output ends the body.
+// Ten inputs, each a separate per-response value, so bundling them would only rename them.
 #[allow(clippy::too_many_arguments)]
 fn build_response(
     state: &AppState,
@@ -1229,6 +1959,8 @@ fn build_response(
     started: Instant,
     transform: Option<BodyTransform>,
     client: Option<String>,
+    commit: Option<SmartAutoCommit>,
+    selection: Option<SelectionEvent>,
 ) -> Response {
     let status = upstream.status();
     let limit_model =
@@ -1275,6 +2007,7 @@ fn build_response(
     let observed = futures_util::stream::unfold(
         StreamState {
             inner: upstream.bytes_stream(),
+            head: Vec::new(),
             tail: Vec::new(),
             transform,
             sender: Some(summary_sender),
@@ -1282,6 +2015,7 @@ fn build_response(
             started,
             ttft_ms: None,
             keepalive,
+            complete: false,
         },
         pump,
     );
@@ -1291,16 +2025,7 @@ fn build_response(
         if let Some(model) = &limit_model {
             state_for_stats.learn_prompt_limit(&outcome_seed.profile, model, &summary.tail);
         }
-        let scraped = scrape_usage(&summary.tail);
-        let usage = match summary.observed_usage {
-            Some(observed) => ScrapedUsage {
-                tokens_in: observed.tokens_in,
-                tokens_out: observed.tokens_out,
-                cache_read_tokens: observed.cache_read_tokens.max(scraped.cache_read_tokens),
-                cache_write_tokens: observed.cache_write_tokens.max(scraped.cache_write_tokens),
-            },
-            None => scraped,
-        };
+        let usage = summary_usage(&summary);
         let outcome = RequestOutcome {
             latency_ms: crate::utils::time::elapsed_ms(started),
             ttft_ms: summary.ttft_ms,
@@ -1313,6 +2038,10 @@ fn build_response(
             ..outcome_seed
         };
         log_failure(&outcome);
+        if let Some(commit) = commit.filter(|_| summary.completed && outcome.error.is_none()) {
+            commit.apply(&state_for_stats);
+        }
+        finish_selection(&state_for_stats, selection, &outcome, summary.completed);
         state_for_stats.stats().record(&outcome);
         if let Some(store) = state_for_stats.store()
             && let Err(e) = store.record(&outcome)
@@ -1361,6 +2090,7 @@ where
                     if state.ttft_ms.is_none() {
                         state.ttft_ms = Some(crate::utils::time::elapsed_ms(state.started));
                     }
+                    append_head(&mut state.head, &bytes);
                     append_tail(&mut state.tail, &bytes);
                     let Some(active) = state.transform.as_mut() else {
                         return Some((Ok(bytes), state));
@@ -1383,19 +2113,24 @@ where
                     tracing::warn!("upstream stream error, closing translated stream: {e}");
                     state.ended = true;
                 }
-                NextChunk::End => state.ended = true,
+                NextChunk::End => {
+                    state.ended = true;
+                    state.complete = true;
+                }
             }
         }
 
         let tail_chunk = state.transform.as_mut().map(BodyTransform::finish);
         if let Some(sender) = state.sender.take() {
             let _ = sender.send(StreamSummary {
+                head: std::mem::take(&mut state.head),
                 tail: std::mem::take(&mut state.tail),
                 observed_usage: state
                     .transform
                     .as_ref()
                     .and_then(BodyTransform::observed_usage),
                 ttft_ms: state.ttft_ms,
+                completed: state.complete,
             });
         }
         state.transform = None;
@@ -1440,6 +2175,7 @@ where
 /// The per-response state the body stream carries while it drains.
 struct StreamState<S> {
     inner: S,
+    head: Vec<u8>,
     tail: Vec<u8>,
     transform: Option<BodyTransform>,
     sender: Option<tokio::sync::oneshot::Sender<StreamSummary>>,
@@ -1449,6 +2185,8 @@ struct StreamState<S> {
     /// Idle gap after which a keepalive comment goes out. `None` on every
     /// non-SSE body and whenever the knob is off — see `pump`.
     keepalive: Option<Duration>,
+    /// The upstream stream ended on its own, without a read error.
+    complete: bool,
 }
 
 /// Clients such as Copilot CLI and Claude Code close the connection as soon as
@@ -1459,12 +2197,14 @@ impl<S> Drop for StreamState<S> {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(StreamSummary {
+                head: std::mem::take(&mut self.head),
                 tail: std::mem::take(&mut self.tail),
                 observed_usage: self
                     .transform
                     .as_ref()
                     .and_then(BodyTransform::observed_usage),
                 ttft_ms: self.ttft_ms,
+                completed: false,
             });
         }
     }
@@ -1475,9 +2215,25 @@ impl<S> Drop for StreamState<S> {
 /// `input_tokens`/`output_tokens`, which older scrapers could not see.
 #[derive(Default)]
 struct StreamSummary {
+    head: Vec<u8>,
     tail: Vec<u8>,
     observed_usage: Option<ScrapedUsage>,
     ttft_ms: Option<u64>,
+    /// The upstream body was read to its end, so the routed answer is complete.
+    completed: bool,
+}
+
+fn summary_usage(summary: &StreamSummary) -> ScrapedUsage {
+    let scraped = scrape_stream_usage(&summary.head, &summary.tail);
+    match summary.observed_usage {
+        Some(observed) => ScrapedUsage {
+            tokens_in: observed.tokens_in,
+            tokens_out: observed.tokens_out,
+            cache_read_tokens: observed.cache_read_tokens.max(scraped.cache_read_tokens),
+            cache_write_tokens: observed.cache_write_tokens.max(scraped.cache_write_tokens),
+        },
+        None => scraped,
+    }
 }
 
 /// True when the upstream answered with an SSE body.
@@ -1495,7 +2251,7 @@ fn is_event_stream(response: &reqwest::Response) -> bool {
 /// frame-at-a-time translator instead — and it is bounded by
 /// `MAX_TRANSFORM_BUFFER_BYTES`. Every other route keeps the byte-for-byte
 /// streaming path in `build_response`.
-// One argument over the lint's threshold; each is a separate per-response input.
+// Nine inputs, each a separate per-response value the translator needs.
 #[allow(clippy::too_many_arguments)]
 async fn build_anthropic_response(
     state: &AppState,
@@ -1506,6 +2262,8 @@ async fn build_anthropic_response(
     started: Instant,
     plan: &TransformPlan,
     client: Option<String>,
+    commit: Option<SmartAutoCommit>,
+    selection: Option<SelectionEvent>,
 ) -> Response {
     let upstream_status = upstream.status();
     let limit_model = prompt_limit_model(
@@ -1589,7 +2347,11 @@ async fn build_anthropic_response(
     log_failure(&outcome);
     let state_for_stats = state.clone();
     tokio::spawn(async move {
+        finish_selection(&state_for_stats, selection, &outcome, !overflowed);
         state_for_stats.stats().record(&outcome);
+        if let Some(commit) = commit.filter(|_| outcome.error.is_none()) {
+            commit.apply(&state_for_stats);
+        }
         if let Some(store) = state_for_stats.store()
             && let Err(e) = store.record(&outcome)
         {
@@ -1766,6 +2528,8 @@ async fn passthrough_oversized(
         started,
         None,
         client_signature(headers),
+        None,
+        None,
     ))
 }
 
@@ -1836,6 +2600,11 @@ fn log_failure(outcome: &RequestOutcome) {
     }
 }
 
+fn append_head(head: &mut Vec<u8>, bytes: &Bytes) {
+    let room = USAGE_SCRAPE_HEAD_BYTES.saturating_sub(head.len());
+    head.extend_from_slice(&bytes[..room.min(bytes.len())]);
+}
+
 fn append_tail(tail: &mut Vec<u8>, bytes: &Bytes) {
     tail.extend_from_slice(bytes);
     let overflow = tail.len().saturating_sub(USAGE_SCRAPE_TAIL_BYTES);
@@ -1888,6 +2657,7 @@ fn headermap_from_reqwest(headers: &reqwest::header::HeaderMap) -> HeaderMap {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
 
     use futures_util::stream::{self, BoxStream, StreamExt as _};
@@ -1941,6 +2711,7 @@ mod tests {
     ) -> StreamState<TestStream> {
         StreamState {
             inner,
+            head: Vec::new(),
             tail: Vec::new(),
             transform: None,
             sender,
@@ -1948,7 +2719,52 @@ mod tests {
             started: Instant::now(),
             ttft_ms: None,
             keepalive,
+            complete: false,
         }
+    }
+
+    #[test]
+    fn a_routed_commit_needs_a_2xx_status() {
+        let signals = TurnSignals::from_body(
+            "/chat/completions",
+            &serde_json::json!({}),
+            0,
+            Some("session-1".to_owned()),
+        );
+        let plan = SmartAutoPlan {
+            key: AffinityKey::new(
+                &signals,
+                &SmartAutoHeaders::default(),
+                &SmartAutoPolicy::default(),
+                "/chat/completions",
+            ),
+            tier: SmartAutoTier::Balance,
+            role: WorkRole::Conversation,
+            plan_backed: false,
+            turn: 1,
+            requested: None,
+            model: "alpha/m1".to_owned(),
+            effort: None,
+            reason: RouteReason::Fresh,
+            review: None,
+            task: None,
+            template: SelectionEvent::new(
+                SelectionStage::Solver,
+                SelectionState::Selected,
+                "alpha/m1",
+            ),
+        };
+        let served = ModelId {
+            profile: "alpha".to_owned(),
+            model: "m1".to_owned(),
+        };
+
+        assert!(plan.commit(500, &served).is_none());
+        assert!(plan.commit(429, &served).is_none());
+        assert_eq!(
+            plan.commit(200, &served).map(|commit| commit.model),
+            Some("alpha/m1".to_owned())
+        );
     }
 
     /// Drives the body stream to exhaustion, returning every chunk as text.
@@ -2000,6 +2816,82 @@ mod tests {
         assert!(summary.ttft_ms.is_some());
         let usage = scrape_usage(&summary.tail);
         assert_eq!((usage.tokens_in, usage.tokens_out), (1200, 34));
+    }
+
+    /// A native `/v1/messages` stream reports input and cache usage only in
+    /// `message_start`. The final `message_delta` carries output tokens only.
+    fn long_native_messages_stream() -> Vec<reqwest::Result<Bytes>> {
+        let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus\",\"content\":[],\"usage\":{\"input_tokens\":12,\"cache_creation_input_tokens\":30,\"cache_read_input_tokens\":900,\"output_tokens\":1}}}\n\n";
+        let delta = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lorem ipsum dolor sit amet \"}}\n\n";
+        let end = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4000}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let delta_count = USAGE_SCRAPE_TAIL_BYTES / delta.len() + 1;
+        std::iter::once(start)
+            .chain(std::iter::repeat_n(delta, delta_count))
+            .chain(std::iter::once(end))
+            .map(|frame| Ok(Bytes::from_static(frame.as_bytes())))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn long_native_messages_stream_keeps_message_start_cache_usage() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
+        let upstream = stream::iter(long_native_messages_stream()).boxed();
+
+        drain(state_for(upstream, None, Some(sender))).await;
+        let usage = summary_usage(&receiver.await.unwrap());
+
+        assert_eq!(
+            usage,
+            ScrapedUsage {
+                tokens_in: 12,
+                tokens_out: 4000,
+                cache_read_tokens: 900,
+                cache_write_tokens: 30,
+            }
+        );
+    }
+
+    #[test]
+    fn no_eligible_model_names_every_restriction() {
+        let selector = HubSelector::parse("hub/smart-auto-fast", &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+        let policy = SmartAutoPolicy {
+            include: vec![BTreeSet::from([
+                "alpha/*".to_string(),
+                "beta/*".to_string(),
+            ])],
+            exclude: BTreeSet::from(["*preview*".to_string()]),
+            min_context_tokens: Some(1_000_000),
+            ..SmartAutoPolicy::default()
+        };
+        let profiles = ProfileFilter::from_list("beta,gamma");
+
+        let error = no_eligible_model(&selector, &policy, Some(&profiles), "/v1/messages");
+
+        let AppError::BadRequest(message) = error else {
+            panic!("expected a 400, got {error:?}");
+        };
+        assert_eq!(
+            message,
+            "smart_auto_no_eligible_model: no model serves hub/smart-auto-fast on /v1/messages \
+             under: tier fast, profiles beta|gamma, include alpha/*|beta/*, exclude *preview*, \
+             min context 1000000 tokens"
+        );
+    }
+
+    #[test]
+    fn profile_filter_restricts_the_pool_only_when_it_names_a_concrete_profile() {
+        let filter = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(ProfileFilter::HEADER, value.parse().unwrap());
+            concrete_profile_filter(&headers).map(|filter| filter.to_list())
+        };
+
+        assert_eq!(filter("hub"), None);
+        assert_eq!(filter(" "), None);
+        assert_eq!(filter("hub, Beta"), Some("hub,beta".to_string()));
+        assert_eq!(concrete_profile_filter(&HeaderMap::new()), None);
     }
 
     #[test]
@@ -3252,6 +4144,185 @@ mod tests {
             assert_eq!(decisions[0].tier, AutoTier::Intelligence);
         }
 
+        /// Polls the selection log until it holds `count` events. A stream's end is recorded by the
+        /// stats task, which can run after the body has been read.
+        async fn selection_events(copilot: &Copilot, count: usize) -> Vec<SelectionEvent> {
+            use crate::schemas::history_query::HistoryQuery;
+
+            for _ in 0..200 {
+                let events = copilot.state.selection_log().history(&HistoryQuery {
+                    since_seq: 0,
+                    limit: usize::MAX,
+                    ..HistoryQuery::default()
+                });
+                if events.len() >= count {
+                    return events;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("the selection log holds fewer than {count} events");
+        }
+
+        fn states(events: &[SelectionEvent]) -> Vec<SelectionState> {
+            events.iter().map(|event| event.state).collect()
+        }
+
+        #[tokio::test]
+        async fn auto_success_records_selected_started_then_completed() {
+            let copilot = copilot().await;
+            mount_auto(&copilot, NATIVE_UPSTREAM_ID).await;
+            mount_native_reply(&copilot).await;
+
+            let (status, _) = send(
+                &copilot,
+                &with_session("selection-success"),
+                &anthropic_body(COPILOT_AUTO_MODEL, false),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            let events = selection_events(&copilot, 3).await;
+            assert_eq!(
+                states(&events),
+                [
+                    SelectionState::Selected,
+                    SelectionState::Started,
+                    SelectionState::Completed,
+                ]
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.model == format!("{PROFILE}/{NATIVE_ID}"))
+            );
+            assert_eq!(events[0].tier.as_deref(), Some("balance"));
+            assert!(events[0].worker.is_some());
+            assert_eq!(events[2].status, Some(200));
+            assert_eq!(events[0].attempt, events[2].attempt);
+        }
+
+        #[tokio::test]
+        async fn auto_fallback_records_the_rejection_then_the_served_attempt() {
+            let copilot = copilot().await;
+            mount_auto(&copilot, NATIVE_UPSTREAM_ID).await;
+            Mock::given(method("POST"))
+                .and(path(MESSAGES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+                    "type": "error",
+                    "error": {"type": "rate_limit_error", "message": "slow down"},
+                })))
+                .mount(&copilot.upstream)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+            let mut headers = with_session("selection-fallback");
+            headers.insert(
+                HEADER_FALLBACKS,
+                HeaderValue::from_str(&format!("{PROFILE}/{PLAIN_ID}")).unwrap(),
+            );
+
+            let (status, _) = send(
+                &copilot,
+                &headers,
+                &anthropic_body(COPILOT_AUTO_MODEL, false),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            let events = selection_events(&copilot, 5).await;
+            assert_eq!(
+                states(&events),
+                [
+                    SelectionState::Selected,
+                    SelectionState::Rejected,
+                    SelectionState::Selected,
+                    SelectionState::Started,
+                    SelectionState::Completed,
+                ]
+            );
+            let models: Vec<&str> = events.iter().map(|event| event.model.as_str()).collect();
+            let native = format!("{PROFILE}/{NATIVE_ID}");
+            let plain = format!("{PROFILE}/{PLAIN_ID}");
+            assert_eq!(
+                models,
+                [
+                    native.as_str(),
+                    native.as_str(),
+                    plain.as_str(),
+                    plain.as_str(),
+                    plain.as_str(),
+                ]
+            );
+            assert_eq!(events[1].status, Some(429));
+        }
+
+        #[tokio::test]
+        async fn auto_stream_the_client_drops_records_cancelled() {
+            let copilot = copilot().await;
+            mount_auto(&copilot, NATIVE_UPSTREAM_ID).await;
+            Mock::given(method("POST"))
+                .and(path(MESSAGES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    "event: message_start\ndata: {\"type\":\"message_start\"}\n\n".as_bytes(),
+                    "text/event-stream",
+                ))
+                .mount(&copilot.upstream)
+                .await;
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                MESSAGES_ENDPOINT,
+                &with_session("selection-drop"),
+                Bytes::from(anthropic_body(COPILOT_AUTO_MODEL, true).to_string()),
+                RouteKind::Anthropic,
+            )
+            .await
+            .unwrap();
+            drop(response);
+
+            let events = selection_events(&copilot, 3).await;
+            assert_eq!(
+                states(&events),
+                [
+                    SelectionState::Selected,
+                    SelectionState::Started,
+                    SelectionState::Cancelled,
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn direct_model_records_no_selection() {
+            let copilot = copilot().await;
+            mount_native_reply(&copilot).await;
+
+            let (status, _) = send(
+                &copilot,
+                &client_headers(),
+                &anthropic_body(NATIVE_ID, false),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert!(
+                copilot
+                    .state
+                    .selection_log()
+                    .history(&crate::schemas::history_query::HistoryQuery {
+                        limit: usize::MAX,
+                        ..Default::default()
+                    })
+                    .is_empty()
+            );
+        }
+
         #[tokio::test]
         async fn invalid_session_id_is_recorded_as_null() {
             let copilot = copilot().await;
@@ -3611,5 +4682,27 @@ mod tests {
         assert!(translated.contains("event: message_stop"), "{translated}");
         assert!(!translated.contains("keepalive"), "{translated}");
         assert!(receiver.await.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod review_body_tests {
+    use super::*;
+
+    #[test]
+    fn non_streaming_turns_streaming_off_and_drops_stream_options() {
+        let body = Bytes::from_static(
+            br#"{"model":"m1","stream":true,"stream_options":{"include_usage":true},"messages":[]}"#,
+        );
+        let value: Value = serde_json::from_slice(&non_streaming(body)).unwrap();
+        assert_eq!(value["stream"], false);
+        assert!(value.get("stream_options").is_none());
+        assert_eq!(value["model"], "m1");
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_passes_through_unchanged() {
+        let body = Bytes::from_static(b"not json");
+        assert_eq!(non_streaming(body.clone()), body);
     }
 }

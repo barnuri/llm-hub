@@ -40,6 +40,9 @@ pub fn load_env_vars() -> HashMap<String, String> {
 
 #[tokio::main]
 async fn main() {
+    if run_smart_auto_command().await {
+        return;
+    }
     if run_launch_command().await {
         return;
     }
@@ -209,6 +212,9 @@ GitHub Copilot upstream:
   llm-hub copilot logout [--profile NAME]  remove the saved GitHub token
 
 Other:
+  llm-hub smart-auto export --workflow <id> --out <path>
+                                  write a workflow's Smart Auto history into the generated
+                                  block of a Markdown file (git-tracked files are refused)
   llm-hub help                    show this help (also --help, -h)
 
 Environment: LLM_HUB_URL (default http://localhost:8888) and LLM_HUB_API_KEY for the agent commands.";
@@ -250,6 +256,23 @@ async fn run_cli_command() -> bool {
             std::process::exit(2);
         }
     }
+}
+
+/// `llm-hub smart-auto export --workflow <id> --out <path>`. It runs before tracing starts, so no
+/// `logs/` dir appears in the working directory. Returns true when the command was handled.
+async fn run_smart_auto_command() -> bool {
+    if std::env::args().nth(1).as_deref() != Some("smart-auto") {
+        return false;
+    }
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    match services::history_exporter::run(&args).await {
+        Ok(message) => println!("{message}"),
+        Err(e) => {
+            eprintln!("llm-hub smart-auto: {e}");
+            std::process::exit(1);
+        }
+    }
+    true
 }
 
 /// `llm-hub [--profiles a,b] <claude|codex|opencode|copilot-cli|pi> [model] [args...]`
@@ -365,6 +388,12 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/copilot/auto/decisions",
             get(routes::copilot::auto_decisions),
+        )
+        .route("/api/smart-auto/current", get(routes::smart_auto::current))
+        .route("/api/smart-auto/history", get(routes::smart_auto::history))
+        .route(
+            "/api/smart-auto/decisions",
+            get(routes::smart_auto::decisions),
         )
         .route("/api/copilot/usage", get(routes::copilot::usage))
         .route("/api/fallbacks", post(routes::admin::set_default_fallbacks))
@@ -529,6 +558,7 @@ mod tests {
             selection_reason: None,
             turn: AutoTurn::Routed,
             estimated_prompt_tokens: 10,
+            effort: None,
         }
     }
 
@@ -582,5 +612,73 @@ mod tests {
         assert_eq!(decision_count(&client, &url("?limit=0")).await, 1);
         assert_eq!(decision_count(&client, &url("?limit=1000")).await, 200);
         assert_eq!(decision_count(&client, &url("?limit=7")).await, 7);
+    }
+
+    #[tokio::test]
+    async fn smart_auto_routes_are_protected() {
+        use crate::schemas::scope_kind::ScopeKind;
+        use crate::schemas::selection_event::SelectionEvent;
+        use crate::schemas::selection_stage::SelectionStage;
+        use crate::schemas::selection_state::SelectionState;
+
+        let (base, state) = serve_hub_with_auth_state().await;
+        let log = state.selection_log();
+        let worker = log.scope_key(ScopeKind::Worker, "session-1");
+        log.record(SelectionEvent {
+            worker: Some(worker),
+            ..SelectionEvent::new(
+                SelectionStage::Solver,
+                SelectionState::Selected,
+                "copilot/claude-opus-4-5",
+            )
+        });
+        let client = reqwest::Client::new();
+        let current = format!("{base}/api/smart-auto/current?session=session-1");
+
+        let with_key = client
+            .get(&current)
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap();
+        let without_key = client.get(&current).send().await.unwrap();
+
+        assert_eq!(with_key.status().as_u16(), 200);
+        let body: serde_json::Value = with_key.json().await.unwrap();
+        assert_eq!(body["selection"]["state"], "selected");
+        assert_eq!(
+            body["selection"]["main"]["model"],
+            "copilot/claude-opus-4-5"
+        );
+        assert_eq!(body["selection"]["stale"], false);
+        assert_eq!(without_key.status().as_u16(), 401);
+
+        for route in ["/api/smart-auto/history", "/api/smart-auto/decisions"] {
+            let url = format!("{base}{route}");
+            let with_key = client
+                .get(&url)
+                .bearer_auth(MASTER_KEY)
+                .send()
+                .await
+                .unwrap();
+            let without_key = client.get(&url).send().await.unwrap();
+            assert_eq!(with_key.status().as_u16(), 200, "{route}");
+            assert_eq!(without_key.status().as_u16(), 401, "{route}");
+        }
+    }
+
+    #[tokio::test]
+    async fn smart_auto_current_needs_a_worker_or_session() {
+        let base = serve_hub_with_auth().await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get(format!("{base}/api/smart-auto/current"))
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 400);
     }
 }

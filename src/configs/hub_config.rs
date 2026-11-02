@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use super::copilot_auth::CopilotAuth;
@@ -7,6 +7,8 @@ use super::profile_config::ProfileConfig;
 use crate::consts::{
     DEFAULT_BIND, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_PORT, DEFAULT_SSE_KEEPALIVE_MS,
 };
+use crate::schemas::hub_selector::HubSelector;
+use crate::schemas::smart_auto_policy::SmartAutoPolicy;
 
 use crate::services::transforms::{
     CopilotModels, DEFAULT_COPILOT_GUARD_MODELS, DEFAULT_COPILOT_STRIP_SAMPLING_MODELS,
@@ -21,6 +23,8 @@ const PREFIX: &str = "LLM_HUB_";
 #[derive(Debug, Clone)]
 pub struct HubConfig {
     pub profiles: Vec<ProfileConfig>,
+    /// Operator Smart Auto presets from `LLM_HUB_SMART_AUTO_PRESETS`, served as `hub/<name>`.
+    pub smart_auto_presets: BTreeMap<String, SmartAutoPolicy>,
     pub master_key: Option<String>,
     pub default_fallbacks: Vec<String>,
     pub max_replay_bytes: usize,
@@ -134,6 +138,7 @@ impl HubConfig {
         };
 
         Ok(HubConfig {
+            smart_auto_presets: smart_auto_presets_from_map(vars)?,
             profiles,
             master_key,
             default_fallbacks,
@@ -166,6 +171,12 @@ impl HubConfig {
     fn parse_profile(name: &str, vars: &HashMap<String, String>) -> Result<ProfileConfig, String> {
         if name.contains('/') {
             return Err(format!("profile name may not contain '/': {name}"));
+        }
+        if name.eq_ignore_ascii_case(HubSelector::NAMESPACE) {
+            return Err(format!(
+                "profile name {name} is reserved: the hub serves its own virtual models under {}/",
+                HubSelector::NAMESPACE
+            ));
         }
         let upper = env_name(name);
         let get = |key: &str| {
@@ -235,6 +246,26 @@ impl HubConfig {
             copilot,
         })
     }
+}
+
+/// Operator Smart Auto presets from `LLM_HUB_SMART_AUTO_PRESETS`, a JSON object of name to policy.
+/// An unset or empty var yields no presets. A preset only adds constraints to a request.
+pub fn smart_auto_presets_from_map(
+    vars: &HashMap<String, String>,
+) -> Result<BTreeMap<String, SmartAutoPolicy>, String> {
+    let key = format!("{PREFIX}SMART_AUTO_PRESETS");
+    let Some(raw) = vars.get(&key).map(|value| value.trim()) else {
+        return Ok(BTreeMap::new());
+    };
+    if raw.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let presets: BTreeMap<String, SmartAutoPolicy> =
+        serde_json::from_str(raw).map_err(|e| format!("{key} is not a valid preset map: {e}"))?;
+    for name in presets.keys() {
+        HubSelector::validate_operator_preset_name(name).map_err(|e| format!("{key}: {e}"))?;
+    }
+    Ok(presets)
 }
 
 fn parse_headers_json(upper: &str, raw: &str) -> Result<Vec<(String, String)>, String> {
@@ -362,6 +393,67 @@ mod tests {
         vars.insert("LLM_HUB_PROFILES".into(), "bad/name".into());
         let err = HubConfig::from_map(&vars).unwrap_err();
         assert!(err.contains("may not contain '/'"));
+    }
+
+    #[test]
+    fn rejects_the_reserved_hub_profile_name() {
+        for name in ["hub", "HUB"] {
+            let mut vars = base_vars();
+            vars.insert("LLM_HUB_PROFILES".into(), name.into());
+            vars.insert(
+                "LLM_HUB_HUB_BASE_URL".into(),
+                "https://example.com/v1".into(),
+            );
+            let err = HubConfig::from_map(&vars).unwrap_err();
+            assert!(err.contains("reserved"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn config_without_smart_auto_presets_parses_with_none() {
+        assert!(HubConfig::from_map(&base_vars()).is_ok());
+        assert!(
+            smart_auto_presets_from_map(&base_vars())
+                .unwrap()
+                .is_empty()
+        );
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_SMART_AUTO_PRESETS".into(), "  ".into());
+        assert!(smart_auto_presets_from_map(&vars).unwrap().is_empty());
+    }
+
+    #[test]
+    fn smart_auto_presets_parse_into_policies() {
+        let mut vars = base_vars();
+        vars.insert(
+            "LLM_HUB_SMART_AUTO_PRESETS".into(),
+            r#"{"team":{"tier":"fast","include":[["copilot/*"]],"min_context_tokens":1000000}}"#
+                .into(),
+        );
+        let presets = smart_auto_presets_from_map(&vars).unwrap();
+        let team = &presets["team"];
+        assert_eq!(
+            team.tier,
+            Some(crate::schemas::smart_auto_tier::SmartAutoTier::Fast)
+        );
+        assert_eq!(team.include, vec![["copilot/*".to_string()].into()]);
+        assert_eq!(team.min_context_tokens, Some(1_000_000));
+    }
+
+    #[test]
+    fn smart_auto_presets_reject_bad_json_unknown_fields_and_reserved_names() {
+        for (raw, expected) in [
+            ("[]", "not a valid preset map"),
+            (r#"{"team":{"min_ctx":1}}"#, "not a valid preset map"),
+            (r#"{"smart-auto-balance":{}}"#, "reserved"),
+            (r#"{"a/b":{}}"#, "malformed"),
+        ] {
+            let mut vars = base_vars();
+            vars.insert("LLM_HUB_SMART_AUTO_PRESETS".into(), raw.into());
+            let err = smart_auto_presets_from_map(&vars).unwrap_err();
+            assert!(err.contains("LLM_HUB_SMART_AUTO_PRESETS"), "{raw}: {err}");
+            assert!(err.contains(expected), "{raw}: {err}");
+        }
     }
 
     #[test]

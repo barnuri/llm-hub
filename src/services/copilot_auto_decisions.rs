@@ -25,6 +25,8 @@ pub struct AutoDecision {
     pub selection_reason: Option<String>,
     pub turn: AutoTurn,
     pub estimated_prompt_tokens: u64,
+    /// The effort sent with `model`, as its published level name.
+    pub effort: Option<String>,
 }
 
 /// A logged decision and the Auto tier it was routed on, serialized as one flat object.
@@ -135,6 +137,7 @@ mod tests {
             selection_reason: None,
             turn: AutoTurn::Routed,
             estimated_prompt_tokens: 10,
+            effort: None,
         }
     }
 

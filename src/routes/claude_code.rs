@@ -8,10 +8,8 @@ use crate::routes::models::{ProfilesQuery, enabled_models};
 use crate::schemas::launch::profile_filter::ProfileFilter;
 use crate::services::model_picker::sort_models;
 
-/// `claude --settings` input listing every hub model, since gateway
-/// discovery only keeps ids that mention `claude` or `anthropic`.
-/// Auto models come first, then the rest by request count, most used first.
-/// `?profiles=a,b` or the `x-llm-hub-profiles` header limits it to those profiles.
+/// `claude --settings` input listing every hub model, since gateway discovery keeps only ids
+/// with `claude` or `anthropic`. Auto models first, then by request count; `?profiles=a,b` limits it.
 pub async fn settings(
     State(state): State<AppState>,
     Query(query): Query<ProfilesQuery>,
@@ -32,10 +30,15 @@ pub async fn settings(
 
 fn picker_option(model: &Value) -> Option<Value> {
     let id = model.get("id").and_then(Value::as_str)?;
-    let label = model
+    let name = model
         .get("display_name")
         .and_then(Value::as_str)
         .unwrap_or(id);
+    let label = if model.get("recommended").and_then(Value::as_bool) == Some(true) {
+        format!("{name} (recommended)")
+    } else {
+        name.to_string()
+    };
     let mut option = json!({ "model": id, "label": label });
     if let Some(description) = model.get("description").and_then(Value::as_str) {
         option["description"] = json!(description);
@@ -160,6 +163,44 @@ mod tests {
                 {"model": "copilot/gpt-4.1", "label": "copilot/gpt-4.1"},
             ]}})
         );
+    }
+
+    #[tokio::test]
+    async fn recommended_smart_auto_balance_is_first_and_marked() {
+        let state = state_from(&[
+            ("LLM_HUB_PROFILES", "copilot"),
+            ("LLM_HUB_COPILOT_BASE_URL", "http://127.0.0.1:9"),
+        ]);
+        state.set_model_cache(json!({"data": [
+            {"id": "copilot/gpt-4.1", "owned_by": "copilot"},
+            {
+                "id": "hub/smart-auto-intelligence",
+                "owned_by": "hub",
+                "display_name": "Smart Auto (Intelligence)",
+                "recommended": false,
+            },
+            {
+                "id": "hub/smart-auto-balance",
+                "owned_by": "hub",
+                "display_name": "Smart Auto (Balance)",
+                "recommended": true,
+            },
+        ]}));
+
+        let Json(settings) = super::settings(
+            State(state),
+            Query(ProfilesQuery::default()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        let options = settings["modelPicker"]["options"].as_array().unwrap();
+        assert_eq!(options[0]["model"], "hub/smart-auto-balance");
+        assert_eq!(options[0]["label"], "Smart Auto (Balance) (recommended)");
+        assert!(options.iter().any(|option| {
+            option["model"] == "hub/smart-auto-intelligence"
+                && option["label"] == "Smart Auto (Intelligence)"
+        }));
     }
 
     #[tokio::test]

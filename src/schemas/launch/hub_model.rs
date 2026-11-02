@@ -1,10 +1,11 @@
 use serde_json::Value;
 
-/// One `/v1/models` entry, with the window the hub reports for it.
+/// One `/v1/models` entry, with the window and output limit the hub reports for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubModel {
     id: String,
     context_window: Option<u64>,
+    advertised_max_output_tokens: Option<u64>,
 }
 
 impl HubModel {
@@ -18,7 +19,16 @@ impl HubModel {
         Self {
             id: id.to_string(),
             context_window,
+            advertised_max_output_tokens: None,
         }
+    }
+
+    /// A catalog entry whose hub entry advertises `max_output_tokens`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_max_output_tokens(mut self, tokens: u64) -> Self {
+        self.advertised_max_output_tokens = Some(tokens);
+        self
     }
 
     /// Every entry of a `/v1/models` payload that has a string `id`.
@@ -43,6 +53,7 @@ impl HubModel {
         Some(Self {
             id: entry.get("id")?.as_str()?.to_string(),
             context_window: entry.get("context_window").and_then(Value::as_u64),
+            advertised_max_output_tokens: entry.get("max_output_tokens").and_then(Value::as_u64),
         })
     }
 
@@ -58,17 +69,25 @@ impl HubModel {
         self.context_window
     }
 
-    /// A quarter of the window, capped at 32768 tokens.
+    /// The hub's advertised output limit, else a quarter of the window capped at 32768 tokens.
     #[must_use]
     pub fn max_output_tokens(&self) -> Option<u64> {
-        self.context_window
-            .map(|window| (window / 4).min(Self::MAX_OUTPUT_TOKENS))
+        self.advertised_max_output_tokens
+            .or_else(|| self.derived_output_budget())
     }
 
-    /// The window minus the output budget.
+    /// The window minus the derived output budget. The advertised window is already the prompt
+    /// limit, so a larger advertised output limit does not shrink it.
     #[must_use]
     pub fn max_prompt_tokens(&self) -> Option<u64> {
-        Some(self.context_window? - self.max_output_tokens()?)
+        self.context_window?
+            .checked_sub(self.derived_output_budget()?)
+            .filter(|tokens| *tokens > 0)
+    }
+
+    fn derived_output_budget(&self) -> Option<u64> {
+        self.context_window
+            .map(|window| (window / 4).min(Self::MAX_OUTPUT_TOKENS))
     }
 }
 
@@ -124,6 +143,32 @@ mod tests {
 
         assert_eq!(model.max_output_tokens(), None);
         assert_eq!(model.max_prompt_tokens(), None);
+    }
+
+    #[test]
+    fn advertised_output_limit_replaces_the_derived_budget() {
+        let payload = json!({"data": [
+            {"id": "copilot/claude-opus-5-5[1m]", "context_window": 1_000_000,
+             "max_output_tokens": 128_000},
+        ]});
+
+        let model = &HubModel::list_from(&payload)[0];
+
+        assert_eq!(
+            model,
+            &HubModel::new("copilot/claude-opus-5-5[1m]", Some(1_000_000))
+                .with_max_output_tokens(128_000)
+        );
+        assert_eq!(model.max_output_tokens(), Some(128_000));
+        assert_eq!(model.max_prompt_tokens(), Some(967_232));
+    }
+
+    #[test]
+    fn output_limit_filling_the_window_keeps_the_derived_prompt_budget() {
+        let model = HubModel::new("m", Some(64_000)).with_max_output_tokens(64_000);
+
+        assert_eq!(model.max_output_tokens(), Some(64_000));
+        assert_eq!(model.max_prompt_tokens(), Some(48_000));
     }
 
     #[test]

@@ -110,6 +110,7 @@ mod tests {
                 copilot: None,
             }],
             master_key: None,
+            smart_auto_presets: std::collections::BTreeMap::new(),
             default_fallbacks: vec![],
             max_replay_bytes: 1,
             config_readonly: false,

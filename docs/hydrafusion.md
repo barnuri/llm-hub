@@ -2,7 +2,8 @@
 
 This page records what we know about GitHub Copilot's HydraFusion, so that llm-hub can add
 support later. llm-hub does not support HydraFusion today. For Copilot Auto and the hydra
-classifier, see [copilot-auto.md](copilot-auto.md).
+classifier, see [copilot-auto.md](copilot-auto.md). llm-hub's own Smart Auto tiers also review
+answers with other models. That is a separate feature, described in [smart-auto.md](smart-auto.md).
 
 Facts below come from three sources: the open-source VS Code Copilot code, a live Copilot CLI
 run on 2026-11-01, and direct calls to the Copilot API. Each section says which.

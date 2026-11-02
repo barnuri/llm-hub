@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use axum::http::HeaderMap;
 
 use crate::consts::{HEADER_FALLBACKS, HEADER_FALLBACKS_ALIAS, HEADER_RETRY_ON, HEADER_TIMEOUT_MS};
+use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_descriptor::ModelDescriptor;
 
 /// Statuses that describe the request itself — identical on every upstream,
 /// so retrying only multiplies latency and cost. Never retried even via 5xx rule.
@@ -69,6 +71,24 @@ pub fn fallback_chain(headers: &HeaderMap, default_chain: &[String]) -> Vec<Stri
         .collect()
 }
 
+/// Keeps only fallbacks in the Smart Auto `eligible` pool, in chain order. Deny wins: a
+/// selector, unknown or filtered model is dropped. `None` (not a `hub/*` route) keeps the chain.
+#[must_use]
+pub fn retain_eligible(chain: Vec<String>, eligible: Option<&[&ModelDescriptor]>) -> Vec<String> {
+    let Some(eligible) = eligible else {
+        return chain;
+    };
+    chain
+        .into_iter()
+        .filter(|entry| {
+            let entry = strip_1m_suffix(entry);
+            eligible
+                .iter()
+                .any(|descriptor| strip_1m_suffix(&descriptor.qualified_id) == entry)
+        })
+        .collect()
+}
+
 /// Validates and normalizes (trims) a default fallback chain before
 /// persisting. Entries are stored comma-joined in the env file, so commas
 /// inside an entry are rejected; profiles are deliberately not checked for
@@ -104,7 +124,14 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    use crate::schemas::evidence_source::EvidenceSource;
+    use crate::schemas::limit_evidence::LimitEvidence;
+    use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
+    use crate::schemas::smart_auto_policy::SmartAutoPolicy;
+    use crate::services::smart_auto_pool::SmartAutoPool;
     use axum::http::HeaderValue;
 
     #[test]
@@ -162,6 +189,65 @@ mod tests {
     fn validate_chain_rejects_empty_and_comma_entries() {
         assert!(validate_chain(&["  ".into()]).is_err());
         assert!(validate_chain(&["a/x,b/y".into()]).is_err());
+    }
+
+    fn descriptor(qualified_id: &str, context: u64) -> ModelDescriptor {
+        ModelDescriptor {
+            context: Some(LimitEvidence::new(
+                context,
+                EvidenceSource::Seeded,
+                "test",
+                0.9,
+            )),
+            ..ModelDescriptor::for_test(qualified_id)
+        }
+    }
+
+    fn chain(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|&entry| entry.to_owned()).collect()
+    }
+
+    #[test]
+    fn retain_eligible_drops_forbidden_fallbacks_and_keeps_order() {
+        let snapshot = ModelDescriptorSnapshot::new(vec![
+            descriptor("copilot/opus", 1_000_000),
+            descriptor("copilot/gpt-6-sol", 1_000_000),
+            descriptor("copilot/grok-fast-preview", 1_000_000),
+            descriptor("copilot/haiku", 200_000),
+        ]);
+        let policy = SmartAutoPolicy {
+            exclude: BTreeSet::from(["*fast-preview*".to_owned()]),
+            min_context_tokens: Some(1_000_000),
+            ..SmartAutoPolicy::default()
+        };
+        let eligible = SmartAutoPool::eligible(&snapshot, &policy, "/v1/messages", 0);
+        let fallbacks = chain(&[
+            "copilot/gpt-6-sol",
+            "copilot/grok-fast-preview",
+            "copilot/haiku",
+            "copilot/auto",
+            "hub/smart-auto-fast",
+            "openai/unknown",
+            "copilot/opus[1m]",
+        ]);
+
+        assert_eq!(
+            retain_eligible(fallbacks, Some(&eligible)),
+            ["copilot/gpt-6-sol", "copilot/opus[1m]"]
+        );
+    }
+
+    #[test]
+    fn retain_eligible_with_an_empty_pool_drops_every_fallback() {
+        assert!(retain_eligible(chain(&["copilot/opus"]), Some(&[])).is_empty());
+    }
+
+    #[test]
+    fn non_hub_chain_is_unchanged() {
+        let default_chain = chain(&["copilot/auto", "hub/smart-auto", "a/x"]);
+        let fallbacks = fallback_chain(&HeaderMap::new(), &default_chain);
+
+        assert_eq!(retain_eligible(fallbacks, None), default_chain);
     }
 
     #[test]

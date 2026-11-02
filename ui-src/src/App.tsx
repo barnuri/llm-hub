@@ -17,6 +17,7 @@ import { StatsScreen } from "./screens/StatsScreen";
 import { ErrorsScreen } from "./screens/ErrorsScreen";
 import { InsightsScreen } from "./screens/InsightsScreen";
 import { AutoScreen } from "./screens/AutoScreen";
+import { SmartAutoScreen } from "./screens/SmartAutoScreen";
 import { type OverviewPeriod, UsageScreen } from "./screens/UsageScreen";
 
 interface Page {
@@ -41,6 +42,7 @@ const NAV_TABS: readonly NavTab[] = [
   { label: "Stats", pages: [{ id: "stats", label: "Stats" }] },
   { label: "Models", pages: [{ id: "models", label: "Models" }] },
   { label: "Copilot Auto", pages: [{ id: "auto", label: "Copilot Auto" }] },
+  { label: "Smart Auto", pages: [{ id: "smart-auto", label: "Smart Auto" }] },
   { label: "Profiles", pages: [{ id: "profiles", label: "Profiles" }] },
   { label: "Settings", pages: SETTINGS_PAGES },
 ];
@@ -281,6 +283,7 @@ export function App() {
             {tab === "overview" ? <UsageScreen period={overviewPeriod(route.query.get("range"))} /> : null}
             {tab === "errors" ? <ErrorsScreen /> : null}
             {tab === "auto" ? <AutoScreen models={modelEntries} /> : null}
+            {tab === "smart-auto" ? <SmartAutoScreen /> : null}
             {tab === "insights" ? <InsightsScreen onCopy={copy} /> : null}
             {tab === "profiles" ? (
               <ProfilesScreen meta={meta} models={models} onChanged={loadAll} onToast={toast} />

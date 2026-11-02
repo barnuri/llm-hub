@@ -2,6 +2,7 @@ use super::hub_endpoint::HubEndpoint;
 use crate::schemas::launch::launch_args::LaunchArgs;
 use crate::schemas::launch::launch_spec::LaunchSpec;
 use crate::schemas::launch::profile_filter::ProfileFilter;
+use crate::schemas::launch::smart_auto_flags::SmartAutoFlags;
 
 /// `llm-hub claude`: Claude Code on the hub's `/v1/messages`.
 #[derive(Debug)]
@@ -20,16 +21,15 @@ impl ClaudeLauncher {
         "CLAUDE_CODE_SUBAGENT_MODEL",
     ];
 
-    /// `settings` is the hub's `/api/claude-code/settings` body, passed as
-    /// `--settings` so `/model` lists every hub model. A non-empty `profiles`
-    /// adds `x-llm-hub-profiles` to `ANTHROPIC_CUSTOM_HEADERS`, after the
-    /// caller's own `inherited_headers`, so gateway discovery is limited too.
+    /// `settings` is the hub's `/api/claude-code/settings` body, passed as `--settings`.
+    /// Profile and Smart Auto flags become `ANTHROPIC_CUSTOM_HEADERS` lines after `inherited_headers`.
     #[must_use]
     pub fn spec(
         endpoint: &HubEndpoint,
         args: LaunchArgs,
         settings: Option<String>,
         profiles: &ProfileFilter,
+        smart_auto: &SmartAutoFlags,
         inherited_headers: Option<&str>,
     ) -> LaunchSpec {
         let mut spec = LaunchSpec::new(Self::PROGRAM)
@@ -39,7 +39,7 @@ impl ClaudeLauncher {
             .env("ANTHROPIC_SERVER_NAME", Self::SERVER_NAME)
             .env("ANTHROPIC_BASE_URL", endpoint.url())
             .env("ANTHROPIC_AUTH_TOKEN", endpoint.api_key());
-        if let Some(headers) = Self::custom_headers(profiles, inherited_headers) {
+        if let Some(headers) = Self::custom_headers(profiles, smart_auto, inherited_headers) {
             spec = spec.env(Self::CUSTOM_HEADERS_VAR, headers);
         }
         if let Some(model) = args.model() {
@@ -59,12 +59,31 @@ impl ClaudeLauncher {
         Self::CUSTOM_HEADERS_VAR
     }
 
+    /// The model Claude Code already names in the environment, trimmed, if any.
+    #[must_use]
+    pub fn inherited_model(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+        Self::MODEL_VARS.into_iter().find_map(|name| {
+            lookup(name)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+    }
+
     /// `ANTHROPIC_CUSTOM_HEADERS` is one `Name: value` per line.
-    fn custom_headers(profiles: &ProfileFilter, inherited: Option<&str>) -> Option<String> {
-        if profiles.is_empty() {
+    fn custom_headers(
+        profiles: &ProfileFilter,
+        smart_auto: &SmartAutoFlags,
+        inherited: Option<&str>,
+    ) -> Option<String> {
+        let mut lines = Vec::new();
+        if !profiles.is_empty() {
+            lines.push(format!("{}: {}", ProfileFilter::HEADER, profiles.to_list()));
+        }
+        lines.extend(smart_auto.header_lines());
+        if lines.is_empty() {
             return None;
         }
-        let header = format!("{}: {}", ProfileFilter::HEADER, profiles.to_list());
+        let header = lines.join("\n");
         Some(
             match inherited.map(str::trim_end).filter(|v| !v.is_empty()) {
                 Some(existing) => format!("{existing}\n{header}"),
@@ -83,7 +102,14 @@ mod tests {
     }
 
     fn spec_of(args: LaunchArgs, settings: Option<String>) -> LaunchSpec {
-        ClaudeLauncher::spec(&endpoint(), args, settings, &ProfileFilter::default(), None)
+        ClaudeLauncher::spec(
+            &endpoint(),
+            args,
+            settings,
+            &ProfileFilter::default(),
+            &SmartAutoFlags::default(),
+            None,
+        )
     }
 
     fn profiled(inherited: Option<&str>) -> LaunchSpec {
@@ -92,8 +118,75 @@ mod tests {
             LaunchArgs::from_strs(&[]),
             None,
             &ProfileFilter::from_list("copilot,ivrit"),
+            &SmartAutoFlags::default(),
             inherited,
         )
+    }
+
+    fn smart_auto(args: &[&str]) -> SmartAutoFlags {
+        let mut flags = SmartAutoFlags::default();
+        flags
+            .take_flags(
+                &mut args
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>(),
+            )
+            .unwrap();
+        flags
+    }
+
+    #[test]
+    fn smart_auto_flags_follow_the_profiles_header() {
+        let spec = ClaudeLauncher::spec(
+            &endpoint(),
+            LaunchArgs::from_strs(&["hub/smart-auto-balance"]),
+            None,
+            &ProfileFilter::from_list("copilot"),
+            &smart_auto(&["--smart-auto-tier=fast", "--smart-auto-min-context=1m"]),
+            Some("X-Team: core"),
+        );
+
+        assert_eq!(
+            spec.env_value("ANTHROPIC_CUSTOM_HEADERS"),
+            Some(
+                "X-Team: core\nx-llm-hub-profiles: copilot\nx-llm-hub-smart-auto-tier: fast\nx-llm-hub-smart-auto-min-context: 1000000"
+            )
+        );
+    }
+
+    #[test]
+    fn smart_auto_flags_alone_set_the_custom_headers() {
+        let spec = ClaudeLauncher::spec(
+            &endpoint(),
+            LaunchArgs::from_strs(&["hub/smart-auto-balance"]),
+            None,
+            &ProfileFilter::default(),
+            &smart_auto(&["--smart-auto-role=planning"]),
+            None,
+        );
+
+        assert_eq!(
+            spec.env_value("ANTHROPIC_CUSTOM_HEADERS"),
+            Some("x-llm-hub-smart-auto-role: planning")
+        );
+    }
+
+    #[test]
+    fn inherited_model_is_detected_so_the_default_stays_away() {
+        assert_eq!(
+            ClaudeLauncher::inherited_model(|name| {
+                (name == "CLAUDE_CODE_SUBAGENT_MODEL").then(|| " copilot/x ".to_string())
+            }),
+            Some("copilot/x".to_string())
+        );
+        assert_eq!(
+            ClaudeLauncher::inherited_model(|name| {
+                (name == "ANTHROPIC_MODEL").then(|| "  ".to_string())
+            }),
+            None
+        );
+        assert_eq!(ClaudeLauncher::inherited_model(|_| None), None);
     }
 
     #[test]
@@ -133,6 +226,7 @@ mod tests {
             LaunchArgs::from_strs(&[]),
             None,
             &ProfileFilter::default(),
+            &SmartAutoFlags::default(),
             Some("X-Team: core"),
         );
 

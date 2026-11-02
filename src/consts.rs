@@ -68,6 +68,10 @@ pub const AUTO_REASON_HEADER_MAX_CHARS: usize = 200;
 pub const AUTO_DECISIONS_DEFAULT_LIMIT: usize = 50;
 /// The most decisions one `GET /api/copilot/auto/decisions` returns.
 pub const AUTO_DECISIONS_MAX_LIMIT: usize = 200;
+/// `GET /api/smart-auto/history` returns this many events without `limit`.
+pub const SELECTION_HISTORY_DEFAULT_LIMIT: usize = 200;
+/// The most events one `GET /api/smart-auto/history` returns.
+pub const SELECTION_HISTORY_MAX_LIMIT: usize = 1000;
 
 /// Cap for `x-llm-hub-system-prompt-mode: truncate`, in CHARACTERS (not bytes
 /// — see the UTF-8 note in transforms.rs).

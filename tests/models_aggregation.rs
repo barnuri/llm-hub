@@ -2,57 +2,14 @@
 //! its static list — never a 502.
 
 use std::collections::HashMap;
-use std::process::{Child, Command};
-use std::time::Duration;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-struct HubProcess(Child);
+#[path = "support/hub.rs"]
+mod hub;
 
-impl Drop for HubProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
-    let port = free_port();
-    let binary = env!("CARGO_BIN_EXE_llm-hub");
-    let dir = tempfile::tempdir().unwrap().keep();
-    let mut command = Command::new(binary);
-    command
-        .current_dir(&dir)
-        .env("LLM_HUB_PORT", port.to_string())
-        .env("LLM_HUB_AUTO_UPDATE", "0");
-    for (key, value) in vars {
-        command.env(key, value);
-    }
-    let child = command.spawn().expect("hub starts");
-    let base = format!("http://127.0.0.1:{port}");
-    wait_ready(&base).await;
-    (HubProcess(child), base)
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-async fn wait_ready(base: &str) {
-    let client = reqwest::Client::new();
-    for _ in 0..50 {
-        if client.get(format!("{base}/healthz")).send().await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("hub did not become ready");
-}
+use hub::{free_port, start_hub};
 
 fn models_response(ids: &[&str]) -> ResponseTemplate {
     let data: Vec<serde_json::Value> = ids
@@ -141,5 +98,97 @@ async fn aggregates_partially_when_one_upstream_is_down() {
         !ids.contains(&"disabled/hidden"),
         "disabled profiles must not appear in the models API"
     );
+    drop(hub);
+}
+
+async fn copilot_upstream(models: serde_json::Value) -> (MockServer, MockServer) {
+    let github = MockServer::start().await;
+    let copilot = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/copilot_internal/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "chat_enabled": true,
+            "endpoints": {"api": copilot.uri()},
+        })))
+        .mount(&github)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": models})))
+        .mount(&copilot)
+        .await;
+    (github, copilot)
+}
+
+#[tokio::test]
+async fn copilot_entries_add_output_and_limit_provenance_beside_the_old_fields() {
+    let (github, _copilot) = copilot_upstream(serde_json::json!([
+        {"id": "claude-opus-5.5", "supported_endpoints": ["/v1/messages"],
+         "capabilities": {"limits": {"max_context_window_tokens": 328_000,
+                                     "max_output_tokens": 128_000,
+                                     "max_prompt_tokens": 200_000}}},
+        {"id": "gpt-new", "supported_endpoints": ["/responses"],
+         "capabilities": {"limits": {"max_prompt_tokens": 272_000}}}
+    ]))
+    .await;
+    let dead_port = free_port();
+    let (hub, base) = start_hub(HashMap::from([
+        ("LLM_HUB_PROFILES".into(), "copilot".into()),
+        (
+            "LLM_HUB_COPILOT_BASE_URL".into(),
+            format!("http://127.0.0.1:{dead_port}"),
+        ),
+        ("LLM_HUB_COPILOT_AUTH".into(), "github-copilot".into()),
+        ("LLM_HUB_COPILOT_GITHUB_TOKEN_SOURCE".into(), "gh".into()),
+        ("LLM_HUB_COPILOT_GITHUB_API_URL".into(), github.uri()),
+        ("GH_TOKEN".into(), "gho_test".into()),
+    ]))
+    .await;
+
+    let body: serde_json::Value = reqwest::get(format!("{base}/v1/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = |id: &str| {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from {body}"))
+            .clone()
+    };
+
+    let opus = entry("copilot/claude-opus-5-5[1m]");
+    for field in ["max_input_tokens", "context_length", "context_window"] {
+        assert_eq!(opus[field], 1_000_000, "{field}");
+    }
+    assert_eq!(opus["max_output_tokens"], 128_000);
+    let limits = &opus["llm_hub_limits"];
+    assert_eq!(limits["input"]["value"], 1_000_000);
+    assert_eq!(limits["input"]["source"], "seeded");
+    assert_eq!(limits["context"]["value"], 328_000);
+    assert_eq!(limits["output"]["value"], 128_000);
+    assert_eq!(limits["output"]["source"], "listed");
+    assert_eq!(limits["output"]["conflict"], false);
+    assert!(limits.get("runtime_context").is_none(), "{opus}");
+    assert!(limits["output"].get("observed_at").is_none(), "{opus}");
+
+    let gpt = entry("copilot/gpt-new");
+    for field in ["max_input_tokens", "context_length", "context_window"] {
+        assert_eq!(gpt[field], 272_000, "{field}");
+    }
+    assert!(gpt.get("max_output_tokens").is_none(), "{gpt}");
+    assert!(gpt["llm_hub_limits"].get("output").is_none(), "{gpt}");
+    assert_eq!(gpt["llm_hub_limits"]["input"]["source"], "listed");
+
+    let balance = entry("hub/smart-auto-balance");
+    assert_eq!(balance["owned_by"], "hub");
+    assert_eq!(balance["recommended"], true);
+    assert!(balance["max_input_tokens"].is_u64(), "{balance}");
+    assert!(balance["context_length"].is_u64(), "{balance}");
+    assert_eq!(entry("hub/smart-auto-efficiency")["recommended"], false);
     drop(hub);
 }

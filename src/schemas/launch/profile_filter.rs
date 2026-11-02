@@ -102,10 +102,16 @@ impl ProfileFilter {
         }
     }
 
+    /// The allowed profile names in first-seen order; empty means every profile.
+    #[must_use]
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
     /// The names joined with commas, for the header and the query.
     #[must_use]
     pub fn to_list(&self) -> String {
-        self.names.join(",")
+        self.names().join(",")
     }
 
     /// Adds the other filter's names, keeping the first-seen order.
@@ -275,6 +281,13 @@ mod tests {
         for args in [&["--profiles"][..], &["--profiles", "-p"], &["--profiles="]] {
             assert!(ProfileFilter::take_flags(&mut strings(args)).is_err());
         }
+    }
+
+    #[test]
+    fn hub_entries_are_listed_only_without_a_filter_or_with_the_hub_name() {
+        assert!(ProfileFilter::default().allows("hub/smart-auto-balance"));
+        assert!(ProfileFilter::from_list("hub").allows("hub/smart-auto-long-balance"));
+        assert!(!ProfileFilter::from_list("copilot").allows("hub/smart-auto-balance"));
     }
 
     #[test]

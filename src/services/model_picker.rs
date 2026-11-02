@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::dependencies::state::AppState;
+use crate::routes::models::RECOMMENDED_MODEL;
 use crate::services::copilot_auto::AutoTier;
 use crate::services::store::now_ms;
 
@@ -61,6 +62,7 @@ fn sort_by_usage(models: &mut [Value], usage: &HashMap<String, u64>) {
             ""
         };
         (
+            id != RECOMMENDED_MODEL,
             tier.is_none(),
             Reverse(requests),
             profile.to_string(),
@@ -194,5 +196,29 @@ mod tests {
         assert_eq!(models[1]["id"], "p/auto-balanced");
         assert_eq!(models[2]["id"], "p/auto-max");
         assert_eq!(models[3]["id"], "p/ordinary");
+    }
+
+    #[test]
+    fn recommended_smart_auto_balance_sorts_first() {
+        let mut models = vec![
+            json!({"id": "hub/smart-auto-intelligence"}),
+            json!({"id": "copilot/auto"}),
+            json!({"id": "hub/smart-auto-balance"}),
+        ];
+
+        sort_by_usage(&mut models, &HashMap::new());
+
+        let ids: Vec<&str> = models
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "hub/smart-auto-balance",
+                "copilot/auto",
+                "hub/smart-auto-intelligence",
+            ]
+        );
     }
 }

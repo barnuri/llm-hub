@@ -11,9 +11,14 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::schemas::copilot_auto_response::CopilotAutoResponse;
+use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::model_context;
+use crate::schemas::smart_auto_tier::SmartAutoTier;
+use crate::schemas::turn_signals::TurnSignals;
 use crate::services::copilot_auto_decisions::AutoDecisionLog;
 use crate::services::model_limits::{ModelLimit, ModelLimits};
+use crate::services::smart_auto_effort::SmartAutoEffort;
+use crate::services::smart_auto_roles::SmartAutoRoles;
 
 const AUTO_PATH: &str = "auto";
 /// The bare model id of Copilot Auto on its default tier; `auto-<tier>` names a tier.
@@ -45,7 +50,8 @@ const PROMPT_BYTES_PER_TOKEN: usize = 4;
 const ROLE_USER: &str = "user";
 const ROLES_SYSTEM: [&str; 2] = ["system", "developer"];
 
-type ConversationKey = [u8; 32];
+/// A SHA-256 over the length-prefixed parts that identify one conversation.
+pub(crate) type ConversationKey = [u8; 32];
 type ConversationSlot = tokio::sync::Mutex<Option<Conversation>>;
 
 /// Per-conversation Copilot Auto decisions, shared by every request so a
@@ -70,6 +76,8 @@ pub struct AutoRoute {
     pub selection_reason: Option<String>,
     pub turn: AutoTurn,
     pub estimated_prompt_tokens: u64,
+    /// The effort to send to `model`, snapped to the levels the catalog publishes for it.
+    pub effort: Option<EffortLevel>,
 }
 
 /// A Copilot Auto tier, sent as the `tier` field of the `/auto` body.
@@ -166,8 +174,9 @@ struct ModelTraits {
     usable: bool,
 }
 
+/// The request body format a client path carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BodyShape {
+pub(crate) enum BodyShape {
     ChatCompletions,
     Responses,
     AnthropicMessages,
@@ -175,17 +184,19 @@ enum BodyShape {
 
 /// What one request body says about its conversation and its latest turn.
 #[derive(Debug)]
-struct Turn {
-    key: ConversationKey,
-    endpoint: &'static str,
+pub(crate) struct Turn {
+    pub(crate) key: ConversationKey,
+    pub(crate) endpoint: &'static str,
     /// The latest user message text, or `None` for a tool-loop follow-up.
-    prompt: Option<String>,
-    has_image: bool,
-    user_turns: usize,
+    pub(crate) prompt: Option<String>,
+    /// The text of the most recent real user turn, even behind later tool results.
+    pub(crate) last_user_text: Option<String>,
+    pub(crate) has_image: bool,
+    pub(crate) user_turns: usize,
 }
 
 /// One message-like item of a request body.
-struct Item<'a> {
+pub(crate) struct Item<'a> {
     role: &'a str,
     content: &'a Value,
 }
@@ -219,6 +230,7 @@ impl std::fmt::Debug for AutoRoute {
             .field("selection_reason", &self.selection_reason)
             .field("turn", &self.turn)
             .field("estimated_prompt_tokens", &self.estimated_prompt_tokens)
+            .field("effort", &self.effort)
             .finish()
     }
 }
@@ -330,10 +342,12 @@ impl CopilotAutoRouter {
         &self.decisions
     }
 
-    /// Routes `input` on its tier and returns the upstream model id, its session token and
-    /// what Auto decided. Each tier keeps its own conversation decision.
+    /// Routes `input` on its tier and returns the upstream model id, its session token, what Auto
+    /// decided and the effort to send to that model. Each tier keeps its own conversation decision.
     pub async fn route(&self, upstream: &AutoUpstream<'_>, input: &AutoInput<'_>) -> AutoRoute {
-        self.route_at(upstream, input, unix_now_secs()).await
+        let mut route = self.route_at(upstream, input, unix_now_secs()).await;
+        route.effort = pick_effort(input, &route.model);
+        route
     }
 
     async fn route_at(
@@ -420,6 +434,7 @@ impl CopilotAutoRouter {
                 AutoTurn::Reused
             },
             estimated_prompt_tokens: estimated,
+            effort: None,
         }
     }
 
@@ -461,13 +476,43 @@ impl AutoRoute {
             selection_reason: None,
             turn: AutoTurn::Default,
             estimated_prompt_tokens,
+            effort: None,
         }
     }
 }
 
+/// The effort to send to `model`: the caller's explicit level when the model publishes it, else
+/// the tier and role objective. Either snaps to the levels the catalog publishes for `model`.
+fn pick_effort(input: &AutoInput<'_>, model: &str) -> Option<EffortLevel> {
+    let published: Vec<String> = input
+        .catalog
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(model))?
+        .pointer("/capabilities/supports/reasoning_effort")?
+        .as_array()?
+        .iter()
+        .filter_map(|level| level.as_str().map(str::to_owned))
+        .collect();
+    if published.is_empty() {
+        return None;
+    }
+    let requested = SmartAutoEffort::requested(bare_path(input.path), input.body)
+        .ok()
+        .flatten();
+    let signals = TurnSignals::from_body(input.path, input.body, input.prompt_bytes, None);
+    let turn = SmartAutoRoles::classify_user_text(&signals, None);
+    SmartAutoEffort::select(
+        SmartAutoTier::from(input.tier),
+        turn.role,
+        turn.plan_backed,
+        requested,
+        &published,
+    )
+}
+
 /// Roughly one token per four request bytes: too rough for anything but ruling
 /// out prompt windows that are clearly too small.
-fn estimated_prompt_tokens(prompt_bytes: usize) -> u64 {
+pub(crate) fn estimated_prompt_tokens(prompt_bytes: usize) -> u64 {
     u64::try_from(prompt_bytes / PROMPT_BYTES_PER_TOKEN).unwrap_or(u64::MAX)
 }
 
@@ -919,11 +964,13 @@ impl BodyShape {
 }
 
 impl Turn {
-    fn parse(profile: &str, tier: AutoTier, path: &str, body: &Value) -> Option<Turn> {
+    /// Reads the turn from a body whose shape `path` names; `None` for any other path.
+    /// The key hashes `profile`, `tier`, the system prompt and the first user message.
+    pub(crate) fn parse(profile: &str, tier: AutoTier, path: &str, body: &Value) -> Option<Turn> {
         let shape = BodyShape::from_path(path)?;
         let items = items(shape, body);
         let system = system_text(shape, body, &items);
-        let user_texts: Vec<String> = items.iter().filter_map(Item::user_turn_text).collect();
+        let mut user_texts: Vec<String> = items.iter().filter_map(Item::user_turn_text).collect();
         let latest = items
             .iter()
             .rev()
@@ -932,17 +979,21 @@ impl Turn {
         let has_image =
             latest.is_some_and(|item| content_has_image(item.content, shape.image_part_type()));
         let first_user = user_texts.first().map_or("", String::as_str);
+        let key = conversation_key(profile, tier, &system, first_user);
+        let user_turns = user_texts.len();
         Some(Turn {
-            key: conversation_key(profile, tier, &system, first_user),
+            key,
             endpoint: shape.endpoint(),
             prompt,
+            last_user_text: user_texts.pop(),
             has_image,
-            user_turns: user_texts.len(),
+            user_turns,
         })
     }
 }
 
-fn items(shape: BodyShape, body: &Value) -> Vec<Item<'_>> {
+/// The message-like items of a body: `input` for Responses, else `messages`.
+pub(crate) fn items(shape: BodyShape, body: &Value) -> Vec<Item<'_>> {
     let key = match shape {
         BodyShape::Responses => "input",
         BodyShape::ChatCompletions | BodyShape::AnthropicMessages => "messages",
@@ -998,7 +1049,8 @@ fn content_has_tool_result(content: &Value) -> bool {
         .any(|part| part.get("type").and_then(Value::as_str) == Some(TOOL_RESULT_PART_TYPE))
 }
 
-fn system_text(shape: BodyShape, body: &Value, items: &[Item<'_>]) -> String {
+/// The top-level system prompt, else the first system or developer message's text.
+pub(crate) fn system_text(shape: BodyShape, body: &Value, items: &[Item<'_>]) -> String {
     let top_level = match shape {
         BodyShape::AnthropicMessages => body.get("system"),
         BodyShape::Responses => body.get("instructions"),
@@ -1046,7 +1098,7 @@ fn content_has_image(content: &Value, image_type: &str) -> bool {
 
 /// Hashes the profile, tier, system prompt and first user message, each length-prefixed,
 /// so the key is stable across a conversation's turns and a tier switch starts afresh.
-fn conversation_key(
+pub(crate) fn conversation_key(
     profile: &str,
     tier: AutoTier,
     system: &str,
@@ -2333,6 +2385,40 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    fn input_for<'a>(catalog: &'a [Value], body: &'a Value) -> AutoInput<'a> {
+        AutoInput {
+            tier: AutoTier::Intelligence,
+            path: CHAT_ENDPOINT,
+            body,
+            prompt_bytes: 64,
+            catalog,
+            default_model: "m-plain",
+        }
+    }
+
+    #[test]
+    fn pick_effort_follows_the_catalog_and_keeps_a_supported_caller_level() {
+        let catalog = vec![
+            json!({"id": "m-levels", "capabilities": {"supports": {"reasoning_effort": ["low", "high"]}}}),
+            json!({"id": "m-plain"}),
+        ];
+        let asked = json!({"messages": [{"role": "user", "content": "review the diff"}]});
+        let explicit = json!({
+            "reasoning_effort": "low",
+            "messages": [{"role": "user", "content": "review the diff"}]
+        });
+
+        assert_eq!(pick_effort(&input_for(&catalog, &asked), "m-plain"), None);
+        assert_eq!(
+            pick_effort(&input_for(&catalog, &asked), "m-levels"),
+            Some(EffortLevel::High)
+        );
+        assert_eq!(
+            pick_effort(&input_for(&catalog, &explicit), "m-levels"),
+            Some(EffortLevel::Low)
+        );
     }
 
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {

@@ -1,11 +1,19 @@
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::hub_endpoint::HubEndpoint;
 use crate::consts::VERSION;
 use crate::schemas::launch::hub_model::HubModel;
 use crate::schemas::launch::profile_filter::ProfileFilter;
+use crate::schemas::selection_event::SelectionEvent;
+
+/// The body of `GET /api/smart-auto/history`.
+#[derive(Deserialize)]
+struct HistoryPage {
+    events: Vec<SelectionEvent>,
+}
 
 /// The few hub calls a launcher makes before it starts the harness.
 #[derive(Debug, Clone)]
@@ -18,6 +26,7 @@ pub struct HubClient {
 impl HubClient {
     const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
     const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+    const HISTORY_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// A client for `endpoint`.
     ///
@@ -87,6 +96,40 @@ impl HubClient {
             .unwrap_or_default()
     }
 
+    /// Smart Auto selection events of `workflow` after `since_seq`, oldest first, at most `limit`.
+    ///
+    /// # Errors
+    /// Returns a message when the request fails, the hub answers an error status, or the body is not history.
+    pub async fn smart_auto_history(
+        &self,
+        workflow: &str,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SelectionEvent>, String> {
+        let url = format!("{}/api/smart-auto/history", self.endpoint.url());
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(self.endpoint.api_key())
+            .query(&[
+                ("workflow", workflow.to_string()),
+                ("since_seq", since_seq.to_string()),
+                ("limit", limit.to_string()),
+            ])
+            .timeout(Self::HISTORY_TIMEOUT)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| format!("smart-auto history request failed: {e}"))?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("smart-auto history body could not be read: {e}"))?;
+        serde_json::from_str::<HistoryPage>(&body)
+            .map(|page| page.events)
+            .map_err(|e| format!("smart-auto history body is not valid: {e}"))
+    }
+
     async fn fetch(&self, path: &str) -> Option<String> {
         let mut request = self
             .http
@@ -112,6 +155,8 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::schemas::selection_stage::SelectionStage;
+    use crate::schemas::selection_state::SelectionState;
 
     fn client_for(url: &str) -> HubClient {
         let endpoint = HubEndpoint::from_lookup(|name| match name {
@@ -213,6 +258,52 @@ mod tests {
 
         assert_eq!(client.claude_settings().await, None);
         assert!(client.models().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_sends_the_workflow_cursor_and_bearer() {
+        let server = MockServer::start().await;
+        let mut event = SelectionEvent::new(
+            SelectionStage::Solver,
+            SelectionState::Selected,
+            "copilot/m",
+        );
+        event.seq = 4;
+        Mock::given(method("GET"))
+            .and(path("/api/smart-auto/history"))
+            .and(query_param("workflow", "wf-1"))
+            .and(query_param("since_seq", "3"))
+            .and(query_param("limit", "50"))
+            .and(header("authorization", "Bearer key-1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"events": [serde_json::to_value(&event).unwrap()]})),
+            )
+            .mount(&server)
+            .await;
+
+        let events = client_for(&server.uri())
+            .smart_auto_history("wf-1", 3, 50)
+            .await
+            .unwrap();
+
+        assert_eq!(events, [event]);
+    }
+
+    #[tokio::test]
+    async fn history_error_status_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/smart-auto/history"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        assert!(
+            client_for(&server.uri())
+                .smart_auto_history("wf-1", 0, 50)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

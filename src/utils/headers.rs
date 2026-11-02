@@ -4,6 +4,7 @@ use crate::consts::{
     HEADER_FALLBACKS, HEADER_FALLBACKS_ALIAS, HEADER_REASONING_STRIP, HEADER_RETRY_ON,
     HEADER_SYSTEM_PROMPT_MODE, HEADER_TIMEOUT_MS,
 };
+use crate::schemas::smart_auto_headers::SmartAutoHeaders;
 
 const HOP_BY_HOP: [&str; 8] = [
     "connection",
@@ -33,15 +34,18 @@ const REQUEST_ONLY_STRIP: [&str; 11] = [
     crate::schemas::launch::profile_filter::ProfileFilter::HEADER,
 ];
 
+/// Header name prefixes that are never forwarded upstream, for llm-hub control header families.
+const REQUEST_ONLY_STRIP_PREFIXES: [&str; 1] = [SmartAutoHeaders::PREFIX];
+
 pub fn filter_request_headers(headers: &HeaderMap) -> HeaderMap {
-    filter(headers, &REQUEST_ONLY_STRIP)
+    filter(headers, &REQUEST_ONLY_STRIP, &REQUEST_ONLY_STRIP_PREFIXES)
 }
 
 pub fn filter_response_headers(headers: &HeaderMap) -> HeaderMap {
-    filter(headers, &["content-length"])
+    filter(headers, &["content-length"], &[])
 }
 
-fn filter(headers: &HeaderMap, extra_strip: &[&str]) -> HeaderMap {
+fn filter(headers: &HeaderMap, extra_strip: &[&str], strip_prefixes: &[&str]) -> HeaderMap {
     let connection_named: Vec<String> = headers
         .get("connection")
         .and_then(|v| v.to_str().ok())
@@ -55,6 +59,12 @@ fn filter(headers: &HeaderMap, extra_strip: &[&str]) -> HeaderMap {
             continue;
         }
         if extra_strip.contains(&lower.as_str()) {
+            continue;
+        }
+        if strip_prefixes
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+        {
             continue;
         }
         if connection_named.contains(&lower) {
@@ -92,6 +102,27 @@ mod tests {
         ]));
         assert_eq!(out.len(), 1);
         assert!(out.contains_key("content-type"));
+    }
+
+    #[test]
+    fn strips_every_smart_auto_header_on_requests() {
+        let out = filter_request_headers(&headers(&[
+            (SmartAutoHeaders::TIER, "balance"),
+            ("X-LLM-Hub-Smart-Auto-Min-Context", "1m"),
+            (SmartAutoHeaders::WORKER, "run/node/1"),
+            ("x-llm-hub-smart-auto-unknown", "1"),
+            ("x-llm-hub-smart-autopilot", "kept"),
+            ("content-type", "application/json"),
+        ]));
+        assert_eq!(out.len(), 2);
+        assert!(out.contains_key("content-type"));
+        assert!(out.contains_key("x-llm-hub-smart-autopilot"));
+    }
+
+    #[test]
+    fn response_keeps_smart_auto_headers() {
+        let out = filter_response_headers(&headers(&[(SmartAutoHeaders::TIER, "balance")]));
+        assert!(out.contains_key(SmartAutoHeaders::TIER));
     }
 
     #[test]

@@ -6,6 +6,8 @@ use dashmap::DashMap;
 
 use crate::configs::HubConfig;
 use crate::consts::LOGS_DIR;
+use crate::schemas::model_descriptor::ModelDescriptor;
+use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
 use crate::schemas::upstream_model::UpstreamModel;
 use crate::services::copilot_auto::CopilotAutoRouter;
 use crate::services::copilot_body_fields::{BodyField, UnsupportedBodyFields};
@@ -17,6 +19,9 @@ use crate::services::keyring_credential_store::KeyringCredentialStore;
 use crate::services::managed_process::ProcessManager;
 use crate::services::model_limits::{ModelLimit, ModelLimits};
 use crate::services::process_gh_cli::ProcessGhCli;
+use crate::services::selection_log::SelectionLog;
+use crate::services::smart_auto_affinity::SmartAutoAffinity;
+use crate::services::smart_auto_decisions::SmartAutoDecisionLog;
 use crate::services::stats::StatsRegistry;
 use crate::services::store::{Store, now_ms};
 use crate::services::upstream::build_clients;
@@ -29,10 +34,12 @@ struct Inner {
     config: ArcSwap<HubConfig>,
     clients: ArcSwap<HashMap<String, reqwest::Client>>,
     stats: StatsRegistry,
-    store: Option<Store>,
+    store: Option<Arc<Store>>,
     /// SHA-256 hex hashes of enabled hub api keys, refreshed on CRUD.
     api_key_hashes: ArcSwap<HashSet<String>>,
     model_cache: ArcSwap<Option<Arc<CachedModels>>>,
+    /// Rebuilt with the model list on every refresh, never per request.
+    model_descriptors: ArcSwap<ModelDescriptorSnapshot>,
     model_usage: ArcSwap<HashMap<String, u64>>,
     /// profile name -> reachable, updated on every models fan-out.
     upstream_health: DashMap<String, bool>,
@@ -52,6 +59,11 @@ struct Inner {
     model_limits: Arc<ModelLimits>,
     /// Request fields each Copilot profile rejected on `/v1/messages`.
     unsupported_body_fields: UnsupportedBodyFields,
+    smart_auto_affinity: SmartAutoAffinity,
+    /// The bounded log of Smart Auto routes.
+    smart_auto_decisions: SmartAutoDecisionLog,
+    /// The selection history of Smart Auto and Copilot Auto dispatches.
+    selection_log: SelectionLog,
 }
 
 #[derive(Clone)]
@@ -81,12 +93,14 @@ impl AppState {
             .iter()
             .filter(|p| p.copilot.is_some())
             .map(|p| p.name.as_str());
+        let store = store.map(Arc::new);
         let model_limits = Arc::new(ModelLimits::load(
-            store.as_ref(),
+            store.as_deref(),
             copilot_profiles,
             now_ms(),
         ));
-        let unsupported_body_fields = UnsupportedBodyFields::load(store.as_ref());
+        let unsupported_body_fields = UnsupportedBodyFields::load(store.as_deref());
+        let selection_log = SelectionLog::open(store.clone());
         let state = AppState(Arc::new(Inner {
             config: ArcSwap::from_pointee(config),
             clients: ArcSwap::from_pointee(clients),
@@ -94,6 +108,7 @@ impl AppState {
             store,
             api_key_hashes: ArcSwap::from_pointee(HashSet::new()),
             model_cache: ArcSwap::from_pointee(None),
+            model_descriptors: ArcSwap::from_pointee(ModelDescriptorSnapshot::default()),
             model_usage: ArcSwap::from_pointee(HashMap::new()),
             upstream_health: DashMap::new(),
             upstream_models: DashMap::new(),
@@ -106,6 +121,9 @@ impl AppState {
             copilot_usage: CopilotUsageCache::new(credentials, gh),
             model_limits,
             unsupported_body_fields,
+            smart_auto_affinity: SmartAutoAffinity::new(),
+            smart_auto_decisions: SmartAutoDecisionLog::default(),
+            selection_log,
         }));
         state.refresh_api_key_hashes();
         Ok(state)
@@ -152,7 +170,7 @@ impl AppState {
     }
 
     pub fn store(&self) -> Option<&Store> {
-        self.0.store.as_ref()
+        self.0.store.as_deref()
     }
 
     pub fn api_key_hashes(&self) -> Arc<HashSet<String>> {
@@ -187,6 +205,18 @@ impl AppState {
 
     pub fn clear_model_cache(&self) {
         self.0.model_cache.store(Arc::new(None));
+    }
+
+    /// The descriptors from the last model refresh. Empty before the first one.
+    pub fn model_descriptors(&self) -> Arc<ModelDescriptorSnapshot> {
+        self.0.model_descriptors.load_full()
+    }
+
+    /// Swaps in the descriptors a model refresh built. Readers keep the snapshot they loaded.
+    pub fn set_model_descriptors(&self, descriptors: Vec<ModelDescriptor>) {
+        self.0
+            .model_descriptors
+            .store(Arc::new(ModelDescriptorSnapshot::new(descriptors)));
     }
 
     pub fn set_upstream_models(&self, profile: &str, models: HashMap<String, UpstreamModel>) {
@@ -259,6 +289,21 @@ impl AppState {
 
     pub fn model_limits(&self) -> &ModelLimits {
         &self.0.model_limits
+    }
+
+    /// The Smart Auto model pins, shared by every request.
+    pub fn smart_auto_affinity(&self) -> &SmartAutoAffinity {
+        &self.0.smart_auto_affinity
+    }
+
+    /// The bounded log of Smart Auto routes.
+    pub fn smart_auto_decisions(&self) -> &SmartAutoDecisionLog {
+        &self.0.smart_auto_decisions
+    }
+
+    /// The selection history that Smart Auto and Copilot Auto dispatches are recorded in.
+    pub fn selection_log(&self) -> &SelectionLog {
+        &self.0.selection_log
     }
 
     /// Learns `model`'s prompt limit from a Copilot rejection body. A changed
@@ -355,5 +400,53 @@ impl AppState {
             .iter()
             .map(|e| (e.key().clone(), *e.value()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor(qualified_id: &str) -> ModelDescriptor {
+        ModelDescriptor::for_test(qualified_id)
+    }
+
+    fn snapshot() -> ModelDescriptorSnapshot {
+        ModelDescriptorSnapshot::new(vec![
+            descriptor("copilot/claude-opus-5-5"),
+            descriptor("llmgw/bedrock/claude-opus-5"),
+        ])
+    }
+
+    #[test]
+    fn get_finds_a_qualified_id_with_or_without_the_1m_alias() {
+        let snapshot = snapshot();
+        assert_eq!(snapshot.len(), 2);
+        let plain = snapshot.get("copilot/claude-opus-5-5").unwrap();
+        assert_eq!(plain.profile, "copilot");
+        assert_eq!(snapshot.get("copilot/claude-opus-5-5[1m]"), Some(plain));
+        assert_eq!(snapshot.get("copilot/claude-opus-5.5"), None);
+        assert_eq!(snapshot.get("copilot/unknown"), None);
+    }
+
+    #[test]
+    fn for_model_joins_profile_and_bare_id() {
+        let snapshot = snapshot();
+        assert_eq!(
+            snapshot
+                .for_model("llmgw", "bedrock/claude-opus-5[1M]")
+                .map(|d| d.qualified_id.as_str()),
+            Some("llmgw/bedrock/claude-opus-5")
+        );
+        assert_eq!(snapshot.for_model("copilot", "bedrock/claude-opus-5"), None);
+    }
+
+    #[test]
+    fn later_descriptor_with_the_same_id_replaces_the_earlier_one() {
+        let mut replacement = descriptor("copilot/gpt-9");
+        replacement.chat = false;
+        let snapshot = ModelDescriptorSnapshot::new(vec![descriptor("copilot/gpt-9"), replacement]);
+        assert_eq!(snapshot.iter().count(), 1);
+        assert!(!snapshot.get("copilot/gpt-9").unwrap().chat);
     }
 }

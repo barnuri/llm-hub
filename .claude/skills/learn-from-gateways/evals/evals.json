@@ -1,0 +1,23 @@
+{
+  "skill_name": "learn-from-gateways",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Compare model limits from Bifrost, LiteLLM, models.dev/OpenCode, and OpenRouter for a synthetic llm-hub catalog. Keep this research-only and do not upload the local inventory.",
+      "expected_output": "Use current public documentation and source. Keep context/input/output separate, identify provenance/conflicts, treat OpenRouter as hosted, and avoid implementation or uploads.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "A router drops all exclusions when its tier becomes empty. Should Smart Auto copy that behavior? Also review cache-aware token prediction that makes provider requests.",
+      "expected_output": "Reject silent exclusion relaxation and request-time network prediction. Apply hard filters to every participant/fallback. Keep selection local and cache evidence scoped.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Learn from orch's worker routing and review public Fusion patterns. Do not run jobs. A synthetic accepted prompt reaches 800k despite a 200k listing. Does that prove 1M support?",
+      "expected_output": "Study orchestration code without dispatcher execution or personal state. Accepted 800k is a scoped lower bound, not 1M proof. Keep unknown capacity unknown.",
+      "files": []
+    }
+  ]
+}

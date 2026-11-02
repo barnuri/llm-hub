@@ -63,8 +63,11 @@ impl ModelLimits {
     const PROMPT_LIMIT_ERROR_CODE: &str = "model_max_prompt_tokens_exceeded";
     /// The word after the limit in "N tokens > M maximum".
     const LIMIT_MARKER: &str = "maximum";
-    /// Copilot `/v1/messages` limits measured with oversized probes on 2026-10-31.
-    pub const SEEDED: [(&str, u64); 8] = [
+    /// The words before the limit in "prompt token count of N exceeds the limit of M".
+    const LIMIT_OF_MARKER: &str = "exceeds the limit of";
+    /// Copilot prompt limits read from oversized-probe rejections. They win over Copilot
+    /// `/models`, which understates most of them, and a limit learned later replaces them.
+    pub const SEEDED: [(&str, u64); 19] = [
         ("claude-opus-5.5", 1_000_000),
         ("claude-opus-5", 1_000_000),
         ("claude-opus-4.8", 1_000_000),
@@ -73,6 +76,17 @@ impl ModelLimits {
         ("claude-sonnet-5", 1_000_000),
         ("claude-haiku-5.5", 1_000_000),
         ("claude-haiku-4.5", 200_000),
+        ("gpt-6.1-terra", 1_000_000),
+        ("gpt-6.1-sol", 922_000),
+        ("gpt-6-luna", 872_000),
+        ("gpt-6-sol", 872_000),
+        ("gpt-5.6-luna", 922_000),
+        ("gpt-5.6-sol", 922_000),
+        ("gpt-5.6-terra", 922_000),
+        ("gpt-5.3-codex", 272_000),
+        ("grok-4.6", 372_000),
+        ("grok-4.7", 372_000),
+        ("mai-code-1.1-flash", 128_000),
     ];
 
     /// Seeds every Copilot profile (a seed never replaces a learned limit), then
@@ -146,8 +160,8 @@ impl ModelLimits {
         Some((entry, previous))
     }
 
-    /// `M` from a Copilot 400 body whose `error.code` is
-    /// `model_max_prompt_tokens_exceeded` and whose message ends "N tokens > M maximum".
+    /// `M` from a Copilot 400 body whose `error.code` is `model_max_prompt_tokens_exceeded`.
+    /// Claude messages end "N tokens > M maximum"; GPT messages end "exceeds the limit of M".
     pub fn limit_from_error(body: &[u8]) -> Option<u64> {
         let value: Value = serde_json::from_slice(body).ok()?;
         let error = value.get("error")?;
@@ -155,13 +169,26 @@ impl ModelLimits {
             return None;
         }
         let message = error.get("message").and_then(Value::as_str)?;
+        Self::limit_before_maximum(message).or_else(|| Self::limit_after_limit_of(message))
+    }
+
+    fn limit_before_maximum(message: &str) -> Option<u64> {
         let (_, after) = message.rsplit_once('>')?;
         let mut words = after.split_whitespace();
         let number = words.next()?;
         if words.next() != Some(Self::LIMIT_MARKER) {
             return None;
         }
-        number
+        Self::parse_token_count(number)
+    }
+
+    fn limit_after_limit_of(message: &str) -> Option<u64> {
+        let (_, after) = message.rsplit_once(Self::LIMIT_OF_MARKER)?;
+        Self::parse_token_count(after.split_whitespace().next()?)
+    }
+
+    fn parse_token_count(raw: &str) -> Option<u64> {
+        raw.trim_end_matches('.')
             .replace(',', "")
             .parse()
             .ok()
@@ -216,13 +243,36 @@ mod tests {
     }
 
     #[test]
+    fn limit_is_read_from_a_gpt_responses_rejection() {
+        let body = rejection(
+            "model_max_prompt_tokens_exceeded",
+            "prompt token count of 1150005 exceeds the limit of 872000",
+        );
+        assert_eq!(ModelLimits::limit_from_error(&body), Some(872_000));
+    }
+
+    #[test]
+    fn gpt_limit_with_separators_and_period_is_read() {
+        let body = rejection(
+            "model_max_prompt_tokens_exceeded",
+            "prompt token count of 1,150,005 exceeds the limit of 1,000,000.",
+        );
+        assert_eq!(ModelLimits::limit_from_error(&body), Some(1_000_000));
+    }
+
+    #[test]
     fn other_errors_teach_nothing() {
         let other_code = rejection("rate_limited", "1 tokens > 5 maximum");
         let other_message = rejection("model_max_prompt_tokens_exceeded", "prompt is too long");
         let no_marker = rejection("model_max_prompt_tokens_exceeded", "a > 5 tokens");
+        let no_number = rejection(
+            "model_max_prompt_tokens_exceeded",
+            "prompt exceeds the limit of tokens",
+        );
         assert_eq!(ModelLimits::limit_from_error(&other_code), None);
         assert_eq!(ModelLimits::limit_from_error(&other_message), None);
         assert_eq!(ModelLimits::limit_from_error(&no_marker), None);
+        assert_eq!(ModelLimits::limit_from_error(&no_number), None);
         assert_eq!(ModelLimits::limit_from_error(b"not json"), None);
     }
 
@@ -233,7 +283,11 @@ mod tests {
         assert_eq!(profile["claude-opus-5.5"].limit, 1_000_000);
         assert_eq!(profile["claude-haiku-4.5"].limit, 200_000);
         assert_eq!(profile["claude-haiku-4.5"].source, LimitSource::Seeded);
-        assert!(!profile.contains_key("gpt-6.1-sol"));
+        assert_eq!(profile["gpt-6.1-sol"].limit, 922_000);
+        assert_eq!(profile["gpt-6.1-terra"].limit, 1_000_000);
+        assert_eq!(profile["gpt-6-luna"].source, LimitSource::Seeded);
+        assert_eq!(profile["grok-4.7"].limit, 372_000);
+        assert!(!profile.contains_key("unlisted-model"));
     }
 
     #[test]
