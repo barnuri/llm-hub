@@ -10,7 +10,7 @@ Every change must keep the request path at the lowest latency available. Measure
 - Reuse the pooled per-profile `reqwest` client. Keep the background model refresh interval (`MODELS_CACHE_TTL`) below both `POOL_IDLE_TIMEOUT` and the upstream's idle close, so the connection stays warm.
 - Stream responses through without buffering. Forward a request in its native format when the upstream supports it, instead of translating it.
 - Prefer an in-process upstream over an extra proxy hop.
-- Review buffering: Balance buffers planning and implementation turns, except plan-backed implementation. Intelligence buffers every turn except plan-backed implementation, so a judge or critic can check the draft first. Every other turn streams.
+- Review buffering: Balance buffers planning and implementation turns, except plan-backed implementation. Intelligence buffers every turn on chat completions and `/v1/messages` except plan-backed implementation, so a judge or critic can check the draft first. Native Anthropic attempts, `/v1/responses` turns and turns with no eligible reviewer stream. See `docs/smart-auto.md`.
 - When a change touches the request path, compare the hub's time to first byte with a direct `curl` to the upstream. The hub may add at most 50 ms.
 
 ## After finishing work here
