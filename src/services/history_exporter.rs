@@ -137,7 +137,7 @@ pub fn resolve_target(out: &Path) -> Result<PathBuf, String> {
     let target = resolve_symlinks(out)?;
     if is_git_tracked(&target) {
         return Err(format!(
-            "refusing to write git-tracked file {}; use the private companion file {} instead",
+            "refusing to write git-tracked file {}. Use the private companion file {} instead.",
             target.display(),
             companion_path(&target).display()
         ));

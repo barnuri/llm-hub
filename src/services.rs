@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod auth;
 pub mod body_transform;
+pub mod bounded_ring;
 pub mod buffered_reply_stream;
 pub mod config_reload;
 pub mod copilot_auto;

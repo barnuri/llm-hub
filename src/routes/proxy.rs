@@ -1185,9 +1185,13 @@ async fn review_deliver(
         ));
     };
     let status = response.status().as_u16();
-    let cap = graph.budget.bytes_left();
     let solve_reply = async {
-        let raw = StageClient::read_capped(response, cap).await?;
+        // The whole reply is read even past the byte cap: the orchestrator charges it, finds the budget
+        // spent, and delivers it unreviewed.
+        let raw = response
+            .bytes()
+            .await
+            .map_err(|e| StageError::Upstream(format!("read error: {e}")))?;
         let completion: Value =
             serde_json::from_slice(&raw).map_err(|e| StageError::Malformed(e.to_string()))?;
         Ok::<StageReply, StageError>(StageReply {

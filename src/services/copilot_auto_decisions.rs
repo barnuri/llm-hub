@@ -5,6 +5,7 @@ use std::sync::{Mutex, PoisonError};
 
 use serde::Serialize;
 
+use crate::services::bounded_ring::BoundedRing;
 use crate::services::copilot_auto::{AutoTier, AutoTurn};
 
 const MAX_DECISIONS: usize = 500;
@@ -54,11 +55,21 @@ pub struct AutoDecisionLog {
     state: Mutex<LogState>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct LogState {
-    ring: VecDeque<TieredDecision>,
+    ring: BoundedRing<TieredDecision>,
     latest_by_session: HashMap<String, TieredDecision>,
     session_order: VecDeque<String>,
+}
+
+impl Default for LogState {
+    fn default() -> Self {
+        Self {
+            ring: BoundedRing::new(MAX_DECISIONS),
+            latest_by_session: HashMap::new(),
+            session_order: VecDeque::new(),
+        }
+    }
 }
 
 impl AutoDecisionLog {
@@ -69,10 +80,7 @@ impl AutoDecisionLog {
         if let Some(session) = decision.decision.session.clone() {
             state.remember_session(session, decision.clone());
         }
-        if state.ring.len() >= MAX_DECISIONS {
-            state.ring.pop_front();
-        }
-        state.ring.push_back(decision);
+        state.ring.push(decision);
     }
 
     /// Up to `limit` decisions, newest first, for one session or for all of them.

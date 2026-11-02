@@ -32,6 +32,7 @@ const WRITE_BATCH_MAX: usize = 256;
 const SALT_BYTES: usize = 24;
 
 /// The selection history of this process. Events get a sequence number when recorded.
+#[derive(Debug)]
 pub struct SelectionLog {
     salt: String,
     attempts: AtomicU64,
@@ -160,9 +161,8 @@ impl SelectionLog {
             .collect()
     }
 
-    /// The current selection of the worker with scope key `worker`, or `None` before its first event.
-    #[must_use]
     /// The current selection of the only worker whose scope key starts with `prefix`; `None` when none or several match.
+    #[must_use]
     pub fn current_by_prefix(&self, prefix: &str, now: u64) -> Option<CurrentSelection> {
         let key = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -176,6 +176,7 @@ impl SelectionLog {
         self.current(&key, now)
     }
 
+    /// The current selection of the worker with scope key `worker`, or `None` before its first event.
     pub fn current(&self, worker: &str, now: u64) -> Option<CurrentSelection> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = state.current.get(worker)?;

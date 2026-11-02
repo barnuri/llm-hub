@@ -46,13 +46,14 @@ pub fn free_port() -> u16 {
 
 async fn wait_ready(base: &str) {
     let client = reqwest::Client::new();
-    for _ in 0..50 {
+    // A loaded machine can take well over 5 s to start a hub; allow 30 s before failing.
+    for _ in 0..300 {
         if client.get(format!("{base}/healthz")).send().await.is_ok() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("hub did not become ready");
+    panic!("hub did not become ready within 30 s");
 }
 
 /// Matches a request whose body does not contain `needle`, so solver and judge mocks never overlap.

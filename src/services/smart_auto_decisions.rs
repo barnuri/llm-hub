@@ -1,14 +1,22 @@
 //! A bounded in-memory log of Smart Auto routes, one entry per routed request.
 
-use std::collections::VecDeque;
 use std::sync::{Mutex, PoisonError};
 
 use crate::schemas::smart_auto_decision::SmartAutoDecision;
+use crate::services::bounded_ring::BoundedRing;
 
 /// The latest routes in a ring of at most 500 entries, oldest dropped first.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SmartAutoDecisionLog {
-    ring: Mutex<VecDeque<SmartAutoDecision>>,
+    ring: Mutex<BoundedRing<SmartAutoDecision>>,
+}
+
+impl Default for SmartAutoDecisionLog {
+    fn default() -> Self {
+        Self {
+            ring: Mutex::new(BoundedRing::new(Self::MAX_DECISIONS)),
+        }
+    }
 }
 
 impl SmartAutoDecisionLog {
@@ -17,10 +25,7 @@ impl SmartAutoDecisionLog {
     /// Appends `decision`, dropping the oldest entry when the ring is full.
     pub fn record(&self, decision: SmartAutoDecision) {
         let mut ring = self.ring.lock().unwrap_or_else(PoisonError::into_inner);
-        if ring.len() >= Self::MAX_DECISIONS {
-            ring.pop_front();
-        }
-        ring.push_back(decision);
+        ring.push(decision);
     }
 
     /// Up to `limit` routes, newest first.

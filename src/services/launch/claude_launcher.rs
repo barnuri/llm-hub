@@ -140,7 +140,7 @@ mod tests {
     fn smart_auto_flags_follow_the_profiles_header() {
         let spec = ClaudeLauncher::spec(
             &endpoint(),
-            LaunchArgs::from_strs(&["hub/smart-auto-balance"]),
+            LaunchArgs::from_strs(&["hub/smart-auto-fast"]),
             None,
             &ProfileFilter::from_list("copilot"),
             &smart_auto(&["--smart-auto-tier=fast", "--smart-auto-min-context=1m"]),

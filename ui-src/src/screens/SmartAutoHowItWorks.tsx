@@ -14,19 +14,10 @@ interface Step {
  */
 const STEPS: readonly Step[] = [
   {
-    title: "Request arrives",
+    title: "Headers",
     detail: (
       <>
-        The client calls <code>hub/smart-auto-&lt;tier&gt;</code>.
-      </>
-    ),
-  },
-  {
-    title: "Read the selector and tier",
-    detail: (
-      <>
-        The model name sets the tier. Headers (<code>x-llm-hub-smart-auto-*</code>) add more filters, minimums, a role
-        and a rules mode.
+        Every <code>x-llm-hub-smart-auto-*</code> header is read, then removed. No upstream sees it.
       </>
     ),
   },
@@ -34,23 +25,23 @@ const STEPS: readonly Step[] = [
     title: "Rules layer",
     detail: (
       <>
-        <code>LLM_HUB_SMART_AUTO_RULES</code>, if set, replaces everything else. Otherwise the saved rules file applies:
-        the global lists and each profile's lists.
+        If <code>LLM_HUB_SMART_AUTO_RULES</code> is set, its rules are the only layer. Otherwise the saved rules file
+        applies. No file means no rules.
       </>
     ),
   },
   {
     title: "Merge",
     detail:
-      "Rules, selector and headers combine. They only narrow the pool. A header can widen it only when no env rules are set.",
+      "Rules, then the selector's policy, then the headers. Merge only tightens. Excludes add up, include lists stack and minimums take the larger value. Override mode can replace the saved rules, but only when no env rules are set.",
   },
   {
     title: "Eligible pool",
     detail:
-      "Chat models only, with no Auto aliases. Then profile, include and exclude filters, minimums and prompt size. Unknown capacity fails any minimum.",
+      "Chat models only, with no Auto aliases. Each model must serve the route, pass the rules and minimums, and fit the prompt size. Unknown capacity fails any minimum.",
   },
   {
-    title: "Classify the role",
+    title: "Role and plan-backed",
     detail:
       "Each turn gets a role: planning, investigation, implementation, validation or conversation. It is also marked plan-backed or not.",
   },
@@ -60,8 +51,9 @@ const STEPS: readonly Step[] = [
       "The session keeps its model, so the prompt cache stays warm. Tool follow-ups use that model. It switches only when the work really changes.",
   },
   {
-    title: "Pick the model",
-    detail: "Picks the best model for the role and tier. Usage breaks ties.",
+    title: "Router picks the model",
+    detail:
+      "A session with a kept model keeps it. A new session takes the role's last model if it is still eligible. Otherwise the highest score wins.",
   },
   {
     title: "Effort",
@@ -69,21 +61,27 @@ const STEPS: readonly Step[] = [
       "The tier and role set the effort. The client's effort is ignored. The value snaps to a level the model supports.",
   },
   {
-    title: "A second model checks",
+    title: "Review decision",
     detail:
-      "Balance checks planning and implementation turns. Intelligence checks with up to two models. The checker uses another profile and is never the answering model.",
+      "Balance checks planning and implementation turns with one checker. Intelligence uses up to two. A checker is never the answering model.",
   },
   {
     title: "Stream or buffer",
-    detail: "Checked turns are held until the check ends. All other turns stream.",
+    detail:
+      "Checked answers are held until the check ends. Every other answer streams. A tool call goes out at once, unchecked.",
   },
   {
-    title: "Fallbacks and history",
-    detail: (
-      <>
-        Fallbacks use the same filters. Each choice is written to history. The status line shows the current model.
-      </>
-    ),
+    title: "Fallbacks",
+    detail: "Fallback chains use the same eligible pool. A fallback that the policy forbids is never called.",
+  },
+  {
+    title: "History",
+    detail:
+      "Each dispatch writes a selected event before the request is sent, then started, then completed, rejected or cancelled.",
+  },
+  {
+    title: "Status line",
+    detail: "Shows the worker's current model.",
   },
 ];
 

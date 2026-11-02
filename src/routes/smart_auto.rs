@@ -161,3 +161,18 @@ fn rules_response(loaded: &LoadedRules) -> Response {
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|raw| !raw.is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_scope_key_prefix;
+
+    #[test]
+    fn scope_key_prefix_is_8_to_64_lowercase_hex() {
+        assert!(is_scope_key_prefix("0123abcd"));
+        assert!(is_scope_key_prefix(&"f".repeat(64)));
+        assert!(!is_scope_key_prefix("0123abc"));
+        assert!(!is_scope_key_prefix(&"f".repeat(65)));
+        assert!(!is_scope_key_prefix("0123ABCD"));
+        assert!(!is_scope_key_prefix("0123abcg"));
+    }
+}

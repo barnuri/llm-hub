@@ -7,6 +7,8 @@ pub mod hub_endpoint;
 pub mod opencode_launcher;
 pub mod pi_launcher;
 
+use std::collections::BTreeMap;
+
 use self::claude_launcher::ClaudeLauncher;
 use self::codex_launcher::CodexLauncher;
 use self::copilot_cli_launcher::CopilotCliLauncher;
@@ -147,10 +149,29 @@ fn claude_model(
                 format!("{}/{}", HubSelector::NAMESPACE, tier.selector()),
             ))
         }
-        Some(model) if smart_auto.is_empty() || model.starts_with(&hub_prefix) => Ok(args),
+        Some(_) if smart_auto.is_empty() => Ok(args),
+        Some(model) if model.starts_with(&hub_prefix) => {
+            check_tier_matches(&model, smart_auto)?;
+            Ok(args)
+        }
         Some(model) => Err(format!(
             "--smart-auto-* only applies to a {hub_prefix} model, and {model} is not one: name a {hub_prefix} model or drop the --smart-auto-* flags"
         )),
+    }
+}
+
+/// A tier flag must name the tier of a `hub/smart-auto-<tier>` model, as the proxy refuses it otherwise.
+fn check_tier_matches(model: &str, smart_auto: &SmartAutoFlags) -> Result<(), String> {
+    let Some(header_tier) = smart_auto.tier() else {
+        return Ok(());
+    };
+    match HubSelector::parse(model, &BTreeMap::new()).ok().flatten() {
+        Some(selector) if selector.tier != header_tier => Err(format!(
+            "tier header `{}` conflicts with model `{}`: use the matching model id or remove the header",
+            header_tier.as_str(),
+            model,
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -353,24 +374,44 @@ mod tests {
         assert!(claude_model(LaunchArgs::from_strs(&["copilot/m"]), &fast, None).is_err());
         assert!(claude_model(LaunchArgs::from_strs(&[]), &fast, Some("copilot/m")).is_err());
         assert_eq!(
-            claude_model(
-                LaunchArgs::from_strs(&["hub/smart-auto-long-balance"]),
-                &fast,
-                None
-            )
-            .unwrap()
-            .model(),
-            Some("hub/smart-auto-long-balance")
+            claude_model(LaunchArgs::from_strs(&["hub/smart-auto-fast"]), &fast, None)
+                .unwrap()
+                .model(),
+            Some("hub/smart-auto-fast")
         );
+    }
+
+    #[test]
+    fn a_tier_flag_naming_another_tier_than_the_model_is_an_error() {
+        let fast = flags_of(&["--smart-auto-tier=fast"]);
+
+        let error = claude_model(
+            LaunchArgs::from_strs(&["hub/smart-auto-balance"]),
+            &fast,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(
+            error,
+            "tier header `fast` conflicts with model `hub/smart-auto-balance`: use the matching model id or remove the header"
+        );
+        assert!(
             claude_model(
                 LaunchArgs::from_strs(&[]),
                 &fast,
                 Some("hub/smart-auto-balance")
             )
+            .is_err()
+        );
+        assert_eq!(
+            claude_model(
+                LaunchArgs::from_strs(&["hub/smart-auto-long-balance"]),
+                &flags_of(&["--smart-auto-tier=balance"]),
+                None
+            )
             .unwrap()
             .model(),
-            None
+            Some("hub/smart-auto-long-balance")
         );
     }
 

@@ -149,7 +149,7 @@ impl SmartAutoRouter {
         })
     }
 
-    /// 0 below 256 requests, 1 below 65,536, else 2: usage separates only near ties.
+    /// 0 below 128 requests, 1 below 32,768, else 2: usage separates only near ties.
     fn usage_points(model: &ModelDescriptor, usage: &HashMap<String, u64>) -> u32 {
         let requests = usage
             .get(strip_1m_suffix(&model.qualified_id))

@@ -175,3 +175,30 @@ async fn responses_route_skips_review() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_reply_over_the_review_byte_cap_is_delivered_unreviewed() {
+    // Balance's review byte cap is 256 KiB, so this solver reply is over it.
+    let draft = "x".repeat(300 * 1024);
+    let alpha = review_upstream("m1", &draft).await;
+    let beta = review_upstream("m2", &draft).await;
+    let (_hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&chat_body("hub/smart-auto-balance", false))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], draft.as_str());
+    for upstream in [&alpha, &beta] {
+        assert!(
+            requests_on(upstream, "/chat/completions", true)
+                .await
+                .is_empty()
+        );
+    }
+}

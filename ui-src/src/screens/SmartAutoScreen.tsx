@@ -192,8 +192,7 @@ function EventRow({ event, startsTurn }: { readonly event: SelectionEvent; reado
 
 /**
  * The current selection of one session or worker, from `GET /api/smart-auto/current`.
- * The hub looks the id up by its raw value; the Worker column shows salted hashes it cannot match,
- * so the id is typed here rather than taken from the filters.
+ * The Worker column shows salted hashes the hub cannot match, so the id is typed here instead.
  */
 function CurrentSelectionPanel() {
   const [draft, setDraft] = useState("");
@@ -216,7 +215,7 @@ function CurrentSelectionPanel() {
           setUnavailable(false);
           setSelection(body.selection);
         }
-      } catch {
+      } catch (err: unknown) {
         if (!cancelled) {
           setUnavailable(true);
         }
@@ -403,9 +402,7 @@ function isAllowed(row: SmartAutoEffectRow): boolean {
 
 /**
  * `saved` with one Results row flipped, or null when no global list edit can flip it.
- * An allowed row is excluded: its exact id leaves the global allow and joins the global exclude.
- * A row excluded by a global or profile exclude is allowed: its exact id joins the global allow and
- * leaves the global exclude. Matched globs stay, because the explicit allow overrides them.
+ * An allowed row moves from the global allow to the global exclude, and an excluded row moves back.
  */
 function rulesWithResultToggled(saved: SmartAutoRules, row: SmartAutoEffectRow): SmartAutoRules | null {
   const id = row.qualified_id;
@@ -1072,7 +1069,7 @@ export function SmartAutoScreen({ profiles }: SmartAutoScreenProps) {
           setUnavailable(false);
           setEvents((current) => [...(current ?? []), ...fresh].slice(-MAX_EVENTS));
         }
-      } catch {
+      } catch (err: unknown) {
         if (!cancelled) {
           setUnavailable(true);
         }

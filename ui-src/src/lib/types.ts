@@ -264,11 +264,11 @@ export interface CopilotUsageReport {
 /** Where one Smart Auto dispatch stands; a dispatch emits selected, started, then one terminal state. */
 export type SelectionState = "selected" | "started" | "completed" | "rejected" | "cancelled";
 
-export type SelectionStage = "solver" | "judge" | "critic" | "repair";
+type SelectionStage = "solver" | "judge" | "critic" | "repair";
 
-export type SelectionRole = "planning" | "investigation" | "implementation" | "validation" | "conversation";
+type SelectionRole = "planning" | "investigation" | "implementation" | "validation" | "conversation";
 
-export type SelectionEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+type SelectionEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 /** One row of `GET /api/smart-auto/history`. Scope keys are salted hashes; no prompt or response text is present. */
 export interface SelectionEvent {

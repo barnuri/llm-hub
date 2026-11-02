@@ -100,13 +100,18 @@ mod tests {
 
     use super::*;
 
-    const CHAT_PATH: &str = "/v1/chat/completions";
-    const RESPONSES_PATH: &str = "/v1/responses";
-    const MESSAGES_PATH: &str = "/v1/messages";
-    const BODY_BYTES: usize = 4000;
+    /// Request paths and body size shared by the tests, with the helper that reads a body's signals.
+    struct Fixture;
 
-    fn signals(path: &str, body: &Value) -> TurnSignals {
-        TurnSignals::from_body(path, body, BODY_BYTES, None)
+    impl Fixture {
+        const CHAT_PATH: &'static str = "/v1/chat/completions";
+        const RESPONSES_PATH: &'static str = "/v1/responses";
+        const MESSAGES_PATH: &'static str = "/v1/messages";
+        const BODY_BYTES: usize = 4000;
+
+        fn signals(path: &str, body: &Value) -> TurnSignals {
+            TurnSignals::from_body(path, body, Self::BODY_BYTES, None)
+        }
     }
 
     #[test]
@@ -120,7 +125,12 @@ mod tests {
             "prompt_cache_key": "pck-1"
         });
 
-        let signals = TurnSignals::from_body(CHAT_PATH, &body, BODY_BYTES, Some("s-1".into()));
+        let signals = TurnSignals::from_body(
+            Fixture::CHAT_PATH,
+            &body,
+            Fixture::BODY_BYTES,
+            Some("s-1".into()),
+        );
 
         assert_eq!(signals.estimated_prompt_tokens, 1000);
         assert!(!signals.tool_continuation);
@@ -141,7 +151,7 @@ mod tests {
             {"role": "tool", "tool_call_id": "c1", "content": "ok"}
         ]});
 
-        let signals = signals(CHAT_PATH, &body);
+        let signals = Fixture::signals(Fixture::CHAT_PATH, &body);
 
         assert!(signals.tool_continuation);
         assert_eq!(signals.user_turns, 1);
@@ -159,10 +169,10 @@ mod tests {
             {"role": "user", "content": "more"}
         ]});
 
-        let later_signals = signals(CHAT_PATH, &later);
+        let later_signals = Fixture::signals(Fixture::CHAT_PATH, &later);
 
         assert_eq!(
-            signals(CHAT_PATH, &first).content_key,
+            Fixture::signals(Fixture::CHAT_PATH, &first).content_key,
             later_signals.content_key
         );
         assert_eq!(later_signals.user_turns, 2);
@@ -177,8 +187,8 @@ mod tests {
         ]});
         let fresh = json!({"input": "describe the image", "tools": []});
 
-        let continued = signals(RESPONSES_PATH, &continuation);
-        let first = signals(RESPONSES_PATH, &fresh);
+        let continued = Fixture::signals(Fixture::RESPONSES_PATH, &continuation);
+        let first = Fixture::signals(Fixture::RESPONSES_PATH, &fresh);
 
         assert!(continued.tool_continuation);
         assert_eq!(continued.last_user_text.as_deref(), Some("go"));
@@ -203,8 +213,8 @@ mod tests {
             {"type": "text", "text": "what is this"}
         ]}]});
 
-        let continued = signals(MESSAGES_PATH, &continuation);
-        let pictured = signals(MESSAGES_PATH, &image);
+        let continued = Fixture::signals(Fixture::MESSAGES_PATH, &continuation);
+        let pictured = Fixture::signals(Fixture::MESSAGES_PATH, &image);
 
         assert!(continued.tool_continuation);
         assert!(continued.has_tools);
@@ -217,7 +227,9 @@ mod tests {
         let long = "é".repeat(TurnSignals::MAX_LAST_USER_TEXT_BYTES);
         let body = json!({"messages": [{"role": "user", "content": long}]});
 
-        let text = signals(CHAT_PATH, &body).last_user_text.unwrap();
+        let text = Fixture::signals(Fixture::CHAT_PATH, &body)
+            .last_user_text
+            .unwrap();
 
         assert_eq!(text.len(), TurnSignals::MAX_LAST_USER_TEXT_BYTES);
         assert!(text.chars().all(|c| c == 'é'));
@@ -227,7 +239,7 @@ mod tests {
     fn unknown_path_keeps_only_the_estimate_and_affinity_inputs() {
         let body = json!({"input": "embed me", "prompt_cache_key": "k"});
 
-        let signals = signals("/v1/embeddings", &body);
+        let signals = Fixture::signals("/v1/embeddings", &body);
 
         assert_eq!(signals.estimated_prompt_tokens, 1000);
         assert_eq!(signals.user_turns, 0);
