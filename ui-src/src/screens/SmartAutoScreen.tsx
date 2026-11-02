@@ -404,10 +404,19 @@ function isAllowed(row: SmartAutoEffectRow): boolean {
  * `saved` with one Results row flipped, or null when no global list edit can flip it.
  * An allowed row moves from the global allow to the global exclude, and an excluded row moves back.
  */
+/** True when a `*` glob matches the whole id, with `*` standing for any run of characters. */
+function globMatches(glob: string, id: string): boolean {
+  const pattern = glob.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*");
+  return new RegExp(`^${pattern}$`).test(id);
+}
+
 function rulesWithResultToggled(saved: SmartAutoRules, row: SmartAutoEffectRow): SmartAutoRules | null {
   const id = row.qualified_id;
   if (isAllowed(row)) {
-    return { ...saved, allow: saved.allow.filter((entry) => entry !== id), exclude: withGlob(saved.exclude, id) };
+    const allow = saved.allow.filter((entry) => entry !== id);
+    // Only add the exact id when no remaining exclude glob already excludes it, so the rules keep their form.
+    const excludedAnyway = saved.exclude.some((glob) => globMatches(glob, id));
+    return { ...saved, allow, exclude: excludedAnyway ? saved.exclude : withGlob(saved.exclude, id) };
   }
   if (row.reason !== "excluded_by_global" && row.reason !== "excluded_by_profile") {
     return null;

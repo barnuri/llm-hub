@@ -219,32 +219,37 @@ impl SmartAutoHeaders {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schemas::smart_auto_policy::tests::globs;
+    use crate::schemas::smart_auto_policy::tests::Fixture as PolicyFixture;
     use axum::http::header::HeaderName;
 
-    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
-        let mut map = HeaderMap::new();
-        for (name, value) in pairs {
-            map.append(
-                name.parse::<HeaderName>().unwrap(),
-                HeaderValue::from_str(value).unwrap(),
-            );
+    /// Builds header maps and parses them, for the header tests.
+    struct Fixture;
+
+    impl Fixture {
+        fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.append(
+                    name.parse::<HeaderName>().unwrap(),
+                    HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            map
         }
-        map
-    }
 
-    fn parse(pairs: &[(&str, &str)]) -> Result<SmartAutoHeaders, AppError> {
-        SmartAutoHeaders::from_headers(&headers(pairs))
-    }
+        fn parse(pairs: &[(&str, &str)]) -> Result<SmartAutoHeaders, AppError> {
+            SmartAutoHeaders::from_headers(&Self::headers(pairs))
+        }
 
-    fn assert_bad_request(pairs: &[(&str, &str)]) {
-        let error = parse(pairs).unwrap_err();
-        assert!(matches!(error, AppError::BadRequest(_)), "{pairs:?}");
+        fn assert_bad_request(pairs: &[(&str, &str)]) {
+            let error = Self::parse(pairs).unwrap_err();
+            assert!(matches!(error, AppError::BadRequest(_)), "{pairs:?}");
+        }
     }
 
     #[test]
     fn absent_headers_give_an_empty_layer() {
-        let parsed = parse(&[
+        let parsed = Fixture::parse(&[
             ("content-type", "application/json"),
             ("x-llm-hub-profiles", "copilot"),
         ])
@@ -255,7 +260,7 @@ mod tests {
 
     #[test]
     fn every_header_parses() {
-        let parsed = parse(&[
+        let parsed = Fixture::parse(&[
             (SmartAutoHeaders::TIER, "intelligence"),
             (SmartAutoHeaders::INCLUDE, " copilot/* , llama_swap/*"),
             (SmartAutoHeaders::EXCLUDE, "*fast-preview*"),
@@ -274,8 +279,8 @@ mod tests {
             SmartAutoHeaders {
                 policy: SmartAutoPolicy {
                     tier: Some(SmartAutoTier::Intelligence),
-                    include: vec![globs(&["copilot/*", "llama_swap/*"])],
-                    exclude: globs(&["*fast-preview*"]),
+                    include: vec![PolicyFixture::globs(&["copilot/*", "llama_swap/*"])],
+                    exclude: PolicyFixture::globs(&["*fast-preview*"]),
                     min_context_tokens: Some(1_000_000),
                     min_input_tokens: Some(200_000),
                     min_output_tokens: Some(32_000),
@@ -293,19 +298,19 @@ mod tests {
     #[test]
     fn rules_header_selects_merge_or_override_and_rejects_anything_else() {
         assert_eq!(
-            parse(&[(SmartAutoHeaders::RULES, "Override")])
+            Fixture::parse(&[(SmartAutoHeaders::RULES, "Override")])
                 .unwrap()
                 .rules_mode,
             Some(SmartAutoRulesMode::Override)
         );
         assert_eq!(
-            parse(&[(SmartAutoHeaders::RULES, "merge")])
+            Fixture::parse(&[(SmartAutoHeaders::RULES, "merge")])
                 .unwrap()
                 .rules_mode,
             Some(SmartAutoRulesMode::Merge)
         );
-        assert_bad_request(&[(SmartAutoHeaders::RULES, "widen")]);
-        assert_bad_request(&[
+        Fixture::assert_bad_request(&[(SmartAutoHeaders::RULES, "widen")]);
+        Fixture::assert_bad_request(&[
             (SmartAutoHeaders::RULES, "merge"),
             (SmartAutoHeaders::RULES, "override"),
         ]);
@@ -313,7 +318,7 @@ mod tests {
 
     #[test]
     fn header_names_match_case_insensitively() {
-        let parsed = parse(&[("X-LLM-Hub-Smart-Auto-Tier", "Fast")]).unwrap();
+        let parsed = Fixture::parse(&[("X-LLM-Hub-Smart-Auto-Tier", "Fast")]).unwrap();
         assert_eq!(parsed.policy.tier, Some(SmartAutoTier::Fast));
     }
 
@@ -321,19 +326,20 @@ mod tests {
     fn every_tier_and_role_name_matches_its_serde_name() {
         for tier in SmartAutoTier::ALL {
             let name = serde_json::to_value(tier).unwrap();
-            let parsed = parse(&[(SmartAutoHeaders::TIER, name.as_str().unwrap())]).unwrap();
+            let parsed =
+                Fixture::parse(&[(SmartAutoHeaders::TIER, name.as_str().unwrap())]).unwrap();
             assert_eq!(parsed.policy.tier, Some(tier));
         }
         for (role_name, role) in SmartAutoHeaders::ROLES {
             assert_eq!(serde_json::to_value(role).unwrap(), role_name);
-            let parsed = parse(&[(SmartAutoHeaders::ROLE, role_name)]).unwrap();
+            let parsed = Fixture::parse(&[(SmartAutoHeaders::ROLE, role_name)]).unwrap();
             assert_eq!(parsed.policy.role, Some(role));
         }
     }
 
     #[test]
     fn repeated_list_headers_join_one_allow_list() {
-        let parsed = parse(&[
+        let parsed = Fixture::parse(&[
             (SmartAutoHeaders::INCLUDE, "copilot/*"),
             (SmartAutoHeaders::INCLUDE, "openai/*"),
             (SmartAutoHeaders::EXCLUDE, "a/*"),
@@ -342,9 +348,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             parsed.policy.include,
-            vec![globs(&["copilot/*", "openai/*"])]
+            vec![PolicyFixture::globs(&["copilot/*", "openai/*"])]
         );
-        assert_eq!(parsed.policy.exclude, globs(&["a/*", "b/*"]));
+        assert_eq!(parsed.policy.exclude, PolicyFixture::globs(&["a/*", "b/*"]));
     }
 
     #[test]
@@ -354,7 +360,7 @@ mod tests {
             min_context_tokens: Some(1_000_000),
             ..SmartAutoPolicy::default()
         };
-        let parsed = parse(&[
+        let parsed = Fixture::parse(&[
             (SmartAutoHeaders::TIER, "fast"),
             (SmartAutoHeaders::MIN_CONTEXT, "200k"),
             (SmartAutoHeaders::INCLUDE, "copilot/*"),
@@ -363,7 +369,7 @@ mod tests {
         let merged = selector.merge(&parsed.policy);
         assert_eq!(merged.tier, Some(SmartAutoTier::Balance));
         assert_eq!(merged.min_context_tokens, Some(1_000_000));
-        assert_eq!(merged.include, vec![globs(&["copilot/*"])]);
+        assert_eq!(merged.include, vec![PolicyFixture::globs(&["copilot/*"])]);
     }
 
     #[test]
@@ -380,17 +386,17 @@ mod tests {
             [(SmartAutoHeaders::WORKER, "")],
             [("x-llm-hub-smart-auto-min-ctx", "1m")],
         ] {
-            assert_bad_request(&pairs);
+            Fixture::assert_bad_request(&pairs);
         }
     }
 
     #[test]
     fn repeated_single_value_headers_are_bad_requests() {
-        assert_bad_request(&[
+        Fixture::assert_bad_request(&[
             (SmartAutoHeaders::MIN_CONTEXT, "1m"),
             (SmartAutoHeaders::MIN_CONTEXT, "200k"),
         ]);
-        assert_bad_request(&[
+        Fixture::assert_bad_request(&[
             (SmartAutoHeaders::WORKER, "a"),
             (SmartAutoHeaders::WORKER, "b"),
         ]);
@@ -399,9 +405,9 @@ mod tests {
     #[test]
     fn identity_longer_than_the_limit_is_a_bad_request() {
         let long = "w".repeat(SmartAutoHeaders::MAX_IDENTITY_LENGTH + 1);
-        assert_bad_request(&[(SmartAutoHeaders::PARENT, &long)]);
+        Fixture::assert_bad_request(&[(SmartAutoHeaders::PARENT, &long)]);
         let limit = "w".repeat(SmartAutoHeaders::MAX_IDENTITY_LENGTH);
-        let parsed = parse(&[(SmartAutoHeaders::PARENT, &limit)]).unwrap();
+        let parsed = Fixture::parse(&[(SmartAutoHeaders::PARENT, &limit)]).unwrap();
         assert_eq!(parsed.parent, Some(limit));
     }
 

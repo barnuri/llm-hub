@@ -251,7 +251,7 @@ mod tests {
     use super::*;
     use crate::consts::CONTEXT_TOKENS_1M;
     use crate::schemas::evidence_source::EvidenceSource;
-    use crate::schemas::smart_auto_policy::tests::globs;
+    use crate::schemas::smart_auto_policy::tests::Fixture;
     use crate::schemas::smart_auto_rules::SmartAutoRules;
 
     const MESSAGES: &str = "/v1/messages";
@@ -388,8 +388,8 @@ mod tests {
     #[test]
     fn exclude_beats_include() {
         let policy = SmartAutoPolicy {
-            include: vec![globs(&["copilot/*"])],
-            exclude: globs(&["*fast-preview*"]),
+            include: vec![Fixture::globs(&["copilot/*"])],
+            exclude: Fixture::globs(&["*fast-preview*"]),
             ..SmartAutoPolicy::default()
         };
         let models = vec![
@@ -404,8 +404,8 @@ mod tests {
     fn multiple_include_lists_intersect() {
         let policy = SmartAutoPolicy {
             include: vec![
-                globs(&["copilot/*", "llama_swap/*"]),
-                globs(&["claude-*", "qwen*"]),
+                Fixture::globs(&["copilot/*", "llama_swap/*"]),
+                Fixture::globs(&["claude-*", "qwen*"]),
             ],
             ..SmartAutoPolicy::default()
         };
@@ -473,11 +473,11 @@ mod tests {
     #[test]
     fn one_m_suffix_is_ignored_on_globs_and_ids() {
         let exclude_suffixed_glob = SmartAutoPolicy {
-            exclude: globs(&["copilot/claude-opus-4.7[1m]"]),
+            exclude: Fixture::globs(&["copilot/claude-opus-4.7[1m]"]),
             ..SmartAutoPolicy::default()
         };
         let include_plain_glob = SmartAutoPolicy {
-            include: vec![globs(&["claude-opus-4.7"])],
+            include: vec![Fixture::globs(&["claude-opus-4.7"])],
             ..SmartAutoPolicy::default()
         };
 

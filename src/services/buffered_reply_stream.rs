@@ -229,57 +229,62 @@ impl BufferedReplyStream {
 mod tests {
     use super::*;
 
-    /// Parses SSE text into (event name, data) pairs; `OpenAI` frames have no event line.
-    fn parse_sse(text: &str) -> Vec<(Option<String>, String)> {
-        text.split("\n\n")
-            .filter(|frame| !frame.is_empty())
-            .map(|frame| {
-                let mut event = None;
-                let mut data = String::new();
-                for line in frame.lines() {
-                    if let Some(name) = line.strip_prefix("event: ") {
-                        event = Some(name.to_owned());
-                    } else if let Some(payload) = line.strip_prefix("data: ") {
-                        data = payload.to_owned();
+    /// Renders replies and parses their SSE text for the golden and shape tests.
+    struct Fixture;
+
+    impl Fixture {
+        /// Parses SSE text into (event name, data) pairs; `OpenAI` frames have no event line.
+        fn parse_sse(text: &str) -> Vec<(Option<String>, String)> {
+            text.split("\n\n")
+                .filter(|frame| !frame.is_empty())
+                .map(|frame| {
+                    let mut event = None;
+                    let mut data = String::new();
+                    for line in frame.lines() {
+                        if let Some(name) = line.strip_prefix("event: ") {
+                            event = Some(name.to_owned());
+                        } else if let Some(payload) = line.strip_prefix("data: ") {
+                            data = payload.to_owned();
+                        }
                     }
-                }
-                (event, data)
+                    (event, data)
+                })
+                .collect()
+        }
+
+        fn render_text(protocol: ReplyProtocol, reply: &Value) -> String {
+            String::from_utf8(
+                BufferedReplyStream::render(protocol, reply)
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        }
+
+        fn completion() -> Value {
+            json!({
+                "id": "chatcmpl-42",
+                "object": "chat.completion",
+                "created": 1_700_000_000u64,
+                "model": "copilot/gpt-5",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "The sum is 5.",
+                        "reasoning_content": "Add 2 and 3."
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 20, "completion_tokens": 6, "total_tokens": 26 }
             })
-            .collect()
-    }
-
-    fn render_text(protocol: ReplyProtocol, reply: &Value) -> String {
-        String::from_utf8(
-            BufferedReplyStream::render(protocol, reply)
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap()
-    }
-
-    fn completion() -> Value {
-        json!({
-            "id": "chatcmpl-42",
-            "object": "chat.completion",
-            "created": 1_700_000_000u64,
-            "model": "copilot/gpt-5",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "The sum is 5.",
-                    "reasoning_content": "Add 2 and 3."
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": { "prompt_tokens": 20, "completion_tokens": 6, "total_tokens": 26 }
-        })
+        }
     }
 
     #[test]
     fn openai_golden_frames_keep_id_finish_reason_usage_and_reasoning() {
-        let text = render_text(ReplyProtocol::OpenAiChat, &completion());
-        let frames = parse_sse(&text);
+        let text = Fixture::render_text(ReplyProtocol::OpenAiChat, &Fixture::completion());
+        let frames = Fixture::parse_sse(&text);
         assert!(text.ends_with("data: [DONE]\n\n"));
         let values: Vec<Value> = frames
             .iter()
@@ -325,7 +330,7 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let text = render_text(ReplyProtocol::OpenAiChat, &reply);
+        let text = Fixture::render_text(ReplyProtocol::OpenAiChat, &reply);
         assert!(text.contains("\"name\":\"read_file\""));
         assert!(text.contains("\"finish_reason\":\"tool_calls\""));
     }
@@ -344,8 +349,8 @@ mod tests {
             "stop_reason": "end_turn",
             "usage": { "input_tokens": 20, "output_tokens": 6 }
         });
-        let text = render_text(ReplyProtocol::AnthropicMessage, &message);
-        let events: Vec<(String, Value)> = parse_sse(&text)
+        let text = Fixture::render_text(ReplyProtocol::AnthropicMessage, &message);
+        let events: Vec<(String, Value)> = Fixture::parse_sse(&text)
             .into_iter()
             .map(|(event, data)| (event.unwrap(), serde_json::from_str(&data).unwrap()))
             .collect();
@@ -383,7 +388,7 @@ mod tests {
             "stop_reason": "tool_use",
             "usage": { "input_tokens": 1, "output_tokens": 2 }
         });
-        let text = render_text(ReplyProtocol::AnthropicMessage, &message);
+        let text = Fixture::render_text(ReplyProtocol::AnthropicMessage, &message);
         assert!(text.contains("\"partial_json\":\"{\\\"q\\\":\\\"x\\\"}\""));
         assert!(text.contains("\"name\":\"grep\""));
     }

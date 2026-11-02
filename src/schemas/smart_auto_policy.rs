@@ -114,42 +114,53 @@ impl SmartAutoPolicy {
 pub(crate) mod tests {
     use super::*;
 
-    /// A glob set from string slices, built the way the header and flag parsers build one.
-    pub(crate) fn globs(patterns: &[&str]) -> BTreeSet<String> {
-        patterns
-            .iter()
-            .map(|&pattern| pattern.to_string())
-            .collect()
-    }
+    /// Builds the policies and glob sets the tests compare against.
+    pub(crate) struct Fixture;
 
-    fn restrictive() -> SmartAutoPolicy {
-        SmartAutoPolicy {
-            tier: Some(SmartAutoTier::Intelligence),
-            include: vec![globs(&["copilot/*", "llama_swap/*"])],
-            exclude: globs(&["*fast-preview*"]),
-            allow: globs(&["copilot/gpt-6-sol"]),
-            profile_include: BTreeMap::from([("copilot".to_string(), vec![globs(&["gpt-*"])])]),
-            profile_exclude: BTreeMap::from([("llama_swap".to_string(), globs(&["*preview*"]))]),
-            min_context_tokens: Some(1_000_000),
-            min_input_tokens: Some(200_000),
-            min_output_tokens: Some(32_000),
-            role: Some(WorkRole::Planning),
+    impl Fixture {
+        /// A glob set from string slices, built the way the header and flag parsers build one.
+        pub(crate) fn globs(patterns: &[&str]) -> BTreeSet<String> {
+            patterns
+                .iter()
+                .map(|&pattern| pattern.to_string())
+                .collect()
+        }
+
+        fn restrictive() -> SmartAutoPolicy {
+            SmartAutoPolicy {
+                tier: Some(SmartAutoTier::Intelligence),
+                include: vec![Fixture::globs(&["copilot/*", "llama_swap/*"])],
+                exclude: Fixture::globs(&["*fast-preview*"]),
+                allow: Fixture::globs(&["copilot/gpt-6-sol"]),
+                profile_include: BTreeMap::from([(
+                    "copilot".to_string(),
+                    vec![Fixture::globs(&["gpt-*"])],
+                )]),
+                profile_exclude: BTreeMap::from([(
+                    "llama_swap".to_string(),
+                    Fixture::globs(&["*preview*"]),
+                )]),
+                min_context_tokens: Some(1_000_000),
+                min_input_tokens: Some(200_000),
+                min_output_tokens: Some(32_000),
+                role: Some(WorkRole::Planning),
+            }
         }
     }
 
     #[test]
     fn allow_globs_union_across_layers_and_never_clear_one() {
         let parent = SmartAutoPolicy {
-            allow: globs(&["copilot/gpt-6-sol"]),
+            allow: Fixture::globs(&["copilot/gpt-6-sol"]),
             ..SmartAutoPolicy::default()
         };
         let child = SmartAutoPolicy {
-            allow: globs(&["llama_swap/*"]),
+            allow: Fixture::globs(&["llama_swap/*"]),
             ..SmartAutoPolicy::default()
         };
         assert_eq!(
             parent.merge(&child).allow,
-            globs(&["copilot/gpt-6-sol", "llama_swap/*"])
+            Fixture::globs(&["copilot/gpt-6-sol", "llama_swap/*"])
         );
         assert_eq!(
             parent.merge(&SmartAutoPolicy::default()).allow,
@@ -159,7 +170,7 @@ pub(crate) mod tests {
 
     #[test]
     fn serde_round_trips_every_field() {
-        let policy = restrictive();
+        let policy = Fixture::restrictive();
         let json = serde_json::to_value(&policy).unwrap();
         assert_eq!(json["tier"], "intelligence");
         assert_eq!(json["role"], "planning");
@@ -185,17 +196,20 @@ pub(crate) mod tests {
     #[test]
     fn includes_intersect_by_requiring_every_allow_list() {
         let parent = SmartAutoPolicy {
-            include: vec![globs(&["copilot/*"])],
+            include: vec![Fixture::globs(&["copilot/*"])],
             ..SmartAutoPolicy::default()
         };
         let child = SmartAutoPolicy {
-            include: vec![globs(&["copilot/gpt-*", "openai/*"])],
+            include: vec![Fixture::globs(&["copilot/gpt-*", "openai/*"])],
             ..SmartAutoPolicy::default()
         };
         let merged = parent.merge(&child);
         assert_eq!(
             merged.include,
-            vec![globs(&["copilot/*"]), globs(&["copilot/gpt-*", "openai/*"])]
+            vec![
+                Fixture::globs(&["copilot/*"]),
+                Fixture::globs(&["copilot/gpt-*", "openai/*"])
+            ]
         );
         assert_eq!(merged.merge(&child).include, merged.include);
     }
@@ -203,7 +217,7 @@ pub(crate) mod tests {
     #[test]
     fn empty_include_means_no_restriction_and_never_clears_one() {
         let restricted = SmartAutoPolicy {
-            include: vec![globs(&["copilot/*"])],
+            include: vec![Fixture::globs(&["copilot/*"])],
             ..SmartAutoPolicy::default()
         };
         let empty_list = SmartAutoPolicy {
@@ -223,51 +237,57 @@ pub(crate) mod tests {
     #[test]
     fn excludes_union() {
         let parent = SmartAutoPolicy {
-            exclude: globs(&["*fast-preview*"]),
+            exclude: Fixture::globs(&["*fast-preview*"]),
             ..SmartAutoPolicy::default()
         };
         let child = SmartAutoPolicy {
-            exclude: globs(&["openai/*"]),
+            exclude: Fixture::globs(&["openai/*"]),
             ..SmartAutoPolicy::default()
         };
         assert_eq!(
             parent.merge(&child).exclude,
-            globs(&["*fast-preview*", "openai/*"])
+            Fixture::globs(&["*fast-preview*", "openai/*"])
         );
     }
 
     #[test]
     fn a_later_include_never_lifts_an_earlier_exclude() {
         let parent = SmartAutoPolicy {
-            exclude: globs(&["copilot/gpt-5-mini"]),
+            exclude: Fixture::globs(&["copilot/gpt-5-mini"]),
             ..SmartAutoPolicy::default()
         };
         let child = SmartAutoPolicy {
-            include: vec![globs(&["copilot/gpt-5-mini"])],
+            include: vec![Fixture::globs(&["copilot/gpt-5-mini"])],
             ..SmartAutoPolicy::default()
         };
         let merged = parent.merge(&child);
         assert!(merged.exclude.contains("copilot/gpt-5-mini"));
-        assert_eq!(merged.include, vec![globs(&["copilot/gpt-5-mini"])]);
+        assert_eq!(
+            merged.include,
+            vec![Fixture::globs(&["copilot/gpt-5-mini"])]
+        );
     }
 
     #[test]
     fn profile_rules_only_tighten_like_global_rules() {
         let parent = SmartAutoPolicy {
-            profile_include: BTreeMap::from([("copilot".to_string(), vec![globs(&["gpt-*"])])]),
-            profile_exclude: BTreeMap::from([("copilot".to_string(), globs(&["a"]))]),
+            profile_include: BTreeMap::from([(
+                "copilot".to_string(),
+                vec![Fixture::globs(&["gpt-*"])],
+            )]),
+            profile_exclude: BTreeMap::from([("copilot".to_string(), Fixture::globs(&["a"]))]),
             ..SmartAutoPolicy::default()
         };
         let child = SmartAutoPolicy {
             profile_include: BTreeMap::from([
                 (
                     "copilot".to_string(),
-                    vec![globs(&["gpt-5*", "o3"]), BTreeSet::new()],
+                    vec![Fixture::globs(&["gpt-5*", "o3"]), BTreeSet::new()],
                 ),
-                ("openai".to_string(), vec![globs(&["gpt-*"])]),
+                ("openai".to_string(), vec![Fixture::globs(&["gpt-*"])]),
             ]),
             profile_exclude: BTreeMap::from([
-                ("copilot".to_string(), globs(&["b"])),
+                ("copilot".to_string(), Fixture::globs(&["b"])),
                 ("groq".to_string(), BTreeSet::new()),
             ]),
             ..SmartAutoPolicy::default()
@@ -280,14 +300,17 @@ pub(crate) mod tests {
             BTreeMap::from([
                 (
                     "copilot".to_string(),
-                    vec![globs(&["gpt-*"]), globs(&["gpt-5*", "o3"])]
+                    vec![
+                        Fixture::globs(&["gpt-*"]),
+                        Fixture::globs(&["gpt-5*", "o3"])
+                    ]
                 ),
-                ("openai".to_string(), vec![globs(&["gpt-*"])]),
+                ("openai".to_string(), vec![Fixture::globs(&["gpt-*"])]),
             ])
         );
         assert_eq!(
             merged.profile_exclude,
-            BTreeMap::from([("copilot".to_string(), globs(&["a", "b"]))])
+            BTreeMap::from([("copilot".to_string(), Fixture::globs(&["a", "b"]))])
         );
         assert_eq!(merged.merge(&child), merged);
     }
@@ -314,7 +337,7 @@ pub(crate) mod tests {
 
     #[test]
     fn merging_an_unrestricted_layer_never_relaxes() {
-        let policy = restrictive();
+        let policy = Fixture::restrictive();
         assert_eq!(policy.merge(&SmartAutoPolicy::default()), policy);
         assert_eq!(SmartAutoPolicy::default().merge(&policy), policy);
     }
