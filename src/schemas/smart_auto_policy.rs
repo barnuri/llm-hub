@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,12 @@ pub struct SmartAutoPolicy {
     pub include: Vec<BTreeSet<String>>,
     /// Deny globs. A model that matches any of them is ineligible, even when an include matches it.
     pub exclude: BTreeSet<String>,
+    /// Allow globs. A model that matches one is eligible even when an exclude matches it.
+    pub allow: BTreeSet<String>,
+    /// Profile name to allow-lists that bind only that profile's models, with the same AND rule.
+    pub profile_include: BTreeMap<String, Vec<BTreeSet<String>>>,
+    /// Profile name to deny globs that remove only that profile's models.
+    pub profile_exclude: BTreeMap<String, BTreeSet<String>>,
     /// The minimum total context window, in tokens.
     pub min_context_tokens: Option<u64>,
     /// The minimum prompt capacity, in tokens.
@@ -31,7 +37,7 @@ impl SmartAutoPolicy {
     const THOUSAND: u64 = 1_000;
     const MILLION: u64 = 1_000_000;
 
-    /// Returns this policy tightened by a later layer; no restriction is ever relaxed.
+    /// Returns this policy tightened by a later layer; allow globs are the one relaxation and union in.
     /// The earlier tier is kept, and the later role hint replaces the earlier one.
     #[must_use]
     pub fn merge(&self, later: &SmartAutoPolicy) -> SmartAutoPolicy {
@@ -42,10 +48,31 @@ impl SmartAutoPolicy {
             }
         }
         include.retain(|allow_list| !allow_list.is_empty());
+        let mut profile_include = self.profile_include.clone();
+        for (profile, lists) in &later.profile_include {
+            let own = profile_include.entry(profile.clone()).or_default();
+            for allow_list in lists {
+                if !allow_list.is_empty() && !own.contains(allow_list) {
+                    own.push(allow_list.clone());
+                }
+            }
+        }
+        profile_include.retain(|_, lists| !lists.is_empty());
+        let mut profile_exclude = self.profile_exclude.clone();
+        for (profile, globs) in &later.profile_exclude {
+            profile_exclude
+                .entry(profile.clone())
+                .or_default()
+                .extend(globs.iter().cloned());
+        }
+        profile_exclude.retain(|_, globs| !globs.is_empty());
         SmartAutoPolicy {
             tier: self.tier.or(later.tier),
             include,
             exclude: self.exclude.union(&later.exclude).cloned().collect(),
+            allow: self.allow.union(&later.allow).cloned().collect(),
+            profile_include,
+            profile_exclude,
             min_context_tokens: self.min_context_tokens.max(later.min_context_tokens),
             min_input_tokens: self.min_input_tokens.max(later.min_input_tokens),
             min_output_tokens: self.min_output_tokens.max(later.min_output_tokens),
@@ -100,11 +127,34 @@ pub(crate) mod tests {
             tier: Some(SmartAutoTier::Intelligence),
             include: vec![globs(&["copilot/*", "llama_swap/*"])],
             exclude: globs(&["*fast-preview*"]),
+            allow: globs(&["copilot/gpt-6-sol"]),
+            profile_include: BTreeMap::from([("copilot".to_string(), vec![globs(&["gpt-*"])])]),
+            profile_exclude: BTreeMap::from([("llama_swap".to_string(), globs(&["*preview*"]))]),
             min_context_tokens: Some(1_000_000),
             min_input_tokens: Some(200_000),
             min_output_tokens: Some(32_000),
             role: Some(WorkRole::Planning),
         }
+    }
+
+    #[test]
+    fn allow_globs_union_across_layers_and_never_clear_one() {
+        let parent = SmartAutoPolicy {
+            allow: globs(&["copilot/gpt-6-sol"]),
+            ..SmartAutoPolicy::default()
+        };
+        let child = SmartAutoPolicy {
+            allow: globs(&["llama_swap/*"]),
+            ..SmartAutoPolicy::default()
+        };
+        assert_eq!(
+            parent.merge(&child).allow,
+            globs(&["copilot/gpt-6-sol", "llama_swap/*"])
+        );
+        assert_eq!(
+            parent.merge(&SmartAutoPolicy::default()).allow,
+            parent.allow
+        );
     }
 
     #[test]
@@ -199,6 +249,47 @@ pub(crate) mod tests {
         let merged = parent.merge(&child);
         assert!(merged.exclude.contains("copilot/gpt-5-mini"));
         assert_eq!(merged.include, vec![globs(&["copilot/gpt-5-mini"])]);
+    }
+
+    #[test]
+    fn profile_rules_only_tighten_like_global_rules() {
+        let parent = SmartAutoPolicy {
+            profile_include: BTreeMap::from([("copilot".to_string(), vec![globs(&["gpt-*"])])]),
+            profile_exclude: BTreeMap::from([("copilot".to_string(), globs(&["a"]))]),
+            ..SmartAutoPolicy::default()
+        };
+        let child = SmartAutoPolicy {
+            profile_include: BTreeMap::from([
+                (
+                    "copilot".to_string(),
+                    vec![globs(&["gpt-5*", "o3"]), BTreeSet::new()],
+                ),
+                ("openai".to_string(), vec![globs(&["gpt-*"])]),
+            ]),
+            profile_exclude: BTreeMap::from([
+                ("copilot".to_string(), globs(&["b"])),
+                ("groq".to_string(), BTreeSet::new()),
+            ]),
+            ..SmartAutoPolicy::default()
+        };
+
+        let merged = parent.merge(&child);
+
+        assert_eq!(
+            merged.profile_include,
+            BTreeMap::from([
+                (
+                    "copilot".to_string(),
+                    vec![globs(&["gpt-*"]), globs(&["gpt-5*", "o3"])]
+                ),
+                ("openai".to_string(), vec![globs(&["gpt-*"])]),
+            ])
+        );
+        assert_eq!(
+            merged.profile_exclude,
+            BTreeMap::from([("copilot".to_string(), globs(&["a", "b"]))])
+        );
+        assert_eq!(merged.merge(&child), merged);
     }
 
     #[test]

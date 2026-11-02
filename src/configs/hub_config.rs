@@ -25,6 +25,8 @@ pub struct HubConfig {
     pub profiles: Vec<ProfileConfig>,
     /// Operator Smart Auto presets from `LLM_HUB_SMART_AUTO_PRESETS`, served as `hub/<name>`.
     pub smart_auto_presets: BTreeMap<String, SmartAutoPolicy>,
+    /// Smart Auto include and exclude rules from `LLM_HUB_SMART_AUTO_RULES`; set, they replace the saved file.
+    pub smart_auto_rules_env: Option<String>,
     pub master_key: Option<String>,
     pub default_fallbacks: Vec<String>,
     pub max_replay_bytes: usize,
@@ -139,6 +141,7 @@ impl HubConfig {
 
         Ok(HubConfig {
             smart_auto_presets: smart_auto_presets_from_map(vars)?,
+            smart_auto_rules_env: get("SMART_AUTO_RULES").filter(|v| !v.trim().is_empty()),
             profiles,
             master_key,
             default_fallbacks,

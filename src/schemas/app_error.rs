@@ -10,6 +10,7 @@ pub enum AppError {
     NotFound(String),
     NotImplemented(String),
     ReadOnly,
+    Conflict(String),
     Internal(String),
     UpstreamUnavailable(String),
 }
@@ -22,6 +23,7 @@ impl AppError {
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             AppError::ReadOnly => StatusCode::FORBIDDEN,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::UpstreamUnavailable(_) => StatusCode::BAD_GATEWAY,
         }
@@ -34,6 +36,7 @@ impl AppError {
             AppError::NotFound(_) => "not_found_error",
             AppError::NotImplemented(_) => "not_implemented_error",
             AppError::ReadOnly => "read_only_error",
+            AppError::Conflict(_) => "conflict_error",
             AppError::Internal(_) => "internal_error",
             AppError::UpstreamUnavailable(_) => "upstream_error",
         }
@@ -45,7 +48,8 @@ impl AppError {
             | AppError::NotFound(m)
             | AppError::NotImplemented(m)
             | AppError::Internal(m)
-            | AppError::UpstreamUnavailable(m) => m.clone(),
+            | AppError::UpstreamUnavailable(m)
+            | AppError::Conflict(m) => m.clone(),
             AppError::Unauthorized => "missing or invalid api key".to_string(),
             AppError::ReadOnly => "config is read-only (LLM_HUB_CONFIG_READONLY=true)".to_string(),
         }

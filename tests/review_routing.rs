@@ -49,7 +49,7 @@ fn chat_body(model: &str, stream: bool) -> serde_json::Value {
     serde_json::json!({
         "model": model,
         "stream": stream,
-        "messages": [{"role": "user", "content": "Sum 2 and 3."}]
+        "messages": [{"role": "user", "content": "Plan how to sum 2 and 3 across the two services."}]
     })
 }
 

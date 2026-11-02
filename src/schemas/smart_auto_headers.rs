@@ -4,6 +4,7 @@ use axum::http::{HeaderMap, HeaderValue};
 
 use crate::schemas::app_error::AppError;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
+use crate::schemas::smart_auto_rules::SmartAutoRulesMode;
 use crate::schemas::smart_auto_tier::SmartAutoTier;
 use crate::schemas::work_role::WorkRole;
 
@@ -19,6 +20,8 @@ pub struct SmartAutoHeaders {
     pub parent: Option<String>,
     /// The parent policy handle the worker inherits; it is not proof of authorization.
     pub policy_handle: Option<String>,
+    /// `None` means merge: include and exclude tighten the saved rules.
+    pub rules_mode: Option<SmartAutoRulesMode>,
 }
 
 impl SmartAutoHeaders {
@@ -44,6 +47,8 @@ impl SmartAutoHeaders {
     pub const PARENT: &str = "x-llm-hub-smart-auto-parent";
     /// The parent policy handle.
     pub const POLICY: &str = "x-llm-hub-smart-auto-policy";
+    /// `merge` (default) or `override`: whether include and exclude tighten or replace the saved rules.
+    pub const RULES: &str = "x-llm-hub-smart-auto-rules";
     /// The reasoning effort a routed request was sent with, on a response.
     pub const EFFORT: &str = "x-llm-hub-smart-auto-effort";
     /// The reason code of a route, on a response.
@@ -120,6 +125,11 @@ impl SmartAutoHeaders {
                 &mut self.policy_handle,
                 Self::parse_identity(name, text)?,
             ),
+            Self::RULES => Self::set_once(
+                name,
+                &mut self.rules_mode,
+                Self::parse_rules_mode(name, text)?,
+            ),
             _ => Err(AppError::BadRequest(format!(
                 "unknown header {name}: Smart Auto does not support it"
             ))),
@@ -167,6 +177,14 @@ impl SmartAutoHeaders {
                     "header {name} has unknown role {text:?}: use planning, investigation, implementation, validation or conversation"
                 ))
             })
+    }
+
+    fn parse_rules_mode(name: &str, text: &str) -> Result<SmartAutoRulesMode, AppError> {
+        SmartAutoRulesMode::from_name(text).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "header {name} has unknown mode {text:?}: use merge or override"
+            ))
+        })
     }
 
     fn parse_token_count(name: &str, text: &str) -> Result<u64, AppError> {
@@ -248,6 +266,7 @@ mod tests {
             (SmartAutoHeaders::WORKER, "run-1/node-2/attempt-1"),
             (SmartAutoHeaders::PARENT, "run-1"),
             (SmartAutoHeaders::POLICY, "policy-abc"),
+            (SmartAutoHeaders::RULES, "override"),
         ])
         .unwrap();
         assert_eq!(
@@ -261,12 +280,35 @@ mod tests {
                     min_input_tokens: Some(200_000),
                     min_output_tokens: Some(32_000),
                     role: Some(WorkRole::Implementation),
+                    ..SmartAutoPolicy::default()
                 },
                 worker: Some("run-1/node-2/attempt-1".to_string()),
                 parent: Some("run-1".to_string()),
                 policy_handle: Some("policy-abc".to_string()),
+                rules_mode: Some(SmartAutoRulesMode::Override),
             }
         );
+    }
+
+    #[test]
+    fn rules_header_selects_merge_or_override_and_rejects_anything_else() {
+        assert_eq!(
+            parse(&[(SmartAutoHeaders::RULES, "Override")])
+                .unwrap()
+                .rules_mode,
+            Some(SmartAutoRulesMode::Override)
+        );
+        assert_eq!(
+            parse(&[(SmartAutoHeaders::RULES, "merge")])
+                .unwrap()
+                .rules_mode,
+            Some(SmartAutoRulesMode::Merge)
+        );
+        assert_bad_request(&[(SmartAutoHeaders::RULES, "widen")]);
+        assert_bad_request(&[
+            (SmartAutoHeaders::RULES, "merge"),
+            (SmartAutoHeaders::RULES, "override"),
+        ]);
     }
 
     #[test]

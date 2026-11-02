@@ -41,6 +41,7 @@ pub mod selection_state;
 pub mod smart_auto_decision;
 pub mod smart_auto_headers;
 pub mod smart_auto_policy;
+pub mod smart_auto_rules;
 pub mod smart_auto_tier;
 pub mod stage_budget;
 pub mod stage_error;

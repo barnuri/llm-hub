@@ -156,6 +156,20 @@ impl SelectionLog {
 
     /// The current selection of the worker with scope key `worker`, or `None` before its first event.
     #[must_use]
+    /// The current selection of the only worker whose scope key starts with `prefix`; `None` when none or several match.
+    pub fn current_by_prefix(&self, prefix: &str, now: u64) -> Option<CurrentSelection> {
+        let key = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut matches = state.current.keys().filter(|key| key.starts_with(prefix));
+            let only = matches.next()?.clone();
+            if matches.next().is_some() {
+                return None;
+            }
+            only
+        };
+        self.current(&key, now)
+    }
+
     pub fn current(&self, worker: &str, now: u64) -> Option<CurrentSelection> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = state.current.get(worker)?;

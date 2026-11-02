@@ -15,6 +15,10 @@ fn chat_body(model: &str) -> serde_json::Value {
     serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
 }
 
+fn chat_body_with(model: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({"model": model, "messages": [{"role": "user", "content": text}]})
+}
+
 fn ok_completion() -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
         "id": "chatcmpl-1", "object": "chat.completion",
@@ -600,7 +604,7 @@ async fn smart_auto_dispatch_is_visible_in_the_selection_history() {
         .respond_with(ok_completion())
         .mount(&alpha)
         .await;
-    // Balance reviews the answer with one judge on the other profile, so beta accepts it.
+    // Balance reviews planning and implementation turns with one judge on the other profile, so beta accepts it.
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(wiremock::matchers::body_string_contains("<draft>"))
@@ -618,7 +622,10 @@ async fn smart_auto_dispatch_is_visible_in_the_selection_history() {
     let response = client
         .post(format!("{base}/v1/chat/completions"))
         .header(SMART_AUTO_WORKER, worker)
-        .json(&chat_body("hub/smart-auto-balance"))
+        .json(&chat_body_with(
+            "hub/smart-auto-balance",
+            "Plan the migration of the billing service",
+        ))
         .send()
         .await
         .unwrap();

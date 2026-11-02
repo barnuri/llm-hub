@@ -390,6 +390,14 @@ fn build_router(state: AppState) -> Router {
             get(routes::copilot::auto_decisions),
         )
         .route("/api/smart-auto/current", get(routes::smart_auto::current))
+        .route(
+            "/api/smart-auto/rules",
+            get(routes::smart_auto::get_rules).put(routes::smart_auto::put_rules),
+        )
+        .route(
+            "/api/smart-auto/rules/effect",
+            get(routes::smart_auto::rules_effect),
+        )
         .route("/api/smart-auto/history", get(routes::smart_auto::history))
         .route(
             "/api/smart-auto/decisions",
@@ -665,6 +673,119 @@ mod tests {
             assert_eq!(with_key.status().as_u16(), 200, "{route}");
             assert_eq!(without_key.status().as_u16(), 401, "{route}");
         }
+    }
+
+    async fn serve_hub_with_rules(store_dir: &std::path::Path, env_rules: Option<&str>) -> String {
+        let mut vars: HashMap<String, String> = [
+            ("LLM_HUB_PROFILES", "copilot"),
+            ("LLM_HUB_COPILOT_BASE_URL", "http://127.0.0.1:9"),
+            ("LLM_HUB_MASTER_KEY", MASTER_KEY),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        vars.insert(
+            "LLM_HUB_STORE_PATH".into(),
+            store_dir.join("hub.db").to_string_lossy().into_owned(),
+        );
+        if let Some(rules) = env_rules {
+            vars.insert("LLM_HUB_SMART_AUTO_RULES".into(), rules.into());
+        }
+        let state = AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            None,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router = build_router(state);
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        base
+    }
+
+    #[tokio::test]
+    async fn smart_auto_rules_save_to_the_file_and_env_locks_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = serve_hub_with_rules(dir.path(), None).await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/smart-auto/rules");
+
+        let empty: serde_json::Value = client
+            .get(&url)
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(empty["source"], "none");
+        assert_eq!(empty["readonly"], false);
+
+        for body in [r#"{"exclude":[""]}"#, r#"{"include":["a b"]}"#, "{"] {
+            let rejected = client
+                .put(&url)
+                .bearer_auth(MASTER_KEY)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), 400, "{body}");
+        }
+        let saved = client
+            .put(&url)
+            .bearer_auth(MASTER_KEY)
+            .json(&json!({
+                "include": ["copilot/*"],
+                "profiles": {"copilot": {"exclude": ["gpt-*"]}}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), 200);
+        assert!(dir.path().join("smart-auto-rules.json").exists());
+        let reread: serde_json::Value = client
+            .get(&url)
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(reread["source"], "file");
+        assert_eq!(reread["rules"]["include"], json!(["copilot/*"]));
+        assert_eq!(
+            reread["rules"]["profiles"]["copilot"]["exclude"],
+            json!(["gpt-*"])
+        );
+
+        let locked_base =
+            serve_hub_with_rules(dir.path(), Some(r#"{"include":["llama_swap/*"]}"#)).await;
+        let locked_url = format!("{locked_base}/api/smart-auto/rules");
+        let locked: serde_json::Value = client
+            .get(&locked_url)
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(locked["source"], "env");
+        assert_eq!(locked["readonly"], true);
+        assert_eq!(locked["rules"]["include"], json!(["llama_swap/*"]));
+        let conflict = client
+            .put(&locked_url)
+            .bearer_auth(MASTER_KEY)
+            .json(&json!({"include": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), 409);
     }
 
     #[tokio::test]

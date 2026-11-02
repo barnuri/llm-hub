@@ -479,7 +479,12 @@ fn resolve_hub(
         return Ok(HubResolution::NotHub(fallbacks));
     };
     let caller = SmartAutoHeaders::from_headers(headers)?;
-    let policy = selector.policy.merge(&caller.policy);
+    let rules = state.smart_auto_rules().current();
+    let policy = rules.layer(
+        caller.rules_mode.unwrap_or_default(),
+        &selector.policy,
+        &caller.policy,
+    );
     let endpoint = match bodies.route {
         RouteKind::OpenAi => bare_path(bodies.upstream_path),
         RouteKind::Anthropic => MESSAGES_ENDPOINT,
@@ -504,7 +509,8 @@ fn resolve_hub(
     }
     let affinity_key = AffinityKey::new(&signals, &caller, &policy, endpoint);
     let selector_name = requested.qualified();
-    let requested = SmartAutoEffort::requested(bare_path(path), body)?;
+    // Smart Auto ignores the effort the client sends: the hub picks it from the tier and role.
+    let requested = None;
     let usage = state.model_usage();
     let anchor = affinity_key
         .as_ref()
@@ -575,7 +581,7 @@ fn resolve_hub(
         },
     );
     if review.is_none()
-        && endpoint == RESPONSES_ENDPOINT
+        && is_responses_endpoint(endpoint)
         && matches!(tier, SmartAutoTier::Balance | SmartAutoTier::Intelligence)
     {
         // A Responses caller is streamed unreviewed; history names the skip.
@@ -1124,6 +1130,16 @@ fn review_applies(attempt: &Attempt<'_>) -> bool {
     !attempt.native_messages && attempt.path.as_str().ends_with(CHAT_ENDPOINT)
 }
 
+/// True for a Responses call; the `OpenAI` route keeps the client's `/v1` prefix in its endpoint.
+fn is_responses_endpoint(endpoint: &str) -> bool {
+    endpoint.trim_start_matches("/v1") == RESPONSES_ENDPOINT
+}
+
+/// The reason a `review_failed` selection event carries for a review that ended on `reason`.
+fn review_failed_reason(reason: &str) -> String {
+    format!("review_failed: {reason}")
+}
+
 /// The same request body with streaming off, so review reads the whole answer before replying.
 fn non_streaming(body: Bytes) -> Bytes {
     let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
@@ -1188,7 +1204,11 @@ async fn review_deliver(
         Ok(outcome) => outcome,
         Err(error) => {
             if let Some(event) = &selection {
-                record_transition(state, event, SelectionState::Rejected, Some(status));
+                state.selection_log().record(SelectionEvent {
+                    status: Some(status),
+                    reason: Some(review_failed_reason(error.reason())),
+                    ..event.in_state(SelectionState::Rejected)
+                });
             }
             return Err(AppError::UpstreamUnavailable(format!(
                 "review failed: {}",
@@ -1217,7 +1237,7 @@ async fn review_deliver(
                 ..event.in_state(stage.state)
             });
         }
-        if outcome.review_failed == Some(ReviewOrchestrator::REASON_DRAFT_REJECTED) {
+        if outcome.rejected {
             state.selection_log().record(SelectionEvent {
                 status: Some(status),
                 reason: Some(ReviewOrchestrator::REASON_DRAFT_REJECTED.to_owned()),
@@ -1225,12 +1245,12 @@ async fn review_deliver(
             });
         } else if let Some(reason) = outcome.review_failed {
             state.selection_log().record(SelectionEvent {
-                reason: Some(format!("review_failed: {reason}")),
+                reason: Some(review_failed_reason(reason)),
                 ..event.in_state(SelectionState::Completed)
             });
         }
     }
-    if outcome.review_failed == Some(ReviewOrchestrator::REASON_DRAFT_REJECTED) {
+    if outcome.rejected {
         return Err(AppError::UpstreamUnavailable(
             "review rejected the draft".to_owned(),
         ));
@@ -4704,5 +4724,18 @@ mod review_body_tests {
     fn a_body_that_is_not_json_passes_through_unchanged() {
         let body = Bytes::from_static(b"not json");
         assert_eq!(non_streaming(body.clone()), body);
+    }
+
+    #[test]
+    fn responses_endpoints_match_with_or_without_the_v1_prefix() {
+        assert!(is_responses_endpoint("/responses"));
+        assert!(is_responses_endpoint("/v1/responses"));
+        assert!(!is_responses_endpoint("/v1/chat/completions"));
+        assert!(!is_responses_endpoint("/v1/messages"));
+    }
+
+    #[test]
+    fn review_failed_events_name_the_reason() {
+        assert_eq!(review_failed_reason("timeout"), "review_failed: timeout");
     }
 }

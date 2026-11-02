@@ -7,6 +7,21 @@ use crate::schemas::pool_limits::PoolLimits;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
 use crate::services::copilot_auto::AutoTier;
 
+/// The one verdict the pool and the rule effects share. `AllowedOverride`, `Admitted` and the
+/// excludes carry the glob that decided it. `Admitted` carries the first include glob that matched.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RuleDecision<'a> {
+    NotChat,
+    AutoAlias,
+    HubNamespace,
+    AllowedOverride(&'a String),
+    Admitted(Option<&'a String>),
+    ExcludedByGlobal(&'a String),
+    ExcludedByProfile(&'a String),
+    NotInProfileInclude,
+    NotInGlobalInclude,
+}
+
 /// The concrete chat models a Smart Auto policy allows. Pure: no I/O, one allocation.
 /// Unknown, conflicting or too small capacity never satisfies a minimum.
 #[derive(Debug)]
@@ -39,17 +54,20 @@ impl SmartAutoPool {
         endpoint: &str,
         prompt_tokens: u64,
     ) -> bool {
-        Self::is_concrete_chat(descriptor)
+        Self::passes_rules(descriptor, policy)
             && Self::serves(descriptor, endpoint)
-            && Self::passes_filters(descriptor, policy)
             && Self::meets_minima(descriptor, policy)
             && Self::fits_prompt(descriptor, prompt_tokens)
     }
 
-    fn is_concrete_chat(descriptor: &ModelDescriptor) -> bool {
-        descriptor.chat
-            && descriptor.profile != HubSelector::NAMESPACE
-            && AutoTier::from_model(Self::bare_id(&descriptor.qualified_id)).is_none()
+    /// True for a model in the `hub/` namespace, which is a selector, not a backend model.
+    pub(crate) fn is_hub(descriptor: &ModelDescriptor) -> bool {
+        descriptor.profile == HubSelector::NAMESPACE
+    }
+
+    /// True for a Copilot Auto alias such as `auto` or `auto-fast`.
+    pub(crate) fn is_auto_alias(descriptor: &ModelDescriptor) -> bool {
+        AutoTier::from_model(Self::bare_id(&descriptor.qualified_id)).is_some()
     }
 
     fn bare_id(qualified_id: &str) -> &str {
@@ -64,21 +82,70 @@ impl SmartAutoPool {
             || descriptor.endpoints.iter().any(|route| route == endpoint)
     }
 
-    /// Deny wins. Every include list needs a match, so an empty list admits nothing.
-    fn passes_filters(descriptor: &ModelDescriptor, policy: &SmartAutoPolicy) -> bool {
+    fn passes_rules(descriptor: &ModelDescriptor, policy: &SmartAutoPolicy) -> bool {
+        matches!(
+            Self::rule_decision(descriptor, policy),
+            RuleDecision::Admitted(_) | RuleDecision::AllowedOverride(_)
+        )
+    }
+
+    /// The one decision both the pool and `rule_effects` use. It checks, in order: not chat,
+    /// auto alias, hub, allow, global exclude, profile exclude, profile include, global include.
+    pub(crate) fn rule_decision<'a>(
+        descriptor: &ModelDescriptor,
+        policy: &'a SmartAutoPolicy,
+    ) -> RuleDecision<'a> {
+        if !descriptor.chat {
+            return RuleDecision::NotChat;
+        }
+        if Self::is_auto_alias(descriptor) {
+            return RuleDecision::AutoAlias;
+        }
+        if Self::is_hub(descriptor) {
+            return RuleDecision::HubNamespace;
+        }
         let qualified_id = strip_1m_suffix(&descriptor.qualified_id);
+        if let Some(glob) = Self::first_match(&policy.allow, qualified_id) {
+            return RuleDecision::AllowedOverride(glob);
+        }
+        if let Some(glob) = Self::first_match(&policy.exclude, qualified_id) {
+            return RuleDecision::ExcludedByGlobal(glob);
+        }
+        let profile = descriptor.profile.as_str();
+        if let Some(glob) = policy
+            .profile_exclude
+            .get(profile)
+            .and_then(|globs| Self::first_match(globs, qualified_id))
+        {
+            return RuleDecision::ExcludedByProfile(glob);
+        }
+        let mut matched = None;
+        for allow_list in policy.profile_include.get(profile).into_iter().flatten() {
+            match Self::first_match(allow_list, qualified_id) {
+                Some(glob) => matched = matched.or(Some(glob)),
+                None => return RuleDecision::NotInProfileInclude,
+            }
+        }
+        for allow_list in &policy.include {
+            match Self::first_match(allow_list, qualified_id) {
+                Some(glob) => matched = matched.or(Some(glob)),
+                None => return RuleDecision::NotInGlobalInclude,
+            }
+        }
+        RuleDecision::Admitted(matched)
+    }
+
+    /// The first glob in `globs` that matches `qualified_id`, which has its `[1m]` alias stripped.
+    /// It matches the qualified id or the bare id, and an alias suffix on the glob is ignored.
+    fn first_match<'a>(
+        globs: impl IntoIterator<Item = &'a String>,
+        qualified_id: &str,
+    ) -> Option<&'a String> {
         let bare_id = Self::bare_id(qualified_id);
-        let matches = |glob: &String| {
+        globs.into_iter().find(|glob| {
             let glob = strip_1m_suffix(glob);
             Self::glob_matches(glob, qualified_id) || Self::glob_matches(glob, bare_id)
-        };
-        if policy.exclude.iter().any(matches) {
-            return false;
-        }
-        policy
-            .include
-            .iter()
-            .all(|allow_list| allow_list.iter().any(matches))
+        })
     }
 
     /// Total context is at least the prompt allowance, and the local runtime caps both.
@@ -185,6 +252,7 @@ mod tests {
     use crate::consts::CONTEXT_TOKENS_1M;
     use crate::schemas::evidence_source::EvidenceSource;
     use crate::schemas::smart_auto_policy::tests::globs;
+    use crate::schemas::smart_auto_rules::SmartAutoRules;
 
     const MESSAGES: &str = "/v1/messages";
     const CONFIDENCE: f32 = 0.9;
@@ -525,5 +593,157 @@ mod tests {
             }
         );
         assert_eq!(SmartAutoPool::advertised_limits(&[]), PoolLimits::default());
+    }
+    fn policy_from(json: &str) -> SmartAutoPolicy {
+        SmartAutoRules::from_json(json.as_bytes())
+            .unwrap()
+            .to_policy()
+    }
+
+    #[test]
+    fn profile_exclude_removes_only_its_own_profiles_models() {
+        let policy = policy_from(r#"{"profiles":{"copilot":{"exclude":["gpt-*"]}}}"#);
+        let models = vec![
+            model("copilot/gpt-6-sol"),
+            model("llama_swap/gpt-6-sol"),
+            model("copilot/claude-opus-4.7"),
+        ];
+
+        let ids = eligible_ids(models, &policy, 0);
+
+        assert_eq!(ids, ["copilot/claude-opus-4.7", "llama_swap/gpt-6-sol"]);
+    }
+
+    #[test]
+    fn profile_include_binds_only_its_own_profiles_models() {
+        let policy = policy_from(r#"{"profiles":{"copilot":{"include":["claude-*"]}}}"#);
+        let models = vec![
+            model("copilot/claude-opus-4.7"),
+            model("copilot/gpt-6-sol"),
+            model("llama_swap/gpt-6-sol"),
+        ];
+
+        let ids = eligible_ids(models, &policy, 0);
+
+        assert_eq!(ids, ["copilot/claude-opus-4.7", "llama_swap/gpt-6-sol"]);
+    }
+
+    #[test]
+    fn global_and_profile_includes_both_apply() {
+        let policy = policy_from(
+            r#"{"include":["copilot/*","llama_swap/*"],
+                "profiles":{"copilot":{"include":["claude-*"]}}}"#,
+        );
+        let models = vec![
+            model("copilot/claude-opus-4.7"),
+            model("copilot/gpt-6-sol"),
+            model("llama_swap/gpt-6-sol"),
+            model("llama_swap/claude-local"),
+            model("other/claude-opus-4.7"),
+        ];
+
+        let ids = eligible_ids(models, &policy, 0);
+
+        assert_eq!(
+            ids,
+            [
+                "copilot/claude-opus-4.7",
+                "llama_swap/claude-local",
+                "llama_swap/gpt-6-sol"
+            ]
+        );
+    }
+
+    #[test]
+    fn global_exclude_removes_every_profile_and_deny_wins_over_a_profile_include() {
+        let policy = policy_from(
+            r#"{"exclude":["*preview*"],
+                "profiles":{"copilot":{"include":["gpt-*"],"exclude":["gpt-6-sol"]}}}"#,
+        );
+        let models = vec![
+            model("copilot/gpt-6-sol"),
+            model("copilot/gpt-6-preview"),
+            model("llama_swap/gpt-6-preview"),
+            model("llama_swap/gpt-6-sol"),
+        ];
+
+        let ids = eligible_ids(models, &policy, 0);
+
+        assert_eq!(ids, ["llama_swap/gpt-6-sol"]);
+    }
+
+    #[test]
+    fn allow_beats_a_global_exclude_and_the_exclude_still_applies_elsewhere() {
+        let policy = policy_from(r#"{"exclude":["*preview*"],"allow":["copilot/gpt-6-preview"]}"#);
+        let models = vec![
+            model("copilot/gpt-6-preview"),
+            model("copilot/grok-preview"),
+            model("copilot/gpt-6-sol"),
+        ];
+
+        let ids = eligible_ids(models, &policy, 0);
+
+        assert_eq!(ids, ["copilot/gpt-6-preview", "copilot/gpt-6-sol"]);
+    }
+
+    #[test]
+    fn allow_beats_a_profile_exclude_only_for_the_model_it_names() {
+        let policy = policy_from(
+            r#"{"profiles":{"copilot":{"exclude":["gpt-*"]}},"allow":["copilot/gpt-6-sol"]}"#,
+        );
+        let models = vec![
+            model("copilot/gpt-6-sol"),
+            model("copilot/gpt-6-luna"),
+            model("llama_swap/gpt-6-sol"),
+        ];
+
+        let ids = eligible_ids(models, &policy, 0);
+
+        assert_eq!(ids, ["copilot/gpt-6-sol", "llama_swap/gpt-6-sol"]);
+    }
+
+    #[test]
+    fn allow_admits_a_model_outside_the_include_lists() {
+        let policy = policy_from(r#"{"include":["copilot/*"],"allow":["llama_swap/qwen*"]}"#);
+        let models = vec![
+            model("copilot/gpt-6-sol"),
+            model("llama_swap/qwen3.6-35b"),
+            model("llama_swap/other"),
+        ];
+
+        let ids = eligible_ids(models, &policy, 0);
+
+        assert_eq!(ids, ["copilot/gpt-6-sol", "llama_swap/qwen3.6-35b"]);
+    }
+
+    #[test]
+    fn allow_matches_the_bare_id_and_ignores_the_1m_suffix() {
+        let policy = policy_from(r#"{"exclude":["*"],"allow":["claude-opus-4.7[1m]"]}"#);
+        let models = vec![
+            model("copilot/claude-opus-4.7[1m]"),
+            model("copilot/gpt-6-sol"),
+        ];
+
+        let ids = eligible_ids(models, &policy, 0);
+
+        assert_eq!(ids, ["copilot/claude-opus-4.7[1m]"]);
+    }
+
+    #[test]
+    fn allow_never_lifts_not_chat_auto_or_hub() {
+        let policy = policy_from(r#"{"exclude":["*"],"allow":["*"]}"#);
+        let models = vec![
+            ModelDescriptor {
+                chat: false,
+                ..model("copilot/tts")
+            },
+            model("copilot/auto"),
+            model("hub/smart-auto-balance"),
+            model("copilot/gpt-6-sol"),
+        ];
+
+        let ids = eligible_ids(models, &policy, 0);
+
+        assert_eq!(ids, ["copilot/gpt-6-sol"]);
     }
 }

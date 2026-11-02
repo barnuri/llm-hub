@@ -945,6 +945,9 @@ button.stat-tile-link:hover {
 
   .topbar-actions {
     flex-wrap: wrap;
+    flex-shrink: 1;
+    min-width: 0;
+    max-width: 100%;
     padding: 6px 0;
   }
 

@@ -44,6 +44,7 @@ pub mod smart_auto_effort;
 pub mod smart_auto_pool;
 pub mod smart_auto_roles;
 pub mod smart_auto_router;
+pub mod smart_auto_rules;
 pub mod smart_auto_suitability;
 pub mod source_install;
 pub mod sse;

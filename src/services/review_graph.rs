@@ -12,12 +12,14 @@ use crate::services::smart_auto_pool::SmartAutoPool;
 pub struct ReviewGraph {
     /// Reviewers in call order, each a concrete model other than the solver.
     pub reviewers: Vec<ModelDescriptor>,
+    /// The next eligible candidate, which judges in place of a planned reviewer that answered.
+    pub spare: Option<ModelDescriptor>,
     /// The stage the reviewers run as: a judge for Balance, critics for Intelligence.
     pub reviewer_stage: SelectionStage,
+    /// True when the planned reviewers or the spare sit on a single-resident profile, so their calls run one at a time.
+    pub serialized: bool,
     /// True when a non-accepting verdict may trigger one repair call.
     pub repair: bool,
-    /// True when a reviewer sits on a single-resident local profile, so reviewer calls run one at a time.
-    pub serialized: bool,
     /// The limits the review runs under, solver call included.
     pub budget: StageBudget,
 }
@@ -47,6 +49,12 @@ impl ReviewGraph {
         if !reviewed_route || (request.plan_backed && request.role == WorkRole::Implementation) {
             return None;
         }
+        // Balance buffers a draft for review, so only the turns that need a second opinion are buffered.
+        if request.tier == SmartAutoTier::Balance
+            && !matches!(request.role, WorkRole::Planning | WorkRole::Implementation)
+        {
+            return None;
+        }
         let wanted = match request.tier {
             SmartAutoTier::Balance => Self::BALANCE_REVIEWERS,
             SmartAutoTier::Intelligence => Self::INTELLIGENCE_REVIEWERS,
@@ -67,16 +75,24 @@ impl ReviewGraph {
         candidates.sort_by_key(|descriptor| {
             Some(descriptor.profile.as_str()) == solver_profile.as_deref()
         });
-        let reviewers: Vec<ModelDescriptor> =
-            candidates.into_iter().take(wanted).cloned().collect();
+        let reviewers: Vec<ModelDescriptor> = candidates
+            .iter()
+            .take(wanted)
+            .map(|descriptor| (*descriptor).clone())
+            .collect();
         if reviewers.is_empty() {
             return None;
         }
+        let spare = candidates
+            .get(wanted)
+            .map(|descriptor| (*descriptor).clone());
         let serialized = reviewers
             .iter()
+            .chain(spare.iter())
             .any(|reviewer| is_single_resident(&reviewer.profile));
         Some(ReviewGraph {
             reviewers,
+            spare,
             reviewer_stage,
             repair: true,
             serialized,
@@ -159,6 +175,26 @@ mod tests {
         req.plan_backed = true;
         assert!(ReviewGraph::plan(&req, &never_resident).is_none());
         req.plan_backed = false;
+        assert!(ReviewGraph::plan(&req, &never_resident).is_some());
+    }
+
+    #[test]
+    fn balance_streams_turns_that_need_no_second_opinion() {
+        let snap = snapshot(vec![model("copilot", "judge", 200_000)]);
+        let policy = SmartAutoPolicy::default();
+        let mut req = request(SmartAutoTier::Balance, &snap, &policy);
+        for role in [
+            WorkRole::Conversation,
+            WorkRole::Investigation,
+            WorkRole::Validation,
+        ] {
+            req.role = role;
+            assert!(
+                ReviewGraph::plan(&req, &never_resident).is_none(),
+                "{role:?}"
+            );
+        }
+        req.role = WorkRole::Planning;
         assert!(ReviewGraph::plan(&req, &never_resident).is_some());
     }
 
@@ -258,5 +294,27 @@ mod tests {
         )
         .expect("reviews");
         assert!(graph.serialized);
+    }
+
+    #[test]
+    fn the_next_candidate_is_kept_as_the_spare() {
+        let snap = snapshot(vec![
+            model("copilot", "judge-a", 200_000),
+            model("local", "judge-c", 200_000),
+        ]);
+        let policy = SmartAutoPolicy::default();
+        let graph = ReviewGraph::plan(
+            &request(SmartAutoTier::Balance, &snap, &policy),
+            &never_resident,
+        )
+        .expect("reviews");
+        assert_eq!(graph.reviewers[0].qualified_id, "local/judge-c");
+        assert_eq!(
+            graph
+                .spare
+                .as_ref()
+                .map(|spare| spare.qualified_id.as_str()),
+            Some("copilot/judge-a")
+        );
     }
 }

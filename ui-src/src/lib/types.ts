@@ -301,3 +301,63 @@ export interface SelectionEvent {
 export interface SelectionHistoryResponse {
   readonly events: readonly SelectionEvent[];
 }
+
+/** The `selection` of `GET /api/smart-auto/current`: the worker's main solver event, its active stages and freshness. */
+export interface CurrentSelection {
+  readonly main: SelectionEvent | null;
+  readonly active: readonly SelectionEvent[];
+  readonly state: SelectionState;
+  readonly age_ms: number;
+  readonly stale: boolean;
+}
+
+/** `GET /api/smart-auto/current?session=<id>` (or `worker=<id>`); `selection` is null until the worker has one. */
+export interface CurrentSelectionResponse {
+  readonly selection: CurrentSelection | null;
+}
+
+/** Include and exclude globs over "profile/model" ids; "*" matches any run of characters, including "/". */
+export interface SmartAutoGlobs {
+  readonly include: readonly string[];
+  readonly exclude: readonly string[];
+}
+
+/** The Smart Auto rules document, from `GET` and `PUT /api/smart-auto/rules`. */
+export interface SmartAutoRules extends SmartAutoGlobs {
+  /** Global globs that let a model in even when an exclude or include list would keep it out. */
+  readonly allow: readonly string[];
+  readonly profiles: Readonly<Record<string, SmartAutoGlobs>>;
+}
+
+export type SmartAutoRulesSource = "file" | "env" | "none";
+
+/** `GET /api/smart-auto/rules`; `readonly` is true when LLM_HUB_SMART_AUTO_RULES controls the rules. */
+export interface SmartAutoRulesResponse {
+  readonly source: SmartAutoRulesSource;
+  readonly readonly: boolean;
+  readonly rules: SmartAutoRules;
+}
+
+/** Why the saved rules let a model in (`eligible`) or keep it out. */
+export type SmartAutoEffectReason =
+  | "eligible"
+  | "allowed_override"
+  | "excluded_by_global"
+  | "excluded_by_profile"
+  | "not_in_global_include"
+  | "not_in_profile_include"
+  | "not_chat"
+  | "auto_alias"
+  | "hub_namespace";
+
+/** One model from `GET /api/smart-auto/rules/effect`; `matched` is the glob that decided it, if any. */
+export interface SmartAutoEffectRow {
+  readonly qualified_id: string;
+  readonly eligible: boolean;
+  readonly reason: SmartAutoEffectReason;
+  readonly matched: string | null;
+}
+
+export interface SmartAutoEffectResponse {
+  readonly rows: readonly SmartAutoEffectRow[];
+}

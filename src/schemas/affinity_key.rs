@@ -56,6 +56,22 @@ impl AffinityKey {
             Self::globs(hasher, allow_list.iter());
         }
         Self::globs(hasher, policy.exclude.iter());
+        // Profile rules are hashed only when set, so a key without them stays as it was.
+        if !policy.profile_include.is_empty() || !policy.profile_exclude.is_empty() {
+            Self::part(hasher, &(policy.profile_include.len() as u64).to_le_bytes());
+            for (profile, lists) in &policy.profile_include {
+                Self::part(hasher, profile.as_bytes());
+                Self::part(hasher, &(lists.len() as u64).to_le_bytes());
+                for allow_list in lists {
+                    Self::globs(hasher, allow_list.iter());
+                }
+            }
+            Self::part(hasher, &(policy.profile_exclude.len() as u64).to_le_bytes());
+            for (profile, globs) in &policy.profile_exclude {
+                Self::part(hasher, profile.as_bytes());
+                Self::globs(hasher, globs.iter());
+            }
+        }
         for minimum in [
             policy.min_context_tokens,
             policy.min_input_tokens,

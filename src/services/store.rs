@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,6 +26,15 @@ const SELECTION_RETENTION_MS: u64 = 14 * MS_PER_DAY;
 const MS_PER_DAY: u64 = 86_400_000;
 /// The `install_settings` name that holds the salt of the scope keys.
 const INSTALL_SALT_NAME: &str = "selection_salt";
+
+/// The directory that holds the store file. Files kept beside the store, such as the Smart Auto rules, live here.
+#[must_use]
+pub fn store_dir(store_path: Option<&str>) -> PathBuf {
+    match Path::new(store_path.unwrap_or(DEFAULT_SQLITE_PATH)).parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
 
 /// Durable store behind `LLM_HUB_PERSISTENT=true`. Sqlite keeps a full request
 /// log; Json keeps a rolling recent window flushed on every write batch.

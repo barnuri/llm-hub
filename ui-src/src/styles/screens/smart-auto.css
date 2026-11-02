@@ -32,6 +32,210 @@
   overflow-wrap: anywhere;
 }
 
+.smart-auto > .smart-auto-current {
+  margin-top: 0;
+  margin-bottom: 16px;
+}
+
+.smart-auto-current-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 14px;
+  margin-bottom: 12px;
+}
+
+.smart-auto-current-input .input {
+  width: 320px;
+}
+
+.smart-auto-current-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px 16px;
+  margin: 0;
+}
+
+.smart-auto-current-facts > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.smart-auto-current-facts dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.smart-auto-current-facts dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.smart-auto > .smart-auto-rules {
+  margin-top: 0;
+  margin-bottom: 16px;
+}
+
+.smart-auto-rules-notice {
+  margin: 0 0 12px;
+}
+
+.smart-auto-rules-global {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.smart-auto-rules-group,
+.smart-auto-globs {
+  min-width: 0;
+}
+
+.smart-auto-rules-heading {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* A second heading inside one group, such as Global allow under Global exclude. */
+.smart-auto-rules-subheading {
+  margin-top: 16px;
+}
+
+.smart-auto-globs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.smart-auto-glob-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.smart-auto-glob {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding-right: 4px;
+  cursor: default;
+}
+
+.smart-auto-glob:hover {
+  border-color: var(--border);
+  color: var(--muted);
+}
+
+.smart-auto-glob-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.smart-auto-glob-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--muted);
+  font: 14px/1 var(--sans);
+  cursor: pointer;
+  transition: background-color var(--ease), color var(--ease);
+}
+
+.smart-auto-glob-remove:hover {
+  background: var(--danger-soft);
+  color: var(--danger-text);
+}
+
+.smart-auto-glob-remove:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 0;
+}
+
+.smart-auto-glob-remove:disabled {
+  opacity: 0.45;
+  background: none;
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.smart-auto-glob-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.smart-auto-glob-form .input {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+}
+
+.smart-auto-glob-form .btn {
+  flex-shrink: 0;
+}
+
+.smart-auto-rules-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 14px;
+  margin-bottom: 12px;
+}
+
+.smart-auto-rules-form .smart-auto-filter .input {
+  width: 240px;
+  max-width: 100%;
+}
+
+.smart-auto-rules-error {
+  min-width: 0;
+  color: var(--danger-text);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.smart-auto-rules-save {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 12px;
+  margin-top: 12px;
+}
+
+.smart-auto-effect {
+  margin-top: 16px;
+}
+
+.smart-auto-effect-summary {
+  margin: 0 0 8px;
+}
+
+.smart-auto-effect-reasons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
 .smart-auto-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -57,8 +261,13 @@
 
 .smart-auto-table .table td,
 .smart-auto-table .table th {
-  white-space: nowrap;
+  white-space: normal;
   vertical-align: top;
+}
+
+/* Long model names and hashes break inside the cell instead of pushing the table past the panel. */
+.smart-auto-table .table td.mono {
+  overflow-wrap: anywhere;
 }
 
 .smart-auto-table .table-scroll {
@@ -86,8 +295,181 @@
   white-space: normal;
 }
 
+/* A Results row is a button: a click flips the model between allowed and excluded. */
+.smart-auto-table tr[role="button"] {
+  cursor: pointer;
+}
+
+.smart-auto-table tr[role="button"]:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.smart-auto-table tr[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* How Smart Auto works: a single column of boxes. Boxes are HTML so their text wraps at any width. */
+.smart-auto-how-flow {
+  display: flex;
+  flex-direction: column;
+  max-width: 640px;
+  margin: 0 0 16px;
+  padding: 0;
+  list-style: none;
+}
+
+.smart-auto-how-item {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.smart-auto-how-step {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--panel-2);
+}
+
+.smart-auto-how-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font: 600 12px/1 var(--mono);
+}
+
+.smart-auto-how-text {
+  min-width: 0;
+}
+
+.smart-auto-how-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.smart-auto-how-detail {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.smart-auto-how-detail code,
+.smart-auto-how-where code {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.smart-auto-how-arrow {
+  display: block;
+  width: 100%;
+  max-width: 24px;
+  height: auto;
+  margin: 0 auto;
+  color: var(--muted);
+  overflow: visible;
+}
+
+.smart-auto-how-arrow path {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.smart-auto-how-where-heading {
+  margin-top: 16px;
+}
+
+.smart-auto-how-where {
+  margin: 0;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
+}
+
+.smart-auto-how-where li + li {
+  margin-top: 4px;
+}
+
 @media (max-width: 720px) {
   .smart-auto-kpis {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .smart-auto-kpis .kpi-value {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+  }
+
+  /* Each row becomes a stack of label and value, so all thirteen fields fit without a sideways scroll. */
+  .smart-auto-table .table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+
+  .smart-auto-table .table,
+  .smart-auto-table .table tbody {
+    display: block;
+    width: 100%;
+  }
+
+  .smart-auto-table .table tbody tr {
+    display: block;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .smart-auto-table .table tbody tr.turn-start {
+    border-top: 1px solid var(--border-strong);
+  }
+
+  .smart-auto-table .table td[data-label] {
+    display: grid;
+    grid-template-columns: minmax(96px, 38%) minmax(0, 1fr);
+    gap: 10px;
+    padding: 3px 10px;
+    border-bottom: 0;
+    text-align: left;
+  }
+
+  .smart-auto-table .table td[data-label]::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .smart-auto-table .table td:not([data-label]) {
+    display: block;
+  }
+
+  .smart-auto-table tr.turn-start td {
+    border-top: 0;
+  }
+
+  .smart-auto-table .table td.num {
+    text-align: left;
+  }
+
+  .smart-auto-table .smart-auto-reason {
+    min-width: 0;
   }
 }

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -227,10 +228,16 @@ impl ReviewOrchestrator {
         let stage = graph.reviewer_stage;
         let mut admitted: Vec<ModelId> = Vec::new();
         let mut failure: Option<&'static str> = None;
-        for reviewer in &graph.reviewers {
-            let Some(model) = ModelId::parse(&reviewer.qualified_id) else {
-                continue;
-            };
+        let mut spare = graph
+            .spare
+            .as_ref()
+            .and_then(|descriptor| ModelId::parse(&descriptor.qualified_id));
+        let mut queue: VecDeque<ModelId> = graph
+            .reviewers
+            .iter()
+            .filter_map(|descriptor| ModelId::parse(&descriptor.qualified_id))
+            .collect();
+        while let Some(model) = queue.pop_front() {
             if model.qualified() == solver.qualified() {
                 // The answering solver never judges its own draft, even when it is a fallback.
                 stages.push(Self::record(
@@ -239,6 +246,13 @@ impl ReviewOrchestrator {
                     SelectionState::Rejected,
                     Some(Self::REASON_REVIEWER_IS_SOLVER),
                 ));
+                // The spare candidate takes the seat the answering solver gives up.
+                if let Some(replacement) = spare
+                    .take()
+                    .filter(|replacement| replacement.qualified() != solver.qualified())
+                {
+                    queue.push_back(replacement);
+                }
                 continue;
             }
             if budget.admit_call() {
@@ -285,7 +299,16 @@ impl ReviewOrchestrator {
             budget.charge(tokens, bytes);
             match outcome {
                 Ok(verdict) => {
-                    stages.push(Self::record(stage, model, SelectionState::Completed, None));
+                    if matches!(verdict, ReviewVerdict::Reject { .. }) {
+                        stages.push(Self::record(
+                            stage,
+                            model,
+                            SelectionState::Rejected,
+                            Some(Self::REASON_DRAFT_REJECTED),
+                        ));
+                    } else {
+                        stages.push(Self::record(stage, model, SelectionState::Completed, None));
+                    }
                     verdicts.push(verdict);
                 }
                 Err(reason) => {
@@ -461,19 +484,17 @@ impl ReviewOrchestrator {
             stages,
             review_failed,
             reviewed,
+            rejected: false,
             aborted: false,
         }
     }
 
-    /// Builds the outcome of a draft a reviewer rejected, which is sent without a repair.
+    /// Builds the outcome of a draft a reviewer rejected: it gets no repair and is not sent.
     fn rejected(completion: Value, served: &ModelId, stages: Vec<StageRecord>) -> ReviewOutcome {
-        Self::finished(
-            completion,
-            served,
-            stages,
-            Some(Self::REASON_DRAFT_REJECTED),
-            true,
-        )
+        ReviewOutcome {
+            rejected: true,
+            ..Self::finished(completion, served, stages, None, true)
+        }
     }
 
     /// Builds the outcome of a review the caller dropped, with no completion to send.
@@ -610,6 +631,7 @@ mod tests {
             } else {
                 SelectionStage::Judge
             },
+            spare: None,
             repair: true,
             serialized: false,
             budget: StageBudget::for_tier(tier).expect("reviewed tier"),
@@ -882,13 +904,60 @@ mod tests {
         )
         .await
         .expect("solver succeeds");
-        assert_eq!(
-            outcome.review_failed,
-            Some(ReviewOrchestrator::REASON_DRAFT_REJECTED)
+        assert!(
+            outcome.review_failed.is_none(),
+            "a rejection is not a failed review"
         );
-        assert!(outcome.reviewed && !outcome.aborted);
+        assert!(outcome.rejected && outcome.reviewed && !outcome.aborted);
         assert_eq!(transport.calls(), 1);
         assert!(stage_states(&outcome, SelectionStage::Repair).is_empty());
+        assert_eq!(
+            stage_states(&outcome, SelectionStage::Judge),
+            [SelectionState::Started, SelectionState::Rejected]
+        );
+        assert_eq!(
+            outcome.stages.last().and_then(|record| record.reason),
+            Some(ReviewOrchestrator::REASON_DRAFT_REJECTED)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fallback_answer_hands_its_reviewer_seat_to_the_spare() {
+        let transport = Scripted::new(vec![reply(r#"{"verdict":"accept"}"#)], Duration::ZERO);
+        let mut seated = graph(SmartAutoTier::Balance, 0);
+        // The planned reviewer is the model that answered, so the spare judges instead.
+        seated.reviewers = vec![judge_descriptor("solver")];
+        seated.spare = Some(judge_descriptor("judge-0"));
+        let outcome = ReviewOrchestrator::run(
+            std::future::ready(reply("The sum is 5.")),
+            &solver(),
+            &seated,
+            &transport,
+            evidence(),
+            never(),
+        )
+        .await
+        .expect("solver succeeds");
+        assert!(outcome.reviewed && outcome.review_failed.is_none());
+        assert_eq!(transport.calls(), 1);
+        assert_eq!(
+            stage_states(&outcome, SelectionStage::Judge),
+            [
+                SelectionState::Rejected,
+                SelectionState::Started,
+                SelectionState::Completed
+            ]
+        );
+        let judges: Vec<&str> = outcome
+            .stages
+            .iter()
+            .filter(|record| record.stage == SelectionStage::Judge)
+            .map(|record| record.model.as_str())
+            .collect();
+        assert_eq!(
+            judges,
+            ["copilot/solver", "copilot/judge-0", "copilot/judge-0"]
+        );
     }
 
     #[tokio::test]

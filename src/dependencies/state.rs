@@ -22,8 +22,9 @@ use crate::services::process_gh_cli::ProcessGhCli;
 use crate::services::selection_log::SelectionLog;
 use crate::services::smart_auto_affinity::SmartAutoAffinity;
 use crate::services::smart_auto_decisions::SmartAutoDecisionLog;
+use crate::services::smart_auto_rules::SmartAutoRulesStore;
 use crate::services::stats::StatsRegistry;
-use crate::services::store::{Store, now_ms};
+use crate::services::store::{Store, now_ms, store_dir};
 use crate::services::upstream::build_clients;
 
 pub struct CachedModels {
@@ -64,6 +65,8 @@ struct Inner {
     smart_auto_decisions: SmartAutoDecisionLog,
     /// The selection history of Smart Auto and Copilot Auto dispatches.
     selection_log: SelectionLog,
+    /// The user-editable Smart Auto include and exclude rules.
+    smart_auto_rules: SmartAutoRulesStore,
 }
 
 #[derive(Clone)]
@@ -101,6 +104,10 @@ impl AppState {
         ));
         let unsupported_body_fields = UnsupportedBodyFields::load(store.as_deref());
         let selection_log = SelectionLog::open(store.clone());
+        let smart_auto_rules = SmartAutoRulesStore::open(
+            &store_dir(config.store_path.as_deref()),
+            config.smart_auto_rules_env.as_deref(),
+        )?;
         let state = AppState(Arc::new(Inner {
             config: ArcSwap::from_pointee(config),
             clients: ArcSwap::from_pointee(clients),
@@ -124,6 +131,7 @@ impl AppState {
             smart_auto_affinity: SmartAutoAffinity::new(),
             smart_auto_decisions: SmartAutoDecisionLog::default(),
             selection_log,
+            smart_auto_rules,
         }));
         state.refresh_api_key_hashes();
         Ok(state)
@@ -299,6 +307,11 @@ impl AppState {
     /// The bounded log of Smart Auto routes.
     pub fn smart_auto_decisions(&self) -> &SmartAutoDecisionLog {
         &self.0.smart_auto_decisions
+    }
+
+    /// The Smart Auto include and exclude rules, read at startup and on each save.
+    pub fn smart_auto_rules(&self) -> &SmartAutoRulesStore {
+        &self.0.smart_auto_rules
     }
 
     /// The selection history that Smart Auto and Copilot Auto dispatches are recorded in.
