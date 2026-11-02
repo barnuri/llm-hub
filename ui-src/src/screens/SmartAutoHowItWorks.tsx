@@ -22,11 +22,11 @@ const STEPS: readonly Step[] = [
     ),
   },
   {
-    title: "Read the selector and the tier",
+    title: "Read the selector and tier",
     detail: (
       <>
-        The selector and the tier come from the model name. The request headers add tier, include, exclude, min
-        context, role and rules mode (<code>x-llm-hub-smart-auto-*</code>).
+        The model name sets the tier. Headers (<code>x-llm-hub-smart-auto-*</code>) add more filters, minimums, a role
+        and a rules mode.
       </>
     ),
   },
@@ -34,20 +34,20 @@ const STEPS: readonly Step[] = [
     title: "Rules layer",
     detail: (
       <>
-        <code>LLM_HUB_SMART_AUTO_RULES</code>, when set, replaces everything else. Otherwise the rules come from the UI
-        rules file: the global lists and each profile's lists.
+        <code>LLM_HUB_SMART_AUTO_RULES</code>, if set, replaces everything else. Otherwise the saved rules file applies:
+        the global lists and each profile's lists.
       </>
     ),
   },
   {
     title: "Merge",
     detail:
-      "The rules, the selector and the headers combine. They only tighten the pool. A header can widen it only when no env rules are set.",
+      "Rules, selector and headers combine. They only narrow the pool. A header can widen it only when no env rules are set.",
   },
   {
     title: "Eligible pool",
     detail:
-      "Chat models only, with no Auto aliases. Then the profile filter, the include and exclude globs, the minimum context and the prompt fit. A model with unknown capacity fails any minimum.",
+      "Chat models only, with no Auto aliases. Then profile, include and exclude filters, minimums and prompt size. Unknown capacity fails any minimum.",
   },
   {
     title: "Classify the role",
@@ -55,34 +55,33 @@ const STEPS: readonly Step[] = [
       "Each turn gets a role: planning, investigation, implementation, validation or conversation. It is also marked plan-backed or not.",
   },
   {
-    title: "Session pin",
+    title: "Keep the same model",
     detail:
-      "The session keeps the same model to reuse the prompt cache. Tool follow-ups replay that model. The model switches only on a real change in the work.",
+      "The session keeps its model, so the prompt cache stays warm. Tool follow-ups use that model. It switches only when the work really changes.",
   },
   {
     title: "Pick the model",
-    detail: "The pick weighs suitability for the role and the tier. Usage breaks ties.",
+    detail: "Picks the best model for the role and tier. Usage breaks ties.",
   },
   {
     title: "Effort",
     detail:
-      "The tier and the role set the default effort. The client's effort is ignored. The value snaps to the levels the model publishes.",
+      "The tier and role set the effort. The client's effort is ignored. The value snaps to a level the model supports.",
   },
   {
-    title: "Review",
+    title: "A second model checks",
     detail:
-      "Balance reviews planning and implementation turns. Intelligence uses a critic. The reviewer runs on another profile and is never the answering model.",
+      "Balance checks planning and implementation turns. Intelligence checks with up to two models. The checker uses another profile and is never the answering model.",
   },
   {
     title: "Stream or buffer",
-    detail: "Reviewed turns are buffered. All other turns stream.",
+    detail: "Checked turns are held until the check ends. All other turns stream.",
   },
   {
     title: "Fallbacks and history",
     detail: (
       <>
-        Fallbacks are re-checked against the same pool. A history event is written, and the status line shows the
-        current selection.
+        Fallbacks use the same filters. Each choice is written to history. The status line shows the current model.
       </>
     ),
   },
@@ -99,12 +98,12 @@ const TIERS: readonly TierRow[] = [
   { tier: "Efficiency", optimises: "Cost", review: "None", buffering: "Streams" },
   {
     tier: "Balance (default)",
-    optimises: "Balanced",
+    optimises: "Cost and quality",
     review: "Planning and implementation",
-    buffering: "Reviewed turns buffered, others stream",
+    buffering: "Checked turns buffered, others stream",
   },
-  { tier: "Intelligence", optimises: "Quality", review: "Critic", buffering: "Buffered" },
-  { tier: "Fast", optimises: "Latency", review: "None", buffering: "Streams" },
+  { tier: "Intelligence", optimises: "Quality", review: "Up to two models", buffering: "Buffered" },
+  { tier: "Fast", optimises: "Speed", review: "None", buffering: "Streams" },
 ];
 
 function FlowArrow() {
@@ -166,10 +165,10 @@ export function SmartAutoHowItWorks() {
       <h3 className="smart-auto-rules-heading smart-auto-how-where-heading">Where to see it</h3>
       <ul className="smart-auto-how-where">
         <li>
-          This tab: the current selection panel shows one session's or worker's selection, the rules panel shows the
-          saved rules, and the timeline shows the history.
+          This tab: the current selection panel shows one session's or worker's model, the rules panel shows the saved
+          rules, and the timeline shows history.
         </li>
-        <li>The status line shows the current selection.</li>
+        <li>The status line shows the current model.</li>
         <li>
           Hub endpoints: <code>/api/smart-auto/current</code>, <code>/api/smart-auto/history</code> and{" "}
           <code>/api/smart-auto/rules</code>.

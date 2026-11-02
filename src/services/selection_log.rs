@@ -87,14 +87,20 @@ impl SelectionLog {
         writer: Option<SyncSender<SelectionEvent>>,
     ) -> SelectionLog {
         let last_seq = history.iter().map(|event| event.seq).max().unwrap_or(0);
+        let mut state = LogState {
+            last_seq,
+            ring: VecDeque::default(),
+            current: HashMap::new(),
+        };
+        // Rebuild each worker's current selection from the reloaded history, so a restart keeps it.
+        for event in &history {
+            state.apply_current(event);
+        }
+        state.ring = history.into_iter().collect();
         SelectionLog {
             salt,
             attempts: AtomicU64::new(0),
-            state: Mutex::new(LogState {
-                last_seq,
-                ring: history.into_iter().collect(),
-                current: HashMap::new(),
-            }),
+            state: Mutex::new(state),
             writer,
         }
     }
@@ -549,7 +555,8 @@ mod tests {
 
         assert_eq!(reloaded.len(), 2);
         assert_eq!(log.scope_key(ScopeKind::Worker, WORKER), key);
-        assert!(log.current(&key, now_ms()).is_none());
+        // The current selection is rebuilt from the saved history, so it survives the restart.
+        assert!(log.current(&key, now_ms()).is_some());
         log.record(event(
             None,
             SelectionStage::Solver,

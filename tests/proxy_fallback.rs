@@ -596,6 +596,49 @@ async fn a_tool_continuation_stays_on_the_routed_solver() {
 }
 
 #[tokio::test]
+async fn a_tier_header_that_conflicts_with_the_model_is_refused() {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    let (_hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("x-llm-hub-smart-auto-tier", "fast")
+        .json(&chat_body("hub/smart-auto-balance"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 400);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("conflicts with model"), "{body}");
+    assert!(chat_requests(&alpha).await.is_empty());
+    assert!(chat_requests(&beta).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_tier_header_that_matches_the_model_is_accepted() {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ok_completion())
+        .mount(&alpha)
+        .await;
+    let (_hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("x-llm-hub-smart-auto-tier", "balance")
+        .json(&chat_body("hub/smart-auto-balance"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
 async fn smart_auto_dispatch_is_visible_in_the_selection_history() {
     let alpha = listing_upstream("m1").await;
     let beta = listing_upstream("m2").await;

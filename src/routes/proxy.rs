@@ -479,6 +479,14 @@ fn resolve_hub(
         return Ok(HubResolution::NotHub(fallbacks));
     };
     let caller = SmartAutoHeaders::from_headers(headers)?;
+    // The tier is chosen by the model id; a header that names another tier is refused, never ignored.
+    if let Some(header_tier) = caller.policy.tier.filter(|tier| *tier != selector.tier) {
+        return Err(AppError::BadRequest(format!(
+            "tier header `{}` conflicts with model `{}`: use the matching model id or remove the header",
+            header_tier.as_str(),
+            selector.name,
+        )));
+    }
     let rules = state.smart_auto_rules().current();
     let policy = rules.layer(
         caller.rules_mode.unwrap_or_default(),
