@@ -53,6 +53,15 @@ fn chat_body(model: &str, stream: bool) -> serde_json::Value {
     })
 }
 
+/// Asserts that `upstream` received no review judge request.
+async fn assert_no_judge_calls(upstream: &MockServer) {
+    assert!(
+        requests_on(upstream, "/chat/completions", true)
+            .await
+            .is_empty()
+    );
+}
+
 /// Every request the upstream received on `route` and whether it carried the judge marker.
 async fn requests_on(upstream: &MockServer, route: &str, judge: bool) -> Vec<Request> {
     upstream
@@ -168,11 +177,7 @@ async fn responses_route_skips_review() {
 
     assert_eq!(response.status(), 200);
     for upstream in [&alpha, &beta] {
-        assert!(
-            requests_on(upstream, "/chat/completions", true)
-                .await
-                .is_empty()
-        );
+        assert_no_judge_calls(upstream).await;
     }
 }
 
@@ -195,10 +200,6 @@ async fn a_reply_over_the_review_byte_cap_is_delivered_unreviewed() {
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], draft.as_str());
     for upstream in [&alpha, &beta] {
-        assert!(
-            requests_on(upstream, "/chat/completions", true)
-                .await
-                .is_empty()
-        );
+        assert_no_judge_calls(upstream).await;
     }
 }

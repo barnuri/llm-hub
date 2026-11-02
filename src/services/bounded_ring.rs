@@ -21,6 +21,9 @@ impl<T> BoundedRing<T> {
 
     /// Appends `item`, dropping the oldest entry when the ring is full.
     pub fn push(&mut self, item: T) {
+        if self.capacity == 0 {
+            return;
+        }
         if self.items.len() >= self.capacity {
             self.items.pop_front();
         }
@@ -30,5 +33,38 @@ impl<T> BoundedRing<T> {
     /// The entries, oldest first.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
         self.items.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pushing_up_to_capacity_keeps_every_item_in_order() {
+        let mut ring = BoundedRing::new(3);
+        ring.push(1);
+        ring.push(2);
+        ring.push(3);
+
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn one_more_push_evicts_the_oldest_item() {
+        let mut ring = BoundedRing::new(3);
+        for item in 1..=4 {
+            ring.push(item);
+        }
+
+        assert_eq!(ring.iter().copied().collect::<Vec<_>>(), [2, 3, 4]);
+    }
+
+    #[test]
+    fn zero_capacity_keeps_nothing() {
+        let mut ring = BoundedRing::new(0);
+        ring.push(1);
+
+        assert_eq!(ring.iter().count(), 0);
     }
 }

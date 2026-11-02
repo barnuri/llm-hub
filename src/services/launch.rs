@@ -67,6 +67,21 @@ impl LaunchCommand {
             args,
         }))
     }
+
+    /// A tier flag must name the tier of a `hub/smart-auto-<tier>` model, as the proxy refuses it otherwise.
+    fn check_tier_matches(model: &str, smart_auto: &SmartAutoFlags) -> Result<(), String> {
+        let Some(header_tier) = smart_auto.tier() else {
+            return Ok(());
+        };
+        match HubSelector::parse(model, &BTreeMap::new()).ok().flatten() {
+            Some(selector) if selector.tier != header_tier => Err(format!(
+                "tier header `{}` conflicts with model `{}`: use the matching model id or remove the header",
+                header_tier.as_str(),
+                model,
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Checks that the hub answers, then replaces this process with the harness.
@@ -151,27 +166,12 @@ fn claude_model(
         }
         Some(_) if smart_auto.is_empty() => Ok(args),
         Some(model) if model.starts_with(&hub_prefix) => {
-            check_tier_matches(&model, smart_auto)?;
+            LaunchCommand::check_tier_matches(&model, smart_auto)?;
             Ok(args)
         }
         Some(model) => Err(format!(
             "--smart-auto-* only applies to a {hub_prefix} model, and {model} is not one: name a {hub_prefix} model or drop the --smart-auto-* flags"
         )),
-    }
-}
-
-/// A tier flag must name the tier of a `hub/smart-auto-<tier>` model, as the proxy refuses it otherwise.
-fn check_tier_matches(model: &str, smart_auto: &SmartAutoFlags) -> Result<(), String> {
-    let Some(header_tier) = smart_auto.tier() else {
-        return Ok(());
-    };
-    match HubSelector::parse(model, &BTreeMap::new()).ok().flatten() {
-        Some(selector) if selector.tier != header_tier => Err(format!(
-            "tier header `{}` conflicts with model `{}`: use the matching model id or remove the header",
-            header_tier.as_str(),
-            model,
-        )),
-        _ => Ok(()),
     }
 }
 

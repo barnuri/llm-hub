@@ -215,7 +215,7 @@ function CurrentSelectionPanel() {
           setUnavailable(false);
           setSelection(body.selection);
         }
-      } catch (err: unknown) {
+      } catch {
         if (!cancelled) {
           setUnavailable(true);
         }
@@ -400,16 +400,14 @@ function isAllowed(row: SmartAutoEffectRow): boolean {
   return row.eligible || row.reason === "allowed_override";
 }
 
-/**
- * `saved` with one Results row flipped, or null when no global list edit can flip it.
- * An allowed row moves from the global allow to the global exclude, and an excluded row moves back.
- */
 /** True when a `*` glob matches the whole id, with `*` standing for any run of characters. */
 function globMatches(glob: string, id: string): boolean {
   const pattern = glob.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*");
   return new RegExp(`^${pattern}$`).test(id);
 }
 
+/** `saved` with one Results row flipped, or null when no global list edit can flip it.
+ * An allowed row moves from the global allow to the global exclude, and an excluded row moves back. */
 function rulesWithResultToggled(saved: SmartAutoRules, row: SmartAutoEffectRow): SmartAutoRules | null {
   const id = row.qualified_id;
   if (isAllowed(row)) {
@@ -1078,7 +1076,7 @@ export function SmartAutoScreen({ profiles }: SmartAutoScreenProps) {
           setUnavailable(false);
           setEvents((current) => [...(current ?? []), ...fresh].slice(-MAX_EVENTS));
         }
-      } catch (err: unknown) {
+      } catch {
         if (!cancelled) {
           setUnavailable(true);
         }

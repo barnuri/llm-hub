@@ -159,7 +159,7 @@ Among eligible models, the router picks the highest score. Ties go to the most u
   - Intelligence: quality 6, cheapness 0, speed 1.
   - Fast: quality 1, cheapness 1, speed 4.
 - **Capable bonus.** A model whose role quality is at least 5 gets +1000. So every capable model beats every other one.
-- **Usage.** The 30-day request count gives 0 points below 256 requests, 1 point below 65,536, and 2 points above. Usage only separates near ties.
+- **Usage.** The 30-day request count gives 0 points below 128 requests, 1 point below 32,768, and 2 points above. Usage only separates near ties.
 
 Ranking uses these built-in seeds and the usage counts. It does not use measured latency or quality.
 
