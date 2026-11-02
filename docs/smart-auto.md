@@ -52,7 +52,7 @@ flowchart TD
     J --> K["Router picks model"]
     K --> L["Set effort"]
     L --> M{"Checker runs?"}
-    M -->|"Balance: planning or implementation, not plan-backed"| N["Check, one fix at most"]
+    M -->|"Balance: planning or implementation, except plan-backed implementation"| N["Check, one fix at most"]
     M -->|"Intelligence, not plan-backed implementation"| O["Check, up to two checkers"]
     M -->|"Other turns, Efficiency, Fast"| P["No check"]
     N --> Q["Stream or buffer"]
