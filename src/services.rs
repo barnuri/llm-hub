@@ -7,6 +7,7 @@ pub mod config_reload;
 pub mod copilot_auto;
 pub mod copilot_auto_decisions;
 pub mod copilot_body_fields;
+pub mod copilot_descriptions;
 pub mod copilot_headers;
 pub mod copilot_login;
 pub mod copilot_prices;

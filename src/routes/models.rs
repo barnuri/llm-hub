@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::Json;
 use axum::extract::{Query, Request, State};
@@ -25,6 +25,7 @@ use crate::schemas::upstream_model::UpstreamModel;
 use crate::services::copilot_auto::{
     AUTO_MODEL, AutoTier, CHAT_ENDPOINT, MESSAGES_ENDPOINT, RESPONSES_ENDPOINT,
 };
+use crate::services::copilot_prices::CopilotPrices;
 use crate::services::model_descriptors::ModelDescriptors;
 use crate::services::model_limits::ModelLimit;
 use crate::services::smart_auto_pool::SmartAutoPool;
@@ -133,10 +134,47 @@ pub async fn refresh_models(state: &AppState) -> Value {
     if crate::services::pricing::annotate_listing(&mut merged, &state.pricing_book()) {
         state.copilot_prices().request_refresh();
     }
+    let copilot_profiles: HashSet<&str> = config
+        .profiles
+        .iter()
+        .filter(|p| p.enabled && p.copilot.is_some())
+        .map(|p| p.name.as_str())
+        .collect();
+    annotate_copilot_descriptions(
+        &mut merged,
+        &copilot_profiles,
+        &state.copilot_descriptions().snapshot(),
+    );
     merged.extend(smart_auto_entries(&state.model_descriptors()));
     let payload = json!({ "object": "list", "data": merged });
     state.set_model_cache(payload.clone());
     payload
+}
+
+/// Replaces the `via llm-hub profile` text of a Copilot model that has a GitHub Docs row.
+/// The Smart Auto tiers keep their own description, and a model without a row keeps its text.
+fn annotate_copilot_descriptions(
+    models: &mut [Value],
+    copilot_profiles: &HashSet<&str>,
+    table: &HashMap<String, String>,
+) {
+    for model in models {
+        let Some(id) = model.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((profile, bare)) = id.split_once('/') else {
+            continue;
+        };
+        if !copilot_profiles.contains(profile) || AutoTier::from_model(bare).is_some() {
+            continue;
+        }
+        let Some(text) = table.get(&CopilotPrices::normalize_id(bare)) else {
+            continue;
+        };
+        if let Some(obj) = model.as_object_mut() {
+            obj.insert("description".into(), json!(text));
+        }
+    }
 }
 
 /// One profile's advertised `/v1/models` entries and the descriptors of its concrete models.
@@ -1341,6 +1379,104 @@ mod tests {
         let models = static_models(&profile("local", &["qwen3"]));
         assert_eq!(models[0]["display_name"], "qwen3 · local");
         assert_eq!(models[0]["description"], "via llm-hub profile local");
+    }
+
+    fn docs_table() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "gpt-6-luna".to_string(),
+                "Fast help with simple tasks.".to_string(),
+            ),
+            ("claude-opus-4-8".to_string(), "Deep reasoning.".to_string()),
+            (
+                "claude-opus-4-8-fast".to_string(),
+                "Quick Opus.".to_string(),
+            ),
+            (
+                "auto-fast".to_string(),
+                "Docs text for an Auto tier.".to_string(),
+            ),
+        ])
+    }
+
+    /// Runs the post-pass on one model and returns its description afterwards.
+    fn described(id: &str, description: &str, copilot_profiles: &[&str]) -> String {
+        let mut models = [json!({"id": id, "description": description})];
+        let profiles: HashSet<&str> = copilot_profiles.iter().copied().collect();
+        annotate_copilot_descriptions(&mut models, &profiles, &docs_table());
+        models[0]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn copilot_model_takes_the_docs_description() {
+        assert_eq!(
+            described(
+                "copilot/gpt-6-luna",
+                "via llm-hub profile copilot",
+                &["copilot"]
+            ),
+            "Fast help with simple tasks."
+        );
+    }
+
+    #[test]
+    fn copilot_dotted_fast_model_takes_its_dashed_docs_row() {
+        assert_eq!(
+            described(
+                "copilot/claude-opus-4.8-fast",
+                "via llm-hub profile copilot",
+                &["copilot"]
+            ),
+            "Quick Opus."
+        );
+    }
+
+    #[test]
+    fn copilot_1m_model_takes_the_base_docs_row() {
+        assert_eq!(
+            described(
+                "copilot/claude-opus-4-8[1m]",
+                "via llm-hub profile copilot",
+                &["copilot"]
+            ),
+            "Deep reasoning."
+        );
+    }
+
+    #[test]
+    fn copilot_model_without_docs_row_keeps_profile_text() {
+        assert_eq!(
+            described(
+                "copilot/mai-code-1.1-flash",
+                "via llm-hub profile copilot",
+                &["copilot"]
+            ),
+            "via llm-hub profile copilot"
+        );
+    }
+
+    #[test]
+    fn copilot_auto_tier_keeps_its_own_description() {
+        let tier_text = AutoTier::Fast.description();
+        assert_eq!(
+            described("copilot/auto-fast", tier_text, &["copilot"]),
+            tier_text
+        );
+    }
+
+    #[test]
+    fn non_copilot_model_with_a_docs_row_keeps_profile_text() {
+        assert_eq!(
+            described(
+                "local/gpt-6-luna",
+                "via llm-hub profile local",
+                &["copilot"]
+            ),
+            "via llm-hub profile local"
+        );
     }
 
     #[tokio::test]
