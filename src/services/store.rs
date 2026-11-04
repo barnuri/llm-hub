@@ -41,7 +41,7 @@ pub fn store_dir(store_path: Option<&str>) -> PathBuf {
 #[derive(Debug)]
 pub enum Store {
     Sqlite(Mutex<Connection>),
-    Json(Mutex<JsonStore>),
+    Json(Box<Mutex<JsonStore>>),
 }
 
 #[derive(Debug)]
@@ -170,10 +170,10 @@ impl Store {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(_) => JsonState::default(),
         };
-        Store::Json(Mutex::new(JsonStore {
+        Store::Json(Box::new(Mutex::new(JsonStore {
             path: path_buf,
             state,
-        }))
+        })))
     }
 
     pub fn record(&self, outcome: &RequestOutcome) -> Result<(), String> {
