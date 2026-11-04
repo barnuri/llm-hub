@@ -13,6 +13,8 @@ const PUBLIC_GITHUB_HOST: &str = "github.com";
 const PUBLIC_TOKEN_VAR: &str = "GH_TOKEN";
 const ENTERPRISE_TOKEN_VAR: &str = "GH_ENTERPRISE_TOKEN";
 const MAX_STDERR_CHARS: usize = 200;
+const SPAWN_BUSY_ATTEMPTS: u32 = 5;
+const SPAWN_BUSY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// Runs the real gh binary, without a shell. A token in the process
 /// environment wins, the same way gh itself resolves one.
@@ -57,7 +59,7 @@ async fn run_gh(gh_path: &str, host: &str, user: Option<&str>, limit: Duration) 
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let child = match command.spawn() {
+    let child = match spawn_retrying_busy(&mut command).await {
         Ok(child) => child,
         Err(e) if e.kind() == ErrorKind::NotFound => return GhOutcome::NotInstalled,
         Err(e) => return GhOutcome::Failed(format!("{gh_path} could not start: {e}")),
@@ -85,6 +87,23 @@ async fn run_gh(gh_path: &str, host: &str, user: Option<&str>, limit: Duration) 
         return GhOutcome::Failed(format!("{gh_path} auth token printed no usable token"));
     }
     GhOutcome::Token(token.to_string())
+}
+
+/// Linux refuses to run a file another process still holds open for writing (ETXTBSY),
+/// e.g. while `gh` is being replaced. That clears within milliseconds, so retry briefly.
+async fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<tokio::process::Child> {
+    let mut attempt = 1;
+    loop {
+        match command.spawn() {
+            Err(e)
+                if e.kind() == ErrorKind::ExecutableFileBusy && attempt < SPAWN_BUSY_ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(SPAWN_BUSY_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
 }
 
 fn first_stderr_line(stderr: &[u8]) -> String {
