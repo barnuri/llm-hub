@@ -13,6 +13,7 @@ use crate::routes::models::send_models_request;
 use crate::schemas::api_key_input::ApiKeyInput;
 use crate::schemas::api_key_record::ApiKeyRecord;
 use crate::schemas::app_error::AppError;
+use crate::schemas::copilot_prices_input::CopilotPricesInput;
 use crate::schemas::errors_report::ErrorsReport;
 use crate::schemas::fallbacks_input::FallbacksInput;
 use crate::schemas::insights::insights_report::InsightsReport;
@@ -46,6 +47,7 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
                 "models": p.static_models,
                 "healthy": health.get(&p.name).copied(),
                 "managed": p.managed.is_some(),
+                "copilot": p.copilot.is_some(),
                 "running": state.managed().is_running(&p.name),
             })
         })
@@ -54,6 +56,7 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
         "profiles": profiles,
         "default_fallbacks": config.default_fallbacks,
         "readonly": config.config_readonly,
+        "copilot_prices_refresh_secs": config.copilot_prices_refresh.map_or(0, |d| d.as_secs()),
         "persistent": config.persistent,
         "auth_enabled": config.master_key.is_some() || !state.api_key_hashes().is_empty(),
         "version": VERSION,
@@ -132,6 +135,20 @@ pub async fn set_default_fallbacks(
         .map_err(AppError::BadRequest)?;
     env_writer::set_default_fallbacks(Path::new(ENV_FILE), &chain).map_err(AppError::Internal)?;
     reload_config(&state)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn set_copilot_prices(
+    State(state): State<AppState>,
+    Json(input): Json<CopilotPricesInput>,
+) -> Result<Json<Value>, AppError> {
+    if state.config().config_readonly {
+        return Err(AppError::ReadOnly);
+    }
+    env_writer::set_copilot_prices_refresh(Path::new(ENV_FILE), input.refresh_secs)
+        .map_err(AppError::Internal)?;
+    reload_config(&state)?;
+    state.copilot_prices().request_refresh();
     Ok(Json(json!({ "ok": true })))
 }
 

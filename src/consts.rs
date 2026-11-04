@@ -150,8 +150,8 @@ pub const COPILOT_USER_RETRY: Duration = Duration::from_mins(1);
 pub const COPILOT_USAGE_TTL: Duration = Duration::from_mins(1);
 /// GitHub's "Models and pricing for GitHub Copilot" page, served as Markdown.
 pub const COPILOT_PRICES_URL: &str = "https://docs.github.com/api/article/body?pathname=/en/copilot/reference/copilot-billing/models-and-pricing";
-/// How often the Copilot price table is fetched while a Copilot profile is enabled.
-pub const COPILOT_PRICES_REFRESH: Duration = Duration::from_hours(24);
+/// Default for `LLM_HUB_COPILOT_PRICES_REFRESH_SECS`: fetch the Copilot price table daily.
+pub const DEFAULT_COPILOT_PRICES_REFRESH_SECS: u64 = 86_400;
 /// The shortest time between two fetches, so an unpriced model cannot cause a fetch loop.
 pub const COPILOT_PRICES_MIN_GAP: Duration = Duration::from_hours(1);
 /// Suffix of a model id advertised with a one-million-token window.

@@ -24,6 +24,7 @@ Boolean flags accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off`.
 | `LLM_HUB_MAX_REPLAY_BYTES` | `268435456` (256 MB) | Largest request body the hub buffers for fallback replay and Anthropic translation. |
 | `LLM_HUB_STREAM_ROLE` | `true` | Add `role: "assistant"` to the first streamed delta when the upstream leaves it out. |
 | `LLM_HUB_SSE_KEEPALIVE_MS` | `15000` | Idle time before an SSE keepalive comment. `0` turns it off. |
+| `LLM_HUB_COPILOT_PRICES_REFRESH_SECS` | `86400` (24 hours) | How often the hub fetches Copilot model prices from GitHub Docs while a Copilot profile is enabled. Fetches stay at least 1 hour apart. `0` turns the fetch off and the built-in prices apply. Editable on the Models page. |
 | `LLM_HUB_COPILOT_GUARD_MODELS` | `*` | Models (`<model>`, `<profile>/<model>` or `*`) whose Copilot CLI requests get the tool-loop guard. The guard adds a system-prompt note. It also withholds a tool that the history shows called the same way 3 times in a row. Empty turns it off. |
 | `LLM_HUB_COPILOT_STRIP_SAMPLING_MODELS` | 10 local model ids (`DEFAULT_COPILOT_STRIP_SAMPLING_MODELS` in `src/services/transforms.rs`) | Models whose Copilot CLI requests lose Copilot's fixed `temperature`, `top_p` and penalties, so the model's own sampling applies. Empty turns it off. |
 

@@ -406,6 +406,10 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/api/copilot/usage", get(routes::copilot::usage))
         .route("/api/fallbacks", post(routes::admin::set_default_fallbacks))
+        .route(
+            "/api/copilot/prices",
+            post(routes::admin::set_copilot_prices),
+        )
         .route("/api/restart", post(routes::admin::restart_server))
         .route("/api/stats", get(routes::admin::stats))
         .route("/api/usage", get(routes::admin::usage))

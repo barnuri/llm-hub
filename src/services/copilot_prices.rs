@@ -9,8 +9,7 @@ use tokio::time::Instant;
 
 use crate::configs::TokenRates;
 use crate::consts::{
-    COPILOT_PRICES_MIN_GAP, COPILOT_PRICES_REFRESH, COPILOT_PRICES_TIMEOUT, COPILOT_PRICES_URL,
-    LONG_CONTEXT_SUFFIX,
+    COPILOT_PRICES_MIN_GAP, COPILOT_PRICES_TIMEOUT, COPILOT_PRICES_URL, LONG_CONTEXT_SUFFIX,
 };
 use crate::dependencies::state::AppState;
 
@@ -83,8 +82,8 @@ impl CopilotPrices {
         prices
     }
 
-    /// Fetches at startup and every [`COPILOT_PRICES_REFRESH`] or on request, at least
-    /// [`COPILOT_PRICES_MIN_GAP`] apart, only while a Copilot profile is enabled.
+    /// Fetches at startup and every `copilot_prices_refresh` or on request, at least
+    /// [`COPILOT_PRICES_MIN_GAP`] apart, while a Copilot profile is enabled and the refresh is on.
     pub fn spawn_refresh_loop(state: AppState) {
         tokio::spawn(async move {
             let client = match reqwest::Client::builder()
@@ -102,12 +101,13 @@ impl CopilotPrices {
                 if let Some(last) = last_fetch {
                     tokio::time::sleep_until(last + COPILOT_PRICES_MIN_GAP).await;
                 }
-                if Self::has_enabled_copilot(&state) {
+                let interval = state.config().copilot_prices_refresh;
+                if interval.is_some() && Self::has_enabled_copilot(&state) {
                     last_fetch = Some(Instant::now());
                     Self::refresh_once(&state, &client, COPILOT_PRICES_URL).await;
                 }
                 tokio::select! {
-                    () = tokio::time::sleep(COPILOT_PRICES_REFRESH) => {}
+                    () = tokio::time::sleep(interval.unwrap_or(COPILOT_PRICES_MIN_GAP)) => {}
                     () = state.copilot_prices().wake.notified() => {}
                 }
             }

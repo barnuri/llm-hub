@@ -278,7 +278,14 @@ export function App() {
               </nav>
             ) : null}
             {tab === "models" ? (
-              <ModelsScreen models={modelEntries} profiles={meta?.profiles ?? []} onCopy={copy} />
+              <ModelsScreen
+                models={modelEntries}
+                profiles={meta?.profiles ?? []}
+                meta={meta}
+                onCopy={copy}
+                onSaved={loadAll}
+                onToast={toast}
+              />
             ) : null}
             {tab === "stats" ? <StatsScreen onError={(message) => toast(message, true)} /> : null}
             {tab === "overview" ? <UsageScreen period={overviewPeriod(route.query.get("range"))} /> : null}

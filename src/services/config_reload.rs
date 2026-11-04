@@ -125,6 +125,7 @@ mod tests {
             copilot_guard_models: vec![],
             copilot_strip_sampling_models: vec![],
             sse_keepalive: None,
+            copilot_prices_refresh: None,
             pricing: TokenRates::default(),
         }
     }

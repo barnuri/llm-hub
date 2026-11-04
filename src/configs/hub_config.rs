@@ -5,7 +5,8 @@ use super::copilot_auth::CopilotAuth;
 use super::managed_command::ManagedCommand;
 use super::profile_config::ProfileConfig;
 use crate::consts::{
-    DEFAULT_BIND, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_PORT, DEFAULT_SSE_KEEPALIVE_MS,
+    DEFAULT_BIND, DEFAULT_COPILOT_PRICES_REFRESH_SECS, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_PORT,
+    DEFAULT_SSE_KEEPALIVE_MS,
 };
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
@@ -54,6 +55,9 @@ pub struct HubConfig {
     /// Idle gap after which an SSE response gets a keepalive comment frame.
     /// `None` when `LLM_HUB_SSE_KEEPALIVE_MS=0` — the knob's off switch.
     pub sse_keepalive: Option<Duration>,
+    /// How often the Copilot price table is fetched. `None` when
+    /// `LLM_HUB_COPILOT_PRICES_REFRESH_SECS=0`: the hub never fetches it.
+    pub copilot_prices_refresh: Option<Duration>,
     /// Global USD/1M token defaults when a profile/model has no rates.
     pub pricing: crate::configs::TokenRates,
 }
@@ -120,6 +124,13 @@ impl HubConfig {
             _ => DEFAULT_SSE_KEEPALIVE_MS,
         };
 
+        let copilot_prices_refresh_secs: u64 = match get("COPILOT_PRICES_REFRESH_SECS") {
+            Some(v) if !v.is_empty() => v
+                .parse()
+                .map_err(|_| format!("LLM_HUB_COPILOT_PRICES_REFRESH_SECS is not a number: {v}"))?,
+            _ => DEFAULT_COPILOT_PRICES_REFRESH_SECS,
+        };
+
         let pricing = crate::configs::TokenRates {
             input_per_1m: crate::configs::token_rates::parse_optional_f64(
                 get("INPUT_USD_PER_1M"),
@@ -167,6 +178,8 @@ impl HubConfig {
                 |list| split_list(&list),
             ),
             sse_keepalive: (sse_keepalive_ms > 0).then(|| Duration::from_millis(sse_keepalive_ms)),
+            copilot_prices_refresh: (copilot_prices_refresh_secs > 0)
+                .then(|| Duration::from_secs(copilot_prices_refresh_secs)),
             pricing,
         })
     }
@@ -681,6 +694,24 @@ mod tests {
         vars.insert("LLM_HUB_SSE_KEEPALIVE_MS".into(), "soon".into());
         let err = HubConfig::from_map(&vars).unwrap_err();
         assert!(err.contains("LLM_HUB_SSE_KEEPALIVE_MS"), "{err}");
+    }
+
+    #[test]
+    fn copilot_prices_refresh_defaults_to_a_day_zero_disables_and_bad_value_is_named() {
+        for (value, expected) in [
+            ("", Some(Duration::from_hours(24))),
+            ("0", None),
+            ("3600", Some(Duration::from_hours(1))),
+        ] {
+            let mut vars = base_vars();
+            vars.insert("LLM_HUB_COPILOT_PRICES_REFRESH_SECS".into(), value.into());
+            let cfg = HubConfig::from_map(&vars).unwrap();
+            assert_eq!(cfg.copilot_prices_refresh, expected, "{value:?}");
+        }
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_COPILOT_PRICES_REFRESH_SECS".into(), "daily".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_COPILOT_PRICES_REFRESH_SECS"), "{err}");
     }
 
     #[test]

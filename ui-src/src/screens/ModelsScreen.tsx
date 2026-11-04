@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { CopilotPricesPanel } from "../components/CopilotPricesPanel";
 import { MixTable, type MixRow } from "../components/MixTable";
 import { Panel } from "../components/Panel";
 import { PriceHeader } from "../components/PriceHeader";
@@ -7,7 +8,7 @@ import { Pill, type PillTone } from "../components/Pill";
 import { formatNumber } from "../lib/format";
 import { formatPrice, parsePriceSort, sortByPrice } from "../lib/pricing";
 import { setQueryParam, useRoute } from "../lib/router";
-import type { HubModel, ProfileRow } from "../lib/types";
+import type { HubMeta, HubModel, ProfileRow } from "../lib/types";
 import "../styles/screens/models.css";
 
 const COPIED_MS = 1500;
@@ -15,7 +16,10 @@ const COPIED_MS = 1500;
 interface ModelsScreenProps {
   readonly models: readonly HubModel[];
   readonly profiles: readonly ProfileRow[];
+  readonly meta: HubMeta | null;
   readonly onCopy: (id: string) => void;
+  readonly onSaved: () => void;
+  readonly onToast: (message: string, isError?: boolean) => void;
 }
 
 interface UpstreamState {
@@ -37,7 +41,7 @@ function upstreamState(profile: ProfileRow): UpstreamState {
   return profile.healthy === false ? { tone: "danger", label: "down" } : { tone: "neutral", label: "unknown" };
 }
 
-export function ModelsScreen({ models, profiles, onCopy }: ModelsScreenProps) {
+export function ModelsScreen({ models, profiles, meta, onCopy, onSaved, onToast }: ModelsScreenProps) {
   const route = useRoute();
   const activeProfile = route.query.get("profile") ?? "";
   const query = route.query.get("q") ?? "";
@@ -225,6 +229,15 @@ export function ModelsScreen({ models, profiles, onCopy }: ModelsScreenProps) {
         </Panel>
 
         <div className="models-side">
+          {meta !== null && profiles.some((profile) => profile.copilot) ? (
+            <CopilotPricesPanel
+              key={meta.copilot_prices_refresh_secs}
+              refreshSecs={meta.copilot_prices_refresh_secs}
+              readonly={meta.readonly}
+              onSaved={onSaved}
+              onToast={onToast}
+            />
+          ) : null}
           {byProfile.length > 0 ? (
             <Panel title="By profile" sub="models listed">
               <MixTable labelHeading="Profile" countHeading="Models" rows={byProfile} />

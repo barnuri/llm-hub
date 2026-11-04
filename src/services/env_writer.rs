@@ -81,6 +81,13 @@ pub fn set_default_fallbacks(path: &Path, chain: &[String]) -> Result<(), String
     write_atomic(path, &lines)
 }
 
+/// Persists `LLM_HUB_COPILOT_PRICES_REFRESH_SECS`. `0` turns the price fetch off.
+pub fn set_copilot_prices_refresh(path: &Path, secs: u64) -> Result<(), String> {
+    let mut lines = read_lines(path)?;
+    set_var(&mut lines, "COPILOT_PRICES_REFRESH_SECS", &secs.to_string());
+    write_atomic(path, &lines)
+}
+
 pub fn remove_profile(
     path: &Path,
     name: &str,
@@ -165,6 +172,22 @@ mod tests {
             managed: None,
             copilot: None,
         }
+    }
+
+    #[test]
+    fn set_copilot_prices_refresh_replaces_the_line_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, "# keep\nLLM_HUB_PROFILES=copilot\n").unwrap();
+
+        set_copilot_prices_refresh(&path, 3600).unwrap();
+        set_copilot_prices_refresh(&path, 0).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content,
+            "# keep\nLLM_HUB_PROFILES=copilot\nLLM_HUB_COPILOT_PRICES_REFRESH_SECS=0\n"
+        );
     }
 
     #[test]

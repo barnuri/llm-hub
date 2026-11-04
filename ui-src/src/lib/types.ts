@@ -27,6 +27,8 @@ export interface ProfileRow {
   readonly enabled: boolean;
   readonly models: readonly string[];
   readonly healthy: boolean | null;
+  /** True for a native GitHub Copilot profile. */
+  readonly copilot: boolean;
 }
 
 export interface HubMeta {
@@ -34,6 +36,8 @@ export interface HubMeta {
   /** Default fallback chain of model ids, tried in order on failure. */
   readonly default_fallbacks: readonly string[];
   readonly readonly: boolean;
+  /** `LLM_HUB_COPILOT_PRICES_REFRESH_SECS`; 0 means the fetch is off. */
+  readonly copilot_prices_refresh_secs: number;
   readonly persistent: boolean;
   readonly auth_enabled: boolean;
   readonly version: string;
