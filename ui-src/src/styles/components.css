@@ -507,6 +507,26 @@ button.stat-tile-link:hover {
   font-variant-numeric: tabular-nums;
 }
 
+.table td.price {
+  white-space: nowrap;
+}
+
+.th-sort {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+
+.th-sort:hover,
+.th-sort:focus-visible {
+  color: var(--text);
+}
+
 .t-ok {
   color: var(--accent-text);
 }

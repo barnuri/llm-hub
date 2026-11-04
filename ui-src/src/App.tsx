@@ -7,6 +7,7 @@ import { ThemeToggle } from "./components/ThemeToggle";
 import { Toasts, type ToastItem } from "./components/Toasts";
 import { api, saveKey, UnauthorizedError } from "./lib/api";
 import { formatNumber } from "./lib/format";
+import { pricesById } from "./lib/pricing";
 import { navigate, useRoute } from "./lib/router";
 import type { ErrorsReport, HubMeta, HubModel } from "./lib/types";
 import { KeysScreen } from "./screens/KeysScreen";
@@ -283,7 +284,9 @@ export function App() {
             {tab === "overview" ? <UsageScreen period={overviewPeriod(route.query.get("range"))} /> : null}
             {tab === "errors" ? <ErrorsScreen /> : null}
             {tab === "auto" ? <AutoScreen models={modelEntries} /> : null}
-            {tab === "smart-auto" ? <SmartAutoScreen profiles={meta?.profiles ?? []} /> : null}
+            {tab === "smart-auto" ? (
+              <SmartAutoScreen profiles={meta?.profiles ?? []} prices={pricesById(modelEntries)} />
+            ) : null}
             {tab === "insights" ? <InsightsScreen onCopy={copy} /> : null}
             {tab === "profiles" ? (
               <ProfilesScreen meta={meta} models={models} onChanged={loadAll} onToast={toast} />

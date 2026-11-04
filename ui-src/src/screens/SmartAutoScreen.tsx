@@ -3,10 +3,13 @@ import { type FormEvent, type ReactNode, useCallback, useEffect, useRef, useStat
 import { KpiCard } from "../components/KpiCard";
 import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
+import { PriceHeader } from "../components/PriceHeader";
 import { api } from "../lib/api";
 import { formatDateTime, formatMs, formatNumber } from "../lib/format";
+import { formatPrice, type PriceSort, sortByPrice } from "../lib/pricing";
 import type {
   CurrentSelection,
+  HubModelPrice,
   CurrentSelectionResponse,
   ProfileRow,
   SelectionEvent,
@@ -456,6 +459,7 @@ const RESULT_FILTER_TEXT: Readonly<Record<ResultFilter, string>> = {
 /** Which models the saved rules let Smart Auto pick. A row click flips it; the profile and result filters narrow the view. */
 function EffectResults({
   rows,
+  prices,
   interactive,
   locked,
   busyId,
@@ -464,6 +468,7 @@ function EffectResults({
   onToggle,
 }: {
   readonly rows: readonly SmartAutoEffectRow[];
+  readonly prices: ReadonlyMap<string, HubModelPrice>;
   /** False for read-only rules, so rows are plain text. */
   readonly interactive: boolean;
   /** True while a save runs, so rows ignore clicks. */
@@ -476,6 +481,7 @@ function EffectResults({
 }) {
   const [profile, setProfile] = useState(ALL);
   const [result, setResult] = useState<ResultFilter>("allowed");
+  const [priceSort, setPriceSort] = useState<PriceSort>("none");
   const eligible = rows.filter(isAllowed).length;
   const counts = new Map<SmartAutoEffectReason, number>();
   for (const row of rows) {
@@ -486,7 +492,11 @@ function EffectResults({
   // A profile that left the rows after a reload shows every row again.
   const active = profiles.includes(profile) ? profile : ALL;
   const inProfile = active === ALL ? rows : rows.filter((row) => profileOf(row.qualified_id) === active);
-  const shown = inProfile.filter((row) => result === "all" || isAllowed(row) === (result === "allowed"));
+  const shown = sortByPrice(
+    inProfile.filter((row) => result === "all" || isAllowed(row) === (result === "allowed")),
+    (row) => prices.get(row.qualified_id),
+    priceSort,
+  );
   let emptyText = "No models match these filters.";
   if (rows.length === 0) {
     emptyText = "No models yet";
@@ -543,12 +553,13 @@ function EffectResults({
               <th>Result</th>
               <th>Reason</th>
               <th>Matched glob</th>
+              <PriceHeader sort={priceSort} onSort={setPriceSort} />
             </tr>
           </thead>
           <tbody>
             {shown.length === 0 ? (
               <tr>
-                <td colSpan={4} className="table-empty">
+                <td colSpan={5} className="table-empty">
                   {emptyText}
                 </td>
               </tr>
@@ -593,6 +604,9 @@ function EffectResults({
                     </td>
                     <td className="mono" data-label="Matched glob">
                       {row.matched ?? UNSET}
+                    </td>
+                    <td className="num price" data-label="Price / 1M">
+                      {formatPrice(prices.get(row.qualified_id))}
                     </td>
                   </tr>
                 );
@@ -668,7 +682,13 @@ function GlobList({ label, globs, disabled, onChange }: GlobListProps) {
  * The Smart Auto rules from `GET /api/smart-auto/rules`: global include and exclude globs, and one
  * row per profile. Edits stay in the draft until Save PUTs the whole document.
  */
-function SmartAutoRulesPanel({ profiles }: { readonly profiles: readonly ProfileRow[] }) {
+function SmartAutoRulesPanel({
+  profiles,
+  prices,
+}: {
+  readonly profiles: readonly ProfileRow[];
+  readonly prices: ReadonlyMap<string, HubModelPrice>;
+}) {
   const [loaded, setLoaded] = useState<SmartAutoRulesResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   // The rules the hub last returned; `draft` is what the form edits until Save.
@@ -1012,6 +1032,7 @@ function SmartAutoRulesPanel({ profiles }: { readonly profiles: readonly Profile
           ) : (
             <EffectResults
               rows={effect}
+              prices={prices}
               interactive={!isReadonly}
               locked={locked}
               busyId={resultBusy}
@@ -1040,9 +1061,11 @@ function SmartAutoRulesPanel({ profiles }: { readonly profiles: readonly Profile
 interface SmartAutoScreenProps {
   /** The hub's profiles (`meta.profiles` from `GET /api/profiles`), the rules table's rows. */
   readonly profiles: readonly ProfileRow[];
+  /** USD per 1M tokens by qualified model id, from `GET /v1/models`. */
+  readonly prices: ReadonlyMap<string, HubModelPrice>;
 }
 
-export function SmartAutoScreen({ profiles }: SmartAutoScreenProps) {
+export function SmartAutoScreen({ profiles, prices }: SmartAutoScreenProps) {
   const [events, setEvents] = useState<readonly SelectionEvent[] | null>(null);
   const [unavailable, setUnavailable] = useState(false);
   const [filters, setFilters] = useState<Filters>(NO_FILTERS);
@@ -1096,7 +1119,7 @@ export function SmartAutoScreen({ profiles }: SmartAutoScreenProps) {
     return (
       <section className="tab active smart-auto">
         <CurrentSelectionPanel />
-        <SmartAutoRulesPanel profiles={profiles} />
+        <SmartAutoRulesPanel profiles={profiles} prices={prices} />
         <Panel title="Smart Auto history unavailable">
           <p className="note" role="status">
             Smart Auto history is unavailable. Send a request to <code>hub/smart-auto-balance</code> and reload this tab.
@@ -1119,7 +1142,7 @@ export function SmartAutoScreen({ profiles }: SmartAutoScreenProps) {
   return (
     <section className="tab active smart-auto" aria-busy={events === null}>
       <CurrentSelectionPanel />
-      <SmartAutoRulesPanel profiles={profiles} />
+      <SmartAutoRulesPanel profiles={profiles} prices={prices} />
       <div className="smart-auto-head">
         <span className="dim">Every stage and turn Smart Auto dispatched, newest first. Keys are salted hashes.</span>
         {unavailable ? (

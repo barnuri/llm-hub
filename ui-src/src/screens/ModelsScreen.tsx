@@ -2,8 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { MixTable, type MixRow } from "../components/MixTable";
 import { Panel } from "../components/Panel";
+import { PriceHeader } from "../components/PriceHeader";
 import { Pill, type PillTone } from "../components/Pill";
 import { formatNumber } from "../lib/format";
+import { formatPrice, parsePriceSort, sortByPrice } from "../lib/pricing";
 import { setQueryParam, useRoute } from "../lib/router";
 import type { HubModel, ProfileRow } from "../lib/types";
 import "../styles/screens/models.css";
@@ -39,6 +41,7 @@ export function ModelsScreen({ models, profiles, onCopy }: ModelsScreenProps) {
   const route = useRoute();
   const activeProfile = route.query.get("profile") ?? "";
   const query = route.query.get("q") ?? "";
+  const priceSort = parsePriceSort(route.query.get("sort"));
   const urlQuery = route.query.toString();
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -69,10 +72,14 @@ export function ModelsScreen({ models, profiles, onCopy }: ModelsScreenProps) {
 
   const filtered = useMemo(
     () =>
-      models
-        .filter(({ id }) => activeProfile === "" || id.startsWith(`${activeProfile}/`))
-        .filter(({ id, description }) => `${id} ${description ?? ""}`.toLowerCase().includes(query.toLowerCase())),
-    [models, query, activeProfile],
+      sortByPrice(
+        models
+          .filter(({ id }) => activeProfile === "" || id.startsWith(`${activeProfile}/`))
+          .filter(({ id, description }) => `${id} ${description ?? ""}`.toLowerCase().includes(query.toLowerCase())),
+        (model) => model.llm_hub_price,
+        priceSort,
+      ),
+    [models, query, activeProfile, priceSort],
   );
 
   const byProfile: readonly MixRow[] = useMemo(() => {
@@ -165,13 +172,17 @@ export function ModelsScreen({ models, profiles, onCopy }: ModelsScreenProps) {
                   <tr>
                     <th>Model id</th>
                     <th className="models-profile-col">Profile</th>
+                    <PriceHeader
+                      sort={priceSort}
+                      onSort={(next) => setQueryParam("sort", next === "none" ? null : next)}
+                    />
                     <th className="models-actions">
                       <span className="sr-only">Actions</span>
                     </th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map(({ id, auto_tier, description }) => {
+                  {filtered.map(({ id, auto_tier, description, llm_hub_price }) => {
                     const profile = profileOf(id);
                     const copied = copiedId === id;
                     return (
@@ -184,6 +195,7 @@ export function ModelsScreen({ models, profiles, onCopy }: ModelsScreenProps) {
                           {auto_tier && description ? <p className="model-description dim">{description}</p> : null}
                         </td>
                         <td className="dim">{labelFor(profile)}</td>
+                        <td className="num price">{formatPrice(llm_hub_price)}</td>
                         <td className="models-actions">
                           <button
                             type="button"

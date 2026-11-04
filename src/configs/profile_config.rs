@@ -29,4 +29,58 @@ impl ProfileConfig {
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.name)
     }
+
+    /// True when the hub starts the server itself or the base URL points at this machine.
+    pub fn is_local(&self) -> bool {
+        if self.managed.is_some() {
+            return true;
+        }
+        let Ok(url) = reqwest::Url::parse(&self.base_url) else {
+            return false;
+        };
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(base_url: &str) -> ProfileConfig {
+        ProfileConfig {
+            name: "p".into(),
+            display_name: None,
+            base_url: base_url.into(),
+            api_key: String::new(),
+            extra_headers: Vec::new(),
+            timeout_ms: None,
+            enabled: true,
+            static_models: Vec::new(),
+            pricing: crate::configs::TokenRates::default(),
+            model_prices: std::collections::HashMap::new(),
+            managed: None,
+            copilot: None,
+        }
+    }
+
+    #[test]
+    fn loopback_and_localhost_urls_are_local() {
+        assert!(profile("http://127.0.0.1:11436/v1").is_local());
+        assert!(profile("http://LOCALHOST:1234/v1").is_local());
+        assert!(profile("http://[::1]:8080").is_local());
+    }
+
+    #[test]
+    fn remote_or_unparseable_urls_are_not_local() {
+        assert!(!profile("https://api.githubcopilot.com").is_local());
+        assert!(!profile("http://10.0.0.5:8080").is_local());
+        assert!(!profile("not a url").is_local());
+    }
 }

@@ -1,8 +1,17 @@
+/** USD per 1M tokens, from `llm_hub_price` on a `/v1/models` entry. All zero for a local model. */
+export interface HubModelPrice {
+  readonly input_usd_per_1m: number;
+  readonly output_usd_per_1m: number;
+  readonly cache_read_usd_per_1m: number;
+  readonly cache_write_usd_per_1m: number;
+}
+
 export interface HubModel {
   readonly id: string;
   readonly display_name?: string;
   readonly description?: string;
   readonly auto_tier?: AutoTier;
+  readonly llm_hub_price?: HubModelPrice;
 }
 
 export interface ProfileRow {
