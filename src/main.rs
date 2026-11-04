@@ -81,6 +81,7 @@ async fn main() {
 
     routes::models::restore_catalogs(&state);
     routes::models::spawn_background_refresh(state.clone());
+    services::copilot_prices::CopilotPrices::spawn_refresh_loop(state.clone());
     state.managed().spawn_idle_reaper();
     let managed = std::sync::Arc::clone(state.managed());
     let restart_notify = state.restart_notify();

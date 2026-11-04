@@ -11,6 +11,7 @@ use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
 use crate::schemas::upstream_model::UpstreamModel;
 use crate::services::copilot_auto::CopilotAutoRouter;
 use crate::services::copilot_body_fields::{BodyField, UnsupportedBodyFields};
+use crate::services::copilot_prices::CopilotPrices;
 use crate::services::copilot_sessions::CopilotSessionCache;
 use crate::services::copilot_usage::CopilotUsageCache;
 use crate::services::credential_store::CredentialStore;
@@ -18,6 +19,7 @@ use crate::services::gh_cli::GhCli;
 use crate::services::keyring_credential_store::KeyringCredentialStore;
 use crate::services::managed_process::ProcessManager;
 use crate::services::model_limits::{ModelLimit, ModelLimits};
+use crate::services::pricing::PricingBook;
 use crate::services::process_gh_cli::ProcessGhCli;
 use crate::services::selection_log::SelectionLog;
 use crate::services::smart_auto_affinity::SmartAutoAffinity;
@@ -56,6 +58,7 @@ struct Inner {
     copilot_sessions: CopilotSessionCache,
     copilot_auto: CopilotAutoRouter,
     copilot_usage: CopilotUsageCache,
+    copilot_prices: CopilotPrices,
     /// Real prompt limits per Copilot model, shared with `copilot_auto`.
     model_limits: Arc<ModelLimits>,
     /// Request fields each Copilot profile rejected on `/v1/messages`.
@@ -126,6 +129,7 @@ impl AppState {
             copilot_sessions: CopilotSessionCache::new(Arc::clone(&credentials), Arc::clone(&gh)),
             copilot_auto: CopilotAutoRouter::with_limits(Arc::clone(&model_limits)),
             copilot_usage: CopilotUsageCache::new(credentials, gh),
+            copilot_prices: CopilotPrices::default(),
             model_limits,
             unsupported_body_fields,
             smart_auto_affinity: SmartAutoAffinity::new(),
@@ -397,6 +401,15 @@ impl AppState {
 
     pub fn copilot_usage(&self) -> &CopilotUsageCache {
         &self.0.copilot_usage
+    }
+
+    pub fn copilot_prices(&self) -> &CopilotPrices {
+        &self.0.copilot_prices
+    }
+
+    /// Rates from the current config and the last fetched Copilot price table.
+    pub fn pricing_book(&self) -> PricingBook {
+        PricingBook::from_hub(&self.config()).with_copilot_prices(self.copilot_prices().snapshot())
     }
 
     pub fn restart_notify(&self) -> Arc<tokio::sync::Notify> {

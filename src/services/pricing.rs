@@ -11,17 +11,19 @@
 //! 8. $0 (unknown)
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::configs::{HubConfig, TokenRates};
+use crate::consts::LONG_CONTEXT_SUFFIX;
 use crate::schemas::usage_report::UsageReport;
 use crate::services::copilot_auto::AutoTier;
+use crate::services::copilot_prices::CopilotPrices;
 use crate::services::stats::StatsSnapshot;
 
 const PER_MILLION: f64 = 1_000_000.0;
-const LONG_CONTEXT_SUFFIX: &str = "[1m]";
 const FREE_TAG: &str = "free";
 /// Per-model price object on each `/v1/models` entry.
 const PRICE_FIELD: &str = "llm_hub_price";
@@ -34,6 +36,8 @@ pub struct PricingBook {
     pub by_model: HashMap<String, TokenRates>,
     pub local_profiles: HashSet<String>,
     pub copilot_profiles: HashSet<String>,
+    /// Fetched from GitHub; wins over [`COPILOT_PRICES`].
+    pub copilot_published: Arc<HashMap<String, TokenRates>>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -51,6 +55,7 @@ impl PricingBook {
             by_model: HashMap::new(),
             local_profiles: HashSet::new(),
             copilot_profiles: HashSet::new(),
+            copilot_published: Arc::default(),
         };
         for profile in &config.profiles {
             if profile.is_local() {
@@ -71,6 +76,12 @@ impl PricingBook {
             }
         }
         book
+    }
+
+    #[must_use]
+    pub fn with_copilot_prices(mut self, published: Arc<HashMap<String, TokenRates>>) -> Self {
+        self.copilot_published = published;
+        self
     }
 
     #[must_use]
@@ -95,7 +106,7 @@ impl PricingBook {
         }
         if let Some(profile) = profile
             && self.copilot_profiles.contains(profile)
-            && let Some(rates) = bare.and_then(copilot_rates)
+            && let Some(rates) = bare.and_then(|bare| self.copilot_rates(bare))
         {
             return rates.with_cache_defaults();
         }
@@ -192,8 +203,9 @@ pub fn apply_costs(snapshot: &mut StatsSnapshot, book: &PricingBook) {
 }
 
 /// Appends each model's price to its `display_name` (`· $in/$out` per 1M tokens, or `· free`
-/// for a local profile) and adds `llm_hub_price`. Auto selectors and unpriced models stay as they are.
-pub fn annotate_listing(models: &mut [Value], book: &PricingBook) {
+/// for a local profile) and adds `llm_hub_price`. Returns true when a Copilot model has no published price.
+pub fn annotate_listing(models: &mut [Value], book: &PricingBook) -> bool {
+    let mut unpriced_copilot = false;
     for model in models {
         let Some(obj) = model.as_object_mut() else {
             continue;
@@ -207,6 +219,9 @@ pub fn annotate_listing(models: &mut [Value], book: &PricingBook) {
         };
         if AutoTier::from_model(bare).is_some() {
             continue;
+        }
+        if book.copilot_profiles.contains(profile) && book.copilot_rates(bare).is_none() {
+            unpriced_copilot = true;
         }
         let rates = book.rates_for(key);
         let tag = if !rates.is_zero() {
@@ -230,6 +245,7 @@ pub fn annotate_listing(models: &mut [Value], book: &PricingBook) {
             }),
         );
     }
+    unpriced_copilot
 }
 
 /// `4.0` → `$4`, `0.125` → `$0.125`.
@@ -413,17 +429,19 @@ const COPILOT_PRICES: &[(&str, TokenRates)] = &[
     ("kimi-k3", rates(3.0, 0.30, 0.0, 15.0)),
 ];
 
-/// Exact match, so `claude-opus-4.8-fast` never takes the `claude-opus-4.8` price.
-fn copilot_rates(bare_model: &str) -> Option<TokenRates> {
-    let id = bare_model
-        .strip_suffix(LONG_CONTEXT_SUFFIX)
-        .unwrap_or(bare_model)
-        .to_ascii_lowercase()
-        .replace('.', "-");
-    COPILOT_PRICES
-        .iter()
-        .find(|(known, _)| *known == id)
-        .map(|(_, rates)| *rates)
+impl PricingBook {
+    /// The fetched Copilot price, else the built-in one. Exact match, so
+    /// `claude-opus-4.8-fast` never takes the `claude-opus-4.8` price.
+    fn copilot_rates(&self, bare_model: &str) -> Option<TokenRates> {
+        let id = CopilotPrices::normalize_id(bare_model);
+        if let Some(rates) = self.copilot_published.get(&id) {
+            return Some(*rates);
+        }
+        COPILOT_PRICES
+            .iter()
+            .find(|(known, _)| *known == id)
+            .map(|(_, rates)| *rates)
+    }
 }
 
 #[cfg(test)]
@@ -498,6 +516,19 @@ mod tests {
     }
 
     #[test]
+    fn fetched_copilot_price_wins_over_builtin_and_prices_new_models() {
+        let book = book_with(&[], &["copilot"]).with_copilot_prices(Arc::new(HashMap::from([
+            ("claude-opus-5-5".to_string(), rates(3.0, 0.3, 3.0, 15.0)),
+            ("gpt-7-nova".to_string(), rates(1.0, 0.1, 1.0, 4.0)),
+        ])));
+        assert!(
+            (book.rates_for("copilot/claude-opus-5.5").input_per_1m - 3.0).abs() < f64::EPSILON
+        );
+        assert!((book.rates_for("copilot/gpt-7-nova").output_per_1m - 4.0).abs() < f64::EPSILON);
+        assert!((book.rates_for("copilot/gpt-6-sol").input_per_1m - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn copilot_fast_variant_does_not_take_base_model_price() {
         let book = book_with(&[], &["copilot"]);
         let rates = book.rates_for("copilot/claude-opus-4.8-fast");
@@ -539,7 +570,7 @@ mod tests {
             json!({"id": "copilot/auto-intelligence", "display_name": "Auto (Intelligence) · copilot"}),
             json!({"id": "remote/mystery", "display_name": "mystery · remote"}),
         ];
-        annotate_listing(&mut models, &book);
+        assert!(!annotate_listing(&mut models, &book));
         let names: Vec<&str> = models
             .iter()
             .map(|model| model["display_name"].as_str().unwrap())
@@ -558,6 +589,13 @@ mod tests {
         assert_eq!(models[2][PRICE_FIELD]["input_usd_per_1m"], 0.0);
         assert!(models[3].get(PRICE_FIELD).is_none());
         assert!(models[4].get(PRICE_FIELD).is_none());
+    }
+
+    #[test]
+    fn listing_reports_a_copilot_model_without_a_published_price() {
+        let book = book_with(&[], &["copilot"]);
+        let mut models = vec![json!({"id": "copilot/claude-opus-9", "display_name": "x"})];
+        assert!(annotate_listing(&mut models, &book));
     }
 
     #[test]

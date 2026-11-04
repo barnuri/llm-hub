@@ -272,7 +272,7 @@ pub async fn stats(
             .map_err(AppError::Internal)?
     };
 
-    let book = crate::services::pricing::PricingBook::from_hub(&state.config());
+    let book = state.pricing_book();
     crate::services::pricing::apply_costs(&mut snapshot, &book);
 
     let body = serde_json::to_value(snapshot)
@@ -287,7 +287,7 @@ pub async fn usage(State(state): State<AppState>) -> Result<Json<Value>, AppErro
         ));
     };
     let mut report = store.usage().map_err(AppError::Internal)?;
-    let book = crate::services::pricing::PricingBook::from_hub(&state.config());
+    let book = state.pricing_book();
     crate::services::pricing::apply_usage_costs(&mut report, &book);
     let body = serde_json::to_value(report)
         .map_err(|e| AppError::Internal(format!("serialize usage report failed: {e}")))?;
@@ -330,7 +330,7 @@ pub async fn errors(
         total_tokens_out: 0,
         recent,
     };
-    let book = crate::services::pricing::PricingBook::from_hub(&state.config());
+    let book = state.pricing_book();
     crate::services::pricing::apply_usage_costs(&mut priced, &book);
     let body = serde_json::to_value(ErrorsReport {
         range: range.to_string(),

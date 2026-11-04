@@ -27,7 +27,6 @@ use crate::services::copilot_auto::{
 };
 use crate::services::model_descriptors::ModelDescriptors;
 use crate::services::model_limits::ModelLimit;
-use crate::services::pricing::PricingBook;
 use crate::services::smart_auto_pool::SmartAutoPool;
 use crate::services::upstream_auth;
 
@@ -131,7 +130,9 @@ pub async fn refresh_models(state: &AppState) -> Value {
     }
 
     state.set_model_descriptors(descriptors);
-    crate::services::pricing::annotate_listing(&mut merged, &PricingBook::from_hub(&config));
+    if crate::services::pricing::annotate_listing(&mut merged, &state.pricing_book()) {
+        state.copilot_prices().request_refresh();
+    }
     merged.extend(smart_auto_entries(&state.model_descriptors()));
     let payload = json!({ "object": "list", "data": merged });
     state.set_model_cache(payload.clone());

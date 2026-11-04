@@ -9,6 +9,7 @@ pub mod copilot_auto_decisions;
 pub mod copilot_body_fields;
 pub mod copilot_headers;
 pub mod copilot_login;
+pub mod copilot_prices;
 pub mod copilot_sessions;
 pub mod copilot_usage;
 pub mod credential_store;
