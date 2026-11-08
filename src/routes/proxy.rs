@@ -228,6 +228,7 @@ pub(crate) async fn attempt_loop(
         return Err(AppError::BadRequest(refusals.join("; ")));
     }
 
+    let client_path = bare_path(path_and_query);
     let client = client_signature(headers);
     let worker = worker_key(state, headers);
     let retry_policy = RetryPolicy::from_headers(headers);
@@ -343,6 +344,7 @@ pub(crate) async fn attempt_loop(
                                 &attempts_trail,
                                 started,
                                 &attempt,
+                                client_path,
                                 client,
                                 worker,
                                 commit,
@@ -367,10 +369,21 @@ pub(crate) async fn attempt_loop(
                     }
                     return Ok(out);
                 }
-                if status == StatusCode::INTERNAL_SERVER_ERROR.as_u16() {
+                let rejected_model = rejected_limit_model(
+                    state,
+                    response.status(),
+                    response.headers(),
+                    model_id,
+                    attempt.path.as_str(),
+                );
+                if rejected_model.is_some() || status == StatusCode::INTERNAL_SERVER_ERROR.as_u16()
+                {
                     let (body, _) =
                         read_upstream_capped(response, MAX_TRANSFORM_BUFFER_BYTES).await;
                     learn_image_refusal(state, model_id, status, &body);
+                    if let Some(upstream) = &rejected_model {
+                        state.learn_rejected_prompt_limit(&model_id.profile, upstream, &body);
+                    }
                 }
                 record_failure(
                     state,
@@ -380,7 +393,10 @@ pub(crate) async fn attempt_loop(
                     format!("HTTP {status}; retried on the next fallback"),
                     client.clone(),
                     worker.clone(),
-                    attempt.path.as_str(),
+                    LogPaths {
+                        client: client_path,
+                        upstream: attempt.path.as_str(),
+                    },
                 );
             }
             Err(reason) => {
@@ -396,7 +412,10 @@ pub(crate) async fn attempt_loop(
                     reason,
                     client.clone(),
                     worker.clone(),
-                    attempt.path.as_str(),
+                    LogPaths {
+                        client: client_path,
+                        upstream: attempt.path.as_str(),
+                    },
                 );
                 if index == last_index {
                     return Err(AppError::UpstreamUnavailable(format!(
@@ -564,6 +583,7 @@ fn resolve_hub(
         pool.retain(|descriptor| profiles.allows(&descriptor.qualified_id));
     }
     let affinity_key = AffinityKey::new(&signals, &caller, &policy, endpoint);
+    let affinity_scope = AffinityKey::scope(&signals, &caller);
     let selector_name = requested.qualified();
     // Smart Auto ignores the effort the client sends: the hub picks it from the tier and role.
     let requested = None;
@@ -626,6 +646,8 @@ fn resolve_hub(
         tier: Some(tier.as_str().to_owned()),
         role: Some(decision.role),
         plan_backed: Some(decision.plan_backed),
+        affinity_scope,
+        pin_miss: decision.pin_miss,
         reason: Some(decision.reason.as_str().to_owned()),
         requested_effort: requested,
         ..SelectionEvent::new(
@@ -781,8 +803,8 @@ fn refusal(
     })
 }
 
-/// The prompt size `model_id` is known to accept: a Copilot model's seeded or learned limit, else
-/// the ceiling its descriptor reports. `None` when neither is known.
+/// The smallest prompt size `model_id` is known to accept: a Copilot model's seeded or learned limit,
+/// else the ceiling its descriptor reports, and any limit an upstream rejection named. `None` when none is known.
 fn known_prompt_limit(
     state: &AppState,
     model_id: &ModelId,
@@ -790,15 +812,18 @@ fn known_prompt_limit(
     upstream: &str,
     descriptor: Option<&ModelDescriptor>,
 ) -> Option<u64> {
-    if is_copilot
+    let configured = if is_copilot
         && let Some(entry) = state
             .model_limits()
             .for_profile(&model_id.profile)
             .get(upstream)
     {
-        return Some(entry.limit);
-    }
-    descriptor.and_then(descriptor_ceiling)
+        Some(entry.limit)
+    } else {
+        descriptor.and_then(descriptor_ceiling)
+    };
+    let rejected = state.rejected_prompt_limit(&model_id.profile, upstream);
+    [configured, rejected].into_iter().flatten().min()
 }
 
 /// The smallest prompt or runtime capacity a descriptor reports. Conflicting and lower-bound
@@ -1268,7 +1293,7 @@ fn default_auto_model<'c>(catalog: &'c [Value], path: &str) -> &'c str {
 /// The SSE decision is the upstream's content-type, not the request's `stream`
 /// flag: an upstream that answers a streaming request with a JSON error must be
 /// translated as a message, not fed to the SSE machinery.
-#[allow(clippy::too_many_arguments)] // ten inputs, each a separate piece of one delivery
+#[allow(clippy::too_many_arguments)] // eleven inputs, each a separate piece of one delivery
 async fn deliver(
     state: &AppState,
     response: reqwest::Response,
@@ -1276,6 +1301,7 @@ async fn deliver(
     attempts_trail: &[String],
     started: Instant,
     attempt: &Attempt<'_>,
+    client_path: &str,
     client: Option<String>,
     worker: Option<String>,
     commit: Option<SmartAutoCommit>,
@@ -1290,6 +1316,7 @@ async fn deliver(
         build_anthropic_response(
             state,
             response,
+            client_path,
             upstream_path,
             model_id,
             attempts_trail,
@@ -1306,6 +1333,7 @@ async fn deliver(
         build_response(
             state,
             response,
+            client_path,
             upstream_path,
             model_id,
             attempts_trail,
@@ -1572,6 +1600,7 @@ async fn attempt_single(
     Ok(build_response(
         state,
         response,
+        bare_path(path_and_query),
         upstream_path.as_str(),
         model_id,
         &trail,
@@ -1904,8 +1933,8 @@ async fn anthropic_from_responses(
         return rewrite_body(stabilize_item_ids(response), translator);
     }
     let (status, version, headers) = parts_for_rewrite(&response);
-    let (raw, overflowed) = read_upstream_capped(response, MAX_TRANSFORM_BUFFER_BYTES).await;
-    if overflowed {
+    let (raw, upstream_end) = read_upstream_capped(response, MAX_TRANSFORM_BUFFER_BYTES).await;
+    if upstream_end == UpstreamEnd::Open {
         let body = anthropic::response::error_body(
             StatusCode::BAD_GATEWAY.as_u16(),
             "upstream response is too large to translate into the anthropic message shape",
@@ -2187,8 +2216,21 @@ enum StopCause {
     HubReject(&'static str),
 }
 
-/// Logs an answer that ended early, with its cause and the path it was sent on.
-fn log_cancel(outcome: &RequestOutcome, stop: Option<StopCause>, path: &str) {
+/// The client's path and the upstream's, as a request's log lines name them.
+#[derive(Clone, Copy)]
+struct LogPaths<'a> {
+    client: &'a str,
+    upstream: &'a str,
+}
+
+/// Logs an answer that ended early, with its cause, both paths, and how much reached the client.
+fn log_cancel(
+    outcome: &RequestOutcome,
+    stop: Option<StopCause>,
+    paths: LogPaths<'_>,
+    bytes_sent: u64,
+    upstream_end: UpstreamEnd,
+) {
     let Some(cause) = stop else {
         return;
     };
@@ -2201,8 +2243,11 @@ fn log_cancel(outcome: &RequestOutcome, stop: Option<StopCause>, path: &str) {
     };
     tracing::info!(
         model = %outcome.model_key,
-        path,
+        client_path = paths.client,
+        upstream_path = paths.upstream,
         latency_ms = outcome.latency_ms,
+        bytes_sent,
+        upstream_end = upstream_end.as_str(),
         cause = kind,
         "request cancelled: {reason}"
     );
@@ -2256,6 +2301,7 @@ fn save_text(
 fn build_response(
     state: &AppState,
     upstream: reqwest::Response,
+    client_path: &str,
     upstream_path: &str,
     model_id: &ModelId,
     attempts_trail: &[String],
@@ -2269,6 +2315,8 @@ fn build_response(
     let status = upstream.status();
     let limit_model =
         prompt_limit_model(state, status, upstream.headers(), model_id, upstream_path);
+    let rejected_model =
+        rejected_limit_model(state, status, upstream.headers(), model_id, upstream_path);
     // Read before `bytes_stream()` consumes the response. A comment frame
     // injected into a JSON body would corrupt it, so this is SSE-only.
     let keepalive = is_event_stream(&upstream)
@@ -2292,6 +2340,7 @@ fn build_response(
     );
 
     let state_for_stats = state.clone();
+    let client_path = client_path.to_owned();
     let path = upstream_path.to_owned();
     let learn_model = model_id.clone();
     let outcome_seed = RequestOutcome {
@@ -2323,7 +2372,8 @@ fn build_response(
             started,
             ttft_ms: None,
             keepalive,
-            complete: false,
+            upstream_end: UpstreamEnd::Open,
+            bytes_sent: 0,
             answer: capture_answer.as_ref().map(|_| Vec::new()),
         },
         pump,
@@ -2333,6 +2383,13 @@ fn build_response(
         let mut summary = summary_receiver.await.unwrap_or_default();
         if let Some(model) = &limit_model {
             state_for_stats.learn_prompt_limit(&outcome_seed.profile, model, &summary.tail);
+        }
+        if let Some(model) = &rejected_model {
+            state_for_stats.learn_rejected_prompt_limit(
+                &outcome_seed.profile,
+                model,
+                &summary.tail,
+            );
         }
         learn_image_refusal(
             &state_for_stats,
@@ -2353,15 +2410,28 @@ fn build_response(
                 .then(|| error_reason(outcome_seed.status, &summary.tail)),
             ..outcome_seed
         };
-        log_failure(&outcome, &path);
-        if let Some(commit) = commit.filter(|_| summary.completed && outcome.error.is_none()) {
+        let logs = LogPaths {
+            client: &client_path,
+            upstream: &path,
+        };
+        log_failure(&outcome, logs, summary.bytes_sent, summary.upstream_end);
+        if let Some(commit) = commit
+            .filter(|_| summary.upstream_end == UpstreamEnd::Complete && outcome.error.is_none())
+        {
             commit.apply(&state_for_stats);
         }
         if let Some(attempt) = capture_answer {
             save_answer(&state_for_stats, &attempt, &answer);
         }
-        let stop = (!summary.completed).then_some(StopCause::ClientDisconnect);
-        log_cancel(&outcome, stop, &path);
+        let stop =
+            (summary.upstream_end != UpstreamEnd::Complete).then_some(StopCause::ClientDisconnect);
+        log_cancel(
+            &outcome,
+            stop,
+            logs,
+            summary.bytes_sent,
+            summary.upstream_end,
+        );
         finish_selection(&state_for_stats, selection, &outcome, stop);
         state_for_stats.stats().record(&outcome);
         if let Some(store) = state_for_stats.store()
@@ -2384,10 +2454,21 @@ fn build_response(
         })
 }
 
+async fn pump<S>(state: StreamState<S>) -> Option<(Result<Bytes, reqwest::Error>, StreamState<S>)>
+where
+    S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    let (item, mut state) = pump_step(state).await?;
+    if let Ok(bytes) = &item {
+        state.bytes_sent += bytes.len() as u64;
+    }
+    Some((item, state))
+}
+
 /// One step of the response body stream: forward or rewrite the next upstream
 /// chunk, and on end-of-upstream emit the transform's tail and hand the stats
 /// task its summary.
-async fn pump<S>(
+async fn pump_step<S>(
     mut state: StreamState<S>,
 ) -> Option<(Result<Bytes, reqwest::Error>, StreamState<S>)>
 where
@@ -2432,21 +2513,24 @@ where
                 // transform active the client is still owed a well-formed tail,
                 // so the error ends the stream instead of being forwarded.
                 NextChunk::Chunk(Err(e)) if state.transform.is_none() => {
+                    state.upstream_end = UpstreamEnd::Error;
                     return Some((Err(e), state));
                 }
                 NextChunk::Chunk(Err(e)) => {
                     tracing::warn!("upstream stream error, closing translated stream: {e}");
+                    state.upstream_end = UpstreamEnd::Error;
                     state.ended = true;
                 }
                 NextChunk::End => {
+                    state.upstream_end = UpstreamEnd::Complete;
                     state.ended = true;
-                    state.complete = true;
                 }
             }
         }
 
         let tail_chunk = state.transform.as_mut().map(BodyTransform::finish);
         if let Some(sender) = state.sender.take() {
+            let tail_bytes = tail_chunk.as_ref().map_or(0, |bytes| bytes.len() as u64);
             let _ = sender.send(StreamSummary {
                 head: std::mem::take(&mut state.head),
                 tail: std::mem::take(&mut state.tail),
@@ -2455,7 +2539,8 @@ where
                     .as_ref()
                     .and_then(BodyTransform::observed_usage),
                 ttft_ms: state.ttft_ms,
-                completed: state.complete,
+                upstream_end: state.upstream_end,
+                bytes_sent: state.bytes_sent + tail_bytes,
                 answer: state.answer.take().unwrap_or_default(),
             });
         }
@@ -2511,8 +2596,10 @@ struct StreamState<S> {
     /// Idle gap after which a keepalive comment goes out. `None` on every
     /// non-SSE body and whenever the knob is off — see `pump`.
     keepalive: Option<Duration>,
-    /// The upstream stream ended on its own, without a read error.
-    complete: bool,
+    /// How the upstream body ended; `Open` until it does.
+    upstream_end: UpstreamEnd,
+    /// Bytes handed to the client so far, keepalive comments included.
+    bytes_sent: u64,
     /// The upstream bytes kept for the answer text, up to `CAPTURE_TEXT_BYTES`. `None` when the attempt is not in Smart Auto history.
     answer: Option<Vec<u8>>,
 }
@@ -2532,7 +2619,8 @@ impl<S> Drop for StreamState<S> {
                     .as_ref()
                     .and_then(BodyTransform::observed_usage),
                 ttft_ms: self.ttft_ms,
-                completed: false,
+                upstream_end: self.upstream_end,
+                bytes_sent: self.bytes_sent,
                 answer: self.answer.take().unwrap_or_default(),
             });
         }
@@ -2548,10 +2636,34 @@ struct StreamSummary {
     tail: Vec<u8>,
     observed_usage: Option<ScrapedUsage>,
     ttft_ms: Option<u64>,
-    /// The upstream body was read to its end, so the routed answer is complete.
-    completed: bool,
+    /// How the upstream body ended. `Complete` means the routed answer is whole.
+    upstream_end: UpstreamEnd,
+    /// Bytes handed to the client before the stream ended.
+    bytes_sent: u64,
     /// The upstream bytes of the answer, cut at `CAPTURE_TEXT_BYTES`. Empty unless the attempt is in Smart Auto history.
     answer: Vec<u8>,
+}
+
+/// How an upstream body ended, as the cancel and failure log lines name it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum UpstreamEnd {
+    /// The hub stopped reading before the upstream body ended.
+    #[default]
+    Open,
+    /// The upstream body ended on its own.
+    Complete,
+    /// The upstream read failed.
+    Error,
+}
+
+impl UpstreamEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            UpstreamEnd::Open => "open",
+            UpstreamEnd::Complete => "complete",
+            UpstreamEnd::Error => "error",
+        }
+    }
 }
 
 fn summary_usage(summary: &StreamSummary) -> ScrapedUsage {
@@ -2587,6 +2699,7 @@ fn is_event_stream(response: &reqwest::Response) -> bool {
 async fn build_anthropic_response(
     state: &AppState,
     upstream: reqwest::Response,
+    client_path: &str,
     upstream_path: &str,
     model_id: &ModelId,
     attempts_trail: &[String],
@@ -2599,6 +2712,13 @@ async fn build_anthropic_response(
 ) -> Response {
     let upstream_status = upstream.status();
     let limit_model = prompt_limit_model(
+        state,
+        upstream_status,
+        upstream.headers(),
+        model_id,
+        upstream_path,
+    );
+    let rejected_model = rejected_limit_model(
         state,
         upstream_status,
         upstream.headers(),
@@ -2620,9 +2740,13 @@ async fn build_anthropic_response(
         &attempts_trail.join(", "),
     );
 
-    let (raw, overflowed) = read_upstream_capped(upstream, MAX_TRANSFORM_BUFFER_BYTES).await;
+    let (raw, upstream_end) = read_upstream_capped(upstream, MAX_TRANSFORM_BUFFER_BYTES).await;
+    let overflowed = upstream_end == UpstreamEnd::Open;
     if let Some(model) = &limit_model {
         state.learn_prompt_limit(&model_id.profile, model, &raw);
+    }
+    if let Some(model) = &rejected_model {
+        state.learn_rejected_prompt_limit(&model_id.profile, model, &raw);
     }
     learn_image_refusal(state, model_id, upstream_status.as_u16(), &raw);
     let (status, payload) = if overflowed {
@@ -2650,6 +2774,7 @@ async fn build_anthropic_response(
             )),
         )
     };
+    let bytes_sent = payload.len() as u64;
 
     // Usage is scraped from the OpenAI-shaped body, before translation — the
     // Anthropic `input_tokens`/`output_tokens` names are also handled now, but
@@ -2678,13 +2803,26 @@ async fn build_anthropic_response(
         client,
         worker,
     };
-    log_failure(&outcome, upstream_path);
+    log_failure(
+        &outcome,
+        LogPaths {
+            client: client_path,
+            upstream: upstream_path,
+        },
+        bytes_sent,
+        upstream_end,
+    );
     let state_for_stats = state.clone();
     let answer_attempt = selection.as_ref().and_then(|event| event.attempt.clone());
+    let client_path = client_path.to_owned();
     let path = upstream_path.to_owned();
     tokio::spawn(async move {
         let stop = overflowed.then_some(StopCause::HubReject("response too large to translate"));
-        log_cancel(&outcome, stop, &path);
+        let logs = LogPaths {
+            client: &client_path,
+            upstream: &path,
+        };
+        log_cancel(&outcome, stop, logs, bytes_sent, upstream_end);
         finish_selection(&state_for_stats, selection, &outcome, stop);
         if let Some(attempt) = answer_attempt {
             save_answer(&state_for_stats, &attempt, &raw);
@@ -2711,7 +2849,7 @@ async fn build_anthropic_response(
     })
 }
 
-/// The upstream model id a Copilot 400 on `upstream_path` may teach a prompt limit for,
+/// The upstream model id a Copilot 400 on `upstream_path` may teach a stored prompt limit for,
 /// read before the body streams. A compressed body is skipped.
 fn prompt_limit_model(
     state: &AppState,
@@ -2720,19 +2858,34 @@ fn prompt_limit_model(
     model_id: &ModelId,
     upstream_path: &str,
 ) -> Option<String> {
-    if status != StatusCode::BAD_REQUEST {
+    if !is_copilot_profile(state, model_id) {
         return None;
     }
-    if is_compressed(headers) {
+    rejected_limit_model(state, status, headers, model_id, upstream_path)
+}
+
+/// The upstream model id a 400 on `upstream_path` may teach an in-memory prompt limit for, read
+/// before the body streams. A Copilot profile teaches only on the paths that speak for its stored limit.
+fn rejected_limit_model(
+    state: &AppState,
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    model_id: &ModelId,
+    upstream_path: &str,
+) -> Option<String> {
+    if status != StatusCode::BAD_REQUEST || is_compressed(headers) {
         return None;
     }
+    let upstream_id = upstream_key(state, model_id);
+    (!is_copilot_profile(state, model_id) || teaches_stored_limit(upstream_path, &upstream_id))
+        .then_some(upstream_id)
+}
+
+fn is_copilot_profile(state: &AppState, model_id: &ModelId) -> bool {
     state
         .config()
-        .profile(&model_id.profile)?
-        .copilot
-        .as_ref()?;
-    let upstream_id = upstream_key(state, model_id);
-    teaches_stored_limit(upstream_path, &upstream_id).then_some(upstream_id)
+        .profile(&model_id.profile)
+        .is_some_and(|found| found.copilot.is_some())
 }
 
 /// True when a rejection on `upstream_path` speaks for `upstream_id`'s stored limit: native
@@ -2747,19 +2900,20 @@ fn teaches_stored_limit(upstream_path: &str, upstream_id: &str) -> bool {
 }
 
 /// Reads an upstream body into memory, stopping once `cap` is exceeded.
-/// Returns `(bytes, overflowed)`; a mid-stream read error ends the read and is
-/// reported as whatever arrived, which the translator then renders as an error.
-async fn read_upstream_capped(upstream: reqwest::Response, cap: usize) -> (Vec<u8>, bool) {
+/// A read error ends the read with whatever arrived, which the translator then renders as an error.
+async fn read_upstream_capped(upstream: reqwest::Response, cap: usize) -> (Vec<u8>, UpstreamEnd) {
     let mut stream = upstream.bytes_stream();
     let mut buffered: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else { break };
+        let Ok(bytes) = chunk else {
+            return (buffered, UpstreamEnd::Error);
+        };
         buffered.extend_from_slice(&bytes);
         if buffered.len() > cap {
-            return (buffered, true);
+            return (buffered, UpstreamEnd::Open);
         }
     }
-    (buffered, false)
+    (buffered, UpstreamEnd::Complete)
 }
 
 #[allow(clippy::too_many_arguments)] // the failure record takes the attempt's values one by one, as the attempt loop holds them
@@ -2771,7 +2925,7 @@ fn record_failure(
     reason: String,
     client: Option<String>,
     worker: Option<String>,
-    path: &str,
+    paths: LogPaths<'_>,
 ) {
     let latency_ms = crate::utils::time::elapsed_ms(started);
     let outcome = RequestOutcome {
@@ -2789,7 +2943,12 @@ fn record_failure(
         client,
         worker,
     };
-    log_failure(&outcome, path);
+    let upstream_end = if status == 0 {
+        UpstreamEnd::Error
+    } else {
+        UpstreamEnd::Complete
+    };
+    log_failure(&outcome, paths, 0, upstream_end);
     state.stats().record(&outcome);
     if let Some(store) = state.store() {
         let _ = store.record(&outcome);
@@ -2866,6 +3025,7 @@ async fn passthrough_oversized(
     Ok(build_response(
         state,
         response,
+        bare_path(path_and_query),
         upstream_path,
         &model_id,
         &[model_id.qualified()],
@@ -2934,13 +3094,21 @@ fn error_reason(status: u16, body: &[u8]) -> String {
     reason.chars().take(ERROR_REASON_MAX_CHARS).collect()
 }
 
-fn log_failure(outcome: &RequestOutcome, path: &str) {
+fn log_failure(
+    outcome: &RequestOutcome,
+    paths: LogPaths<'_>,
+    bytes_sent: u64,
+    upstream_end: UpstreamEnd,
+) {
     if let Some(reason) = &outcome.error {
         tracing::warn!(
             model = %outcome.model_key,
-            path,
+            client_path = paths.client,
+            upstream_path = paths.upstream,
             status = outcome.status,
             latency_ms = outcome.latency_ms,
+            bytes_sent,
+            upstream_end = upstream_end.as_str(),
             "request failed: {reason}"
         );
     }
@@ -3065,7 +3233,8 @@ mod tests {
             started: Instant::now(),
             ttft_ms: None,
             keepalive,
-            complete: false,
+            upstream_end: UpstreamEnd::Open,
+            bytes_sent: 0,
             answer: None,
         }
     }
@@ -3313,6 +3482,36 @@ mod tests {
         // The clock starts at the real first byte, not at the first ping.
         let ttft = summary.ttft_ms.unwrap();
         assert!(ttft >= SILENCE_MS, "ttft {ttft}ms measured from a ping");
+    }
+
+    #[tokio::test]
+    async fn a_drained_stream_reports_a_complete_upstream_and_the_bytes_sent() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
+        let upstream = stream::iter(vec![Ok(Bytes::from_static(b"data: one\n\n"))]).boxed();
+
+        drain(state_for(upstream, None, Some(sender))).await;
+        let summary = receiver.await.unwrap();
+
+        assert_eq!(summary.upstream_end, UpstreamEnd::Complete);
+        assert_eq!(summary.bytes_sent, "data: one\n\n".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_mid_body_reports_an_open_upstream_and_the_bytes_sent() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
+        let upstream = stream::iter(vec![
+            Ok(Bytes::from_static(b"data: one\n\n")),
+            Ok(Bytes::from_static(b"data: two\n\n")),
+        ])
+        .boxed();
+        let (first, state) = pump(state_for(upstream, None, Some(sender))).await.unwrap();
+        assert_eq!(first.unwrap(), "data: one\n\n");
+
+        drop(state);
+        let summary = receiver.await.unwrap();
+
+        assert_eq!(summary.upstream_end, UpstreamEnd::Open);
+        assert_eq!(summary.bytes_sent, "data: one\n\n".len() as u64);
     }
 
     mod copilot_routing {
@@ -4669,6 +4868,87 @@ mod tests {
             assert!(events[2].latency_ms.is_some());
         }
 
+        /// The bytes a tracing subscriber writes, shared between the subscriber and the test.
+        #[derive(Clone, Default)]
+        struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogBuffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogBuffer {
+            type Writer = LogBuffer;
+
+            fn make_writer(&'writer self) -> LogBuffer {
+                self.clone()
+            }
+        }
+
+        #[tokio::test]
+        async fn a_cancelled_stream_logs_the_client_path_and_the_upstream_path() {
+            let logs = LogBuffer::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let copilot = copilot().await;
+            mount_auto(&copilot, NATIVE_UPSTREAM_ID).await;
+            let frames = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n";
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(frames.as_bytes(), "text/event-stream"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+            let body = json!({
+                "model": format!("{PROFILE}/{COPILOT_AUTO_MODEL}"),
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            });
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/chat/completions",
+                &with_session("cancel-log"),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+            let mut answer = response.into_body().into_data_stream();
+            let first = futures_util::StreamExt::next(&mut answer)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(answer);
+
+            selection_events(&copilot, 3).await;
+            let written = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                written.contains("client_path=\"/v1/chat/completions\""),
+                "{written}"
+            );
+            assert!(
+                written.contains("upstream_path=\"/chat/completions\""),
+                "{written}"
+            );
+            assert!(
+                written.contains(&format!("bytes_sent={}", first.len())),
+                "{written}"
+            );
+            assert!(written.contains("upstream_end=\"open\""), "{written}");
+        }
+
         #[tokio::test]
         async fn direct_model_records_no_selection() {
             let copilot = copilot().await;
@@ -5276,6 +5556,96 @@ mod tests {
                     .await
                     .unwrap()
                     .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_rejection_message_teaches_the_limit_for_later_requests() {
+            let rejections = [
+                json!({"error": {"message": "prompt token count of 2500 exceeds the limit of 1000"}}),
+                json!({"error": {"message": "prompt is too long: 2500 tokens > 1000 maximum"}}),
+            ];
+            for rejection in rejections {
+                let copilot = copilot().await;
+                Mock::given(method("POST"))
+                    .and(path(MESSAGES_ENDPOINT))
+                    .respond_with(ResponseTemplate::new(400).set_body_json(rejection))
+                    .mount(&copilot.upstream)
+                    .await;
+
+                let (first, _) = send(
+                    &copilot,
+                    &client_headers(),
+                    &long_anthropic_body(NATIVE_ID, 500),
+                    RouteKind::Anthropic,
+                )
+                .await;
+
+                assert_eq!(first, 400);
+                // The streamed path learns in its stats task, after the body ends.
+                for _ in 0..100 {
+                    if copilot
+                        .state
+                        .rejected_prompt_limit(PROFILE, NATIVE_UPSTREAM_ID)
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(
+                    copilot
+                        .state
+                        .rejected_prompt_limit(PROFILE, NATIVE_UPSTREAM_ID),
+                    Some(1_000)
+                );
+
+                let message = refused_message(
+                    &copilot,
+                    MESSAGES_ENDPOINT,
+                    RouteKind::Anthropic,
+                    &client_headers(),
+                    &long_anthropic_body(NATIVE_ID, 2_000),
+                )
+                .await;
+
+                assert!(
+                    message.starts_with("copilot/claude-opus-4-5: a prompt of about "),
+                    "{message}"
+                );
+                assert!(
+                    message.ends_with("is over the known limit of 1000 tokens"),
+                    "{message}"
+                );
+                assert_eq!(requests_to(&copilot, MESSAGES_ENDPOINT).await.len(), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn the_lowest_known_limit_gates_the_request() {
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, NATIVE_UPSTREAM_ID, 500, 1);
+            copilot.state.learn_rejected_prompt_limit(
+                PROFILE,
+                NATIVE_UPSTREAM_ID,
+                br#"{"error":{"message":"prompt is too long: 1200 tokens > 1000 maximum"}}"#,
+            );
+
+            let message = refused_message(
+                &copilot,
+                MESSAGES_ENDPOINT,
+                RouteKind::Anthropic,
+                &client_headers(),
+                &long_anthropic_body(NATIVE_ID, 600),
+            )
+            .await;
+
+            assert!(
+                message.ends_with("is over the known limit of 500 tokens"),
+                "{message}"
             );
         }
 

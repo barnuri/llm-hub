@@ -1,5 +1,6 @@
 use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::model_descriptor::ModelDescriptor;
+use crate::schemas::pin_miss::PinMiss;
 use crate::schemas::route_reason::RouteReason;
 use crate::schemas::work_role::WorkRole;
 
@@ -16,4 +17,6 @@ pub struct RouteDecision<'a> {
     pub effort: Option<EffortLevel>,
     /// Why the router chose this model.
     pub reason: RouteReason,
+    /// Why no pin served the turn. `None` unless the route is `fresh`.
+    pub pin_miss: Option<PinMiss>,
 }

@@ -67,6 +67,8 @@ struct Inner {
     unsupported_body_fields: UnsupportedBodyFields,
     /// `<profile>/<upstream model>` keys that refused image input, learned from upstream rejections.
     vision_unsupported: DashSet<String>,
+    /// `<profile>/<upstream model>` -> the prompt limit an upstream 400 named in its message.
+    rejected_prompt_limits: DashMap<String, u64>,
     smart_auto_affinity: SmartAutoAffinity,
     /// The bounded log of Smart Auto routes.
     smart_auto_decisions: SmartAutoDecisionLog,
@@ -138,6 +140,7 @@ impl AppState {
             model_limits,
             unsupported_body_fields,
             vision_unsupported: DashSet::new(),
+            rejected_prompt_limits: DashMap::new(),
             smart_auto_affinity: SmartAutoAffinity::new(),
             smart_auto_decisions: SmartAutoDecisionLog::default(),
             selection_log,
@@ -368,6 +371,30 @@ impl AppState {
                 "profile {profile}: model {model} refuses image input; image requests skip it"
             );
         }
+    }
+
+    /// Records the prompt limit a 400 body names for `model` on `profile`. Held in memory until restart.
+    pub fn learn_rejected_prompt_limit(&self, profile: &str, model: &str, body: &[u8]) {
+        let Some(limit) = ModelLimits::limit_from_rejection(body) else {
+            return;
+        };
+        let previous = self
+            .0
+            .rejected_prompt_limits
+            .insert(format!("{profile}/{model}"), limit);
+        if previous != Some(limit) {
+            tracing::info!(
+                "profile {profile}: model {model} rejects prompts over {limit} tokens; larger requests skip it"
+            );
+        }
+    }
+
+    /// The prompt limit a rejection taught for `model` on `profile`, if any.
+    pub fn rejected_prompt_limit(&self, profile: &str, model: &str) -> Option<u64> {
+        self.0
+            .rejected_prompt_limits
+            .get(&format!("{profile}/{model}"))
+            .map(|limit| *limit)
     }
 
     /// The request fields `profile`'s Copilot upstream rejects.

@@ -6,6 +6,7 @@ use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::model_context::strip_1m_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
+use crate::schemas::pin_miss::PinMiss;
 use crate::schemas::role_decision::RoleDecision;
 use crate::schemas::role_reason::RoleReason;
 use crate::schemas::route_decision::RouteDecision;
@@ -43,7 +44,8 @@ impl SmartAutoRouter {
         now: Instant,
     ) -> Option<RouteDecision<'a>> {
         let tier = policy.tier.unwrap_or_default();
-        let (model, turn, reason) = Self::choose(pool, policy, signals, anchor, usage, now)?;
+        let (model, turn, reason, pin_miss) =
+            Self::choose(pool, policy, signals, anchor, usage, now)?;
         let effort = SmartAutoEffort::select(
             tier,
             turn.role,
@@ -57,6 +59,7 @@ impl SmartAutoRouter {
             plan_backed: turn.plan_backed,
             effort,
             reason,
+            pin_miss,
         })
     }
 
@@ -67,18 +70,34 @@ impl SmartAutoRouter {
         anchor: Option<(&SmartAutoAffinity, &AffinityKey)>,
         usage: &HashMap<String, u64>,
         now: Instant,
-    ) -> Option<(&'a ModelDescriptor, RoleDecision, RouteReason)> {
+    ) -> Option<(
+        &'a ModelDescriptor,
+        RoleDecision,
+        RouteReason,
+        Option<PinMiss>,
+    )> {
         let tier = policy.tier.unwrap_or_default();
-        let pin = anchor.and_then(|(affinity, key)| {
-            let (model, role, plan_backed) = affinity.lookup(key, pool, now)?;
-            Some((Self::find(pool, &model)?, role, plan_backed, affinity, key))
-        });
-        let Some((pinned, pinned_role, pinned_plan_backed, affinity, key)) = pin else {
-            let turn = SmartAutoRoles::classify_user_text(signals, policy.role);
-            let incumbent = Self::incumbent(pool, anchor, turn.role, now);
-            let (model, reason) =
-                Self::pick(pool, tier, turn, incumbent, usage, RouteReason::Fresh)?;
-            return Some((model, turn, reason));
+        let pin = match anchor {
+            None => Err(PinMiss::NoKey),
+            Some((affinity, key)) => {
+                affinity
+                    .lookup(key, pool, now)
+                    .and_then(|(model, role, plan_backed)| {
+                        let pinned = Self::find(pool, &model).ok_or(PinMiss::LeftPool)?;
+                        Ok((pinned, role, plan_backed, affinity, key))
+                    })
+            }
+        };
+        let (pinned, pinned_role, pinned_plan_backed, affinity, key) = match pin {
+            Ok(found) => found,
+            Err(miss) => {
+                let turn = SmartAutoRoles::classify_user_text(signals, policy.role);
+                let incumbent = Self::incumbent(pool, anchor, turn.role, now);
+                let (model, reason) =
+                    Self::pick(pool, tier, turn, incumbent, usage, RouteReason::Fresh)?;
+                let pin_miss = (reason == RouteReason::Fresh).then_some(miss);
+                return Some((model, turn, reason, pin_miss));
+            }
         };
         if signals.tool_continuation {
             let turn = RoleDecision {
@@ -86,20 +105,21 @@ impl SmartAutoRouter {
                 plan_backed: pinned_plan_backed,
                 reason: RoleReason::CallerHint,
             };
-            return Some((pinned, turn, RouteReason::ToolContinuationReplay));
+            return Some((pinned, turn, RouteReason::ToolContinuationReplay, None));
         }
         let turn = SmartAutoRoles::classify_user_text(signals, policy.role);
         let settled = affinity.soft_switch_allowed(key, signals.user_turns, now);
-        let switches = SmartAutoAffinity::should_switch(
-            pinned_role,
-            pinned_plan_backed,
-            turn.role,
-            turn.plan_backed,
-            signals,
-            settled,
-        ) || Self::steps_down(pinned_role, pinned_plan_backed, turn, signals, settled);
+        let switches =
+            SmartAutoAffinity::should_switch(
+                pinned_role,
+                pinned_plan_backed,
+                turn.role,
+                turn.plan_backed,
+                signals,
+                settled,
+            ) || Self::steps_down(pinned_role, pinned_plan_backed, turn, signals, settled);
         if !switches {
-            return Some((pinned, turn, RouteReason::Pinned));
+            return Some((pinned, turn, RouteReason::Pinned, None));
         }
         let incumbent = Self::incumbent(pool, anchor, turn.role, now);
         let (model, reason) =
@@ -109,7 +129,7 @@ impl SmartAutoRouter {
         } else {
             reason
         };
-        Some((model, turn, reason))
+        Some((model, turn, reason, None))
     }
 
     /// Whether a settled heavy pin steps down to the conversation pick at the start of a turn.
@@ -566,6 +586,74 @@ mod tests {
         .unwrap();
         assert_eq!(decision.model.qualified_id, HAIKU);
         assert_eq!(decision.reason, RouteReason::Fresh);
+    }
+
+    #[test]
+    fn a_turn_without_an_affinity_key_routes_fresh_for_no_key() {
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+
+        let decision = route_fresh(&pool, SmartAutoTier::Balance, PLANNING_TEXT);
+
+        assert_eq!(decision.reason, RouteReason::Fresh);
+        assert_eq!(decision.pin_miss, Some(PinMiss::NoKey));
+    }
+
+    #[test]
+    fn a_keyed_turn_without_a_pin_routes_fresh_for_no_pin() {
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let affinity = SmartAutoAffinity::new();
+
+        let decision = route_pinned(
+            &pool,
+            &affinity,
+            &signals(PLANNING_TEXT, 1, false),
+            Instant::now(),
+        );
+
+        assert_eq!(decision.reason, RouteReason::Fresh);
+        assert_eq!(decision.pin_miss, Some(PinMiss::NoPin));
+    }
+
+    #[test]
+    fn a_pin_idle_past_its_limit_routes_fresh_for_idle_expired() {
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let start = Instant::now();
+        let affinity = pinned_store(OPUS, WorkRole::Planning, false, start);
+        let expired = start + Duration::from_mins(10) + Duration::from_secs(1);
+
+        let decision = route_pinned(&pool, &affinity, &signals(PLANNING_TEXT, 5, false), expired);
+
+        assert_eq!(decision.reason, RouteReason::Fresh);
+        assert_eq!(decision.pin_miss, Some(PinMiss::IdleExpired));
+    }
+
+    #[test]
+    fn a_pin_whose_model_left_the_pool_routes_fresh_for_left_pool() {
+        let owned = models(&[HAIKU, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let now = Instant::now();
+        let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
+
+        let decision = route_pinned(&pool, &affinity, &signals(PLANNING_TEXT, 5, false), now);
+
+        assert_eq!(decision.reason, RouteReason::Fresh);
+        assert_eq!(decision.pin_miss, Some(PinMiss::LeftPool));
+    }
+
+    #[test]
+    fn a_pinned_turn_has_no_pin_miss() {
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let now = Instant::now();
+        let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
+
+        let decision = route_pinned(&pool, &affinity, &signals("yes, go ahead", 5, false), now);
+
+        assert_eq!(decision.reason, RouteReason::Pinned);
+        assert_eq!(decision.pin_miss, None);
     }
 
     /// Models in the timed catalog, the size of a large gateway's chat list.

@@ -1,4 +1,5 @@
 pub mod affinity_key;
+pub mod affinity_scope;
 pub mod anthropic_error;
 pub mod api_key_input;
 pub mod api_key_record;
@@ -23,6 +24,7 @@ pub mod model_context;
 pub mod model_descriptor;
 pub mod model_descriptor_snapshot;
 pub mod model_id;
+pub mod pin_miss;
 pub mod pool_limits;
 pub mod profile_input;
 pub mod reply_protocol;

@@ -677,6 +677,7 @@ async fn smart_auto_dispatch_is_visible_in_the_selection_history() {
 
     let history_url = format!("{base}/api/smart-auto/history?worker={worker}");
     let mut states = Vec::new();
+    let mut selected = serde_json::Value::Null;
     for _ in 0..100 {
         let history: serde_json::Value = client
             .get(&history_url)
@@ -698,6 +699,7 @@ async fn smart_auto_dispatch_is_visible_in_the_selection_history() {
             })
             .collect();
         if states.len() == 5 {
+            selected = history["events"][0].clone();
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -715,5 +717,7 @@ async fn smart_auto_dispatch_is_visible_in_the_selection_history() {
         .map(|(state, model)| (state.to_string(), model.to_string()))
         .collect();
     assert_eq!(states, expected);
+    assert_eq!(selected["pin_miss"], "no_pin");
+    assert_eq!(selected["affinity_scope"], "content_hash");
     drop(hub);
 }

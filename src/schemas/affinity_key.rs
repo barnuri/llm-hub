@@ -1,5 +1,6 @@
 use sha2::{Digest, Sha256};
 
+use crate::schemas::affinity_scope::AffinityScope;
 use crate::schemas::smart_auto_headers::SmartAutoHeaders;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
 use crate::schemas::turn_signals::TurnSignals;
@@ -11,10 +12,6 @@ pub struct AffinityKey([u8; 32]);
 
 impl AffinityKey {
     const VERSION: &[u8] = b"smart-auto-affinity-v1";
-    const ANCHOR_SESSION: u8 = 1;
-    const ANCHOR_PROMPT_CACHE_KEY: u8 = 2;
-    const ANCHOR_CONTENT: u8 = 3;
-    const ANCHOR_WORKER: u8 = 4;
     const ABSENT: u8 = 0;
     const PRESENT: u8 = 1;
 
@@ -27,18 +24,10 @@ impl AffinityKey {
         policy: &SmartAutoPolicy,
         endpoint: &str,
     ) -> Option<AffinityKey> {
-        let (anchor_kind, anchor): (u8, &[u8]) = if let Some(session) = &signals.session_id {
-            (Self::ANCHOR_SESSION, session.as_bytes())
-        } else if let Some(cache_key) = &signals.prompt_cache_key {
-            (Self::ANCHOR_PROMPT_CACHE_KEY, cache_key.as_bytes())
-        } else if let Some(content) = &signals.content_key {
-            (Self::ANCHOR_CONTENT, content.as_slice())
-        } else {
-            (Self::ANCHOR_WORKER, caller.worker.as_ref()?.as_bytes())
-        };
+        let (scope, anchor) = Self::anchor(signals, caller)?;
         let mut hasher = Sha256::new();
         Self::part(&mut hasher, Self::VERSION);
-        Self::part(&mut hasher, &[anchor_kind]);
+        Self::part(&mut hasher, &[scope as u8]);
         Self::part(&mut hasher, anchor);
         Self::optional(&mut hasher, caller.worker.as_deref());
         Self::optional(&mut hasher, caller.parent.as_deref());
@@ -46,6 +35,30 @@ impl AffinityKey {
         Self::part(&mut hasher, endpoint.as_bytes());
         Self::restrictions(&mut hasher, policy);
         Some(AffinityKey(hasher.finalize().into()))
+    }
+
+    /// The input that anchors the key, `None` when the request has no anchor and names no worker.
+    #[must_use]
+    pub fn scope(signals: &TurnSignals, caller: &SmartAutoHeaders) -> Option<AffinityScope> {
+        Self::anchor(signals, caller).map(|(scope, _)| scope)
+    }
+
+    fn anchor<'a>(
+        signals: &'a TurnSignals,
+        caller: &'a SmartAutoHeaders,
+    ) -> Option<(AffinityScope, &'a [u8])> {
+        if let Some(session) = &signals.session_id {
+            Some((AffinityScope::SessionHeader, session.as_bytes()))
+        } else if let Some(cache_key) = &signals.prompt_cache_key {
+            Some((AffinityScope::PromptCacheKey, cache_key.as_bytes()))
+        } else if let Some(content) = &signals.content_key {
+            Some((AffinityScope::ContentHash, content.as_slice()))
+        } else {
+            Some((
+                AffinityScope::WorkerHeader,
+                caller.worker.as_ref()?.as_bytes(),
+            ))
+        }
     }
 
     /// The role hint is left out: it selects an objective and never changes eligibility.
@@ -194,6 +207,35 @@ mod tests {
             None
         );
         assert!(AffinityKey::new(&none, &worker(Some("w1"), None), &policy, MESSAGES).is_some());
+    }
+
+    #[test]
+    fn scope_names_the_anchor_that_forms_the_key() {
+        let with_worker = worker(Some("w1"), None);
+
+        assert_eq!(
+            AffinityKey::scope(
+                &signals(Some("s1"), Some("c1"), Some(1)),
+                &SmartAutoHeaders::default()
+            ),
+            Some(AffinityScope::SessionHeader)
+        );
+        assert_eq!(
+            AffinityKey::scope(&signals(None, Some("c1"), Some(1)), &with_worker),
+            Some(AffinityScope::PromptCacheKey)
+        );
+        assert_eq!(
+            AffinityKey::scope(&signals(None, None, Some(1)), &with_worker),
+            Some(AffinityScope::ContentHash)
+        );
+        assert_eq!(
+            AffinityKey::scope(&signals(None, None, None), &with_worker),
+            Some(AffinityScope::WorkerHeader)
+        );
+        assert_eq!(
+            AffinityKey::scope(&signals(None, None, None), &SmartAutoHeaders::default()),
+            None
+        );
     }
 
     #[test]

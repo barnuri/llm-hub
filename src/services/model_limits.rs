@@ -168,7 +168,17 @@ impl ModelLimits {
         if error.get("code").and_then(Value::as_str) != Some(Self::PROMPT_LIMIT_ERROR_CODE) {
             return None;
         }
-        let message = error.get("message").and_then(Value::as_str)?;
+        Self::limit_from_message(error.get("message").and_then(Value::as_str)?)
+    }
+
+    /// `M` from any 400 body whose error message names a prompt limit, whatever its code.
+    pub fn limit_from_rejection(body: &[u8]) -> Option<u64> {
+        let value: Value = serde_json::from_slice(body).ok()?;
+        Self::limit_from_message(value.get("error")?.get("message")?.as_str()?)
+    }
+
+    /// `M` from either message form: "N tokens > M maximum" or "exceeds the limit of M".
+    pub fn limit_from_message(message: &str) -> Option<u64> {
         Self::limit_before_maximum(message).or_else(|| Self::limit_after_limit_of(message))
     }
 
@@ -258,6 +268,19 @@ mod tests {
             "prompt token count of 1,150,005 exceeds the limit of 1,000,000.",
         );
         assert_eq!(ModelLimits::limit_from_error(&body), Some(1_000_000));
+    }
+
+    #[test]
+    fn rejection_message_teaches_the_limit_whatever_its_code() {
+        let claude =
+            br#"{"error":{"message":"prompt is too long: 1200000 tokens > 900000 maximum"}}"#;
+        let gpt = br#"{"error":{"type":"invalid_request_error","message":"prompt token count of 1150005 exceeds the limit of 872000"}}"#;
+        let unrelated = br#"{"error":{"message":"prompt is too long"}}"#;
+
+        assert_eq!(ModelLimits::limit_from_rejection(claude), Some(900_000));
+        assert_eq!(ModelLimits::limit_from_rejection(gpt), Some(872_000));
+        assert_eq!(ModelLimits::limit_from_rejection(unrelated), None);
+        assert_eq!(ModelLimits::limit_from_rejection(b"not json"), None);
     }
 
     #[test]

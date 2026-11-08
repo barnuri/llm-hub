@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+use crate::schemas::affinity_scope::AffinityScope;
 use crate::schemas::effort_level::EffortLevel;
+use crate::schemas::pin_miss::PinMiss;
 use crate::schemas::selection_stage::SelectionStage;
 use crate::schemas::selection_state::SelectionState;
 use crate::schemas::work_role::WorkRole;
@@ -29,6 +31,12 @@ pub struct SelectionEvent {
     /// The turn is plan-backed: its text references a plan, tasks file or skill. `None` on events that predate this field.
     #[serde(default)]
     pub plan_backed: Option<bool>,
+    /// The input that anchored the affinity key of the routed request. `None` without a key.
+    #[serde(default)]
+    pub affinity_scope: Option<AffinityScope>,
+    /// Why a fresh route found no pin to reuse. `None` on pinned and incumbent routes.
+    #[serde(default)]
+    pub pin_miss: Option<PinMiss>,
     /// The model call this event belongs to.
     pub stage: SelectionStage,
     /// The qualified id of the model this event concerns.
@@ -82,6 +90,8 @@ impl SelectionEvent {
             tier: None,
             role: None,
             plan_backed: None,
+            affinity_scope: None,
+            pin_miss: None,
             stage,
             model: model.into(),
             state: selection_state,
@@ -135,12 +145,14 @@ mod tests {
             .collect();
         let expected: BTreeSet<&str> = [
             "attempt",
+            "affinity_scope",
             "cache_read_tokens",
             "cache_write_tokens",
             "confirmed_effort",
             "latency_ms",
             "model",
             "plan_backed",
+            "pin_miss",
             "policy_version",
             "reason",
             "requested_effort",
@@ -204,5 +216,32 @@ mod tests {
                 ..event
             }
         );
+    }
+
+    #[test]
+    fn scope_and_pin_miss_serialize_as_codes() {
+        let event = SelectionEvent {
+            affinity_scope: Some(AffinityScope::SessionHeader),
+            pin_miss: Some(PinMiss::LeftPool),
+            ..sample()
+        };
+
+        let json = serde_json::to_value(event).unwrap();
+
+        assert_eq!(json["affinity_scope"], "session_header");
+        assert_eq!(json["pin_miss"], "left_pool");
+    }
+
+    #[test]
+    fn an_event_saved_before_the_fields_parses_with_them_unset() {
+        let mut json = serde_json::to_value(sample()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("affinity_scope");
+        object.remove("pin_miss");
+
+        let parsed: SelectionEvent = serde_json::from_value(json).unwrap();
+
+        assert_eq!(parsed.affinity_scope, None);
+        assert_eq!(parsed.pin_miss, None);
     }
 }

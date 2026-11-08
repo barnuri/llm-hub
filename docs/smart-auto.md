@@ -224,7 +224,7 @@ If a check runs out of budget, times out or returns a bad verdict, the draft is 
 
 ### Privacy and storage
 
-An event holds salted scope keys and metadata: selector, tier, role, stage, model, state, reason, effort, status, latency and token counts. It never holds prompt, response or tool text. The salt is random per install and kept in the store. A stored key does not reveal the id it stands for.
+An event holds salted scope keys and metadata: selector, tier, role, stage, model, state, reason, effort, status, latency and token counts. A solver event also holds `affinity_scope` (which part formed the affinity key: `session_header`, `prompt_cache_key`, `content_hash` or `worker_header`) and, on a `fresh` route, `pin_miss` (why no kept model applied: `no_key`, `no_pin`, `idle_expired` or `left_pool`). Both are codes, never raw values. It never holds prompt, response or tool text. The salt is random per install and kept in the store. A stored key does not reveal the id it stands for.
 
 - Events are saved to the store (`LLM_HUB_STORE`, SQLite by default) by a writer thread. If the writer queue is full, the save is dropped. The in-memory event is kept.
 - The store keeps every event from the last 60 days, with no count limit. Memory holds the newest 2,000.

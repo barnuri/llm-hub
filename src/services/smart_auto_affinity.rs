@@ -6,6 +6,7 @@ use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::model_context::strip_1m_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
+use crate::schemas::pin_miss::PinMiss;
 use crate::schemas::turn_signals::TurnSignals;
 use crate::schemas::work_role::WorkRole;
 use crate::services::copilot_auto::AutoTier;
@@ -69,21 +70,26 @@ impl SmartAutoAffinity {
 
     /// The pinned model, role and plan backing, only while the pin is fresh and in `eligible`.
     /// An idle entry is removed, and an ineligible pin is dropped, so deny always wins.
-    #[must_use]
+    ///
+    /// # Errors
+    /// The reason no usable pin exists.
     pub fn lookup(
         &self,
         key: &AffinityKey,
         eligible: &[&ModelDescriptor],
         now: Instant,
-    ) -> Option<(String, WorkRole, bool)> {
+    ) -> Result<(String, WorkRole, bool), PinMiss> {
         let mut table = self.lock();
-        let entry = table.live_entry(key, now)?;
-        let pin = entry.active.as_ref()?;
+        if !table.entries.contains_key(key) {
+            return Err(PinMiss::NoPin);
+        }
+        let entry = table.live_entry(key, now).ok_or(PinMiss::IdleExpired)?;
+        let pin = entry.active.as_ref().ok_or(PinMiss::NoPin)?;
         if !Self::is_eligible(&pin.model, eligible) {
             entry.active = None;
-            return None;
+            return Err(PinMiss::LeftPool);
         }
-        Some((pin.model.clone(), pin.role, pin.plan_backed))
+        Ok((pin.model.clone(), pin.role, pin.plan_backed))
     }
 
     /// The model this conversation last used for `role`, only while it is in `eligible`.
@@ -363,7 +369,7 @@ mod tests {
 
         assert_eq!(
             store.lookup(&key, &pool.refs(), now),
-            Some(pinned(OPUS, WorkRole::Planning, false))
+            Ok(pinned(OPUS, WorkRole::Planning, false))
         );
     }
 
@@ -374,13 +380,13 @@ mod tests {
         let pool = Pool::of(&[OPUS, MINI]);
         let now = Instant::now();
 
-        assert_eq!(store.lookup(&key, &pool.refs(), now), None);
+        assert_eq!(store.lookup(&key, &pool.refs(), now), Err(PinMiss::NoPin));
         store.commit(&key, OPUS, WorkRole::Planning, false, 1, now);
         // An attempt on MINI fails, so the proxy never calls commit for it.
 
         assert_eq!(
             store.lookup(&key, &pool.refs(), now),
-            Some(pinned(OPUS, WorkRole::Planning, false))
+            Ok(pinned(OPUS, WorkRole::Planning, false))
         );
     }
 
@@ -398,13 +404,13 @@ mod tests {
 
         assert_eq!(
             store.lookup(&first, &pool.refs(), now),
-            Some(pinned(MINI, WorkRole::Implementation, true))
+            Ok(pinned(MINI, WorkRole::Implementation, true))
         );
         assert_eq!(
             store.lookup(&second, &pool.refs(), now),
-            Some(pinned(LOCAL, WorkRole::Validation, false))
+            Ok(pinned(LOCAL, WorkRole::Validation, false))
         );
-        assert_eq!(store.lookup(&main, &pool.refs(), now), None);
+        assert_eq!(store.lookup(&main, &pool.refs(), now), Err(PinMiss::NoPin));
     }
 
     #[test]
@@ -414,10 +420,13 @@ mod tests {
         let now = Instant::now();
         store.commit(&key, OPUS, WorkRole::Planning, false, 1, now);
 
-        assert_eq!(store.lookup(&key, &Pool::of(&[MINI]).refs(), now), None);
+        assert_eq!(
+            store.lookup(&key, &Pool::of(&[MINI]).refs(), now),
+            Err(PinMiss::LeftPool)
+        );
         assert_eq!(
             store.lookup(&key, &Pool::of(&[OPUS, MINI]).refs(), now),
-            None
+            Err(PinMiss::NoPin)
         );
     }
 
@@ -459,10 +468,13 @@ mod tests {
         assert!(
             store
                 .lookup(&key, &pool.refs(), start + SmartAutoAffinity::IDLE)
-                .is_some()
+                .is_ok()
         );
         let expired = start + SmartAutoAffinity::IDLE + Duration::from_secs(1);
-        assert_eq!(store.lookup(&key, &pool.refs(), expired), None);
+        assert_eq!(
+            store.lookup(&key, &pool.refs(), expired),
+            Err(PinMiss::IdleExpired)
+        );
         assert_eq!(store.len(), 0);
     }
 
@@ -479,7 +491,7 @@ mod tests {
         assert!(
             store
                 .lookup(&key, &pool.refs(), later + Duration::from_mins(9))
-                .is_some()
+                .is_ok()
         );
     }
 
@@ -507,12 +519,15 @@ mod tests {
         );
 
         assert_eq!(store.len(), SmartAutoAffinity::CAPACITY);
-        assert!(store.lookup(&keys[0], &pool.refs(), now).is_some());
-        assert_eq!(store.lookup(&keys[1], &pool.refs(), now), None);
+        assert!(store.lookup(&keys[0], &pool.refs(), now).is_ok());
+        assert_eq!(
+            store.lookup(&keys[1], &pool.refs(), now),
+            Err(PinMiss::NoPin)
+        );
         assert!(
             store
                 .lookup(&keys[SmartAutoAffinity::CAPACITY], &pool.refs(), now)
-                .is_some()
+                .is_ok()
         );
     }
 
