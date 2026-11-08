@@ -26,6 +26,9 @@ pub struct SelectionEvent {
     pub tier: Option<String>,
     /// The work role of the turn, when the route has one.
     pub role: Option<WorkRole>,
+    /// The turn is plan-backed: its text references a plan, tasks file or skill. `None` on events that predate this field.
+    #[serde(default)]
+    pub plan_backed: Option<bool>,
     /// The model call this event belongs to.
     pub stage: SelectionStage,
     /// The qualified id of the model this event concerns.
@@ -78,6 +81,7 @@ impl SelectionEvent {
             selector: None,
             tier: None,
             role: None,
+            plan_backed: None,
             stage,
             model: model.into(),
             state: selection_state,
@@ -136,6 +140,7 @@ mod tests {
             "confirmed_effort",
             "latency_ms",
             "model",
+            "plan_backed",
             "policy_version",
             "reason",
             "requested_effort",

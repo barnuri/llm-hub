@@ -473,3 +473,106 @@
     min-width: 0;
   }
 }
+
+/* Sub pages: the nav under the Smart Auto tab, the turn trace and the waste view. */
+.smart-auto-subnav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 14px;
+}
+
+.smart-auto-subnav button {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+  font: inherit;
+  cursor: pointer;
+  transition: color var(--ease), border-color var(--ease), background var(--ease);
+}
+
+.smart-auto-subnav button:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.smart-auto-subnav button.active {
+  color: var(--accent-text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.smart-auto-subnav button:focus-visible,
+.smart-auto .link-button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.smart-auto .link-button {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.smart-auto-turns tr.active td {
+  background: var(--accent-soft);
+}
+
+.smart-auto-why {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px 20px;
+  margin: 0 0 16px;
+}
+
+.smart-auto-why dt {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 0 2px;
+}
+
+.smart-auto-why dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.smart-auto-why .note {
+  margin: 4px 0 0;
+}
+
+.smart-auto-texts {
+  margin-top: 16px;
+}
+
+.smart-auto-texts h4 {
+  margin: 14px 0 6px;
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.smart-auto-text {
+  margin: 0;
+  max-height: 360px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

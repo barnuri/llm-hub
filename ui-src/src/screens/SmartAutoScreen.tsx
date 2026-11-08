@@ -1,19 +1,20 @@
-import { type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { KpiCard } from "../components/KpiCard";
 import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
 import { PriceHeader } from "../components/PriceHeader";
 import { api } from "../lib/api";
-import { formatDateTime, formatMs, formatNumber } from "../lib/format";
+import { formatDateTime, formatMs, formatNumber, formatUsd } from "../lib/format";
 import { formatPrice, type PriceSort, sortByPrice } from "../lib/pricing";
+import { navigate, useRoute } from "../lib/router";
+import { classifyEvents, type CostKind, eventCost, sumCost, WASTE_KINDS } from "../lib/smartAutoCost";
 import type {
   CurrentSelection,
   HubModelPrice,
   CurrentSelectionResponse,
   ProfileRow,
   SelectionEvent,
-  SelectionHistoryResponse,
   SelectionState,
   SmartAutoEffectReason,
   SmartAutoEffectResponse,
@@ -23,20 +24,32 @@ import type {
   SmartAutoRulesResponse,
   SmartAutoRulesSource,
 } from "../lib/types";
+import { REFRESH_MS, useSelectionEvents } from "../lib/useSelectionEvents";
 import "../styles/screens/smart-auto.css";
 import { SmartAutoHowItWorks } from "./SmartAutoHowItWorks";
+import { SmartAutoTracePage } from "./SmartAutoTracePage";
+import { SmartAutoWastePage } from "./SmartAutoWastePage";
 
-/** Events the hub serves per page; the hub clamps larger requests to the same limit. */
-const PAGE_LIMIT = 1000;
-const MAX_PAGES_PER_REFRESH = 10;
-/** Newest events kept in the browser; older ones drop off the timeline. */
-const MAX_EVENTS = 2000;
-/** Rows drawn in the timeline, newest first. */
+/** Rows drawn in the calls table, newest first. */
 const MAX_ROWS = 300;
-const REFRESH_MS = 3000;
 const SHORT_KEY_CHARS = 8;
 const ALL = "";
 const UNSET = "—";
+
+/** The sub pages under `/smart-auto/<id>`. The first one is the page itself, at `/smart-auto`. */
+const SUB_PAGES = [
+  { id: "overview", label: "Overview", path: "smart-auto" },
+  { id: "trace", label: "Trace", path: "smart-auto/trace" },
+  { id: "calls", label: "Calls", path: "smart-auto/calls" },
+  { id: "waste", label: "Waste", path: "smart-auto/waste" },
+  { id: "rules", label: "Rules", path: "smart-auto/rules" },
+  { id: "how", label: "How it works", path: "smart-auto/how" },
+] as const;
+type SubPageId = (typeof SUB_PAGES)[number]["id"];
+
+function subPageOf(segment: string | undefined): SubPageId {
+  return SUB_PAGES.find((page) => page.id === segment)?.id ?? "overview";
+}
 
 const STATE_TONE: Readonly<Record<SelectionState, PillTone>> = {
   selected: "info",
@@ -149,7 +162,15 @@ function FilterSelect({
   );
 }
 
-function EventRow({ event, startsTurn }: { readonly event: SelectionEvent; readonly startsTurn: boolean }) {
+function EventRow({
+  event,
+  startsTurn,
+  cost,
+}: {
+  readonly event: SelectionEvent;
+  readonly startsTurn: boolean;
+  readonly cost: number | null;
+}) {
   const failed = FAILED_STATES.has(event.state);
   const className = [startsTurn ? "turn-start" : "", failed ? "failed" : ""].filter(Boolean).join(" ");
   return (
@@ -188,6 +209,9 @@ function EventRow({ event, startsTurn }: { readonly event: SelectionEvent; reado
       </td>
       <td className="num" data-label="Tokens in / out">
         {tokenText(event)}
+      </td>
+      <td className="num" data-label="Cost">
+        {cost === null ? UNSET : formatUsd(cost)}
       </td>
     </tr>
   );
@@ -1065,200 +1089,217 @@ interface SmartAutoScreenProps {
   readonly prices: ReadonlyMap<string, HubModelPrice>;
 }
 
+/** The sub-page nav. Each button is a path, so Back and Forward move between sub pages. */
+function SubNav({ active }: { readonly active: SubPageId }) {
+  return (
+    <nav className="smart-auto-subnav" aria-label="Smart Auto pages">
+      {SUB_PAGES.map((page) => (
+        <button
+          key={page.id}
+          type="button"
+          className={page.id === active ? "active" : undefined}
+          aria-current={page.id === active ? "page" : undefined}
+          onClick={() => navigate(`/${page.path}`)}
+        >
+          {page.label}
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+function LivePill({ unavailable }: { readonly unavailable: boolean }) {
+  return unavailable ? (
+    <Pill tone="warn" dot>
+      <span role="status">Refresh failed, showing the last result</span>
+    </Pill>
+  ) : (
+    <Pill tone="ok" dot>
+      live · every {REFRESH_MS / 1000} s
+    </Pill>
+  );
+}
+
 export function SmartAutoScreen({ profiles, prices }: SmartAutoScreenProps) {
-  const [events, setEvents] = useState<readonly SelectionEvent[] | null>(null);
-  const [unavailable, setUnavailable] = useState(false);
+  const { events, unavailable } = useSelectionEvents();
   const [filters, setFilters] = useState<Filters>(NO_FILTERS);
-  // The last seq the browser holds; each refresh asks only for events after it.
-  const cursor = useRef(0);
-  const refreshing = useRef(false);
+  const route = useRoute();
+  const sub = subPageOf(route.path.split("/")[1]);
+  const selectedTurn = route.query.get("turn");
 
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = async () => {
-      if (refreshing.current) {
-        return;
-      }
-      refreshing.current = true;
-      const fresh: SelectionEvent[] = [];
-      try {
-        for (let page = 0; page < MAX_PAGES_PER_REFRESH; page += 1) {
-          const params = new URLSearchParams({ since_seq: String(cursor.current), limit: String(PAGE_LIMIT) });
-          const body = await api<SelectionHistoryResponse>(`/api/smart-auto/history?${params}`);
-          const last = body.events[body.events.length - 1];
-          if (last === undefined) {
-            break;
-          }
-          fresh.push(...body.events);
-          cursor.current = last.seq;
-          if (body.events.length < PAGE_LIMIT) {
-            break;
-          }
-        }
-        if (!cancelled) {
-          setUnavailable(false);
-          setEvents((current) => [...(current ?? []), ...fresh].slice(-MAX_EVENTS));
-        }
-      } catch {
-        if (!cancelled) {
-          setUnavailable(true);
-        }
-      } finally {
-        refreshing.current = false;
-      }
-    };
-    void refresh();
-    const timer = setInterval(() => void refresh(), REFRESH_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, []);
-
-  if (unavailable && events === null) {
-    return (
-      <section className="tab active smart-auto">
-        <CurrentSelectionPanel />
-        <SmartAutoRulesPanel profiles={profiles} prices={prices} />
-        <Panel title="Smart Auto history unavailable">
-          <p className="note" role="status">
-            Smart Auto history is unavailable. Send a request to <code>hub/smart-auto-balance</code> and reload this tab.
-          </p>
-        </Panel>
-        <SmartAutoHowItWorks />
-      </section>
-    );
-  }
-
-  const all = events ?? [];
+  const all = useMemo(() => events ?? [], [events]);
+  // Classified over every event, so a rejected judge marks its solver call even when a filter hides the judge.
+  const kinds = useMemo(() => classifyEvents(all), [all]);
   const filtered = all.filter((event) => matches(event, filters));
   const rows = filtered.slice(-MAX_ROWS).reverse();
   const failures = filtered.filter((event) => FAILED_STATES.has(event.state)).length;
   const turns = new Set(filtered.flatMap((event) => (event.turn ? [event.turn] : []))).size;
   const tokensIn = filtered.reduce((sum, event) => sum + (event.tokens_in ?? 0), 0);
   const tokensOut = filtered.reduce((sum, event) => sum + (event.tokens_out ?? 0), 0);
+  const totals = sumCost(filtered, prices);
+  const wasteUsd = filtered.reduce((sum, event) => {
+    const kind: CostKind | undefined = kinds.get(event);
+    const cost = eventCost(event, prices);
+    return kind !== undefined && WASTE_KINDS.includes(kind) && cost !== null ? sum + cost : sum;
+  }, 0);
   const setFilter = (key: keyof Filters) => (value: string) => setFilters((current) => ({ ...current, [key]: value }));
 
-  return (
-    <section className="tab active smart-auto" aria-busy={events === null}>
-      <CurrentSelectionPanel />
-      <SmartAutoRulesPanel profiles={profiles} prices={prices} />
-      <div className="smart-auto-head">
-        <span className="dim">Every stage and turn Smart Auto dispatched, newest first. Keys are salted hashes.</span>
-        {unavailable ? (
-          <Pill tone="warn" dot>
-            <span role="status">Refresh failed, showing the last result</span>
-          </Pill>
-        ) : (
-          <Pill tone="ok" dot>
-            live · every {REFRESH_MS / 1000} s
-          </Pill>
-        )}
-      </div>
-
-      <div className="smart-auto-kpis">
-        <KpiCard label="Events" value={formatNumber(filtered.length)} sub={`${formatNumber(all.length)} kept in this tab`} />
-        <KpiCard
-          label="Failures"
-          value={formatNumber(failures)}
-          sub="Rejected or cancelled dispatches"
-          tone={failures > 0 ? "danger" : "default"}
-        />
-        <KpiCard label="Turns" value={formatNumber(turns)} sub="Distinct turns in view" />
-        <KpiCard
-          label="Tokens in / out"
-          value={`${formatNumber(tokensIn)} / ${formatNumber(tokensOut)}`}
-          sub="Reported by upstreams"
-        />
-      </div>
-
-      <Panel title="Stage and turn timeline" sub={`${formatNumber(rows.length)} shown`} className="smart-auto-panel">
-        <div className="smart-auto-toolbar">
-          <FilterSelect
-            label="Workflow"
-            value={filters.workflow}
-            options={distinct(all, (event) => event.workflow)}
-            format={shortKey}
-            onChange={setFilter("workflow")}
-          />
-          <FilterSelect
-            label="Worker"
-            value={filters.worker}
-            options={distinct(all, (event) => event.worker)}
-            format={shortKey}
-            onChange={setFilter("worker")}
-          />
-          <FilterSelect
-            label="Stage"
-            value={filters.stage}
-            options={distinct(all, (event) => event.stage)}
-            format={(value) => value}
-            onChange={setFilter("stage")}
-          />
-          <FilterSelect
-            label="Model"
-            value={filters.model}
-            options={distinct(all, (event) => event.model)}
-            format={(value) => value}
-            onChange={setFilter("model")}
-          />
-          <FilterSelect
-            label="Effort"
-            value={filters.effort}
-            options={distinct(all, effortText)}
-            format={(value) => value}
-            onChange={setFilter("effort")}
-          />
-        </div>
-
-        <div className="table-scroll smart-auto-table">
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>Turn</th>
-                <th>Worker</th>
-                <th>Workflow</th>
-                <th>Stage</th>
-                <th>Model</th>
-                <th>State</th>
-                <th>Reason</th>
-                <th>Role</th>
-                <th>Effort</th>
-                <th className="num">Status</th>
-                <th className="num">Latency</th>
-                <th className="num">Tokens in / out</th>
-              </tr>
-            </thead>
-            <tbody>
-              {events === null ? (
-                <tr>
-                  <td colSpan={13} className="table-empty">
-                    Loading…
-                  </td>
-                </tr>
-              ) : rows.length === 0 ? (
-                <tr>
-                  <td colSpan={13} className="table-empty">
-                    {all.length === 0
-                      ? "No Smart Auto selections yet. Requests to hub/smart-auto-balance appear here as they run."
-                      : "No events match these filters."}
-                  </td>
-                </tr>
-              ) : (
-                rows.map((event, index) => (
-                  <EventRow
-                    key={event.seq}
-                    event={event}
-                    startsTurn={index === 0 || rows[index - 1]?.turn !== event.turn}
-                  />
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
+  let body: ReactNode;
+  if (sub === "rules") {
+    body = <SmartAutoRulesPanel profiles={profiles} prices={prices} />;
+  } else if (sub === "how") {
+    body = <SmartAutoHowItWorks />;
+  } else if (unavailable && events === null) {
+    body = (
+      <Panel title="Smart Auto history unavailable">
+        <p className="note" role="status">
+          Smart Auto history is unavailable. Send a request to <code>hub/smart-auto-balance</code> and reload this tab.
+        </p>
       </Panel>
-      <SmartAutoHowItWorks />
+    );
+  } else if (sub === "trace") {
+    body = <SmartAutoTracePage events={all} prices={prices} selectedTurn={selectedTurn} />;
+  } else if (sub === "waste") {
+    body = <SmartAutoWastePage events={all} prices={prices} />;
+  } else if (sub === "calls") {
+    body = (
+      <>
+        <div className="smart-auto-head">
+          <span className="dim">Every stage and turn Smart Auto dispatched, newest first. Keys are salted hashes.</span>
+          <LivePill unavailable={unavailable} />
+        </div>
+        <Panel title="Calls" sub={`${formatNumber(rows.length)} shown`} className="smart-auto-panel">
+          <div className="smart-auto-toolbar">
+            <FilterSelect
+              label="Workflow"
+              value={filters.workflow}
+              options={distinct(all, (event) => event.workflow)}
+              format={shortKey}
+              onChange={setFilter("workflow")}
+            />
+            <FilterSelect
+              label="Worker"
+              value={filters.worker}
+              options={distinct(all, (event) => event.worker)}
+              format={shortKey}
+              onChange={setFilter("worker")}
+            />
+            <FilterSelect
+              label="Stage"
+              value={filters.stage}
+              options={distinct(all, (event) => event.stage)}
+              format={(value) => value}
+              onChange={setFilter("stage")}
+            />
+            <FilterSelect
+              label="Model"
+              value={filters.model}
+              options={distinct(all, (event) => event.model)}
+              format={(value) => value}
+              onChange={setFilter("model")}
+            />
+            <FilterSelect
+              label="Effort"
+              value={filters.effort}
+              options={distinct(all, effortText)}
+              format={(value) => value}
+              onChange={setFilter("effort")}
+            />
+          </div>
+
+          <div className="table-scroll smart-auto-table">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Turn</th>
+                  <th>Worker</th>
+                  <th>Workflow</th>
+                  <th>Stage</th>
+                  <th>Model</th>
+                  <th>State</th>
+                  <th>Reason</th>
+                  <th>Role</th>
+                  <th>Effort</th>
+                  <th className="num">Status</th>
+                  <th className="num">Latency</th>
+                  <th className="num">Tokens in / out</th>
+                  <th className="num">Cost</th>
+                </tr>
+              </thead>
+              <tbody>
+                {events === null ? (
+                  <tr>
+                    <td colSpan={14} className="table-empty">
+                      Loading…
+                    </td>
+                  </tr>
+                ) : rows.length === 0 ? (
+                  <tr>
+                    <td colSpan={14} className="table-empty">
+                      {all.length === 0
+                        ? "No Smart Auto selections yet. Requests to hub/smart-auto-balance appear here as they run."
+                        : "No events match these filters."}
+                    </td>
+                  </tr>
+                ) : (
+                  rows.map((event, index) => (
+                    <EventRow
+                      key={event.seq}
+                      event={event}
+                      startsTurn={index === 0 || rows[index - 1]?.turn !== event.turn}
+                      cost={eventCost(event, prices)}
+                    />
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      </>
+    );
+  } else {
+    body = (
+      <>
+        <CurrentSelectionPanel />
+        <div className="smart-auto-head">
+          <span className="dim">Smart Auto at a glance. Calls, Trace and Waste hold the detail.</span>
+          <LivePill unavailable={unavailable} />
+        </div>
+        <div className="smart-auto-kpis">
+          <KpiCard label="Events" value={formatNumber(filtered.length)} sub={`${formatNumber(all.length)} kept in this tab`} />
+          <KpiCard
+            label="Failures"
+            value={formatNumber(failures)}
+            sub="Rejected or cancelled dispatches"
+            tone={failures > 0 ? "danger" : "default"}
+          />
+          <KpiCard label="Turns" value={formatNumber(turns)} sub="Distinct turns in view" />
+          <KpiCard
+            label="Tokens in / out"
+            value={`${formatNumber(tokensIn)} / ${formatNumber(tokensOut)}`}
+            sub="Reported by upstreams"
+          />
+          <KpiCard
+            label="Cost"
+            value={formatUsd(totals.usd)}
+            sub={`${formatNumber(totals.unpriced)} completed calls unpriced`}
+          />
+          <KpiCard
+            label="Waste"
+            value={formatUsd(wasteUsd)}
+            sub={totals.usd > 0 ? `${((wasteUsd / totals.usd) * 100).toFixed(2)}% of cost` : "No cost yet"}
+            tone={wasteUsd > 0 ? "danger" : "default"}
+          />
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <section className="tab active smart-auto" aria-busy={events === null && !unavailable}>
+      <SubNav active={sub} />
+      {body}
     </section>
   );
 }

@@ -154,6 +154,13 @@ impl Store {
                 event TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_selection_events_ts ON selection_events(ts_ms);
+            CREATE TABLE IF NOT EXISTS selection_texts (
+                attempt TEXT PRIMARY KEY,
+                ts_ms INTEGER NOT NULL,
+                prompt TEXT NOT NULL DEFAULT '',
+                answer TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_selection_texts_ts ON selection_texts(ts_ms);
             CREATE TABLE IF NOT EXISTS install_settings (
                 name TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -923,6 +930,80 @@ impl Store {
         }
     }
 
+    /// Saves the prompt text of one dispatch attempt. Texts older than the retention age are dropped.
+    /// Only the sqlite store keeps texts; the json store returns an error.
+    pub fn save_selection_prompt(
+        &self,
+        attempt: &str,
+        now_ms: u64,
+        prompt: &str,
+    ) -> Result<(), String> {
+        self.save_selection_text(
+            "INSERT INTO selection_texts (attempt, ts_ms, prompt) VALUES (?1, ?2, ?3)
+             ON CONFLICT(attempt) DO UPDATE SET prompt = excluded.prompt, ts_ms = excluded.ts_ms",
+            attempt,
+            now_ms,
+            prompt,
+        )
+    }
+
+    /// Saves the answer text of one dispatch attempt. Texts older than the retention age are dropped.
+    /// Only the sqlite store keeps texts; the json store returns an error.
+    pub fn save_selection_answer(
+        &self,
+        attempt: &str,
+        now_ms: u64,
+        answer: &str,
+    ) -> Result<(), String> {
+        self.save_selection_text(
+            "INSERT INTO selection_texts (attempt, ts_ms, answer) VALUES (?1, ?2, ?3)
+             ON CONFLICT(attempt) DO UPDATE SET answer = excluded.answer, ts_ms = excluded.ts_ms",
+            attempt,
+            now_ms,
+            answer,
+        )
+    }
+
+    fn save_selection_text(
+        &self,
+        upsert: &str,
+        attempt: &str,
+        now_ms: u64,
+        text: &str,
+    ) -> Result<(), String> {
+        let Store::Sqlite(conn) = self else {
+            return Err("selection texts need the sqlite store".to_owned());
+        };
+        let cutoff = now_ms.saturating_sub(SELECTION_RETENTION_MS);
+        let mut guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+        let tx = guard.transaction().map_err(|e| e.to_string())?;
+        tx.execute(upsert, rusqlite::params![attempt, db_i64(now_ms), text])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM selection_texts WHERE ts_ms < ?1",
+            rusqlite::params![db_i64(cutoff)],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// The stored `(prompt, answer)` of one dispatch attempt, or `None` when none was kept.
+    pub fn load_selection_text(&self, attempt: &str) -> Result<Option<(String, String)>, String> {
+        let Store::Sqlite(conn) = self else {
+            return Err("selection texts need the sqlite store".to_owned());
+        };
+        let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+        let mut stmt = guard
+            .prepare("SELECT prompt, answer FROM selection_texts WHERE attempt = ?1")
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt
+            .query_map(rusqlite::params![attempt], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.next().transpose().map_err(|e| e.to_string())
+    }
+
     /// The newest `limit` selection events, oldest first.
     pub fn load_selection_events(&self, limit: usize) -> Result<Vec<SelectionEvent>, String> {
         match self {
@@ -1382,6 +1463,56 @@ mod tests {
     #[test]
     fn sqlite_selection_events_expire_by_age() {
         selection_events_expire_by_age("sqlite", "t.db");
+    }
+
+    #[test]
+    fn sqlite_selection_text_round_trips_prompt_then_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let now = 100 * MS_PER_DAY;
+
+        store
+            .save_selection_prompt("att-1", now, "question")
+            .unwrap();
+        assert_eq!(
+            store.load_selection_text("att-1").unwrap(),
+            Some(("question".to_owned(), String::new()))
+        );
+
+        store.save_selection_answer("att-1", now, "reply").unwrap();
+        assert_eq!(
+            store.load_selection_text("att-1").unwrap(),
+            Some(("question".to_owned(), "reply".to_owned()))
+        );
+        assert_eq!(store.load_selection_text("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn sqlite_selection_text_expires_by_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let now = 100 * MS_PER_DAY;
+        let expired = now - SELECTION_RETENTION_MS - 1;
+
+        store
+            .save_selection_prompt("old", expired, "stale")
+            .unwrap();
+        store.save_selection_prompt("new", now, "fresh").unwrap();
+
+        assert_eq!(store.load_selection_text("old").unwrap(), None);
+        assert!(store.load_selection_text("new").unwrap().is_some());
+    }
+
+    #[test]
+    fn json_store_refuses_selection_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        let store = Store::open("json", Some(path.to_str().unwrap())).unwrap();
+
+        assert!(store.save_selection_prompt("a", 1, "x").is_err());
+        assert!(store.load_selection_text("a").is_err());
     }
 
     #[test]

@@ -234,6 +234,22 @@ pub(crate) fn image_url(block: &Value) -> Result<String, AppError> {
     Ok(url)
 }
 
+/// Removes server tools (`web_search_*`, `computer_*`, ...) from an Anthropic body
+/// and drops `tools` when nothing is left. Copilot's native `/v1/messages` rejects
+/// them with a 400, so a native attempt sends the body without them.
+pub(crate) fn drop_server_tools(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    tools.retain(|tool| tool.get("input_schema").is_some());
+    if tools.is_empty() {
+        object.remove("tools");
+    }
+}
+
 /// Custom tools carry an `input_schema`; server tools (`web_search_*`,
 /// `computer_*`, ...) do not and have no `OpenAI` equivalent, so they are skipped.
 fn translate_tools(tools: &[Value]) -> Vec<Value> {
@@ -560,6 +576,24 @@ mod tests {
         }));
         assert_eq!(out["tools"].as_array().unwrap().len(), 1);
         assert_eq!(out["tools"][0]["function"]["name"], "keep");
+    }
+
+    #[test]
+    fn drop_server_tools_keeps_custom_tools_and_drops_empty_list() {
+        let mut body = json!({
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "keep", "input_schema": {"type": "object"}}
+            ]
+        });
+        drop_server_tools(&mut body);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tools"][0]["name"], "keep");
+
+        let mut only_server =
+            json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}]});
+        drop_server_tools(&mut only_server);
+        assert!(only_server.get("tools").is_none());
     }
 
     #[test]

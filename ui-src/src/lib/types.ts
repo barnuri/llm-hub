@@ -294,6 +294,8 @@ export interface SelectionEvent {
   readonly selector: string | null;
   readonly tier: string | null;
   readonly role: SelectionRole | null;
+  /** The turn's text references a plan, tasks file or skill. `null` on events recorded before this field. */
+  readonly plan_backed?: boolean | null;
   readonly stage: SelectionStage;
   readonly model: string;
   readonly state: SelectionState;
@@ -313,6 +315,13 @@ export interface SelectionEvent {
 
 export interface SelectionHistoryResponse {
   readonly events: readonly SelectionEvent[];
+}
+
+/** The stored prompt and answer text of one dispatch attempt. Both are `null` when none was kept. */
+export interface SmartAutoAttemptText {
+  readonly attempt: string;
+  readonly prompt: string | null;
+  readonly answer: string | null;
 }
 
 /** The `selection` of `GET /api/smart-auto/current`: the worker's main solver event, its active stages and freshness. */

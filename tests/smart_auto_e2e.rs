@@ -2,7 +2,7 @@
 //! and history APIs, the store contents, history across a restart, and reviewer counts per tier.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
@@ -218,19 +218,24 @@ async fn wait_for_stored_events(store: &Path, count: i64) {
     panic!("the store holds fewer than {count} selection events");
 }
 
-/// Files directly in `dir` whose bytes contain `needle`.
-fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
-    std::fs::read_dir(dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|file| {
-            file.is_file()
-                && std::fs::read(file)
-                    .unwrap()
-                    .windows(needle.len())
-                    .any(|window| window == needle)
-        })
-        .collect()
+/// Waits until the store's selection texts hold `needle` in a prompt, so the spawned writer has flushed it.
+async fn wait_for_stored_prompt(store: &Path, needle: &str) {
+    for _ in 0..POLL_ATTEMPTS {
+        let found = Connection::open_with_flags(store, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM selection_texts WHERE prompt LIKE ?1",
+                    [format!("%{needle}%")],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap_or(0);
+        if found > 0 {
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    panic!("the store keeps no prompt text containing {needle}");
 }
 
 #[tokio::test]
@@ -448,6 +453,39 @@ async fn review_sizes_the_reviewers_by_tier() {
 }
 
 #[tokio::test]
+async fn reviewer_calls_keep_their_tokens_in_the_event_log() {
+    const WORKER: &str = "run-judge/balance";
+    let (alpha, beta) = reviewed_pair(
+        vec![
+            json!({"id": "claude-opus-4.6"}),
+            json!({"id": "claude-haiku-4.5"}),
+        ],
+        vec![json!({"id": "claude-sonnet-4.6"})],
+    )
+    .await;
+    let (_hub, base) = start_pair(&alpha, &beta, 3, &[]).await;
+
+    let response = post_chat(
+        &base,
+        &[(WORKER_HEADER, WORKER)],
+        &chat_request(BALANCE, vec![user(PLANNING_TEXT)]),
+    )
+    .await;
+
+    assert_eq!(response.status(), 200);
+    let events = wait_for_completed(&base, WORKER, 1).await;
+    let reviewers: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["stage"] == "judge" && event["state"] != "started")
+        .collect();
+    assert!(!reviewers.is_empty(), "no judge event with a result");
+    for reviewer in reviewers {
+        assert_eq!(reviewer["tokens_in"], 10, "{reviewer}");
+        assert_eq!(reviewer["tokens_out"], 5, "{reviewer}");
+    }
+}
+
+#[tokio::test]
 async fn current_and_history_follow_each_dispatch() {
     let alpha = listing_upstream(vec![json!({"id": "m1"})]).await;
     let beta = listing_upstream(vec![json!({"id": "m2"})]).await;
@@ -526,7 +564,7 @@ async fn current_and_history_follow_each_dispatch() {
 }
 
 #[tokio::test]
-async fn the_store_keeps_no_prompt_text() {
+async fn the_prompt_text_stays_out_of_the_event_log() {
     const PROMPT_MARKER: &str = "e2e-prompt-marker-7c2d";
     const WORKER: &str = "run-store/node-1";
     let dir = tempfile::tempdir().unwrap();
@@ -555,11 +593,11 @@ async fn the_store_keeps_no_prompt_text() {
     assert_eq!(response.status(), 200);
     let events = wait_for_completed(&base, WORKER, 1).await;
     wait_for_stored_events(&store, DISPATCH_STATES.len() as i64).await;
+    wait_for_stored_prompt(&store, PROMPT_MARKER).await;
     assert!(
-        files_holding(dir.path(), PROMPT_MARKER.as_bytes()).is_empty(),
-        "the store holds prompt text"
+        !Value::Array(events).to_string().contains(PROMPT_MARKER),
+        "the event history holds prompt text"
     );
-    assert!(!Value::Array(events).to_string().contains(PROMPT_MARKER));
 }
 
 #[tokio::test]

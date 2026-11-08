@@ -15,7 +15,7 @@ use crate::schemas::selection_stage::SelectionStage;
 use crate::schemas::selection_state::SelectionState;
 use crate::schemas::stage_budget::StageBudget;
 use crate::schemas::stage_error::StageError;
-use crate::schemas::stage_record::StageRecord;
+use crate::schemas::stage_record::{StageRecord, StageUsage};
 use crate::schemas::stage_reply::StageReply;
 use crate::services::review_graph::ReviewGraph;
 use crate::services::review_prompts::ReviewPrompts;
@@ -295,30 +295,26 @@ impl ReviewOrchestrator {
             results = join_all(calls) => results,
         };
         let mut verdicts = Vec::new();
-        for (model, ((tokens, bytes), outcome)) in admitted.iter().zip(judged) {
+        for (model, (((tokens, bytes), usage), outcome)) in admitted.iter().zip(judged) {
             budget.charge(tokens, bytes);
             match outcome {
                 Ok(verdict) => {
-                    if matches!(verdict, ReviewVerdict::Reject { .. }) {
-                        stages.push(Self::record(
-                            stage,
-                            model,
-                            SelectionState::Rejected,
-                            Some(Self::REASON_DRAFT_REJECTED),
-                        ));
+                    let (verdict_state, reason) = if matches!(verdict, ReviewVerdict::Reject { .. })
+                    {
+                        (SelectionState::Rejected, Some(Self::REASON_DRAFT_REJECTED))
                     } else {
-                        stages.push(Self::record(stage, model, SelectionState::Completed, None));
-                    }
+                        (SelectionState::Completed, None)
+                    };
+                    stages
+                        .push(Self::record(stage, model, verdict_state, reason).with_usage(usage));
                     verdicts.push(verdict);
                 }
                 Err(reason) => {
                     failure.get_or_insert(reason);
-                    stages.push(Self::record(
-                        stage,
-                        model,
-                        SelectionState::Rejected,
-                        Some(reason),
-                    ));
+                    stages.push(
+                        Self::record(stage, model, SelectionState::Rejected, Some(reason))
+                            .with_usage(usage),
+                    );
                 }
             }
         }
@@ -334,22 +330,26 @@ impl ReviewOrchestrator {
         body: Value,
         cap: u64,
         deadline: Duration,
-    ) -> ((u64, u64), Result<ReviewVerdict, &'static str>)
+    ) -> (
+        ((u64, u64), StageUsage),
+        Result<ReviewVerdict, &'static str>,
+    )
     where
         T: StageTransport + ?Sized,
     {
         let _permit = gate.acquire().await.ok();
         let reply = match Self::bounded(deadline, transport.complete(model, body, cap)).await {
             Ok(reply) => reply,
-            Err(error) => return ((0, 0), Err(error.reason())),
+            Err(error) => return (((0, 0), StageUsage::default()), Err(error.reason())),
         };
-        let usage = (Self::total_tokens(&reply.completion), reply.bytes);
+        let charge = (Self::total_tokens(&reply.completion), reply.bytes);
+        let usage = Self::usage_of(&reply.completion);
         let verdict = Self::draft_text(&reply.completion)
             .ok_or(Self::REASON_MALFORMED_VERDICT)
             .and_then(|text| {
                 ReviewVerdict::parse(&text).map_err(|_| Self::REASON_MALFORMED_VERDICT)
             });
-        (usage, verdict)
+        ((charge, usage), verdict)
     }
 
     /// Asks the solver for one repair that fixes `issues`, and returns its reply in place of the draft.
@@ -406,12 +406,15 @@ impl ReviewOrchestrator {
         match repaired {
             Ok(reply) => {
                 budget.charge(Self::total_tokens(&reply.completion), reply.bytes);
-                stages.push(Self::record(
-                    SelectionStage::Repair,
-                    solver_model,
-                    SelectionState::Completed,
-                    None,
-                ));
+                stages.push(
+                    Self::record(
+                        SelectionStage::Repair,
+                        solver_model,
+                        SelectionState::Completed,
+                        None,
+                    )
+                    .with_usage(Self::usage_of(&reply.completion)),
+                );
                 Ok(Self::finished(
                     reply.completion,
                     solver_model,
@@ -467,6 +470,7 @@ impl ReviewOrchestrator {
             model: model.qualified(),
             state: selection_state,
             reason,
+            usage: StageUsage::default(),
         }
     }
 
@@ -511,6 +515,22 @@ impl ReviewOrchestrator {
             .pointer("/usage/total_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0)
+    }
+
+    /// The completion's reported input, output and cached tokens, or zero for each it does not report.
+    fn usage_of(completion: &Value) -> StageUsage {
+        let count = |pointer: &str| {
+            completion
+                .pointer(pointer)
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        StageUsage {
+            tokens_in: count("/usage/prompt_tokens"),
+            tokens_out: count("/usage/completion_tokens"),
+            cache_read: count("/usage/prompt_tokens_details/cached_tokens"),
+            cache_write: 0,
+        }
     }
 
     /// True when the completion's first choice asks for tool calls.
@@ -1009,5 +1029,43 @@ mod tests {
         );
         assert!(!outcome.reviewed);
         assert_eq!(transport.calls(), 0);
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use serde_json::json;
+
+    use super::ReviewOrchestrator;
+    use crate::schemas::stage_record::StageUsage;
+
+    #[test]
+    fn usage_reads_input_output_and_cached_tokens() {
+        let completion = json!({
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 80,
+                "total_tokens": 1280,
+                "prompt_tokens_details": { "cached_tokens": 900 }
+            }
+        });
+
+        assert_eq!(
+            ReviewOrchestrator::usage_of(&completion),
+            StageUsage {
+                tokens_in: 1200,
+                tokens_out: 80,
+                cache_read: 900,
+                cache_write: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn usage_is_zero_when_the_reply_reports_none() {
+        assert_eq!(
+            ReviewOrchestrator::usage_of(&json!({ "choices": [] })),
+            StageUsage::default()
+        );
     }
 }

@@ -38,6 +38,18 @@ pub struct DecisionsQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct AttemptParams {
+    pub attempt: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AttemptTextBody {
+    attempt: String,
+    prompt: Option<String>,
+    answer: Option<String>,
+}
+
 #[derive(Serialize)]
 struct CurrentBody {
     /// `null` until the worker has a selection.
@@ -155,6 +167,39 @@ fn rules_response(loaded: &LoadedRules) -> Response {
         rules: &loaded.rules,
     })
     .into_response()
+}
+
+/// `GET /api/smart-auto/attempt?attempt=<key>`: the stored prompt and answer text of one dispatch attempt.
+/// Both are `null` when none was kept, for example when persistence is off or the attempt predates capture.
+pub async fn attempt_text(
+    State(state): State<AppState>,
+    Query(params): Query<AttemptParams>,
+) -> Response {
+    let Some(attempt) = non_empty(params.attempt) else {
+        return AppError::BadRequest("attempt is required".into()).into_response();
+    };
+    let Some(store) = state.store() else {
+        return Json(AttemptTextBody {
+            attempt,
+            prompt: None,
+            answer: None,
+        })
+        .into_response();
+    };
+    match store.load_selection_text(&attempt) {
+        Ok(found) => {
+            let (prompt, answer) = found.map_or((None, None), |(prompt, answer)| {
+                (Some(prompt), Some(answer))
+            });
+            Json(AttemptTextBody {
+                attempt,
+                prompt,
+                answer,
+            })
+            .into_response()
+        }
+        Err(e) => AppError::Internal(format!("selection text cannot be read: {e}")).into_response(),
+    }
 }
 
 /// Drops an empty query value, so `?worker=` behaves as if the parameter were absent.

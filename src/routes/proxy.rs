@@ -87,6 +87,8 @@ const IDENTITY_ENCODING: &str = "identity";
 const CLAUDE_MODEL_PREFIX: &str = "claude";
 /// First bytes of each response kept for usage that only the opening event reports.
 const USAGE_SCRAPE_HEAD_BYTES: usize = 16 * 1024;
+/// Bytes kept of one dispatch's prompt and of its answer for the Smart Auto trace. Each is cut at this length.
+const CAPTURE_TEXT_BYTES: usize = 256 * 1024;
 /// The client-facing chat route that review stages call on a concrete model.
 const STAGE_CHAT_PATH: &str = "/v1/chat/completions";
 static NO_BODY: Value = Value::Null;
@@ -244,6 +246,9 @@ pub(crate) async fn attempt_loop(
             state.selection_log().record(event.clone());
             event
         });
+        if let Some(event) = &selection {
+            save_prompt(state, event, &attempt.body);
+        }
         let reviewing = smart
             .as_ref()
             .filter(|plan| plan.review.is_some() && review_applies(&attempt));
@@ -562,6 +567,7 @@ fn resolve_hub(
         selector: Some(selector_name),
         tier: Some(tier.as_str().to_owned()),
         role: Some(decision.role),
+        plan_backed: Some(decision.plan_backed),
         reason: Some(decision.reason.as_str().to_owned()),
         requested_effort: requested,
         ..SelectionEvent::new(
@@ -746,10 +752,14 @@ impl<'a> AttemptBodies<'a> {
 
         // A native `/v1/messages` attempt sends the client's own Anthropic body,
         // so keep it before translation replaces it.
+        // Server tools are dropped here: Copilot's native endpoint rejects them with a 400.
         let native = json_body
             .clone()
             .filter(|_| route == RouteKind::Anthropic)
-            .map(|anthropic_body| (anthropic_body, with_anthropic_version(headers)));
+            .map(|mut anthropic_body| {
+                anthropic::request::drop_server_tools(&mut anthropic_body);
+                (anthropic_body, with_anthropic_version(headers))
+            });
 
         // Translate first so everything downstream sees exactly one body shape.
         if route == RouteKind::Anthropic {
@@ -1246,6 +1256,10 @@ async fn review_deliver(
                     .reason
                     .map(str::to_owned)
                     .or_else(|| event.reason.clone()),
+                tokens_in: reported(stage.usage.tokens_in),
+                tokens_out: reported(stage.usage.tokens_out),
+                cache_read_tokens: reported(stage.usage.cache_read),
+                cache_write_tokens: reported(stage.usage.cache_write),
                 ..event.in_state(stage.state)
             });
         }
@@ -1291,6 +1305,14 @@ async fn review_deliver(
     };
     if let Some(commit) = commit {
         commit.apply(state);
+    }
+    if let Some(attempt) = selection.as_ref().and_then(|event| event.attempt.clone()) {
+        let state_for_text = state.clone();
+        let completion = outcome.completion.clone();
+        tokio::spawn(async move {
+            let raw = serde_json::to_vec(&completion).unwrap_or_default();
+            save_answer(&state_for_text, &attempt, &raw);
+        });
     }
     finish_selection(state, selection, &request_stats, true);
     state.stats().record(&request_stats);
@@ -1978,6 +2000,42 @@ fn reported(count: u64) -> Option<u64> {
     (count > 0).then_some(count)
 }
 
+/// Saves the request body of one dispatch as its prompt text. The write runs on a spawned task, off the request path.
+fn save_prompt(state: &AppState, selection: &SelectionEvent, body: &Bytes) {
+    let Some(attempt) = selection.attempt.clone() else {
+        return;
+    };
+    let prompt = body.slice(..body.len().min(CAPTURE_TEXT_BYTES));
+    let state = state.clone();
+    tokio::spawn(async move {
+        let text = String::from_utf8_lossy(&prompt);
+        save_text(&state, |store| {
+            store.save_selection_prompt(&attempt, now_ms(), &text)
+        });
+    });
+}
+
+/// Saves the answer of one dispatch from its raw upstream reply, read with `answer_text`. Callers on the request path spawn it.
+fn save_answer(state: &AppState, attempt: &str, raw: &[u8]) {
+    let text = crate::services::answer_text::answer_text(raw);
+    save_text(state, |store| {
+        store.save_selection_answer(attempt, now_ms(), &text)
+    });
+}
+
+/// Runs one text write against the store. A store without text support, or a failed write, is logged and skipped.
+fn save_text(
+    state: &AppState,
+    write: impl FnOnce(&crate::services::store::Store) -> Result<(), String>,
+) {
+    let Some(store) = state.store() else {
+        return;
+    };
+    if let Err(e) = write(store) {
+        tracing::debug!("selection text is not saved: {e}");
+    }
+}
+
 /// Streams the upstream response through, scraping usage from a rolling tail and recording stats at stream end.
 /// `transform` rewrites frames when `Some`; `None` passes bytes through untouched, and `finish()` output ends the body.
 // Ten inputs, each a separate per-response value, so bundling them would only rename them.
@@ -2036,6 +2094,7 @@ fn build_response(
     };
 
     let (summary_sender, summary_receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
+    let capture_answer = selection.as_ref().and_then(|event| event.attempt.clone());
     let observed = futures_util::stream::unfold(
         StreamState {
             inner: upstream.bytes_stream(),
@@ -2048,16 +2107,18 @@ fn build_response(
             ttft_ms: None,
             keepalive,
             complete: false,
+            answer: capture_answer.as_ref().map(|_| Vec::new()),
         },
         pump,
     );
 
     tokio::spawn(async move {
-        let summary = summary_receiver.await.unwrap_or_default();
+        let mut summary = summary_receiver.await.unwrap_or_default();
         if let Some(model) = &limit_model {
             state_for_stats.learn_prompt_limit(&outcome_seed.profile, model, &summary.tail);
         }
         let usage = summary_usage(&summary);
+        let answer = std::mem::take(&mut summary.answer);
         let outcome = RequestOutcome {
             latency_ms: crate::utils::time::elapsed_ms(started),
             ttft_ms: summary.ttft_ms,
@@ -2072,6 +2133,9 @@ fn build_response(
         log_failure(&outcome);
         if let Some(commit) = commit.filter(|_| summary.completed && outcome.error.is_none()) {
             commit.apply(&state_for_stats);
+        }
+        if let Some(attempt) = capture_answer {
+            save_answer(&state_for_stats, &attempt, &answer);
         }
         finish_selection(&state_for_stats, selection, &outcome, summary.completed);
         state_for_stats.stats().record(&outcome);
@@ -2124,6 +2188,10 @@ where
                     }
                     append_head(&mut state.head, &bytes);
                     append_tail(&mut state.tail, &bytes);
+                    if let Some(answer) = state.answer.as_mut() {
+                        let room = CAPTURE_TEXT_BYTES.saturating_sub(answer.len());
+                        answer.extend_from_slice(&bytes[..room.min(bytes.len())]);
+                    }
                     let Some(active) = state.transform.as_mut() else {
                         return Some((Ok(bytes), state));
                     };
@@ -2163,6 +2231,7 @@ where
                     .and_then(BodyTransform::observed_usage),
                 ttft_ms: state.ttft_ms,
                 completed: state.complete,
+                answer: state.answer.take().unwrap_or_default(),
             });
         }
         state.transform = None;
@@ -2219,6 +2288,8 @@ struct StreamState<S> {
     keepalive: Option<Duration>,
     /// The upstream stream ended on its own, without a read error.
     complete: bool,
+    /// The upstream bytes kept for the answer text, up to `CAPTURE_TEXT_BYTES`. `None` when the attempt is not in Smart Auto history.
+    answer: Option<Vec<u8>>,
 }
 
 /// Clients such as Copilot CLI and Claude Code close the connection as soon as
@@ -2237,6 +2308,7 @@ impl<S> Drop for StreamState<S> {
                     .and_then(BodyTransform::observed_usage),
                 ttft_ms: self.ttft_ms,
                 completed: false,
+                answer: self.answer.take().unwrap_or_default(),
             });
         }
     }
@@ -2253,6 +2325,8 @@ struct StreamSummary {
     ttft_ms: Option<u64>,
     /// The upstream body was read to its end, so the routed answer is complete.
     completed: bool,
+    /// The upstream bytes of the answer, cut at `CAPTURE_TEXT_BYTES`. Empty unless the attempt is in Smart Auto history.
+    answer: Vec<u8>,
 }
 
 fn summary_usage(summary: &StreamSummary) -> ScrapedUsage {
@@ -2378,8 +2452,12 @@ async fn build_anthropic_response(
     };
     log_failure(&outcome);
     let state_for_stats = state.clone();
+    let answer_attempt = selection.as_ref().and_then(|event| event.attempt.clone());
     tokio::spawn(async move {
         finish_selection(&state_for_stats, selection, &outcome, !overflowed);
+        if let Some(attempt) = answer_attempt {
+            save_answer(&state_for_stats, &attempt, &raw);
+        }
         state_for_stats.stats().record(&outcome);
         if let Some(commit) = commit.filter(|_| outcome.error.is_none()) {
             commit.apply(&state_for_stats);
@@ -2752,6 +2830,7 @@ mod tests {
             ttft_ms: None,
             keepalive,
             complete: false,
+            answer: None,
         }
     }
 

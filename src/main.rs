@@ -401,6 +401,10 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/api/smart-auto/history", get(routes::smart_auto::history))
         .route(
+            "/api/smart-auto/attempt",
+            get(routes::smart_auto::attempt_text),
+        )
+        .route(
             "/api/smart-auto/decisions",
             get(routes::smart_auto::decisions),
         )
