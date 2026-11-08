@@ -128,6 +128,9 @@ pub struct RequestOutcome {
     pub error: Option<String>,
     /// Caller signature (see `services::harness::client_signature`).
     pub client: Option<String>,
+    /// Salted Claude Code session key, the same value `selection_events.worker` stores,
+    /// so request rows join to selection events. `None` without a session id.
+    pub worker: Option<String>,
 }
 
 impl StatsRegistry {
@@ -501,6 +504,7 @@ mod tests {
             cache_write_tokens: 0,
             error: None,
             client: None,
+            worker: None,
         }
     }
 

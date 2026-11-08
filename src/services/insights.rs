@@ -796,6 +796,7 @@ mod tests {
             cache_write_tokens: 0,
             error: (status >= ERROR_STATUS_MIN).then(|| format!("boom {status}")),
             client: None,
+            worker: None,
         }
     }
 

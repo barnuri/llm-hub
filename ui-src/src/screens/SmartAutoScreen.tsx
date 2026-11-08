@@ -5,7 +5,7 @@ import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
 import { PriceHeader } from "../components/PriceHeader";
 import { api } from "../lib/api";
-import { formatDateTime, formatMs, formatNumber, formatUsd } from "../lib/format";
+import { formatDate, formatDateTime, formatMs, formatNumber, formatTime, formatUsd } from "../lib/format";
 import { formatPrice, type PriceSort, sortByPrice } from "../lib/pricing";
 import { navigate, useRoute } from "../lib/router";
 import { classifyEvents, type CostKind, eventCost, sumCost, WASTE_KINDS } from "../lib/smartAutoCost";
@@ -24,7 +24,7 @@ import type {
   SmartAutoRulesResponse,
   SmartAutoRulesSource,
 } from "../lib/types";
-import { REFRESH_MS, useSelectionEvents } from "../lib/useSelectionEvents";
+import { MAX_EVENTS, REFRESH_MS, useSelectionEvents } from "../lib/useSelectionEvents";
 import "../styles/screens/smart-auto.css";
 import { SmartAutoHowItWorks } from "./SmartAutoHowItWorks";
 import { SmartAutoTracePage } from "./SmartAutoTracePage";
@@ -1131,6 +1131,12 @@ export function SmartAutoScreen({ profiles, prices }: SmartAutoScreenProps) {
   // Classified over every event, so a rejected judge marks its solver call even when a filter hides the judge.
   const kinds = useMemo(() => classifyEvents(all), [all]);
   const filtered = all.filter((event) => matches(event, filters));
+  // The oldest event the Overview counts. Older events are not in this tab, so the window starts here.
+  const countedSince = filtered.reduce<number | null>(
+    (oldest, event) => (oldest === null || event.ts_ms < oldest ? event.ts_ms : oldest),
+    null,
+  );
+  const windowCapped = all.length >= MAX_EVENTS;
   const rows = filtered.slice(-MAX_ROWS).reverse();
   const failures = filtered.filter((event) => FAILED_STATES.has(event.state)).length;
   const turns = new Set(filtered.flatMap((event) => (event.turn ? [event.turn] : []))).size;
@@ -1266,6 +1272,17 @@ export function SmartAutoScreen({ profiles, prices }: SmartAutoScreenProps) {
           <span className="dim">Smart Auto at a glance. Calls, Trace and Waste hold the detail.</span>
           <LivePill unavailable={unavailable} />
         </div>
+        <p className="note smart-auto-window">
+          {countedSince === null ? (
+            "No events counted yet."
+          ) : (
+            <>
+              Counting from <strong>{`${formatDate(countedSince)} ${formatTime(countedSince)}`}</strong> ({formatAge(Date.now() - countedSince)}),{" "}
+              {formatNumber(filtered.length)} events
+              {windowCapped ? `. Capped at ${formatNumber(MAX_EVENTS)} events held in this tab.` : "."}
+            </>
+          )}
+        </p>
         <div className="smart-auto-kpis">
           <KpiCard label="Events" value={formatNumber(filtered.length)} sub={`${formatNumber(all.length)} kept in this tab`} />
           <KpiCard

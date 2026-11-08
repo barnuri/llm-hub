@@ -624,6 +624,7 @@ mod tests {
             cost_usd: 0.0,
             error: None,
             client: None,
+            worker: None,
         }
     }
 

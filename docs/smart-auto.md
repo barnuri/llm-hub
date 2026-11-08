@@ -143,7 +143,7 @@ The hub keeps one kept model per conversation. It also remembers the model used 
 - **The key.** The conversation id is the first of: the Claude Code session header (`x-claude-code-session-id`), the `prompt_cache_key`, a hash of the system prompt and first user message, or the worker header. The key also hashes the worker, parent and policy headers, the endpoint and the active restrictions (tier and globs). Changing a filter starts a new key.
 - **Lookup.** A kept model is used only while it is still in the pool. An ineligible one is dropped.
 - **Tool continuation.** Replays the kept model, with reason `tool_continuation_replay`. No role is classified and no switch is considered.
-- **Switch.** A turn can move to another model only when the work changes weight. Conversation is light. Plan-backed implementation is cheap. Implementation, planning, investigation and validation are heavy. A switch needs a change to a non-light weight. A conversation turn never moves the kept model.
+- **Switch.** A turn can move to another model only when the work changes weight. Conversation is light. Plan-backed implementation is cheap. Implementation, planning, investigation and validation are heavy. A switch needs a change to a non-light weight, with one exception: a heavy kept model steps down to the conversation pick on a plain conversation turn (no role cue) of more than 3 words, so a premium model does not keep running chat and its tool loops. A short approval ("yes, go") keeps the kept model. A tool continuation never switches, so a tool loop keeps its prompt cache and its signed thinking blocks.
 - **Budget.** An optional switch needs the kept model held for at least 2 user turns. It also needs fewer than 2 switches in the last 20 user turns.
 - **Commit.** The kept model is saved only after a 2xx response whose stream finished without error.
 - **Limits.** Up to 1,024 conversations. A conversation idle for 10 minutes is dropped. Kept models live in memory and are not restored after a restart.
@@ -227,7 +227,7 @@ If a check runs out of budget, times out or returns a bad verdict, the draft is 
 An event holds salted scope keys and metadata: selector, tier, role, stage, model, state, reason, effort, status, latency and token counts. It never holds prompt, response or tool text. The salt is random per install and kept in the store. A stored key does not reveal the id it stands for.
 
 - Events are saved to the store (`LLM_HUB_STORE`, SQLite by default) by a writer thread. If the writer queue is full, the save is dropped. The in-memory event is kept.
-- The store keeps the newest 10,000 events and any event from the last 14 days. Memory holds the newest 2,000.
+- The store keeps every event from the last 60 days, with no count limit. Memory holds the newest 2,000.
 - On start, the hub reloads the newest events from the store. Current selections and kept models start empty.
 
 Set `LLM_HUB_STORE_PATH` to choose the store file. See [Configuration](configuration.md).

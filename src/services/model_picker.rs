@@ -157,6 +157,7 @@ mod tests {
             cache_write_tokens: 0,
             error: None,
             client: None,
+            worker: None,
         };
         state.store().unwrap().record(&outcome).unwrap();
         refresh_usage(&state).await;

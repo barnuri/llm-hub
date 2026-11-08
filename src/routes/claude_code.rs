@@ -228,6 +228,7 @@ mod tests {
             cache_write_tokens: 0,
             error: None,
             client: None,
+            worker: None,
         };
         state.stats().record(&outcome);
         let Json(settings) = super::settings(

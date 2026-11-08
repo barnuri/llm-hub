@@ -20,9 +20,10 @@ const DEFAULT_SQLITE_PATH: &str = "llm-hub.db";
 const DEFAULT_JSON_PATH: &str = "llm-hub-stats.json";
 const USAGE_RECENT_LIMIT: usize = 200;
 /// Selection events kept by count; the oldest are dropped first.
-pub const SELECTION_RETENTION_EVENTS: usize = 10_000;
+/// Event count kept besides the age limit. A negative value means no count limit, so only the age limit applies.
+pub const SELECTION_RETENTION_EVENTS: i64 = -1;
 /// Selection events older than this are dropped on the next save.
-const SELECTION_RETENTION_MS: u64 = 14 * MS_PER_DAY;
+const SELECTION_RETENTION_MS: u64 = 60 * MS_PER_DAY;
 const MS_PER_DAY: u64 = 86_400_000;
 /// The `install_settings` name that holds the salt of the scope keys.
 const INSTALL_SALT_NAME: &str = "selection_salt";
@@ -118,7 +119,8 @@ impl Store {
                 tokens_out INTEGER NOT NULL,
                 ttft_ms INTEGER,
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-                cache_write_tokens INTEGER NOT NULL DEFAULT 0
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                worker TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts_ms);
             CREATE TABLE IF NOT EXISTS api_keys (
@@ -198,6 +200,7 @@ impl Store {
             cost_usd: 0.0,
             error: outcome.error.clone(),
             client: outcome.client.clone(),
+            worker: outcome.worker.clone(),
         };
         match self {
             Store::Sqlite(conn) => {
@@ -206,8 +209,8 @@ impl Store {
                     .execute(
                         "INSERT INTO requests (
                             ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                         rusqlite::params![
                             db_i64(row.ts_ms),
                             row.model,
@@ -220,7 +223,8 @@ impl Store {
                             db_i64(row.cache_read_tokens),
                             db_i64(row.cache_write_tokens),
                             row.error,
-                            row.client
+                            row.client,
+                            row.worker
                         ],
                     )
                     .map_err(|e| e.to_string())?;
@@ -270,7 +274,7 @@ impl Store {
                 let mut stmt = guard
                     .prepare(
                         "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                                ttft_ms, cache_read_tokens, cache_write_tokens, error, client
+                                ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker
                          FROM requests ORDER BY id DESC LIMIT ?1",
                     )
                     .map_err(|e| e.to_string())?;
@@ -321,7 +325,7 @@ impl Store {
                     .map_err(|e| e.to_string())?;
                 let mut list_sql = format!(
                     "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client
+                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker
                      FROM requests WHERE status >= {ERROR_STATUS_MIN}"
                 );
                 if since_ms.is_some() {
@@ -424,7 +428,7 @@ impl Store {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
                 let mut sql = String::from(
                     "SELECT model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error, client
+                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error, client, worker
                      FROM requests WHERE 1=1",
                 );
                 let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -457,6 +461,7 @@ impl Store {
                             ts_ms: db_u64(r.get::<_, i64>(9).unwrap_or(0)),
                             error: r.get::<_, Option<String>>(10).unwrap_or(None),
                             client: r.get::<_, Option<String>>(11).unwrap_or(None),
+                            worker: r.get::<_, Option<String>>(12).unwrap_or(None),
                         })
                     })
                     .map_err(|e| e.to_string())?
@@ -494,6 +499,7 @@ impl Store {
                         ts_ms: row.ts_ms,
                         error: row.error.clone(),
                         client: row.client.clone(),
+                        worker: row.worker.clone(),
                     })
                     .collect();
                 Ok(rows)
@@ -873,12 +879,12 @@ impl Store {
         }
     }
 
-    /// Saves `events`, then drops events older than the retention age and keeps only the newest `max_events`.
+    /// Saves `events`, then drops events older than the retention age. A `max_events` of zero or more also keeps only the newest that many.
     pub fn save_selection_events(
         &self,
         events: &[SelectionEvent],
         now_ms: u64,
-        max_events: usize,
+        max_events: i64,
     ) -> Result<(), String> {
         let cutoff = now_ms.saturating_sub(SELECTION_RETENTION_MS);
         match self {
@@ -908,12 +914,14 @@ impl Store {
                     rusqlite::params![db_i64(cutoff)],
                 )
                 .map_err(|e| e.to_string())?;
-                tx.execute(
-                    "DELETE FROM selection_events WHERE seq <= COALESCE(
-                         (SELECT seq FROM selection_events ORDER BY seq DESC LIMIT 1 OFFSET ?1), 0)",
-                    rusqlite::params![i64::try_from(max_events).unwrap_or(i64::MAX)],
-                )
-                .map_err(|e| e.to_string())?;
+                if let Ok(keep) = usize::try_from(max_events) {
+                    tx.execute(
+                        "DELETE FROM selection_events WHERE seq <= COALESCE(
+                             (SELECT seq FROM selection_events ORDER BY seq DESC LIMIT 1 OFFSET ?1), 0)",
+                        rusqlite::params![i64::try_from(keep).unwrap_or(i64::MAX)],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
                 tx.commit().map_err(|e| e.to_string())
             }
             Store::Json(store) => {
@@ -921,7 +929,8 @@ impl Store {
                 let stored = &mut guard.state.selection_events;
                 stored.extend_from_slice(events);
                 stored.retain(|event| event.ts_ms >= cutoff);
-                let excess = stored.len().saturating_sub(max_events);
+                let excess =
+                    usize::try_from(max_events).map_or(0, |keep| stored.len().saturating_sub(keep));
                 if excess > 0 {
                     stored.drain(..excess);
                 }
@@ -1105,6 +1114,7 @@ fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
     )?;
     add("error", "ALTER TABLE requests ADD COLUMN error TEXT")?;
     add("client", "ALTER TABLE requests ADD COLUMN client TEXT")?;
+    add("worker", "ALTER TABLE requests ADD COLUMN worker TEXT")?;
     Ok(())
 }
 
@@ -1123,6 +1133,7 @@ fn map_usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRow> {
         cost_usd: 0.0,
         error: r.get::<_, Option<String>>(10).unwrap_or(None),
         client: r.get::<_, Option<String>>(11).unwrap_or(None),
+        worker: r.get::<_, Option<String>>(12).unwrap_or(None),
     })
 }
 
@@ -1144,6 +1155,7 @@ mod tests {
             ts_ms: 0,
             error: None,
             client: None,
+            worker: None,
         }
     }
 
@@ -1184,6 +1196,84 @@ mod tests {
         assert_eq!(usage.recent[0].tokens_out, 7);
         assert_eq!(usage.recent[0].cache_read_tokens, 3);
         assert_eq!(usage.recent[0].ttft_ms, Some(12));
+    }
+
+    #[test]
+    fn sqlite_database_from_before_worker_gains_the_column_and_keeps_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_ms INTEGER NOT NULL,
+                    model TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    status INTEGER NOT NULL,
+                    latency_ms INTEGER NOT NULL,
+                    tokens_in INTEGER NOT NULL,
+                    tokens_out INTEGER NOT NULL,
+                    ttft_ms INTEGER,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    client TEXT
+                );
+                INSERT INTO requests (ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out)
+                VALUES (1, 'openai/gpt-4o', 'openai', 200, 42, 5, 7);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let has_worker = conn
+                .prepare("PRAGMA table_info(requests)")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|name| name == "worker");
+            assert!(has_worker);
+        }
+        let usage = store.usage().unwrap();
+        assert_eq!(usage.total_requests, 1);
+        assert_eq!(usage.recent[0].model, "openai/gpt-4o");
+        assert_eq!(usage.recent[0].worker, None);
+
+        let mut outcome = sample_outcome();
+        outcome.worker = Some("salted-worker".into());
+        store.record(&outcome).unwrap();
+        let usage = store.usage().unwrap();
+        assert_eq!(usage.recent[0].worker.as_deref(), Some("salted-worker"));
+        assert_eq!(usage.recent[1].worker, None);
+    }
+
+    #[test]
+    fn worker_key_round_trips_through_each_store() {
+        for kind in ["sqlite", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("worker");
+            let store = Store::open(kind, Some(path.to_str().unwrap())).unwrap();
+            let mut outcome = sample_outcome();
+            outcome.worker = Some("salted-worker".into());
+            store.record(&outcome).unwrap();
+
+            assert_eq!(
+                store.usage().unwrap().recent[0].worker.as_deref(),
+                Some("salted-worker")
+            );
+            let filter = StatsFilter {
+                since_ms: None,
+                profile: None,
+                model: None,
+                range_label: String::new(),
+            };
+            let read = store.filtered_outcomes(&filter).unwrap();
+            assert_eq!(read[0].worker.as_deref(), Some("salted-worker"));
+        }
     }
 
     #[test]

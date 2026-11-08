@@ -27,6 +27,8 @@ pub struct SmartAutoRouter;
 impl SmartAutoRouter {
     const USAGE_BITS_PER_POINT: u32 = 8;
     const MAX_USAGE_POINTS: u32 = 2;
+    /// A conversation turn this short is an approval that continues the kept model's work.
+    const APPROVAL_MAX_WORDS: usize = 3;
 
     /// Routes one turn over the eligible `pool`. `anchor` holds the affinity store and the
     /// turn's key, `None` without a key. Returns `None` for an empty pool.
@@ -88,14 +90,15 @@ impl SmartAutoRouter {
         }
         let turn = SmartAutoRoles::classify_user_text(signals, policy.role);
         let settled = affinity.soft_switch_allowed(key, signals.user_turns, now);
-        if !SmartAutoAffinity::should_switch(
+        let switches = SmartAutoAffinity::should_switch(
             pinned_role,
             pinned_plan_backed,
             turn.role,
             turn.plan_backed,
             signals,
             settled,
-        ) {
+        ) || Self::steps_down(pinned_role, pinned_plan_backed, turn, signals, settled);
+        if !switches {
             return Some((pinned, turn, RouteReason::Pinned));
         }
         let incumbent = Self::incumbent(pool, anchor, turn.role, now);
@@ -107,6 +110,37 @@ impl SmartAutoRouter {
             reason
         };
         Some((model, turn, reason))
+    }
+
+    /// Whether a settled heavy pin steps down to the conversation pick at the start of a turn.
+    /// Only a plain conversation turn (no role cue) qualifies, and not a short approval such as
+    /// "yes, go", which continues the heavy work. A tool continuation never steps down, so a
+    /// tool loop keeps its model, its prompt cache and its signed thinking blocks.
+    fn steps_down(
+        pinned_role: WorkRole,
+        pinned_plan_backed: bool,
+        turn: RoleDecision,
+        signals: &TurnSignals,
+        settled: bool,
+    ) -> bool {
+        let pinned_is_heavy = pinned_role != WorkRole::Conversation
+            && !(pinned_role == WorkRole::Implementation && pinned_plan_backed);
+        settled
+            && !signals.tool_continuation
+            && pinned_is_heavy
+            && turn.role == WorkRole::Conversation
+            && turn.reason == RoleReason::NoCue
+            && !Self::is_short_approval(signals)
+    }
+
+    /// A user turn of at most `APPROVAL_MAX_WORDS` visible words.
+    fn is_short_approval(signals: &TurnSignals) -> bool {
+        let text = signals
+            .last_user_text
+            .as_deref()
+            .map(SmartAutoRoles::visible_text)
+            .unwrap_or_default();
+        text.split_whitespace().count() <= Self::APPROVAL_MAX_WORDS
     }
 
     fn incumbent<'a>(
@@ -381,6 +415,59 @@ mod tests {
         assert_eq!(decision.model.qualified_id, OPUS);
         assert_eq!(decision.role, WorkRole::Planning);
         assert_eq!(decision.reason, RouteReason::Incumbent);
+    }
+
+    #[test]
+    fn a_settled_heavy_pin_steps_down_on_a_plain_conversation_turn() {
+        let now = Instant::now();
+        let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let chat = "thanks, what does the new storage layer do for us";
+
+        let unsettled = route_pinned(&pool, &affinity, &signals(chat, 2, false), now);
+        assert_eq!(unsettled.model.qualified_id, OPUS);
+        assert_eq!(unsettled.reason, RouteReason::Pinned);
+
+        let settled = route_pinned(&pool, &affinity, &signals(chat, 3, false), now);
+        assert_eq!(settled.model.qualified_id, HAIKU);
+        assert_eq!(settled.role, WorkRole::Conversation);
+        assert_eq!(settled.reason, RouteReason::RoleSwitch);
+    }
+
+    #[test]
+    fn a_short_approval_keeps_the_heavy_pin() {
+        let now = Instant::now();
+        let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let decision = route_pinned(&pool, &affinity, &signals("yes, go ahead", 5, false), now);
+        assert_eq!(decision.model.qualified_id, OPUS);
+        assert_eq!(decision.reason, RouteReason::Pinned);
+    }
+
+    #[test]
+    fn a_tool_continuation_never_steps_down() {
+        let now = Instant::now();
+        let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let chat = "thanks, what does the new storage layer do for us";
+        let decision = route_pinned(&pool, &affinity, &signals(chat, 5, true), now);
+        assert_eq!(decision.model.qualified_id, OPUS);
+        assert_eq!(decision.reason, RouteReason::ToolContinuationReplay);
+    }
+
+    #[test]
+    fn a_cheap_pin_does_not_step_down() {
+        let now = Instant::now();
+        let affinity = pinned_store(HAIKU, WorkRole::Implementation, true, now);
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let chat = "thanks, what does the new storage layer do for us";
+        let decision = route_pinned(&pool, &affinity, &signals(chat, 5, false), now);
+        assert_eq!(decision.model.qualified_id, HAIKU);
+        assert_eq!(decision.reason, RouteReason::Pinned);
     }
 
     #[test]

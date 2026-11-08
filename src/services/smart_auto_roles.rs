@@ -101,7 +101,7 @@ impl SmartAutoRoles {
     }
 
     /// The ASCII-lowercased text without system reminder blocks, which carry no user intent.
-    fn visible_text(text: &str) -> String {
+    pub(crate) fn visible_text(text: &str) -> String {
         let lower = text.to_ascii_lowercase();
         if !lower.contains(Self::REMINDER_OPEN) {
             return lower;

@@ -206,6 +206,7 @@ pub(crate) async fn attempt_loop(
     }
 
     let client = client_signature(headers);
+    let worker = worker_key(state, headers);
     let retry_policy = RetryPolicy::from_headers(headers);
     let attempt_timeout = per_attempt_timeout_ms(headers).map(Duration::from_millis);
     let client_body = bodies
@@ -305,6 +306,7 @@ pub(crate) async fn attempt_loop(
                                 plan,
                                 client_streams,
                                 client,
+                                worker,
                                 commit,
                                 transition.filter(|_| succeeded),
                             )
@@ -319,6 +321,7 @@ pub(crate) async fn attempt_loop(
                                 started,
                                 &attempt,
                                 client,
+                                worker,
                                 commit,
                                 transition.filter(|_| succeeded),
                             )
@@ -348,6 +351,7 @@ pub(crate) async fn attempt_loop(
                     started,
                     format!("HTTP {status}; retried on the next fallback"),
                     client.clone(),
+                    worker.clone(),
                 );
             }
             Err(reason) => {
@@ -355,7 +359,15 @@ pub(crate) async fn attempt_loop(
                     record_transition(state, event, SelectionState::Rejected, None);
                 }
                 attempts_trail.push(format!("{}={reason}", model_id.qualified()));
-                record_failure(state, model_id, 0, started, reason, client.clone());
+                record_failure(
+                    state,
+                    model_id,
+                    0,
+                    started,
+                    reason,
+                    client.clone(),
+                    worker.clone(),
+                );
                 if index == last_index {
                     return Err(AppError::UpstreamUnavailable(format!(
                         "all attempts failed: {}",
@@ -1061,6 +1073,14 @@ fn claude_code_session_id(headers: &HeaderMap) -> Option<String> {
     valid.then(|| String::from_utf8_lossy(value).into_owned())
 }
 
+/// The salted worker key for the caller's Claude Code session: the same value
+/// `selection_events.worker` stores, so a request row joins to its selection events.
+/// `None` without a valid session id.
+fn worker_key(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    claude_code_session_id(headers)
+        .map(|raw| state.selection_log().scope_key(ScopeKind::Worker, &raw))
+}
+
 /// `text` cut to `max_chars` characters, with every character outside
 /// printable ASCII (0x20-0x7E) replaced by `?`, so it is always a valid header value.
 fn header_safe(text: &str, max_chars: usize) -> String {
@@ -1091,7 +1111,7 @@ fn default_auto_model<'c>(catalog: &'c [Value], path: &str) -> &'c str {
 /// The SSE decision is the upstream's content-type, not the request's `stream`
 /// flag: an upstream that answers a streaming request with a JSON error must be
 /// translated as a message, not fed to the SSE machinery.
-#[allow(clippy::too_many_arguments)] // nine inputs, each a separate piece of one delivery
+#[allow(clippy::too_many_arguments)] // ten inputs, each a separate piece of one delivery
 async fn deliver(
     state: &AppState,
     response: reqwest::Response,
@@ -1100,6 +1120,7 @@ async fn deliver(
     started: Instant,
     attempt: &Attempt<'_>,
     client: Option<String>,
+    worker: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
 ) -> Response {
@@ -1118,6 +1139,7 @@ async fn deliver(
             started,
             plan,
             client,
+            worker,
             commit,
             selection,
         )
@@ -1133,6 +1155,7 @@ async fn deliver(
             started,
             transform,
             client,
+            worker,
             commit,
             selection,
         )
@@ -1186,6 +1209,7 @@ async fn review_deliver(
     plan: &SmartAutoPlan,
     streams: bool,
     client: Option<String>,
+    worker: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
 ) -> Result<Response, AppError> {
@@ -1302,6 +1326,7 @@ async fn review_deliver(
         cache_write_tokens: 0,
         error: None,
         client,
+        worker,
     };
     if let Some(commit) = commit {
         commit.apply(state);
@@ -1396,6 +1421,7 @@ async fn attempt_single(
         started,
         None,
         client_signature(headers),
+        worker_key(state, headers),
         None,
         None,
     ))
@@ -2038,7 +2064,7 @@ fn save_text(
 
 /// Streams the upstream response through, scraping usage from a rolling tail and recording stats at stream end.
 /// `transform` rewrites frames when `Some`; `None` passes bytes through untouched, and `finish()` output ends the body.
-// Ten inputs, each a separate per-response value, so bundling them would only rename them.
+// Eleven inputs, each a separate per-response value, so bundling them would only rename them.
 #[allow(clippy::too_many_arguments)]
 fn build_response(
     state: &AppState,
@@ -2049,6 +2075,7 @@ fn build_response(
     started: Instant,
     transform: Option<BodyTransform>,
     client: Option<String>,
+    worker: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
 ) -> Response {
@@ -2091,6 +2118,7 @@ fn build_response(
         cache_write_tokens: 0,
         error: None,
         client,
+        worker,
     };
 
     let (summary_sender, summary_receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
@@ -2357,7 +2385,7 @@ fn is_event_stream(response: &reqwest::Response) -> bool {
 /// frame-at-a-time translator instead — and it is bounded by
 /// `MAX_TRANSFORM_BUFFER_BYTES`. Every other route keeps the byte-for-byte
 /// streaming path in `build_response`.
-// Nine inputs, each a separate per-response value the translator needs.
+// Ten inputs, each a separate per-response value the translator needs.
 #[allow(clippy::too_many_arguments)]
 async fn build_anthropic_response(
     state: &AppState,
@@ -2368,6 +2396,7 @@ async fn build_anthropic_response(
     started: Instant,
     plan: &TransformPlan,
     client: Option<String>,
+    worker: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
 ) -> Response {
@@ -2449,6 +2478,7 @@ async fn build_anthropic_response(
             }
         }),
         client,
+        worker,
     };
     log_failure(&outcome);
     let state_for_stats = state.clone();
@@ -2539,6 +2569,7 @@ fn record_failure(
     started: Instant,
     reason: String,
     client: Option<String>,
+    worker: Option<String>,
 ) {
     let latency_ms = crate::utils::time::elapsed_ms(started);
     let outcome = RequestOutcome {
@@ -2554,6 +2585,7 @@ fn record_failure(
         cache_write_tokens: 0,
         error: Some(reason),
         client,
+        worker,
     };
     log_failure(&outcome);
     state.stats().record(&outcome);
@@ -2638,6 +2670,7 @@ async fn passthrough_oversized(
         started,
         None,
         client_signature(headers),
+        worker_key(state, headers),
         None,
         None,
     ))
