@@ -9,6 +9,7 @@ use crate::consts::{
     COPILOT_EDITOR_PLUGIN_VERSION, COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID,
     COPILOT_OPENAI_INTENT, COPILOT_VSCODE_API_VERSION, COPILOT_VSCODE_USER_AGENT, VERSION,
 };
+use crate::services::request_images::{BodyShape, request_has_image};
 
 pub const HEADER_X_INITIATOR: &str = "x-initiator";
 pub const HEADER_VISION_REQUEST: &str = "copilot-vision-request";
@@ -25,29 +26,6 @@ const HEADER_INTERACTION_TYPE: &str = "x-interaction-type";
 const MESSAGES_PROXY_INTENT: &str = "messages-proxy";
 const INITIATOR_USER: &str = "user";
 pub const INITIATOR_AGENT: &str = "agent";
-
-/// Which request body shape a path carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BodyShape {
-    ChatCompletions,
-    Responses,
-    AnthropicMessages,
-}
-
-impl BodyShape {
-    fn from_path(path: &str) -> Option<BodyShape> {
-        let path = path.trim_end_matches('/');
-        if path.ends_with("chat/completions") {
-            Some(BodyShape::ChatCompletions)
-        } else if path.ends_with("responses") {
-            Some(BodyShape::Responses)
-        } else if path.ends_with("messages") {
-            Some(BodyShape::AnthropicMessages)
-        } else {
-            None
-        }
-    }
-}
 
 /// Headers for a Copilot `/models` call: the flow's fixed set.
 #[must_use]
@@ -103,7 +81,7 @@ pub fn request_headers(
     let parsed = serde_json::from_slice::<Value>(body).ok();
     let shape = BodyShape::from_path(path);
     let (is_agent, has_vision) = match (shape, parsed.as_ref()) {
-        (Some(shape), Some(body)) => (is_agent_turn(shape, body), has_image(shape, body)),
+        (Some(shape), Some(body)) => (is_agent_turn(shape, body), request_has_image(path, body)),
         _ => (false, false),
     };
     let initiator = if is_agent {
@@ -180,32 +158,6 @@ fn is_only_tool_results(message: &Value) -> bool {
 
 fn part_type(part: &Value) -> Option<&str> {
     part.get("type").and_then(Value::as_str)
-}
-
-fn has_image(shape: BodyShape, body: &Value) -> bool {
-    let (key, image_type) = match shape {
-        BodyShape::ChatCompletions => ("messages", "image_url"),
-        BodyShape::Responses => ("input", "input_image"),
-        BodyShape::AnthropicMessages => ("messages", "image"),
-    };
-    let Some(Value::Array(items)) = body.get(key) else {
-        return false;
-    };
-    items.iter().any(|item| {
-        // Responses items can be content parts themselves, not only messages.
-        part_type(item) == Some(image_type) || content_has_image(item, image_type)
-    })
-}
-
-/// Whether `message.content` holds an `image_type` part, looking inside
-/// nested `content` arrays such as Anthropic `tool_result` parts.
-fn content_has_image(message: &Value, image_type: &str) -> bool {
-    let Some(Value::Array(parts)) = message.get("content") else {
-        return false;
-    };
-    parts
-        .iter()
-        .any(|part| part_type(part) == Some(image_type) || content_has_image(part, image_type))
 }
 
 #[cfg(test)]

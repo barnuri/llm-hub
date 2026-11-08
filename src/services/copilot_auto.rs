@@ -17,6 +17,7 @@ use crate::schemas::smart_auto_tier::SmartAutoTier;
 use crate::schemas::turn_signals::TurnSignals;
 use crate::services::copilot_auto_decisions::AutoDecisionLog;
 use crate::services::model_limits::{ModelLimit, ModelLimits};
+use crate::services::request_images::request_has_image;
 use crate::services::smart_auto_effort::SmartAutoEffort;
 use crate::services::smart_auto_roles::SmartAutoRoles;
 
@@ -29,6 +30,9 @@ use crate::services::copilot_headers::HEADER_API_VERSION;
 const AUTO_API_VERSION: &str = "2026-08-01";
 const AUTO_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_REFRESH_MARGIN_SECS: u64 = 5 * 60;
+/// A model used this recently has a warm prompt cache, so a scheduled re-route keeps it. This
+/// mirrors the 5-minute warm window of the smart-auto affinity cache; the two modules share no symbol.
+const CACHE_WARM_SECS: u64 = 5 * 60;
 const MAX_CONVERSATIONS: usize = 256;
 /// Copilot's chat-completions path, as sent upstream and as `supported_endpoints` lists it.
 pub const CHAT_ENDPOINT: &str = "/chat/completions";
@@ -147,6 +151,8 @@ struct Conversation {
     complexity: Option<&'static str>,
     family_hint: Option<&'static str>,
     selection_reason: Option<String>,
+    /// Unix seconds of the last request this conversation served with its model.
+    last_used_at: u64,
 }
 
 /// The `multi_turn` object of an `/auto` response.
@@ -191,6 +197,7 @@ pub(crate) struct Turn {
     pub(crate) prompt: Option<String>,
     /// The text of the most recent real user turn, even behind later tool results.
     pub(crate) last_user_text: Option<String>,
+    /// Whether any message or tool result in the body holds an image, not only the latest turn.
     pub(crate) has_image: bool,
     pub(crate) user_turns: usize,
 }
@@ -383,6 +390,7 @@ impl CopilotAutoRouter {
                         decision,
                         turn.user_turns,
                         upstream.profile,
+                        now_secs,
                     );
                 }
                 Err(e) => tracing::warn!(
@@ -391,9 +399,10 @@ impl CopilotAutoRouter {
                 ),
             }
         }
-        let Some(conversation) = state.as_ref() else {
+        let Some(conversation) = state.as_mut() else {
             return AutoRoute::default_model(input.default_model, estimated);
         };
+        conversation.last_used_at = now_secs;
         let pick = &conversation.model.id;
         let limits = self.limits.for_profile(upstream.profile);
         let Some((model, swap)) = compatible_model(
@@ -539,7 +548,12 @@ pub fn bare_path(path: &str) -> &str {
 }
 
 impl Conversation {
-    fn anchored(decision: CopilotAutoResponse, model: ModelTraits, turn: usize) -> Conversation {
+    fn anchored(
+        decision: CopilotAutoResponse,
+        model: ModelTraits,
+        turn: usize,
+        now_secs: u64,
+    ) -> Conversation {
         let schedule = parse_schedule(decision.multi_turn.as_ref());
         let complexity = complexity(decision.selection_reason.as_deref());
         Conversation {
@@ -554,6 +568,7 @@ impl Conversation {
             complexity: complexity.map(|(level, _)| level),
             family_hint: complexity.map(|(_, family)| family),
             selection_reason: truncated_reason(decision.selection_reason),
+            last_used_at: now_secs,
         }
     }
 
@@ -595,6 +610,13 @@ impl Conversation {
             .any(|drift| drift >= schedule.escalate_threshold)
     }
 
+    /// Whether a scheduled re-route to `model` keeps the current model. A different model would
+    /// rebuild a warm prompt cache, and the switch is optional, so it waits until the conversation
+    /// has been idle for `CACHE_WARM_SECS`.
+    fn keeps_warm_model(&self, model: &ModelTraits, now_secs: u64) -> bool {
+        model.id != self.model.id && now_secs < self.last_used_at.saturating_add(CACHE_WARM_SECS)
+    }
+
     /// Keeps the anchored model after a check that did not escalate, takes the
     /// fresh session token and widens the skip window.
     fn back_off(&mut self, decision: CopilotAutoResponse, turn: usize) {
@@ -625,6 +647,7 @@ fn apply_decision(
     decision: CopilotAutoResponse,
     turn: usize,
     profile: &str,
+    now_secs: u64,
 ) -> bool {
     let Some(model) = ModelTraits::from_entry(&decision.selected_model) else {
         tracing::warn!("profile {profile}: the Copilot Auto response named no selected model");
@@ -644,12 +667,13 @@ fn apply_decision(
             .unwrap_or("no reason given")
     );
     if let Some(conversation) = state.as_mut().filter(|_| kind == RouteKind::Check)
-        && !conversation.escalates(&decision, &model)
+        && (!conversation.escalates(&decision, &model)
+            || conversation.keeps_warm_model(&model, now_secs))
     {
         conversation.back_off(decision, turn);
         return true;
     }
-    *state = Some(Conversation::anchored(decision, model, turn));
+    *state = Some(Conversation::anchored(decision, model, turn, now_secs));
     true
 }
 
@@ -953,14 +977,6 @@ impl BodyShape {
             BodyShape::AnthropicMessages => MESSAGES_ENDPOINT,
         }
     }
-
-    fn image_part_type(self) -> &'static str {
-        match self {
-            BodyShape::ChatCompletions => "image_url",
-            BodyShape::Responses => "input_image",
-            BodyShape::AnthropicMessages => "image",
-        }
-    }
 }
 
 impl Turn {
@@ -976,8 +992,7 @@ impl Turn {
             .rev()
             .find(|item| !ROLES_SYSTEM.contains(&item.role));
         let prompt = latest.and_then(Item::user_turn_text);
-        let has_image =
-            latest.is_some_and(|item| content_has_image(item.content, shape.image_part_type()));
+        let has_image = request_has_image(bare_path(path), body);
         let first_user = user_texts.first().map_or("", String::as_str);
         let key = conversation_key(profile, tier, &system, first_user);
         let user_turns = user_texts.len();
@@ -1082,18 +1097,6 @@ fn content_text(content: &Value) -> String {
             .join("\n"),
         _ => String::new(),
     }
-}
-
-fn content_has_image(content: &Value, image_type: &str) -> bool {
-    let Value::Array(parts) = content else {
-        return false;
-    };
-    parts.iter().any(|part| {
-        part.get("type").and_then(Value::as_str) == Some(image_type)
-            || part
-                .get("content")
-                .is_some_and(|nested| content_has_image(nested, image_type))
-    })
 }
 
 /// Hashes the profile, tier, system prompt and first user message, each length-prefixed,
@@ -1340,8 +1343,14 @@ mod tests {
         let mut picked = Vec::new();
         for count in 1..=turns.len() {
             let body = chat_body(&turns[..count]);
+            // The drift check runs on a cold cache, so its escalation is not held back as warm.
+            let now = if count == turns.len() {
+                NOW + CACHE_WARM_SECS
+            } else {
+                NOW
+            };
             picked.push(
-                route(&router, &server, UPSTREAM_CHAT_PATH, &body, &[], NOW)
+                route(&router, &server, UPSTREAM_CHAT_PATH, &body, &[], now)
                     .await
                     .0,
             );
@@ -1483,6 +1492,280 @@ mod tests {
             auto_bodies(&server.received_requests().await.unwrap()).len(),
             2
         );
+    }
+
+    /// Auto anchors `gpt-small` on the prompt "one" and picks a drifted `gpt-big` on "four".
+    async fn anchor_then_drift(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/auto"))
+            .and(body_partial_json(json!({"prompt": "one"})))
+            .respond_with(auto_response(
+                &chat_model("gpt-small"),
+                "sess-1",
+                NOW + DAY_SECS,
+                &scores(0.1),
+            ))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/auto"))
+            .and(body_partial_json(json!({"prompt": "four"})))
+            .respond_with(auto_response(
+                &chat_model("gpt-big"),
+                "sess-2",
+                NOW + DAY_SECS,
+                &scores(0.9),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    /// The four-turn body whose check picks `gpt-big`: its skip window of 2 has passed.
+    fn check_body() -> Value {
+        chat_body(&["one", "two", "three", "four"])
+    }
+
+    #[tokio::test]
+    async fn warm_scheduled_reroute_keeps_the_model() {
+        let server = MockServer::start().await;
+        anchor_then_drift(&server).await;
+        let router = CopilotAutoRouter::new();
+        route(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &chat_body(&["one"]),
+            &[],
+            NOW,
+        )
+        .await;
+
+        let (picked, _) = route(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &check_body(),
+            &[],
+            NOW + 60,
+        )
+        .await;
+
+        assert_eq!(picked, "gpt-small");
+        assert_eq!(
+            auto_bodies(&server.received_requests().await.unwrap()).len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_scheduled_reroute_switches_to_the_new_model() {
+        let server = MockServer::start().await;
+        anchor_then_drift(&server).await;
+        let router = CopilotAutoRouter::new();
+        route(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &chat_body(&["one"]),
+            &[],
+            NOW,
+        )
+        .await;
+
+        let (picked, _) = route(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &check_body(),
+            &[],
+            NOW + CACHE_WARM_SECS,
+        )
+        .await;
+
+        assert_eq!(picked, "gpt-big");
+    }
+
+    #[tokio::test]
+    async fn tool_follow_up_keeps_the_conversation_warm() {
+        let server = MockServer::start().await;
+        anchor_then_drift(&server).await;
+        let router = CopilotAutoRouter::new();
+        route(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &chat_body(&["one"]),
+            &[],
+            NOW,
+        )
+        .await;
+        // A tool-loop follow-up never calls /auto, but it does use the model.
+        route(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &tool_follow_up(&["one", "two", "three"]),
+            &[],
+            NOW + 200,
+        )
+        .await;
+
+        let (picked, _) = route(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &check_body(),
+            &[],
+            NOW + 400,
+        )
+        .await;
+
+        assert_eq!(picked, "gpt-small");
+    }
+
+    #[tokio::test]
+    async fn image_escalation_still_switches_while_warm() {
+        let server = MockServer::start().await;
+        let mut blind = priced("gpt-small", &[CHAT_ENDPOINT], 1.0, 1.0);
+        blind["capabilities"]["supports"] = json!({"vision": false});
+        let mut seeing = priced("gpt-vision", &[CHAT_ENDPOINT], 1.0, 1.0);
+        seeing["capabilities"]["supports"] = json!({"vision": true});
+        let catalog = [blind.clone(), seeing];
+        Mock::given(method("POST"))
+            .and(path("/auto"))
+            .respond_with(auto_response(
+                &blind,
+                "sess-1",
+                NOW + DAY_SECS,
+                &scores(0.1),
+            ))
+            .mount(&server)
+            .await;
+        let router = CopilotAutoRouter::new();
+        route(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &chat_body(&["one"]),
+            &catalog,
+            NOW,
+        )
+        .await;
+        let mut image_body = chat_body(&["one"]);
+        image_body["messages"][1]["content"] = json!([
+            {"type": "text", "text": "one"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]);
+
+        let image_route = route_sized(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &image_body,
+            0,
+            &catalog,
+            NOW + 60,
+        )
+        .await;
+        let (text_model, _) = route(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &chat_body(&["one"]),
+            &catalog,
+            NOW + 120,
+        )
+        .await;
+
+        assert_eq!(image_route.model, "gpt-vision");
+        assert!(image_route.swap_reason.is_some());
+        assert_eq!(text_model, "gpt-small");
+    }
+
+    #[tokio::test]
+    async fn prompt_over_the_window_still_switches_while_warm() {
+        let server = MockServer::start().await;
+        let small = windowed("gpt-small", &[CHAT_ENDPOINT], 1.0, Some(1_000));
+        let catalog = [
+            small.clone(),
+            windowed("gpt-big", &[CHAT_ENDPOINT], 1.0, Some(400_000)),
+        ];
+        Mock::given(method("POST"))
+            .and(path("/auto"))
+            .respond_with(auto_response(
+                &small,
+                "sess-1",
+                NOW + DAY_SECS,
+                &scores(0.1),
+            ))
+            .mount(&server)
+            .await;
+        let router = CopilotAutoRouter::new();
+        route(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &chat_body(&["one"]),
+            &catalog,
+            NOW,
+        )
+        .await;
+
+        // 40 000 bytes is 10 000 estimated tokens, past the 1 000-token window.
+        let long_route = route_sized(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &chat_body(&["one"]),
+            40_000,
+            &catalog,
+            NOW + 60,
+        )
+        .await;
+        let (text_model, _) = route(
+            &router,
+            &server,
+            UPSTREAM_CHAT_PATH,
+            &chat_body(&["one"]),
+            &catalog,
+            NOW + 120,
+        )
+        .await;
+
+        assert_eq!(long_route.model, "gpt-big");
+        assert!(long_route.swap_reason.is_some());
+        assert_eq!(text_model, "gpt-small");
+    }
+
+    #[test]
+    fn image_in_an_earlier_turn_sets_has_image_through_the_shared_helper() {
+        let body = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "one"},
+                {"type": "image", "source": {"type": "base64", "data": "AAAA"}}
+            ]},
+            {"role": "assistant", "content": "a cat"},
+            {"role": "user", "content": "and the next one?"},
+        ]});
+
+        let turn =
+            Turn::parse(PROFILE, AutoTier::Balance, "/v1/messages?beta=true", &body).unwrap();
+
+        assert!(turn.has_image);
+        assert_eq!(turn.prompt.as_deref(), Some("and the next one?"));
+    }
+
+    #[test]
+    fn text_only_turn_has_no_image() {
+        let body = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "one"}]},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "two"},
+        ]});
+
+        let turn = Turn::parse(PROFILE, AutoTier::Balance, UPSTREAM_MESSAGES_PATH, &body).unwrap();
+
+        assert!(!turn.has_image);
     }
 
     fn priced(id: &str, endpoints: &[&str], input: f64, output: f64) -> Value {

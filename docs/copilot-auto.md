@@ -52,6 +52,9 @@ Copilot's `multi_turn` schedule decides which user turns route again. llm-hub fo
 - Each check that keeps the model doubles the skip window, up to `max_skip` (32).
 - A check routes to a new model early when a hydra score moves past `escalate_threshold` times
   that task type's sigma.
+- A scheduled check keeps the current model when the conversation used it within the last
+  5 minutes, so its prompt cache stays warm. The switch waits until the conversation has been idle
+  that long. A tool-loop follow-up counts as a use. This mirrors the warm window of smart-auto.
 - llm-hub also routes again when the session token is less than 5 minutes from expiry.
 - Tool-loop follow-ups never call `/auto`. Only user turns can route.
 
@@ -72,6 +75,10 @@ llm-hub then swaps the model:
 
 GPT picks work from Claude Code (`/v1/messages`) without a swap, through the
 [Responses bridge](github-copilot.md#models-and-endpoints).
+
+The swap applies to that request only. The conversation keeps its model, so a later turn that
+needs no swap goes back to it. A swap is a capability escalation, so it still happens while the
+kept model is warm.
 
 It is not verified whether the 10% discount still applies after a swap.
 

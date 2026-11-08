@@ -390,28 +390,48 @@ mod tests {
     #[test]
     fn planning_to_plan_backed_implementation_switches_once_settled() {
         let now = Instant::now();
+        let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
         let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
         let owned = models(&[HAIKU, OPUS, SONNET]);
         let pool: Vec<&ModelDescriptor> = owned.iter().collect();
 
-        let unsettled = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 2, false), now);
+        let unsettled = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 2, false), cold);
         assert_eq!(unsettled.model.qualified_id, OPUS);
         assert_eq!(unsettled.reason, RouteReason::Pinned);
 
-        let settled = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 3, false), now);
+        let settled = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 3, false), cold);
         assert_eq!(settled.model.qualified_id, HAIKU);
         assert_eq!(settled.reason, RouteReason::RoleSwitch);
     }
 
     #[test]
+    fn a_warm_heavy_pin_keeps_its_model_for_a_role_cue() {
+        let now = Instant::now();
+        let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
+        let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+
+        let warm = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 3, false), now);
+        assert_eq!(warm.model.qualified_id, OPUS);
+        assert_eq!(warm.role, WorkRole::Implementation);
+        assert_eq!(warm.reason, RouteReason::Pinned);
+
+        let cold_turn = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 3, false), cold);
+        assert_eq!(cold_turn.model.qualified_id, HAIKU);
+        assert_eq!(cold_turn.reason, RouteReason::RoleSwitch);
+    }
+
+    #[test]
     fn returning_to_a_role_reuses_its_incumbent() {
         let now = Instant::now();
+        let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
         let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
         let key = key(&policy(SmartAutoTier::Balance));
         assert!(affinity.commit(&key, HAIKU, WorkRole::Implementation, true, 3, now));
         let owned = models(&[HAIKU, OPUS, SONNET]);
         let pool: Vec<&ModelDescriptor> = owned.iter().collect();
-        let decision = route_pinned(&pool, &affinity, &signals(PLANNING_TEXT, 5, false), now);
+        let decision = route_pinned(&pool, &affinity, &signals(PLANNING_TEXT, 5, false), cold);
         assert_eq!(decision.model.qualified_id, OPUS);
         assert_eq!(decision.role, WorkRole::Planning);
         assert_eq!(decision.reason, RouteReason::Incumbent);
@@ -420,16 +440,17 @@ mod tests {
     #[test]
     fn a_settled_heavy_pin_steps_down_on_a_plain_conversation_turn() {
         let now = Instant::now();
+        let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
         let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
         let owned = models(&[HAIKU, OPUS, SONNET]);
         let pool: Vec<&ModelDescriptor> = owned.iter().collect();
         let chat = "thanks, what does the new storage layer do for us";
 
-        let unsettled = route_pinned(&pool, &affinity, &signals(chat, 2, false), now);
+        let unsettled = route_pinned(&pool, &affinity, &signals(chat, 2, false), cold);
         assert_eq!(unsettled.model.qualified_id, OPUS);
         assert_eq!(unsettled.reason, RouteReason::Pinned);
 
-        let settled = route_pinned(&pool, &affinity, &signals(chat, 3, false), now);
+        let settled = route_pinned(&pool, &affinity, &signals(chat, 3, false), cold);
         assert_eq!(settled.model.qualified_id, HAIKU);
         assert_eq!(settled.role, WorkRole::Conversation);
         assert_eq!(settled.reason, RouteReason::RoleSwitch);

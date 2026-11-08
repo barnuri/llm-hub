@@ -144,7 +144,7 @@ The hub keeps one kept model per conversation. It also remembers the model used 
 - **Lookup.** A kept model is used only while it is still in the pool. An ineligible one is dropped.
 - **Tool continuation.** Replays the kept model, with reason `tool_continuation_replay`. No role is classified and no switch is considered.
 - **Switch.** A turn can move to another model only when the work changes weight. Conversation is light. Plan-backed implementation is cheap. Implementation, planning, investigation and validation are heavy. A switch needs a change to a non-light weight, with one exception: a heavy kept model steps down to the conversation pick on a plain conversation turn (no role cue) of more than 3 words, so a premium model does not keep running chat and its tool loops. A short approval ("yes, go") keeps the kept model. A tool continuation never switches, so a tool loop keeps its prompt cache and its signed thinking blocks.
-- **Budget.** An optional switch needs the kept model held for at least 2 user turns. It also needs fewer than 2 switches in the last 20 user turns.
+- **Budget.** An optional switch needs the kept model held for at least 2 user turns. It also needs fewer than 2 switches in the last 20 user turns. It also needs a cold cache: no switch while the kept model was used in the last 5 minutes, because a switch would rebuild the whole prompt cache on the new model (measured 32% cache hit on a switch, 95% on a stay).
 - **Commit.** The kept model is saved only after a 2xx response whose stream finished without error.
 - **Limits.** Up to 1,024 conversations. A conversation idle for 10 minutes is dropped. Kept models live in memory and are not restored after a restart.
 
@@ -237,6 +237,9 @@ Set `LLM_HUB_STORE_PATH` to choose the store file. See [Configuration](configura
 - **Deny wins.** A model that matches any exclude is out, even if an include matches it. Global and profile excludes run before any include. Fallbacks use the same pool, so a forbidden fallback is never called.
 - **A request can narrow the rules.** In the default `merge` mode, its include and exclude only add restrictions.
 - **A request can widen them only in override mode, and only with no env rules.** Override replaces the saved include, exclude and profile rules for that request. With `LLM_HUB_SMART_AUTO_RULES` set, override does nothing.
+- **Images need vision.** A request with an image anywhere in its body (any turn, tool results included) keeps only models that report vision. Models with unknown vision support, such as local servers, are left out. A model that answers 500 "image input is not supported" is marked text-only in memory until restart.
+- **Chain gates.** Every attempt in the chain (Smart Auto and direct fallbacks) skips a model that cannot read the request's image, or whose known prompt limit is below the estimated prompt size. Unknown limits are still tried. When no model is left, the hub returns 400 at once, naming each model and the reason, with no upstream call.
+- **Copilot Auto is chat only.** `copilot/auto` on a path other than chat completions, responses or messages (for example `count_tokens`) returns 400 and asks for a concrete model.
 - **Unknown limits fail closed.** A model with an unknown or conflicting total, prompt or output size fails any minimum set for it. An unknown header, a repeated single-value header or an empty value returns 400.
 - **Tier names never widen the pool.** A tier only changes scoring and checks. It never admits a model that the rules or minimums exclude.
 

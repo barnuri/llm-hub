@@ -35,6 +35,7 @@ pub(crate) mod model_picker;
 pub mod multipart_model;
 pub mod pricing;
 pub mod process_gh_cli;
+pub mod request_images;
 pub mod responses_item_ids;
 pub mod restart;
 pub mod review_graph;

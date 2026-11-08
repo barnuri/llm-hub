@@ -23,6 +23,7 @@ use crate::schemas::app_error::AppError;
 use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::profile_filter::ProfileFilter;
+use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_id::ModelId;
 use crate::schemas::reply_protocol::ReplyProtocol;
 use crate::schemas::review_evidence::ReviewEvidence;
@@ -48,7 +49,7 @@ use crate::services::body_transform::BodyTransform;
 use crate::services::buffered_reply_stream::BufferedReplyStream;
 use crate::services::copilot_auto::{
     AutoInput, AutoTier, AutoUpstream, CHAT_ENDPOINT, MESSAGES_ENDPOINT, RESPONSES_ENDPOINT,
-    bare_path,
+    bare_path, estimated_prompt_tokens,
 };
 use crate::services::copilot_auto_decisions::{AutoDecision, TieredDecision};
 use crate::services::copilot_body_fields::BodyField;
@@ -57,6 +58,7 @@ use crate::services::fallback::{
 };
 use crate::services::harness::client_signature;
 use crate::services::multipart_model;
+use crate::services::request_images::request_has_image;
 use crate::services::responses_item_ids::ResponsesItemIds;
 use crate::services::review_graph::ReviewGraph;
 use crate::services::review_orchestrator::ReviewOrchestrator;
@@ -91,6 +93,8 @@ const USAGE_SCRAPE_HEAD_BYTES: usize = 16 * 1024;
 const CAPTURE_TEXT_BYTES: usize = 256 * 1024;
 /// The client-facing chat route that review stages call on a concrete model.
 const STAGE_CHAT_PATH: &str = "/v1/chat/completions";
+/// The text an upstream 500 carries when the model refuses image input.
+const IMAGE_INPUT_REJECTION: &str = "image input is not supported";
 static NO_BODY: Value = Value::Null;
 /// The status codes that count as a success for Smart Auto affinity.
 const SUCCESS_STATUS_RANGE: std::ops::Range<u16> = 200..300;
@@ -203,6 +207,25 @@ pub(crate) async fn attempt_loop(
         if let Some(id) = ModelId::parse(&fallback) {
             chain.push(id);
         }
+    }
+    let needs = RequestNeeds {
+        path: path_and_query,
+        input: bodies.auto_input(),
+        prompt_tokens: estimated_prompt_tokens(bodies.original.len()),
+    };
+    let mut refusals: Vec<String> = Vec::new();
+    let chain: Vec<ModelId> = chain
+        .into_iter()
+        .filter_map(|model| match refusal(state, &config, &model, &needs) {
+            None => Some(model),
+            Some(reason) => {
+                refusals.push(reason);
+                None
+            }
+        })
+        .collect();
+    if chain.is_empty() {
+        return Err(AppError::BadRequest(refusals.join("; ")));
     }
 
     let client = client_signature(headers);
@@ -344,6 +367,11 @@ pub(crate) async fn attempt_loop(
                     }
                     return Ok(out);
                 }
+                if status == StatusCode::INTERNAL_SERVER_ERROR.as_u16() {
+                    let (body, _) =
+                        read_upstream_capped(response, MAX_TRANSFORM_BUFFER_BYTES).await;
+                    learn_image_refusal(state, model_id, status, &body);
+                }
                 record_failure(
                     state,
                     model_id,
@@ -352,6 +380,7 @@ pub(crate) async fn attempt_loop(
                     format!("HTTP {status}; retried on the next fallback"),
                     client.clone(),
                     worker.clone(),
+                    attempt.path.as_str(),
                 );
             }
             Err(reason) => {
@@ -367,6 +396,7 @@ pub(crate) async fn attempt_loop(
                     reason,
                     client.clone(),
                     worker.clone(),
+                    attempt.path.as_str(),
                 );
                 if index == last_index {
                     return Err(AppError::UpstreamUnavailable(format!(
@@ -523,11 +553,12 @@ fn resolve_hub(
     );
     let profiles = concrete_profile_filter(headers);
     let snapshot = state.model_descriptors();
-    let mut pool = SmartAutoPool::eligible(
+    let mut pool = SmartAutoPool::eligible_for(
         &snapshot,
         &policy,
         endpoint,
         signals.estimated_prompt_tokens,
+        signals.has_image,
     );
     if let Some(profiles) = &profiles {
         pool.retain(|descriptor| profiles.allows(&descriptor.qualified_id));
@@ -549,9 +580,24 @@ fn resolve_hub(
         requested,
         Instant::now(),
     )
-    .ok_or_else(|| no_eligible_model(&selector, &policy, profiles.as_ref(), endpoint))?;
-    let primary = ModelId::parse(&decision.model.qualified_id)
-        .ok_or_else(|| no_eligible_model(&selector, &policy, profiles.as_ref(), endpoint))?;
+    .ok_or_else(|| {
+        no_eligible_model(
+            &selector,
+            &policy,
+            profiles.as_ref(),
+            endpoint,
+            signals.has_image,
+        )
+    })?;
+    let primary = ModelId::parse(&decision.model.qualified_id).ok_or_else(|| {
+        no_eligible_model(
+            &selector,
+            &policy,
+            profiles.as_ref(),
+            endpoint,
+            signals.has_image,
+        )
+    })?;
     let tier = policy.tier.unwrap_or_default();
     state.smart_auto_decisions().record(SmartAutoDecision {
         ts_ms: now_ms(),
@@ -654,6 +700,7 @@ fn no_eligible_model(
     policy: &SmartAutoPolicy,
     profiles: Option<&ProfileFilter>,
     endpoint: &str,
+    has_image: bool,
 ) -> AppError {
     let mut restrictions = vec![format!("tier {}", selector.tier.as_str())];
     if let Some(profiles) = profiles {
@@ -676,12 +723,122 @@ fn no_eligible_model(
             restrictions.push(format!("{name} {minimum} tokens"));
         }
     }
+    if has_image {
+        restrictions.push("image input".to_owned());
+    }
     AppError::BadRequest(format!(
         "smart_auto_no_eligible_model: no model serves {namespace}/{name} on {endpoint} under: {}",
         restrictions.join(", "),
         namespace = HubSelector::NAMESPACE,
         name = selector.name,
     ))
+}
+
+/// What one request needs from the model that serves it, read once before the chain runs.
+struct RequestNeeds<'a> {
+    /// The client path, with any query string.
+    path: &'a str,
+    /// The upstream path and body. Scanned for images only when a model refuses them.
+    input: (&'a str, &'a Value),
+    /// Roughly one token per four request bytes.
+    prompt_tokens: u64,
+}
+
+/// Why `model_id` cannot serve the request, or `None` when it may be tried. Reads memory only.
+fn refusal(
+    state: &AppState,
+    config: &HubConfig,
+    model_id: &ModelId,
+    needs: &RequestNeeds<'_>,
+) -> Option<String> {
+    let qualified = model_id.qualified();
+    let is_copilot = config
+        .profile(&model_id.profile)
+        .is_some_and(|found| found.copilot.is_some());
+    if is_copilot && AutoTier::from_model(&model_id.model).is_some() {
+        // Copilot Auto checks the image and the prompt size of the model it picks.
+        return (!serves_chat_path(needs.path)).then(|| {
+            format!(
+                "{qualified} routes chat requests only; pick a model for {}",
+                bare_path(needs.path)
+            )
+        });
+    }
+    let snapshot = state.model_descriptors();
+    let descriptor = snapshot.for_model(&model_id.profile, &model_id.model);
+    let upstream = upstream_key(state, model_id);
+    let refuses_images = descriptor.and_then(|found| found.vision) == Some(false)
+        || state.vision_unsupported(&model_id.profile, &upstream);
+    if refuses_images && request_has_image(needs.input.0, needs.input.1) {
+        return Some(format!("{qualified}: image input is not supported"));
+    }
+    let limit = known_prompt_limit(state, model_id, is_copilot, &upstream, descriptor)?;
+    (needs.prompt_tokens > limit).then(|| {
+        format!(
+            "{qualified}: a prompt of about {} tokens is over the known limit of {limit} tokens",
+            needs.prompt_tokens
+        )
+    })
+}
+
+/// The prompt size `model_id` is known to accept: a Copilot model's seeded or learned limit, else
+/// the ceiling its descriptor reports. `None` when neither is known.
+fn known_prompt_limit(
+    state: &AppState,
+    model_id: &ModelId,
+    is_copilot: bool,
+    upstream: &str,
+    descriptor: Option<&ModelDescriptor>,
+) -> Option<u64> {
+    if is_copilot
+        && let Some(entry) = state
+            .model_limits()
+            .for_profile(&model_id.profile)
+            .get(upstream)
+    {
+        return Some(entry.limit);
+    }
+    descriptor.and_then(descriptor_ceiling)
+}
+
+/// The smallest prompt or runtime capacity a descriptor reports. Conflicting and lower-bound
+/// values are not ceilings.
+fn descriptor_ceiling(descriptor: &ModelDescriptor) -> Option<u64> {
+    [
+        descriptor.input.as_ref().or(descriptor.context.as_ref()),
+        descriptor.runtime_context.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|evidence| !evidence.conflict && !evidence.source.is_lower_bound())
+    .map(|evidence| evidence.value)
+    .min()
+}
+
+/// True for the routes Copilot Auto routes: chat completions, Responses and Anthropic messages.
+fn serves_chat_path(path: &str) -> bool {
+    let bare = bare_path(path);
+    [CHAT_ENDPOINT, RESPONSES_ENDPOINT, MESSAGES_ENDPOINT]
+        .into_iter()
+        .any(|endpoint| bare.ends_with(endpoint))
+}
+
+/// The model id `model_id` is sent as: the catalog's upstream id, else the id the client wrote.
+fn upstream_key(state: &AppState, model_id: &ModelId) -> String {
+    state
+        .upstream_model(&model_id.profile, &model_id.model)
+        .map_or_else(|| model_id.model.clone(), |entry| entry.upstream_id)
+}
+
+/// Learns that `model_id` refuses image input when an upstream 500 body says so.
+fn learn_image_refusal(state: &AppState, model_id: &ModelId, status: u16, body: &[u8]) {
+    if status != StatusCode::INTERNAL_SERVER_ERROR.as_u16() {
+        return;
+    }
+    if !String::from_utf8_lossy(body).contains(IMAGE_INPUT_REJECTION) {
+        return;
+    }
+    state.learn_vision_unsupported(&model_id.profile, &upstream_key(state, model_id));
 }
 
 /// The request in each form an attempt can send: translated for a chat-completions
@@ -1339,7 +1496,7 @@ async fn review_deliver(
             save_answer(&state_for_text, &attempt, &raw);
         });
     }
-    finish_selection(state, selection, &request_stats, true);
+    finish_selection(state, selection, &request_stats, None);
     state.stats().record(&request_stats);
     if let Some(store) = state.store()
         && let Err(e) = store.record(&request_stats)
@@ -2000,12 +2157,12 @@ fn finish_selection(
     state: &AppState,
     selection: Option<SelectionEvent>,
     outcome: &RequestOutcome,
-    completed: bool,
+    stop: Option<StopCause>,
 ) {
     let Some(event) = selection else {
         return;
     };
-    let next = if completed {
+    let next = if stop.is_none() {
         SelectionState::Completed
     } else {
         SelectionState::Cancelled
@@ -2019,6 +2176,36 @@ fn finish_selection(
         cache_write_tokens: reported(outcome.cache_write_tokens),
         ..event.in_state(next)
     });
+}
+
+/// Why a delivered answer ended before its upstream body did.
+#[derive(Clone, Copy)]
+enum StopCause {
+    /// The response body was dropped first: the client closed it, or the upstream read failed.
+    ClientDisconnect,
+    /// The hub ended the answer, for the reason it names.
+    HubReject(&'static str),
+}
+
+/// Logs an answer that ended early, with its cause and the path it was sent on.
+fn log_cancel(outcome: &RequestOutcome, stop: Option<StopCause>, path: &str) {
+    let Some(cause) = stop else {
+        return;
+    };
+    let (kind, reason) = match cause {
+        StopCause::ClientDisconnect => (
+            "client_disconnect",
+            "the client closed the response or the upstream read failed",
+        ),
+        StopCause::HubReject(reason) => ("hub_reject", reason),
+    };
+    tracing::info!(
+        model = %outcome.model_key,
+        path,
+        latency_ms = outcome.latency_ms,
+        cause = kind,
+        "request cancelled: {reason}"
+    );
 }
 
 /// A count the upstream reported, or `None` when it reported none.
@@ -2065,7 +2252,7 @@ fn save_text(
 /// Streams the upstream response through, scraping usage from a rolling tail and recording stats at stream end.
 /// `transform` rewrites frames when `Some`; `None` passes bytes through untouched, and `finish()` output ends the body.
 // Eleven inputs, each a separate per-response value, so bundling them would only rename them.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the stream-end task records one answer in order; a split would thread the same state through helpers
 fn build_response(
     state: &AppState,
     upstream: reqwest::Response,
@@ -2105,6 +2292,8 @@ fn build_response(
     );
 
     let state_for_stats = state.clone();
+    let path = upstream_path.to_owned();
+    let learn_model = model_id.clone();
     let outcome_seed = RequestOutcome {
         profile: model_id.profile.clone(),
         model_key: model_id.qualified(),
@@ -2145,6 +2334,12 @@ fn build_response(
         if let Some(model) = &limit_model {
             state_for_stats.learn_prompt_limit(&outcome_seed.profile, model, &summary.tail);
         }
+        learn_image_refusal(
+            &state_for_stats,
+            &learn_model,
+            outcome_seed.status,
+            &summary.tail,
+        );
         let usage = summary_usage(&summary);
         let answer = std::mem::take(&mut summary.answer);
         let outcome = RequestOutcome {
@@ -2158,14 +2353,16 @@ fn build_response(
                 .then(|| error_reason(outcome_seed.status, &summary.tail)),
             ..outcome_seed
         };
-        log_failure(&outcome);
+        log_failure(&outcome, &path);
         if let Some(commit) = commit.filter(|_| summary.completed && outcome.error.is_none()) {
             commit.apply(&state_for_stats);
         }
         if let Some(attempt) = capture_answer {
             save_answer(&state_for_stats, &attempt, &answer);
         }
-        finish_selection(&state_for_stats, selection, &outcome, summary.completed);
+        let stop = (!summary.completed).then_some(StopCause::ClientDisconnect);
+        log_cancel(&outcome, stop, &path);
+        finish_selection(&state_for_stats, selection, &outcome, stop);
         state_for_stats.stats().record(&outcome);
         if let Some(store) = state_for_stats.store()
             && let Err(e) = store.record(&outcome)
@@ -2386,7 +2583,7 @@ fn is_event_stream(response: &reqwest::Response) -> bool {
 /// `MAX_TRANSFORM_BUFFER_BYTES`. Every other route keeps the byte-for-byte
 /// streaming path in `build_response`.
 // Ten inputs, each a separate per-response value the translator needs.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the buffered answer is read, learned from and recorded in order; a split would thread the same state through helpers
 async fn build_anthropic_response(
     state: &AppState,
     upstream: reqwest::Response,
@@ -2427,6 +2624,7 @@ async fn build_anthropic_response(
     if let Some(model) = &limit_model {
         state.learn_prompt_limit(&model_id.profile, model, &raw);
     }
+    learn_image_refusal(state, model_id, upstream_status.as_u16(), &raw);
     let (status, payload) = if overflowed {
         tracing::warn!(
             "anthropic response exceeded {MAX_TRANSFORM_BUFFER_BYTES} bytes and cannot be translated"
@@ -2480,11 +2678,14 @@ async fn build_anthropic_response(
         client,
         worker,
     };
-    log_failure(&outcome);
+    log_failure(&outcome, upstream_path);
     let state_for_stats = state.clone();
     let answer_attempt = selection.as_ref().and_then(|event| event.attempt.clone());
+    let path = upstream_path.to_owned();
     tokio::spawn(async move {
-        finish_selection(&state_for_stats, selection, &outcome, !overflowed);
+        let stop = overflowed.then_some(StopCause::HubReject("response too large to translate"));
+        log_cancel(&outcome, stop, &path);
+        finish_selection(&state_for_stats, selection, &outcome, stop);
         if let Some(attempt) = answer_attempt {
             save_answer(&state_for_stats, &attempt, &raw);
         }
@@ -2530,8 +2731,7 @@ fn prompt_limit_model(
         .profile(&model_id.profile)?
         .copilot
         .as_ref()?;
-    let upstream = state.upstream_model(&model_id.profile, &model_id.model);
-    let upstream_id = upstream.map_or_else(|| model_id.model.clone(), |entry| entry.upstream_id);
+    let upstream_id = upstream_key(state, model_id);
     teaches_stored_limit(upstream_path, &upstream_id).then_some(upstream_id)
 }
 
@@ -2562,6 +2762,7 @@ async fn read_upstream_capped(upstream: reqwest::Response, cap: usize) -> (Vec<u
     (buffered, false)
 }
 
+#[allow(clippy::too_many_arguments)] // the failure record takes the attempt's values one by one, as the attempt loop holds them
 fn record_failure(
     state: &AppState,
     model_id: &ModelId,
@@ -2570,6 +2771,7 @@ fn record_failure(
     reason: String,
     client: Option<String>,
     worker: Option<String>,
+    path: &str,
 ) {
     let latency_ms = crate::utils::time::elapsed_ms(started);
     let outcome = RequestOutcome {
@@ -2587,7 +2789,7 @@ fn record_failure(
         client,
         worker,
     };
-    log_failure(&outcome);
+    log_failure(&outcome, path);
     state.stats().record(&outcome);
     if let Some(store) = state.store() {
         let _ = store.record(&outcome);
@@ -2732,10 +2934,11 @@ fn error_reason(status: u16, body: &[u8]) -> String {
     reason.chars().take(ERROR_REASON_MAX_CHARS).collect()
 }
 
-fn log_failure(outcome: &RequestOutcome) {
+fn log_failure(outcome: &RequestOutcome, path: &str) {
     if let Some(reason) = &outcome.error {
         tracing::warn!(
             model = %outcome.model_key,
+            path,
             status = outcome.status,
             latency_ms = outcome.latency_ms,
             "request failed: {reason}"
@@ -3011,7 +3214,7 @@ mod tests {
         };
         let profiles = ProfileFilter::from_list("beta,gamma");
 
-        let error = no_eligible_model(&selector, &policy, Some(&profiles), "/v1/messages");
+        let error = no_eligible_model(&selector, &policy, Some(&profiles), "/v1/messages", false);
 
         let AppError::BadRequest(message) = error else {
             panic!("expected a 400, got {error:?}");
@@ -3021,6 +3224,30 @@ mod tests {
             "smart_auto_no_eligible_model: no model serves hub/smart-auto-fast on /v1/messages \
              under: tier fast, profiles beta|gamma, include alpha/*|beta/*, exclude *preview*, \
              min context 1000000 tokens"
+        );
+    }
+
+    #[test]
+    fn no_eligible_model_names_an_image_request() {
+        let selector = HubSelector::parse("hub/smart-auto", &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+
+        let error = no_eligible_model(
+            &selector,
+            &SmartAutoPolicy::default(),
+            None,
+            "/v1/messages",
+            true,
+        );
+
+        let AppError::BadRequest(message) = error else {
+            panic!("expected a 400, got {error:?}");
+        };
+        assert_eq!(
+            message,
+            "smart_auto_no_eligible_model: no model serves hub/smart-auto on /v1/messages \
+             under: tier balance, image input"
         );
     }
 
@@ -3093,7 +3320,7 @@ mod tests {
         use std::sync::Arc;
 
         use serde_json::json;
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{body_partial_json, method, path};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
         use super::*;
@@ -4439,6 +4666,7 @@ mod tests {
                     SelectionState::Cancelled,
                 ]
             );
+            assert!(events[2].latency_ms.is_some());
         }
 
         #[tokio::test]
@@ -4795,6 +5023,290 @@ mod tests {
             assert_eq!(
                 header(&headers, HEADER_SERVED_MODEL),
                 Some(auto_pick.as_str())
+            );
+        }
+
+        /// An Anthropic body whose latest turn carries one image part.
+        fn anthropic_image_body(model: &str) -> Value {
+            json!({
+                "model": format!("{PROFILE}/{model}"),
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                    {"type": "text", "text": "what is this"},
+                ]}],
+            })
+        }
+
+        /// An Anthropic body of about `prompt_tokens` estimated tokens, at one token per four bytes.
+        fn long_anthropic_body(model: &str, prompt_tokens: usize) -> Value {
+            json!({
+                "model": format!("{PROFILE}/{model}"),
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "x".repeat(prompt_tokens * 4)}],
+            })
+        }
+
+        /// A descriptor for `qualified_id` that reports `vision`.
+        fn described(qualified_id: &str, vision: Option<bool>) -> ModelDescriptor {
+            ModelDescriptor {
+                vision,
+                ..ModelDescriptor::for_test(qualified_id)
+            }
+        }
+
+        /// The model each chat completion sent upstream named, in arrival order.
+        async fn chat_models(copilot: &Copilot) -> Vec<String> {
+            requests_to(copilot, UPSTREAM_CHAT_PATH)
+                .await
+                .iter()
+                .map(|request| sent_json(request)["model"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        /// The 400 message of a request that no model can serve. Panics when the request is served.
+        async fn refused_message(
+            copilot: &Copilot,
+            request_path: &str,
+            route: RouteKind,
+            headers: &HeaderMap,
+            body: &Value,
+        ) -> String {
+            let Err(error) = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                request_path,
+                headers,
+                Bytes::from(body.to_string()),
+                route,
+            )
+            .await
+            else {
+                panic!("the request was served, not refused");
+            };
+            let AppError::BadRequest(message) = error else {
+                panic!("expected a 400, got {error:?}");
+            };
+            message
+        }
+
+        fn fallback_to(model: &str) -> HeaderMap {
+            let mut headers = client_headers();
+            headers.insert(
+                HEADER_FALLBACKS,
+                HeaderValue::from_str(&format!("{PROFILE}/{model}")).unwrap(),
+            );
+            headers
+        }
+
+        #[tokio::test]
+        async fn image_request_skips_a_text_only_model_and_reaches_a_vision_fallback() {
+            let copilot = copilot().await;
+            copilot.state.set_model_descriptors(vec![
+                described(&format!("{PROFILE}/{PLAIN_ID}"), Some(false)),
+                described(&format!("{PROFILE}/{TRANSLATED_ID}"), Some(true)),
+            ]);
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, _) = send(
+                &copilot,
+                &fallback_to(TRANSLATED_ID),
+                &anthropic_image_body(PLAIN_ID),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert_eq!(chat_models(&copilot).await, [TRANSLATED_UPSTREAM_ID]);
+        }
+
+        #[tokio::test]
+        async fn image_request_to_a_text_only_model_is_refused_without_an_upstream_call() {
+            let copilot = copilot().await;
+            copilot.state.set_model_descriptors(vec![described(
+                &format!("{PROFILE}/{PLAIN_ID}"),
+                Some(false),
+            )]);
+
+            let message = refused_message(
+                &copilot,
+                MESSAGES_ENDPOINT,
+                RouteKind::Anthropic,
+                &client_headers(),
+                &anthropic_image_body(PLAIN_ID),
+            )
+            .await;
+
+            assert_eq!(message, "copilot/gpt-4.1: image input is not supported");
+            assert!(
+                copilot
+                    .upstream
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_500_that_refuses_images_teaches_the_model_and_later_image_requests_skip_it() {
+            let copilot = copilot().await;
+            copilot.state.set_model_descriptors(vec![
+                described(&format!("{PROFILE}/{PLAIN_ID}"), None),
+                described(&format!("{PROFILE}/{TRANSLATED_ID}"), Some(true)),
+            ]);
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .and(body_partial_json(json!({"model": PLAIN_ID})))
+                .respond_with(
+                    ResponseTemplate::new(500).set_body_string("image input is not supported"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .and(body_partial_json(json!({"model": TRANSLATED_UPSTREAM_ID})))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+            let headers = fallback_to(TRANSLATED_ID);
+
+            let (first, _) = send(
+                &copilot,
+                &headers,
+                &anthropic_image_body(PLAIN_ID),
+                RouteKind::Anthropic,
+            )
+            .await;
+            let (second, _) = send(
+                &copilot,
+                &headers,
+                &anthropic_image_body(PLAIN_ID),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!((first, second), (200, 200));
+            assert!(copilot.state.vision_unsupported(PROFILE, PLAIN_ID));
+            assert_eq!(
+                chat_models(&copilot).await,
+                [PLAIN_ID, TRANSLATED_UPSTREAM_ID, TRANSLATED_UPSTREAM_ID]
+            );
+        }
+
+        #[tokio::test]
+        async fn fallback_whose_known_limit_is_below_the_prompt_is_skipped() {
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 1_000, 1);
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, _) = send(
+                &copilot,
+                &fallback_to(TRANSLATED_ID),
+                &long_anthropic_body(PLAIN_ID, 2_000),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert_eq!(chat_models(&copilot).await, [TRANSLATED_UPSTREAM_ID]);
+        }
+
+        #[tokio::test]
+        async fn model_with_no_known_limit_is_still_tried_with_a_large_prompt() {
+            let copilot = copilot().await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, _) = send(
+                &copilot,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 2_000),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert_eq!(chat_models(&copilot).await, [PLAIN_ID]);
+        }
+
+        #[tokio::test]
+        async fn prompt_over_the_only_known_limit_is_refused_without_an_upstream_call() {
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 1_000, 1);
+
+            let message = refused_message(
+                &copilot,
+                MESSAGES_ENDPOINT,
+                RouteKind::Anthropic,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 2_000),
+            )
+            .await;
+
+            assert!(
+                message.starts_with("copilot/gpt-4.1: a prompt of about "),
+                "{message}"
+            );
+            assert!(
+                message.ends_with("is over the known limit of 1000 tokens"),
+                "{message}"
+            );
+            assert!(
+                copilot
+                    .upstream
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn copilot_auto_on_a_non_chat_path_is_refused_without_an_upstream_call() {
+            let copilot = copilot().await;
+            let body = json!({
+                "model": format!("{PROFILE}/{COPILOT_AUTO_MODEL}"),
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+
+            let message = refused_message(
+                &copilot,
+                "/v1/messages/count_tokens",
+                RouteKind::OpenAi,
+                &client_headers(),
+                &body,
+            )
+            .await;
+
+            assert_eq!(
+                message,
+                "copilot/auto routes chat requests only; pick a model for /v1/messages/count_tokens"
+            );
+            assert!(
+                copilot
+                    .upstream
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty()
             );
         }
     }

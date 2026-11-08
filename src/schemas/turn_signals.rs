@@ -2,6 +2,7 @@ use serde_json::Value;
 
 use crate::schemas::hub_selector::HubSelector;
 use crate::services::copilot_auto::{AutoTier, ConversationKey, Turn, estimated_prompt_tokens};
+use crate::services::request_images::request_has_image;
 
 /// What one request body says about its latest turn, read once from the parsed body.
 /// Smart Auto routes on these signals and never reads the body again.
@@ -18,7 +19,7 @@ pub struct TurnSignals {
     pub last_user_text: Option<String>,
     /// The body declares at least one tool.
     pub has_tools: bool,
-    /// The latest turn holds an image part.
+    /// The request holds an image part in any message, including history and tool results.
     pub has_image: bool,
     /// The caller's session id, the strongest affinity input.
     pub session_id: Option<String>,
@@ -51,7 +52,7 @@ impl TurnSignals {
                 .as_ref()
                 .is_some_and(|turn| turn.prompt.is_none() && user_turns > 0),
             user_turns,
-            has_image: turn.as_ref().is_some_and(|turn| turn.has_image),
+            has_image: request_has_image(path, body),
             content_key: turn.as_ref().map(|turn| turn.key),
             last_user_text: turn.and_then(|turn| turn.last_user_text).map(Self::bounded),
             has_tools: body
@@ -233,6 +234,23 @@ mod tests {
 
         assert_eq!(text.len(), TurnSignals::MAX_LAST_USER_TEXT_BYTES);
         assert!(text.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn history_image_sets_the_whole_body_flag() {
+        let body = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "image", "source": {}},
+                {"type": "text", "text": "what is this"}
+            ]},
+            {"role": "assistant", "content": "a cat"},
+            {"role": "user", "content": "and this one?"}
+        ]});
+
+        let signals = Fixture::signals(Fixture::MESSAGES_PATH, &body);
+
+        assert!(signals.has_image);
+        assert_eq!(signals.user_turns, 2);
     }
 
     #[test]

@@ -40,9 +40,24 @@ impl SmartAutoPool {
         endpoint: &str,
         prompt_tokens: u64,
     ) -> Vec<&'a ModelDescriptor> {
+        Self::eligible_for(snapshot, policy, endpoint, prompt_tokens, false)
+    }
+
+    /// `eligible` plus the image gate. With `has_image`, a model whose `vision` is not
+    /// `Some(true)` is excluded, because an unknown model fails closed.
+    #[must_use]
+    pub fn eligible_for<'a>(
+        snapshot: &'a ModelDescriptorSnapshot,
+        policy: &SmartAutoPolicy,
+        endpoint: &str,
+        prompt_tokens: u64,
+        has_image: bool,
+    ) -> Vec<&'a ModelDescriptor> {
         let mut pool: Vec<&ModelDescriptor> = snapshot
             .iter()
-            .filter(|descriptor| Self::admits(descriptor, policy, endpoint, prompt_tokens))
+            .filter(|descriptor| {
+                Self::admits(descriptor, policy, endpoint, prompt_tokens, has_image)
+            })
             .collect();
         pool.sort_unstable_by(|left, right| left.qualified_id.cmp(&right.qualified_id));
         pool
@@ -53,11 +68,19 @@ impl SmartAutoPool {
         policy: &SmartAutoPolicy,
         endpoint: &str,
         prompt_tokens: u64,
+        has_image: bool,
     ) -> bool {
         Self::passes_rules(descriptor, policy)
             && Self::serves(descriptor, endpoint)
             && Self::meets_minima(descriptor, policy)
             && Self::fits_prompt(descriptor, prompt_tokens)
+            && Self::takes_image(descriptor, has_image)
+    }
+
+    /// A text-only request takes every model. An image request takes only models that report
+    /// vision support, so `None` (unknown, as local servers report) is excluded.
+    fn takes_image(descriptor: &ModelDescriptor, has_image: bool) -> bool {
+        !has_image || descriptor.vision == Some(true)
     }
 
     /// True for a model in the `hub/` namespace, which is a selector, not a backend model.
@@ -531,6 +554,52 @@ mod tests {
         assert_eq!(
             ids,
             ["copilot/exact", "copilot/lower-bound", "llama_swap/unknown"]
+        );
+    }
+
+    fn vision(qualified_id: &str, vision: Option<bool>) -> ModelDescriptor {
+        ModelDescriptor {
+            vision,
+            ..model(qualified_id)
+        }
+    }
+
+    #[test]
+    fn image_request_keeps_only_models_that_report_vision() {
+        let models = vec![
+            vision("copilot/vision", Some(true)),
+            vision("copilot/text-only", Some(false)),
+            vision("llama_swap/unknown", None),
+        ];
+        let snapshot = ModelDescriptorSnapshot::new(models);
+
+        let ids: Vec<&str> =
+            SmartAutoPool::eligible_for(&snapshot, &SmartAutoPolicy::default(), MESSAGES, 0, true)
+                .into_iter()
+                .map(|descriptor| descriptor.qualified_id.as_str())
+                .collect();
+
+        assert_eq!(ids, ["copilot/vision"]);
+    }
+
+    #[test]
+    fn text_request_keeps_text_only_and_unknown_vision_models() {
+        let models = vec![
+            vision("copilot/vision", Some(true)),
+            vision("copilot/text-only", Some(false)),
+            vision("llama_swap/unknown", None),
+        ];
+        let snapshot = ModelDescriptorSnapshot::new(models);
+
+        let ids: Vec<&str> =
+            SmartAutoPool::eligible_for(&snapshot, &SmartAutoPolicy::default(), MESSAGES, 0, false)
+                .into_iter()
+                .map(|descriptor| descriptor.qualified_id.as_str())
+                .collect();
+
+        assert_eq!(
+            ids,
+            ["copilot/text-only", "copilot/vision", "llama_swap/unknown"]
         );
     }
 

@@ -53,6 +53,7 @@ enum RoleWeight {
 impl SmartAutoAffinity {
     const CAPACITY: usize = 1024;
     const IDLE: Duration = Duration::from_mins(10);
+    pub(crate) const CACHE_WARM_WINDOW: Duration = Duration::from_mins(5);
     const MIN_DWELL_TURNS: usize = 2;
     const SOFT_SWITCH_BUDGET: usize = 2;
     const SOFT_SWITCH_WINDOW_TURNS: usize = 20;
@@ -106,8 +107,8 @@ impl SmartAutoAffinity {
             .map(|(_, model)| model.clone())
     }
 
-    /// Whether an optional switch is allowed at user turn `turn`. It needs the minimum dwell
-    /// on the pin and a free slot in the rolling soft-switch budget. A forced switch skips it.
+    /// Whether an optional switch is allowed at user turn `turn`. A kept model used within
+    /// `CACHE_WARM_WINDOW` blocks it. Otherwise it needs the dwell and a free budget slot.
     #[must_use]
     pub fn soft_switch_allowed(&self, key: &AffinityKey, turn: usize, now: Instant) -> bool {
         let mut table = self.lock();
@@ -117,6 +118,9 @@ impl SmartAutoAffinity {
         let Some(pin) = &entry.active else {
             return true;
         };
+        if now.saturating_duration_since(entry.last_used) <= Self::CACHE_WARM_WINDOW {
+            return false;
+        }
         let dwelled = turn.saturating_sub(pin.since_turn) >= Self::MIN_DWELL_TURNS;
         let recent_switches = entry
             .switch_turns
@@ -573,18 +577,55 @@ mod tests {
         let store = SmartAutoAffinity::new();
         let key = key_for("s1", None);
         let now = Instant::now();
+        let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
 
         assert!(store.soft_switch_allowed(&key, 1, now));
         store.commit(&key, OPUS, WorkRole::Planning, false, 1, now);
-        assert!(!store.soft_switch_allowed(&key, 2, now));
-        assert!(store.soft_switch_allowed(&key, 3, now));
+        assert!(!store.soft_switch_allowed(&key, 2, cold));
+        assert!(store.soft_switch_allowed(&key, 3, cold));
 
         store.commit(&key, MINI, WorkRole::Implementation, true, 3, now);
         store.commit(&key, OPUS, WorkRole::Validation, false, 5, now);
-        assert!(!store.soft_switch_allowed(&key, 7, now));
+        assert!(!store.soft_switch_allowed(&key, 7, cold));
 
         let window_end = 3 + SmartAutoAffinity::SOFT_SWITCH_WINDOW_TURNS;
-        assert!(store.soft_switch_allowed(&key, window_end, now));
+        assert!(store.soft_switch_allowed(&key, window_end, cold));
+    }
+
+    #[test]
+    fn a_warm_pin_blocks_an_optional_switch() {
+        let store = SmartAutoAffinity::new();
+        let key = key_for("s1", None);
+        let start = Instant::now();
+        store.commit(&key, OPUS, WorkRole::Planning, false, 1, start);
+
+        // Dwell and budget both allow a switch at turn 3, so only the warm cache blocks it.
+        assert!(!store.soft_switch_allowed(&key, 3, start));
+        assert!(!store.soft_switch_allowed(&key, 3, start + Duration::from_mins(4)));
+        assert!(!store.soft_switch_allowed(&key, 3, start + SmartAutoAffinity::CACHE_WARM_WINDOW));
+    }
+
+    #[test]
+    fn a_reused_pin_stays_warm_for_a_new_window() {
+        let store = SmartAutoAffinity::new();
+        let key = key_for("s1", None);
+        let start = Instant::now();
+        store.commit(&key, OPUS, WorkRole::Planning, false, 1, start);
+        let reused = start + Duration::from_mins(4);
+        store.commit(&key, OPUS, WorkRole::Planning, false, 2, reused);
+
+        assert!(!store.soft_switch_allowed(&key, 3, start + Duration::from_mins(6)));
+    }
+
+    #[test]
+    fn a_cold_pin_allows_an_optional_switch() {
+        let store = SmartAutoAffinity::new();
+        let key = key_for("s1", None);
+        let start = Instant::now();
+        store.commit(&key, OPUS, WorkRole::Planning, false, 1, start);
+        let cold = start + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
+
+        assert!(store.soft_switch_allowed(&key, 3, cold));
     }
 
     #[test]

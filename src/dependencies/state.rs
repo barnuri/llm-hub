@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 
 use crate::configs::HubConfig;
 use crate::consts::LOGS_DIR;
@@ -65,6 +65,8 @@ struct Inner {
     model_limits: Arc<ModelLimits>,
     /// Request fields each Copilot profile rejected on `/v1/messages`.
     unsupported_body_fields: UnsupportedBodyFields,
+    /// `<profile>/<upstream model>` keys that refused image input, learned from upstream rejections.
+    vision_unsupported: DashSet<String>,
     smart_auto_affinity: SmartAutoAffinity,
     /// The bounded log of Smart Auto routes.
     smart_auto_decisions: SmartAutoDecisionLog,
@@ -135,6 +137,7 @@ impl AppState {
             copilot_descriptions: CopilotDescriptions::default(),
             model_limits,
             unsupported_body_fields,
+            vision_unsupported: DashSet::new(),
             smart_auto_affinity: SmartAutoAffinity::new(),
             smart_auto_decisions: SmartAutoDecisionLog::default(),
             selection_log,
@@ -344,6 +347,26 @@ impl AppState {
             let state = self.clone();
             let (profile, model) = (profile.to_string(), model.to_string());
             tokio::task::spawn_blocking(move || state.save_prompt_limit(&profile, &model, &entry));
+        }
+    }
+
+    /// Whether `model` on `profile` refused image input before. Held in memory until restart.
+    pub fn vision_unsupported(&self, profile: &str, model: &str) -> bool {
+        self.0
+            .vision_unsupported
+            .contains(&format!("{profile}/{model}"))
+    }
+
+    /// Records that `model` on `profile` refused image input, so later image requests skip it.
+    pub fn learn_vision_unsupported(&self, profile: &str, model: &str) {
+        if self
+            .0
+            .vision_unsupported
+            .insert(format!("{profile}/{model}"))
+        {
+            tracing::info!(
+                "profile {profile}: model {model} refuses image input; image requests skip it"
+            );
         }
     }
 
