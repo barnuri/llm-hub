@@ -16,17 +16,19 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::configs::{HubConfig, TokenRates};
-use crate::consts::LONG_CONTEXT_SUFFIX;
+use crate::configs::{HubConfig, PriceCard, TokenRates};
+use crate::consts::{LONG_CONTEXT_SUFFIX, STATS_OVERFLOW_KEY};
+use crate::schemas::cost_parts::CostParts;
 use crate::schemas::usage_report::UsageReport;
 use crate::services::copilot_auto::AutoTier;
 use crate::services::copilot_prices::CopilotPrices;
-use crate::services::stats::StatsSnapshot;
+use crate::services::stats::{RequestOutcome, StatsSnapshot, series_bucket_for_range};
 
 const PER_MILLION: f64 = 1_000_000.0;
 const FREE_TAG: &str = "free";
 /// Per-model price object on each `/v1/models` entry.
 const PRICE_FIELD: &str = "llm_hub_price";
+const LIVE_TIER_NOTE: &str = " The hub does not price long-context tiers in this live view. Stored ranges price each request.";
 
 #[derive(Debug, Clone, Default)]
 pub struct PricingBook {
@@ -37,7 +39,7 @@ pub struct PricingBook {
     pub local_profiles: HashSet<String>,
     pub copilot_profiles: HashSet<String>,
     /// Fetched from GitHub; wins over [`COPILOT_PRICES`].
-    pub copilot_published: Arc<HashMap<String, TokenRates>>,
+    pub copilot_published: Arc<HashMap<String, PriceCard>>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -79,43 +81,47 @@ impl PricingBook {
     }
 
     #[must_use]
-    pub fn with_copilot_prices(mut self, published: Arc<HashMap<String, TokenRates>>) -> Self {
+    pub fn with_copilot_prices(mut self, published: Arc<HashMap<String, PriceCard>>) -> Self {
         self.copilot_published = published;
         self
     }
 
     #[must_use]
     pub fn rates_for(&self, model_key: &str) -> TokenRates {
+        self.price_card(model_key).base
+    }
+
+    fn price_card(&self, model_key: &str) -> PriceCard {
         if let Some(rates) = self.by_model.get(model_key) {
-            return *rates;
+            return PriceCard::flat(*rates);
         }
         let (profile, bare) = split_model_key(model_key);
         if let Some(bare) = bare
             && let Some(rates) = self.by_model.get(bare)
         {
-            return *rates;
+            return PriceCard::flat(*rates);
         }
         if let Some(profile) = profile
             && let Some(rates) = self.by_profile.get(profile)
             && !rates.is_zero()
         {
-            return *rates;
+            return PriceCard::flat(*rates);
         }
         if profile.is_some_and(|profile| self.local_profiles.contains(profile)) {
-            return TokenRates::default();
+            return PriceCard::default();
         }
         if let Some(profile) = profile
             && self.copilot_profiles.contains(profile)
-            && let Some(rates) = bare.and_then(|bare| self.copilot_rates(bare))
+            && let Some(card) = bare.and_then(|bare| self.copilot_rates(bare))
         {
-            return rates.with_cache_defaults();
+            return card.with_cache_defaults();
         }
         if let Some(bare) = bare.or(Some(model_key))
             && let Some(rates) = builtin_rates(bare)
         {
-            return rates.with_cache_defaults();
+            return PriceCard::flat(rates.with_cache_defaults());
         }
-        self.global.with_cache_defaults()
+        PriceCard::flat(self.global.with_cache_defaults())
     }
 
     #[must_use]
@@ -127,13 +133,61 @@ impl PricingBook {
         cache_read: u64,
         cache_write: u64,
     ) -> f64 {
-        estimate_with_rates(
+        self.estimate_parts(model_key, tokens_in, tokens_out, cache_read, cache_write)
+            .total()
+    }
+
+    /// Prices one request. The long-context tier is chosen from this request's own prompt total.
+    #[must_use]
+    pub fn estimate_parts(
+        &self,
+        model_key: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) -> CostParts {
+        let card = self.price_card(model_key);
+        let (uncached_in, cached_in) = split_cached_input(tokens_in, cache_read, cache_write);
+        let prompt_tokens = uncached_in + cached_in + cache_write;
+        let mut parts = estimate_parts_with_rates(
+            card.rates_for_prompt(prompt_tokens),
+            tokens_in,
+            tokens_out,
+            cache_read,
+            cache_write,
+        );
+        if card.tier_for_prompt(prompt_tokens).is_some() {
+            parts.long_tier = parts.total();
+        }
+        parts
+    }
+
+    #[must_use]
+    fn estimate_default_tier(
+        &self,
+        model_key: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) -> f64 {
+        estimate_parts_with_rates(
             self.rates_for(model_key),
             tokens_in,
             tokens_out,
             cache_read,
             cache_write,
         )
+        .total()
+    }
+
+    /// True when a fetched Copilot price carries a long-context tier.
+    #[must_use]
+    fn has_long_context(&self) -> bool {
+        self.copilot_published
+            .values()
+            .any(|card| card.long_context.is_some())
     }
 
     #[must_use]
@@ -146,11 +200,11 @@ impl PricingBook {
     }
 }
 
-/// Attach `cost_usd` to every row. Profile + overview costs sum model rows so
-/// mixed model prices stay accurate.
+/// Attach `cost_usd` to every row at each model's default tier, because a sum of requests has no
+/// single prompt size. Profile and overview costs sum model rows.
 pub fn apply_costs(snapshot: &mut StatsSnapshot, book: &PricingBook) {
     for row in &mut snapshot.models {
-        row.cost_usd = book.estimate(
+        row.cost_usd = book.estimate_default_tier(
             &row.key,
             row.tokens_in,
             row.tokens_out,
@@ -168,7 +222,7 @@ pub fn apply_costs(snapshot: &mut StatsSnapshot, book: &PricingBook) {
             .sum();
         // Profile with traffic but no model rows (cardinality overflow edge): fall back.
         if row.cost_usd == 0.0 && (row.tokens_in > 0 || row.tokens_out > 0) {
-            row.cost_usd = book.estimate(
+            row.cost_usd = book.estimate_default_tier(
                 &row.key,
                 row.tokens_in,
                 row.tokens_out,
@@ -179,7 +233,7 @@ pub fn apply_costs(snapshot: &mut StatsSnapshot, book: &PricingBook) {
     }
     snapshot.overview.cost_usd = snapshot.models.iter().map(|row| row.cost_usd).sum();
     for point in &mut snapshot.series {
-        point.cost_usd = book.estimate(
+        point.cost_usd = book.estimate_default_tier(
             &point.key,
             point.tokens_in,
             point.tokens_out,
@@ -187,23 +241,92 @@ pub fn apply_costs(snapshot: &mut StatsSnapshot, book: &PricingBook) {
             point.cache_write_tokens,
         );
     }
-    snapshot.pricing = PricingMeta {
-        configured: book.is_configured() || snapshot.overview.cost_usd > 0.0,
+    snapshot.pricing = pricing_meta(book, snapshot.overview.cost_usd);
+    if book.has_long_context() {
+        snapshot.pricing.note.push_str(LIVE_TIER_NOTE);
+    }
+}
+
+/// Prices each stored request at its own tier and sums the parts into the model, profile,
+/// overview and series rows. A model missing from the snapshot lands in the overflow row.
+pub fn apply_outcome_costs(
+    snapshot: &mut StatsSnapshot,
+    outcomes: &[RequestOutcome],
+    book: &PricingBook,
+) {
+    let listed: HashSet<&str> = snapshot.models.iter().map(|row| row.key.as_str()).collect();
+    let bucket_ms = series_bucket_for_range(&snapshot.range).map(|(_, ms)| ms);
+    let mut by_model: HashMap<&str, CostParts> = HashMap::new();
+    let mut by_profile: HashMap<&str, CostParts> = HashMap::new();
+    let mut by_point: HashMap<(u64, &str), CostParts> = HashMap::new();
+    for outcome in outcomes {
+        let parts = book.estimate_parts(
+            &outcome.model_key,
+            outcome.tokens_in,
+            outcome.tokens_out,
+            outcome.cache_read_tokens,
+            outcome.cache_write_tokens,
+        );
+        let model = if listed.contains(outcome.model_key.as_str()) {
+            outcome.model_key.as_str()
+        } else {
+            STATS_OVERFLOW_KEY
+        };
+        *by_model.entry(model).or_default() += parts;
+        *by_profile.entry(outcome.profile.as_str()).or_default() += parts;
+        if let Some(ms) = bucket_ms {
+            let bucket = (outcome.ts_ms / ms) * ms;
+            *by_point
+                .entry((bucket, outcome.model_key.as_str()))
+                .or_default() += parts;
+        }
+    }
+    for row in &mut snapshot.models {
+        row.cost_usd = by_model
+            .get(row.key.as_str())
+            .map_or(0.0, |parts| parts.total());
+    }
+    for row in &mut snapshot.profiles {
+        row.cost_usd = by_profile
+            .get(row.key.as_str())
+            .map_or(0.0, |parts| parts.total());
+    }
+    snapshot.overview.cost_usd = by_model.values().map(|parts| parts.total()).sum();
+    for point in &mut snapshot.series {
+        point.cost_usd = by_point
+            .get(&(point.ts_ms, point.key.as_str()))
+            .map_or(0.0, |parts| parts.total());
+    }
+    snapshot.pricing = pricing_meta(book, snapshot.overview.cost_usd);
+}
+
+fn pricing_meta(book: &PricingBook, overview_cost_usd: f64) -> PricingMeta {
+    PricingMeta {
+        configured: book.is_configured() || overview_cost_usd > 0.0,
         note: if book.is_configured() {
             "Estimated from configured USD/1M token rates (and built-in cloud guesses when unset)."
                 .into()
-        } else if snapshot.overview.cost_usd > 0.0 {
+        } else if overview_cost_usd > 0.0 {
             "Estimated from built-in cloud model price guesses. Set LLM_HUB_*_INPUT_USD_PER_1M to override."
                 .into()
         } else {
             "No pricing configured — costs stay $0 until you set LLM_HUB_<PROFILE>_INPUT_USD_PER_1M / OUTPUT_USD_PER_1M (or global LLM_HUB_INPUT_USD_PER_1M)."
                 .into()
         },
-    };
+    }
 }
 
-/// Appends each model's price to its `display_name` (`· $in/$out` per 1M tokens, or `· free`
-/// for a local profile) and adds `llm_hub_price`. Returns true when a Copilot model has no published price.
+/// Appends the base price (`· $in/$out` or `· free`) to each `display_name` and adds `llm_hub_price`,
+/// with `long_context` when the price has a tier. Returns true when a Copilot model has no price.
+fn rates_json(rates: TokenRates) -> Value {
+    json!({
+        "input_usd_per_1m": rates.input_per_1m,
+        "output_usd_per_1m": rates.output_per_1m,
+        "cache_read_usd_per_1m": rates.cache_read_per_1m,
+        "cache_write_usd_per_1m": rates.cache_write_per_1m,
+    })
+}
+
 pub fn annotate_listing(models: &mut [Value], book: &PricingBook) -> bool {
     let mut unpriced_copilot = false;
     for model in models {
@@ -223,7 +346,8 @@ pub fn annotate_listing(models: &mut [Value], book: &PricingBook) -> bool {
         if book.copilot_profiles.contains(profile) && book.copilot_rates(bare).is_none() {
             unpriced_copilot = true;
         }
-        let rates = book.rates_for(key);
+        let card = book.price_card(key);
+        let rates = card.base;
         let tag = if !rates.is_zero() {
             format!("{}/{}", usd(rates.input_per_1m), usd(rates.output_per_1m))
         } else if book.local_profiles.contains(profile) {
@@ -235,15 +359,13 @@ pub fn annotate_listing(models: &mut [Value], book: &PricingBook) -> bool {
             let labelled = format!("{name} · {tag}");
             obj.insert("display_name".into(), json!(labelled));
         }
-        obj.insert(
-            PRICE_FIELD.into(),
-            json!({
-                "input_usd_per_1m": rates.input_per_1m,
-                "output_usd_per_1m": rates.output_per_1m,
-                "cache_read_usd_per_1m": rates.cache_read_per_1m,
-                "cache_write_usd_per_1m": rates.cache_write_per_1m,
-            }),
-        );
+        let mut price = rates_json(rates);
+        if let Some(tier) = card.long_context {
+            let mut long_context = rates_json(tier.rates);
+            long_context["threshold_tokens"] = json!(tier.threshold_tokens);
+            price["long_context"] = long_context;
+        }
+        obj.insert(PRICE_FIELD.into(), price);
     }
     unpriced_copilot
 }
@@ -268,27 +390,29 @@ pub fn apply_usage_costs(report: &mut UsageReport, book: &PricingBook) {
 }
 
 #[allow(clippy::cast_precision_loss)] // token counts → USD; mantissa loss is fine for estimates
-pub fn estimate_with_rates(
+pub fn estimate_parts_with_rates(
     rates: TokenRates,
     tokens_in: u64,
     tokens_out: u64,
     cache_read: u64,
     cache_write: u64,
-) -> f64 {
+) -> CostParts {
     let rates = rates.with_cache_defaults();
-    let (uncached_in, cached_in) = split_cached_input(tokens_in, cache_read);
-    let input = uncached_in as f64 * rates.input_per_1m / PER_MILLION;
-    let cached = cached_in as f64 * rates.cache_read_per_1m / PER_MILLION;
-    let written = cache_write as f64 * rates.cache_write_per_1m / PER_MILLION;
-    let output = tokens_out as f64 * rates.output_per_1m / PER_MILLION;
-    input + cached + written + output
+    let (uncached_in, cached_in) = split_cached_input(tokens_in, cache_read, cache_write);
+    CostParts {
+        input: uncached_in as f64 * rates.input_per_1m / PER_MILLION,
+        output: tokens_out as f64 * rates.output_per_1m / PER_MILLION,
+        cache_read: cached_in as f64 * rates.cache_read_per_1m / PER_MILLION,
+        cache_write: cache_write as f64 * rates.cache_write_per_1m / PER_MILLION,
+        long_tier: 0.0,
+    }
 }
 
-/// Splits reported input into `(uncached, cached)` prompt tokens. A cache read larger
-/// than the input was reported apart from it (Anthropic), not as a subset (`OpenAI`).
+/// Splits reported input into `(uncached, cached)`. A cache read above the input, or any cache
+/// write, means the input excludes the cache (Anthropic). Otherwise a cache read is part of it.
 #[must_use]
-pub fn split_cached_input(tokens_in: u64, cache_read: u64) -> (u64, u64) {
-    if cache_read > tokens_in {
+pub fn split_cached_input(tokens_in: u64, cache_read: u64, cache_write: u64) -> (u64, u64) {
+    if cache_read > tokens_in || cache_write > 0 {
         (tokens_in, cache_read)
     } else {
         (tokens_in - cache_read, cache_read)
@@ -432,15 +556,15 @@ const COPILOT_PRICES: &[(&str, TokenRates)] = &[
 impl PricingBook {
     /// The fetched Copilot price, else the built-in one. Exact match, so
     /// `claude-opus-4.8-fast` never takes the `claude-opus-4.8` price.
-    fn copilot_rates(&self, bare_model: &str) -> Option<TokenRates> {
+    fn copilot_rates(&self, bare_model: &str) -> Option<PriceCard> {
         let id = CopilotPrices::normalize_id(bare_model);
-        if let Some(rates) = self.copilot_published.get(&id) {
-            return Some(*rates);
+        if let Some(card) = self.copilot_published.get(&id) {
+            return Some(*card);
         }
         COPILOT_PRICES
             .iter()
             .find(|(known, _)| *known == id)
-            .map(|(_, rates)| *rates)
+            .map(|(_, rates)| PriceCard::flat(*rates))
     }
 }
 
@@ -456,7 +580,7 @@ mod tests {
             cache_read_per_1m: 0.1,
             cache_write_per_1m: 1.0,
         };
-        let cost = estimate_with_rates(rates, 100, 10, 80, 0);
+        let cost = estimate_parts_with_rates(rates, 100, 10, 80, 0).total();
         assert!((cost - 48.0 / PER_MILLION).abs() < 1e-12);
     }
 
@@ -468,17 +592,106 @@ mod tests {
             cache_read_per_1m: 0.1,
             cache_write_per_1m: 1.25,
         };
-        let cost = estimate_with_rates(rates, 20, 10, 80, 5);
+        let cost = estimate_parts_with_rates(rates, 20, 10, 80, 5).total();
         let expected = (20.0 + 8.0 + 6.25 + 20.0) / PER_MILLION;
         assert!((cost - expected).abs() < 1e-12);
     }
 
     #[test]
     fn split_cached_input_handles_subset_and_separate_reports() {
-        assert_eq!(split_cached_input(100, 80), (20, 80));
-        assert_eq!(split_cached_input(20, 80), (20, 80));
-        assert_eq!(split_cached_input(100, 0), (100, 0));
-        assert_eq!(split_cached_input(0, 0), (0, 0));
+        assert_eq!(split_cached_input(100, 80, 0), (20, 80));
+        assert_eq!(split_cached_input(20, 80, 0), (20, 80));
+        assert_eq!(split_cached_input(100, 0, 0), (100, 0));
+        assert_eq!(split_cached_input(0, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn cache_write_with_small_cache_read_counts_input_as_uncached() {
+        assert_eq!(split_cached_input(100, 10, 5), (100, 10));
+    }
+
+    fn long_card(base_output: f64, long_output: f64) -> PriceCard {
+        PriceCard {
+            base: rates(0.1, 0.01, 0.125, base_output),
+            long_context: Some(crate::configs::LongContextTier {
+                threshold_tokens: 100_000,
+                rates: rates(0.5, 0.05, 0.625, long_output),
+            }),
+        }
+    }
+
+    fn long_tier_book() -> PricingBook {
+        book_with(&[], &["copilot"]).with_copilot_prices(Arc::new(HashMap::from([(
+            "demo-long-model".to_string(),
+            long_card(0.5, 2.5),
+        )])))
+    }
+
+    #[test]
+    fn prompt_at_threshold_uses_default_rates() {
+        let book = long_tier_book();
+        let parts = book.estimate_parts("copilot/demo-long-model", 100_000, 0, 0, 0);
+        assert!((parts.input - 0.01).abs() < 1e-12);
+        assert!(parts.long_tier.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn prompt_above_threshold_uses_long_rates() {
+        let book = long_tier_book();
+        let parts = book.estimate_parts("copilot/demo-long-model", 100_001, 0, 0, 0);
+        assert!((parts.input - 0.050_000_5).abs() < 1e-12);
+        assert!((parts.long_tier - parts.total()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn haiku_long_request_matches_hand_calculation() {
+        let book = long_tier_book();
+        let cost = book.estimate("copilot/demo-long-model", 120_000, 1_000, 0, 0);
+        assert!((cost - (120_000.0 * 0.5 + 1_000.0 * 2.5) / PER_MILLION).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gpt_long_request_output_uses_its_own_rate() {
+        let book = book_with(&[], &["copilot"]).with_copilot_prices(Arc::new(HashMap::from([(
+            "demo-long-model".to_string(),
+            long_card(10.0, 15.0),
+        )])));
+        let parts = book.estimate_parts("copilot/demo-long-model", 200_000, 1_000, 0, 0);
+        assert!((parts.output - 15.0 / 1000.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn live_range_still_uses_aggregate_pricing() {
+        use crate::services::stats::StatsRegistry;
+
+        let book = long_tier_book();
+        let registry = StatsRegistry::default();
+        registry.record(&RequestOutcome {
+            profile: "copilot".into(),
+            model_key: "copilot/demo-long-model".into(),
+            status: 200,
+            ts_ms: 0,
+            latency_ms: 1,
+            ttft_ms: None,
+            tokens_in: 200_000,
+            tokens_out: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            error: None,
+            client: None,
+            worker: None,
+        });
+        let mut snap = registry.snapshot("live", false);
+        apply_costs(&mut snap, &book);
+        assert!((snap.overview.cost_usd - 200_000.0 * 0.1 / PER_MILLION).abs() < 1e-12);
+        assert!(snap.pricing.note.contains("live view"));
+    }
+
+    #[test]
+    fn prompt_total_counts_cache_reads_toward_the_tier() {
+        let book = long_tier_book();
+        let parts = book.estimate_parts("copilot/demo-long-model", 20, 0, 110_000, 0);
+        assert!(parts.long_tier > 0.0);
     }
 
     #[test]
@@ -518,8 +731,14 @@ mod tests {
     #[test]
     fn fetched_copilot_price_wins_over_builtin_and_prices_new_models() {
         let book = book_with(&[], &["copilot"]).with_copilot_prices(Arc::new(HashMap::from([
-            ("claude-opus-5-5".to_string(), rates(3.0, 0.3, 3.0, 15.0)),
-            ("gpt-7-nova".to_string(), rates(1.0, 0.1, 1.0, 4.0)),
+            (
+                "claude-opus-5-5".to_string(),
+                PriceCard::flat(rates(3.0, 0.3, 3.0, 15.0)),
+            ),
+            (
+                "gpt-7-nova".to_string(),
+                PriceCard::flat(rates(1.0, 0.1, 1.0, 4.0)),
+            ),
         ])));
         assert!(
             (book.rates_for("copilot/claude-opus-5.5").input_per_1m - 3.0).abs() < f64::EPSILON
@@ -596,6 +815,28 @@ mod tests {
         let book = book_with(&[], &["copilot"]);
         let mut models = vec![json!({"id": "copilot/claude-opus-9", "display_name": "x"})];
         assert!(annotate_listing(&mut models, &book));
+    }
+
+    #[test]
+    fn copilot_model_with_long_tier_listing_has_long_context() {
+        let book = long_tier_book();
+        let mut models = vec![json!({"id": "copilot/demo-long-model", "display_name": "demo"})];
+        assert!(!annotate_listing(&mut models, &book));
+        assert_eq!(models[0]["display_name"], "demo · $0.1/$0.5");
+        let long = &models[0][PRICE_FIELD]["long_context"];
+        assert_eq!(long["threshold_tokens"], 100_000);
+        assert_eq!(long["input_usd_per_1m"], 0.5);
+        assert_eq!(long["output_usd_per_1m"], 2.5);
+        assert_eq!(models[0][PRICE_FIELD]["input_usd_per_1m"], 0.1);
+    }
+
+    #[test]
+    fn copilot_model_without_tier_listing_has_no_long_context() {
+        let book = book_with(&[], &["copilot"]);
+        let mut models = vec![json!({"id": "copilot/claude-opus-5-5", "display_name": "opus"})];
+        assert!(!annotate_listing(&mut models, &book));
+        assert!(models[0][PRICE_FIELD].get("long_context").is_none());
+        assert_eq!(models[0][PRICE_FIELD]["input_usd_per_1m"], 4.0);
     }
 
     #[test]

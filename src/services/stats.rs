@@ -370,7 +370,11 @@ fn entry_snapshot(key: &str, stats: &EntryStats) -> EntrySnapshot {
 #[allow(clippy::cast_precision_loss)] // cache-hit % display; mantissa loss is fine
 fn overview_from_entry(stats: &EntryStats) -> OverviewSnapshot {
     let snap = entry_snapshot("overview", stats);
-    let (uncached_in, cached_in) = split_cached_input(snap.tokens_in, snap.cache_read_tokens);
+    let (uncached_in, cached_in) = split_cached_input(
+        snap.tokens_in,
+        snap.cache_read_tokens,
+        snap.cache_write_tokens,
+    );
     let total_in = uncached_in + cached_in;
     let cache_hit_rate_pct = if total_in == 0 {
         0.0

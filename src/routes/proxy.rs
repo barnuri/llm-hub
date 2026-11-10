@@ -25,6 +25,7 @@ use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::profile_filter::ProfileFilter;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_id::ModelId;
+use crate::schemas::prompt_shape::PromptShape;
 use crate::schemas::reply_protocol::ReplyProtocol;
 use crate::schemas::review_evidence::ReviewEvidence;
 use crate::schemas::review_request::ReviewRequest;
@@ -232,6 +233,8 @@ pub(crate) async fn attempt_loop(
     let client = client_signature(headers);
     let worker = worker_key(state, headers);
     let retry_policy = RetryPolicy::from_headers(headers);
+    // The raw client body, kept only for the Anthropic route's prompt shape row.
+    let shape_body = (bodies.route == RouteKind::Anthropic).then(|| body.clone());
     let attempt_timeout = per_attempt_timeout_ms(headers).map(Duration::from_millis);
     let client_body = bodies
         .native
@@ -349,6 +352,7 @@ pub(crate) async fn attempt_loop(
                                 worker,
                                 commit,
                                 transition.filter(|_| succeeded),
+                                shape_body.clone(),
                             )
                             .await
                         }
@@ -1307,6 +1311,7 @@ async fn deliver(
     worker: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
+    prompt_body: Option<Bytes>,
 ) -> Response {
     let (route, plan, upstream_path) = (attempt.route, attempt.plan, attempt.path.as_str());
     let is_sse = is_event_stream(&response);
@@ -1327,6 +1332,7 @@ async fn deliver(
             worker,
             commit,
             selection,
+            prompt_body,
         )
         .await
     } else {
@@ -1344,6 +1350,7 @@ async fn deliver(
             worker,
             commit,
             selection,
+            prompt_body,
         )
     };
     if let Some(applied) = plan.header_value() {
@@ -1609,6 +1616,7 @@ async fn attempt_single(
         None,
         client_signature(headers),
         worker_key(state, headers),
+        None,
         None,
         None,
     ))
@@ -2312,6 +2320,7 @@ fn build_response(
     worker: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
+    prompt_body: Option<Bytes>,
 ) -> Response {
     let status = upstream.status();
     let limit_model =
@@ -2435,11 +2444,7 @@ fn build_response(
         );
         finish_selection(&state_for_stats, selection, &outcome, stop);
         state_for_stats.stats().record(&outcome);
-        if let Some(store) = state_for_stats.store()
-            && let Err(e) = store.record(&outcome)
-        {
-            tracing::warn!("store record failed: {e}");
-        }
+        record_request(&state_for_stats, &outcome, prompt_body).await;
     });
 
     let mut builder = Response::builder().status(status);
@@ -2710,6 +2715,7 @@ async fn build_anthropic_response(
     worker: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
+    prompt_body: Option<Bytes>,
 ) -> Response {
     let upstream_status = upstream.status();
     let limit_model = prompt_limit_model(
@@ -2832,11 +2838,7 @@ async fn build_anthropic_response(
         if let Some(commit) = commit.filter(|_| outcome.error.is_none()) {
             commit.apply(&state_for_stats);
         }
-        if let Some(store) = state_for_stats.store()
-            && let Err(e) = store.record(&outcome)
-        {
-            tracing::warn!("store record failed: {e}");
-        }
+        record_request(&state_for_stats, &outcome, prompt_body).await;
     });
 
     let mut builder = Response::builder().status(status);
@@ -2915,6 +2917,39 @@ async fn read_upstream_capped(upstream: reqwest::Response, cap: usize) -> (Vec<u
         }
     }
     (buffered, UpstreamEnd::Complete)
+}
+
+/// Writes the request row, then the prompt shape of an Anthropic request beside it. The json store
+/// returns no row id, so it writes no shape.
+async fn record_request(state: &AppState, outcome: &RequestOutcome, prompt_body: Option<Bytes>) {
+    let Some(store) = state.store() else {
+        return;
+    };
+    match store.record(outcome) {
+        Ok(Some(request_id)) => {
+            if let Some(body) = prompt_body {
+                record_prompt_shape(state.clone(), request_id, body).await;
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("store record failed: {e}"),
+    }
+}
+
+/// Reads the shape in `spawn_blocking`, off the runtime threads, then writes it for `request_id`.
+async fn record_prompt_shape(state: AppState, request_id: i64, body: Bytes) {
+    let written = tokio::task::spawn_blocking(move || {
+        let (Some(shape), Some(store)) = (PromptShape::from_body(&body), state.store()) else {
+            return Ok(());
+        };
+        store.record_shape(request_id, &shape)
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("store record shape failed: {e}"),
+        Err(e) => tracing::warn!("prompt shape task failed: {e}"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // the failure record takes the attempt's values one by one, as the attempt loop holds them
@@ -3034,6 +3069,7 @@ async fn passthrough_oversized(
         None,
         client_signature(headers),
         worker_key(state, headers),
+        None,
         None,
         None,
     ))
@@ -3178,6 +3214,7 @@ mod tests {
     use futures_util::stream::{self, BoxStream, StreamExt as _};
 
     use super::*;
+    use crate::services::store::Store;
 
     const KEEPALIVE: Duration = Duration::from_millis(25);
     /// Comfortably longer than `KEEPALIVE`, so the idle branch fires at least
@@ -3550,6 +3587,10 @@ mod tests {
         }
 
         async fn copilot() -> Copilot {
+            copilot_with_store(None).await
+        }
+
+        async fn copilot_with_store(sqlite: Option<Store>) -> Copilot {
             let github = MockServer::start().await;
             let upstream = MockServer::start().await;
             Mock::given(method("GET"))
@@ -3582,7 +3623,7 @@ mod tests {
             let gh = FakeGhCli::new(GhOutcome::Token("gho_gh".to_string()));
             let state = AppState::with_seams(
                 HubConfig::from_map(&vars).unwrap(),
-                None,
+                sqlite,
                 Arc::new(store),
                 Arc::new(gh),
             )
@@ -3752,6 +3793,104 @@ mod tests {
                 CALLER_ANTHROPIC_VERSION
             );
             assert!(requests_to(&copilot, UPSTREAM_CHAT_PATH).await.is_empty());
+        }
+
+        const SSE_REPLY: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+        /// Reads one count from the sqlite file, retrying while the stream-end task writes.
+        async fn count_until(db: &std::path::Path, sql: &str, expected: i64) -> i64 {
+            let conn = rusqlite::Connection::open(db).unwrap();
+            conn.busy_timeout(Duration::from_secs(1)).unwrap();
+            let mut count = 0;
+            for _ in 0..200 {
+                count = conn.query_row(sql, [], |row| row.get(0)).unwrap();
+                if count == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            count
+        }
+
+        #[tokio::test]
+        async fn anthropic_sse_request_writes_one_shape_row() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("hub.db");
+            let copilot = copilot_with_store(Some(
+                Store::open("sqlite", Some(db.to_str().unwrap())).unwrap(),
+            ))
+            .await;
+            Mock::given(method("POST"))
+                .and(path(MESSAGES_ENDPOINT))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(SSE_REPLY.as_bytes(), "text/event-stream"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, _) = send(
+                &copilot,
+                &with_caller_version(client_headers()),
+                &anthropic_body(NATIVE_ID, true),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert_eq!(
+                count_until(&db, "SELECT COUNT(*) FROM request_shapes", 1).await,
+                1
+            );
+            assert_eq!(
+                count_until(
+                    &db,
+                    "SELECT COUNT(*) FROM request_shapes s JOIN requests r ON r.id = s.request_id",
+                    1,
+                )
+                .await,
+                1
+            );
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let (messages, turn_start): (i64, i64) = conn
+                .query_row(
+                    "SELECT messages, turn_start FROM request_shapes",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((messages, turn_start), (1, 1));
+        }
+
+        #[tokio::test]
+        async fn openai_route_request_writes_no_shape_row() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("hub.db");
+            let copilot = copilot_with_store(Some(
+                Store::open("sqlite", Some(db.to_str().unwrap())).unwrap(),
+            ))
+            .await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+            let body = json!({
+                "model": format!("{PROFILE}/{PLAIN_ID}"),
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+
+            let (status, _) = send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
+
+            assert_eq!(status, 200);
+            assert_eq!(
+                count_until(&db, "SELECT COUNT(*) FROM requests", 1).await,
+                1
+            );
+            assert_eq!(
+                count_until(&db, "SELECT COUNT(*) FROM request_shapes", 0).await,
+                0
+            );
         }
 
         #[tokio::test]

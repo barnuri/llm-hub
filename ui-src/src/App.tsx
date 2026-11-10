@@ -17,6 +17,7 @@ import { SetupScreen } from "./screens/SetupScreen";
 import { StatsScreen } from "./screens/StatsScreen";
 import { ErrorsScreen } from "./screens/ErrorsScreen";
 import { InsightsScreen } from "./screens/InsightsScreen";
+import { SessionsScreen } from "./screens/SessionsScreen";
 import { AutoScreen } from "./screens/AutoScreen";
 import { SmartAutoScreen } from "./screens/SmartAutoScreen";
 import { type OverviewPeriod, UsageScreen } from "./screens/UsageScreen";
@@ -36,9 +37,14 @@ const SETTINGS_PAGES: readonly Page[] = [
   { id: "setup", label: "Setup" },
 ];
 
+const INSIGHTS_PAGES: readonly Page[] = [
+  { id: "insights", label: "Insights" },
+  { id: "sessions", label: "Sessions" },
+];
+
 const NAV_TABS: readonly NavTab[] = [
   { label: "Overview", pages: [{ id: "overview", label: "Overview" }] },
-  { label: "Insights", pages: [{ id: "insights", label: "Insights" }] },
+  { label: "Insights", pages: INSIGHTS_PAGES },
   { label: "Errors", pages: [{ id: "errors", label: "Errors" }] },
   { label: "Stats", pages: [{ id: "stats", label: "Stats" }] },
   { label: "Models", pages: [{ id: "models", label: "Models" }] },
@@ -67,6 +73,9 @@ export function App() {
   const page = PAGES.find((candidate) => candidate.id === normalizedTab) ?? DEFAULT_PAGE;
   const tab = page.id;
   const isSettings = SETTINGS_PAGES.some((candidate) => candidate.id === tab);
+  const isInsights = INSIGHTS_PAGES.some((candidate) => candidate.id === tab);
+  const groupPages = isSettings ? SETTINGS_PAGES : isInsights ? INSIGHTS_PAGES : null;
+  const groupLabel = isSettings ? "Settings" : isInsights ? "Insights" : page.label;
   const [errorsToday, setErrorsToday] = useState<number | null>(null);
   const [meta, setMeta] = useState<HubMeta | null>(null);
   const [modelEntries, setModelEntries] = useState<readonly HubModel[]>([]);
@@ -259,12 +268,12 @@ export function App() {
           <main className="content">
             {tab === "overview" ? null : (
               <div className="page-head">
-                <h1 className="page-title">{isSettings ? "Settings" : page.label}</h1>
+                <h1 className="page-title">{groupLabel}</h1>
               </div>
             )}
-            {isSettings ? (
-              <nav className="subtabs" aria-label="Settings">
-                {SETTINGS_PAGES.map((candidate) => (
+            {groupPages ? (
+              <nav className="subtabs" aria-label={groupLabel}>
+                {groupPages.map((candidate) => (
                   <button
                     key={candidate.id}
                     type="button"
@@ -295,6 +304,7 @@ export function App() {
               <SmartAutoScreen profiles={meta?.profiles ?? []} prices={pricesById(modelEntries)} />
             ) : null}
             {tab === "insights" ? <InsightsScreen onCopy={copy} /> : null}
+            {tab === "sessions" ? <SessionsScreen /> : null}
             {tab === "profiles" ? (
               <ProfilesScreen meta={meta} models={models} onChanged={loadAll} onToast={toast} />
             ) : null}

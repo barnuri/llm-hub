@@ -418,6 +418,8 @@ fn build_router(state: AppState) -> Router {
         .route("/api/stats", get(routes::admin::stats))
         .route("/api/usage", get(routes::admin::usage))
         .route("/api/errors", get(routes::admin::errors))
+        .route("/api/sessions", get(routes::sessions::list))
+        .route("/api/sessions/{worker}", get(routes::sessions::detail))
         .route("/api/insights", get(routes::admin::insights))
         .route("/api/insights/pick", get(routes::admin::insights_pick))
         .route(
@@ -543,6 +545,27 @@ mod tests {
             "copilot/claude-opus-4-5"
         );
         assert_eq!(without_key.status().as_u16(), 401);
+    }
+
+    #[tokio::test]
+    async fn sessions_routes_require_master_key() {
+        let base = serve_hub_with_auth().await;
+        let client = reqwest::Client::new();
+        for url in [
+            format!("{base}/api/sessions?range=7d"),
+            format!("{base}/api/sessions/some-worker"),
+        ] {
+            let with_key = client
+                .get(&url)
+                .bearer_auth(MASTER_KEY)
+                .send()
+                .await
+                .unwrap();
+            let without_key = client.get(&url).send().await.unwrap();
+
+            assert_eq!(with_key.status().as_u16(), 400, "{url}");
+            assert_eq!(without_key.status().as_u16(), 401, "{url}");
+        }
     }
 
     #[tokio::test]

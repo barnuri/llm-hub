@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::schemas::api_key_record::ApiKeyRecord;
+use crate::schemas::prompt_shape::PromptShape;
 use crate::schemas::selection_event::SelectionEvent;
 use crate::schemas::usage_report::UsageReport;
 use crate::schemas::usage_row::UsageRow;
@@ -14,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::consts::ERROR_STATUS_MIN;
 use crate::services::model_limits::{LimitSource, ModelLimit};
+use crate::services::pricing::{PricingBook, apply_outcome_costs};
 use crate::services::stats::{RequestOutcome, StatsSnapshot, snapshot_from_outcomes};
 
 const DEFAULT_SQLITE_PATH: &str = "llm-hub.db";
@@ -166,10 +168,26 @@ impl Store {
             CREATE TABLE IF NOT EXISTS install_settings (
                 name TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS request_shapes (
+                request_id INTEGER PRIMARY KEY,
+                system_chars INTEGER NOT NULL,
+                messages INTEGER NOT NULL,
+                turn_start INTEGER NOT NULL,
+                tool_count INTEGER NOT NULL,
+                tool_bytes INTEGER NOT NULL,
+                mcp_tool_count INTEGER NOT NULL,
+                mcp_tool_bytes INTEGER NOT NULL,
+                deferred_listing_chars INTEGER,
+                skills_listing_chars INTEGER,
+                claude_md_chars INTEGER,
+                image_count INTEGER NOT NULL,
+                project TEXT
             );",
         )
         .map_err(|e| format!("sqlite schema init failed: {e}"))?;
         migrate_requests_columns(&conn)?;
+        migrate_request_shapes_columns(&conn)?;
         Ok(Store::Sqlite(Mutex::new(conn)))
     }
 
@@ -185,7 +203,8 @@ impl Store {
         })))
     }
 
-    pub fn record(&self, outcome: &RequestOutcome) -> Result<(), String> {
+    /// Writes the request row and returns its id. The json store keeps no row ids and returns `None`.
+    pub fn record(&self, outcome: &RequestOutcome) -> Result<Option<i64>, String> {
         let row = UsageRow {
             ts_ms: now_ms(),
             model: outcome.model_key.clone(),
@@ -228,7 +247,7 @@ impl Store {
                         ],
                     )
                     .map_err(|e| e.to_string())?;
-                Ok(())
+                Ok(Some(guard.last_insert_rowid()))
             }
             Store::Json(store) => {
                 let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
@@ -245,9 +264,44 @@ impl Store {
                 if overflow > 0 {
                     guard.state.recent.drain(..overflow);
                 }
-                guard.flush()
+                guard.flush().map(|()| None)
             }
         }
+    }
+
+    /// Writes the prompt shape of the request row `request_id`. Only the sqlite store keeps shapes;
+    /// the json store skips them.
+    pub fn record_shape(&self, request_id: i64, shape: &PromptShape) -> Result<(), String> {
+        let Store::Sqlite(conn) = self else {
+            return Ok(());
+        };
+        let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+        guard
+            .execute(
+                "INSERT INTO request_shapes (
+                    request_id, system_chars, messages, turn_start, tool_count, tool_bytes,
+                    mcp_tool_count, mcp_tool_bytes, deferred_listing_chars, skills_listing_chars,
+                    claude_md_chars, image_count, project, stream_key
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    request_id,
+                    db_i64(shape.system_chars),
+                    db_i64(shape.messages),
+                    i64::from(shape.turn_start),
+                    db_i64(shape.tool_count),
+                    db_i64(shape.tool_bytes),
+                    db_i64(shape.mcp_tool_count),
+                    db_i64(shape.mcp_tool_bytes),
+                    shape.deferred_listing_chars.map(db_i64),
+                    shape.skills_listing_chars.map(db_i64),
+                    shape.claude_md_chars.map(db_i64),
+                    db_i64(shape.image_count),
+                    shape.project.as_deref(),
+                    shape.stream_key.as_deref()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn usage(&self) -> Result<UsageReport, String> {
@@ -405,7 +459,7 @@ impl Store {
     }
 
     /// Aggregate filtered request history into the same shape as live stats.
-    pub fn stats(&self, filter: &StatsFilter) -> Result<StatsSnapshot, String> {
+    pub fn stats(&self, filter: &StatsFilter, book: &PricingBook) -> Result<StatsSnapshot, String> {
         let outcomes = self.filtered_outcomes(filter)?;
         let mut snapshot = snapshot_from_outcomes(&outcomes, &filter.range_label, true);
         if let Some((label, bucket_ms)) =
@@ -418,6 +472,7 @@ impl Store {
                 &outcomes, bucket_ms, since_ms, until_ms,
             );
         }
+        apply_outcome_costs(&mut snapshot, &outcomes, book);
         Ok(snapshot)
     }
 
@@ -1083,18 +1138,17 @@ fn db_u64(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
 }
 
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?;
+    stmt.query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| e.to_string())
+        .map(|rows| rows.filter_map(Result::ok).collect())
+}
+
 fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
-    let existing = {
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(requests)")
-            .map_err(|e| e.to_string())?;
-        let names: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))
-            .map_err(|e| e.to_string())?
-            .filter_map(Result::ok)
-            .collect();
-        names
-    };
+    let existing = table_columns(conn, "requests")?;
     let add = |name: &str, ddl: &str| -> Result<(), String> {
         if existing.iter().any(|col| col == name) {
             return Ok(());
@@ -1115,6 +1169,20 @@ fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
     add("error", "ALTER TABLE requests ADD COLUMN error TEXT")?;
     add("client", "ALTER TABLE requests ADD COLUMN client TEXT")?;
     add("worker", "ALTER TABLE requests ADD COLUMN worker TEXT")?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_requests_worker ON requests(worker)",
+        [],
+    )
+    .map_err(|e| format!("sqlite migrate idx_requests_worker: {e}"))?;
+    Ok(())
+}
+
+fn migrate_request_shapes_columns(conn: &Connection) -> Result<(), String> {
+    let existing = table_columns(conn, "request_shapes")?;
+    if !existing.iter().any(|col| col == "stream_key") {
+        conn.execute("ALTER TABLE request_shapes ADD COLUMN stream_key TEXT", [])
+            .map_err(|e| format!("sqlite migrate add stream_key: {e}"))?;
+    }
     Ok(())
 }
 
@@ -1277,6 +1345,150 @@ mod tests {
     }
 
     #[test]
+    fn old_database_without_worker_gains_worker_index_and_shape_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_ms INTEGER NOT NULL,
+                    model TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    status INTEGER NOT NULL,
+                    latency_ms INTEGER NOT NULL,
+                    tokens_in INTEGER NOT NULL,
+                    tokens_out INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+        let _store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_requests_worker'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'request_shapes'"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn record_on_sqlite_returns_row_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ids.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(store.record(&sample_outcome()).unwrap(), Some(1));
+        assert_eq!(store.record(&sample_outcome()).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn record_on_json_store_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ids.json");
+        let store = Store::open("json", Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(store.record(&sample_outcome()).unwrap(), None);
+    }
+
+    #[test]
+    fn record_shape_then_read_round_trips_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shapes.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let id = store.record(&sample_outcome()).unwrap().unwrap();
+        let shape = PromptShape {
+            system_chars: 1200,
+            messages: 7,
+            turn_start: true,
+            tool_count: 3,
+            tool_bytes: 900,
+            mcp_tool_count: 1,
+            mcp_tool_bytes: 300,
+            deferred_listing_chars: Some(450),
+            skills_listing_chars: None,
+            claude_md_chars: Some(2048),
+            image_count: 2,
+            project: Some("sample-project".into()),
+            stream_key: Some("0123456789abcdef".into()),
+        };
+        store.record_shape(id, &shape).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let read = conn
+            .query_row(
+                "SELECT system_chars, messages, turn_start, tool_count, tool_bytes,
+                        mcp_tool_count, mcp_tool_bytes, deferred_listing_chars,
+                        skills_listing_chars, claude_md_chars, image_count, project, stream_key
+                 FROM request_shapes WHERE request_id = ?1",
+                [id],
+                |r| {
+                    Ok(PromptShape {
+                        system_chars: db_u64(r.get(0)?),
+                        messages: db_u64(r.get(1)?),
+                        turn_start: r.get::<_, i64>(2)? == 1,
+                        tool_count: db_u64(r.get(3)?),
+                        tool_bytes: db_u64(r.get(4)?),
+                        mcp_tool_count: db_u64(r.get(5)?),
+                        mcp_tool_bytes: db_u64(r.get(6)?),
+                        deferred_listing_chars: r.get::<_, Option<i64>>(7)?.map(db_u64),
+                        skills_listing_chars: r.get::<_, Option<i64>>(8)?.map(db_u64),
+                        claude_md_chars: r.get::<_, Option<i64>>(9)?.map(db_u64),
+                        image_count: db_u64(r.get(10)?),
+                        project: r.get(11)?,
+                        stream_key: r.get(12)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(read, shape);
+    }
+
+    #[test]
+    fn request_shapes_table_older_than_stream_key_gains_the_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old-shapes.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL,
+                    model TEXT NOT NULL, profile TEXT NOT NULL, status INTEGER NOT NULL,
+                    latency_ms INTEGER NOT NULL, tokens_in INTEGER NOT NULL,
+                    tokens_out INTEGER NOT NULL, ttft_ms INTEGER,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens INTEGER NOT NULL DEFAULT 0, worker TEXT
+                 );
+                 CREATE TABLE request_shapes (
+                    request_id INTEGER PRIMARY KEY, system_chars INTEGER NOT NULL,
+                    messages INTEGER NOT NULL, turn_start INTEGER NOT NULL,
+                    tool_count INTEGER NOT NULL, tool_bytes INTEGER NOT NULL,
+                    mcp_tool_count INTEGER NOT NULL, mcp_tool_bytes INTEGER NOT NULL,
+                    deferred_listing_chars INTEGER, skills_listing_chars INTEGER,
+                    claude_md_chars INTEGER, image_count INTEGER NOT NULL, project TEXT
+                 );",
+            )
+            .unwrap();
+        }
+        let _store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let has_stream_key = conn
+            .prepare("PRAGMA table_info(request_shapes)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|name| name == "stream_key");
+        assert!(has_stream_key);
+    }
+
+    #[test]
     fn sqlite_errors_keep_the_failure_reason() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
@@ -1294,6 +1506,58 @@ mod tests {
     }
 
     #[test]
+    fn two_haiku_requests_one_above_threshold_cost_is_sum_of_each_request() {
+        use crate::configs::{LongContextTier, PriceCard, TokenRates};
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        for tokens_in in [50_000, 150_000] {
+            let mut outcome = sample_outcome();
+            outcome.profile = "copilot".into();
+            outcome.model_key = "copilot/demo-long-model".into();
+            outcome.tokens_in = tokens_in;
+            outcome.tokens_out = 0;
+            outcome.cache_read_tokens = 0;
+            outcome.cache_write_tokens = 0;
+            store.record(&outcome).unwrap();
+        }
+        let card = PriceCard {
+            base: TokenRates {
+                input_per_1m: 0.1,
+                ..TokenRates::default()
+            },
+            long_context: Some(LongContextTier {
+                threshold_tokens: 100_000,
+                rates: TokenRates {
+                    input_per_1m: 0.5,
+                    ..TokenRates::default()
+                },
+            }),
+        };
+        let book = PricingBook {
+            copilot_profiles: HashSet::from(["copilot".to_string()]),
+            copilot_published: Arc::new(HashMap::from([("demo-long-model".to_string(), card)])),
+            ..PricingBook::default()
+        };
+        let snap = store
+            .stats(
+                &StatsFilter {
+                    since_ms: None,
+                    profile: None,
+                    model: None,
+                    range_label: "all".into(),
+                },
+                &book,
+            )
+            .unwrap();
+        let expected = (50_000.0 * 0.1 + 150_000.0 * 0.5) / 1_000_000.0;
+        assert!((snap.overview.cost_usd - expected).abs() < 1e-12);
+    }
+
+    #[test]
     fn sqlite_stats_filter_by_profile() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
@@ -1304,12 +1568,15 @@ mod tests {
         other.model_key = "anthropic/claude".into();
         store.record(&other).unwrap();
         let snap = store
-            .stats(&StatsFilter {
-                since_ms: None,
-                profile: Some("openai".into()),
-                model: None,
-                range_label: "all".into(),
-            })
+            .stats(
+                &StatsFilter {
+                    since_ms: None,
+                    profile: Some("openai".into()),
+                    model: None,
+                    range_label: "all".into(),
+                },
+                &PricingBook::default(),
+            )
             .unwrap();
         assert_eq!(snap.overview.requests, 1);
         assert_eq!(snap.profiles[0].key, "openai");

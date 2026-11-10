@@ -6,7 +6,7 @@ import { Panel } from "../components/Panel";
 import { PriceHeader } from "../components/PriceHeader";
 import { Pill, type PillTone } from "../components/Pill";
 import { formatNumber } from "../lib/format";
-import { formatPrice, parsePriceSort, sortByPrice } from "../lib/pricing";
+import { formatPrice, longContextLabel, longContextTitle, parsePriceSort, sortByPrice } from "../lib/pricing";
 import { setQueryParam, useRoute } from "../lib/router";
 import type { HubMeta, HubModel, ProfileRow } from "../lib/types";
 import "../styles/screens/models.css";
@@ -189,6 +189,8 @@ export function ModelsScreen({ models, profiles, meta, onCopy, onSaved, onToast 
                   {filtered.map(({ id, auto_tier, description, llm_hub_price }) => {
                     const profile = profileOf(id);
                     const copied = copiedId === id;
+                    const longContext = longContextLabel(llm_hub_price);
+                    const longTitle = longContextTitle(llm_hub_price);
                     return (
                       <tr key={id}>
                         <td>
@@ -199,7 +201,15 @@ export function ModelsScreen({ models, profiles, meta, onCopy, onSaved, onToast 
                           {auto_tier && description ? <p className="model-description dim">{description}</p> : null}
                         </td>
                         <td className="dim">{labelFor(profile)}</td>
-                        <td className="num price">{formatPrice(llm_hub_price)}</td>
+                        <td className="num price">
+                          {formatPrice(llm_hub_price)}
+                          {longContext !== undefined ? (
+                            <>
+                              <br />
+                              <span className="dim" title={longTitle}>{longContext}</span>
+                            </>
+                          ) : null}
+                        </td>
                         <td className="models-actions">
                           <button
                             type="button"

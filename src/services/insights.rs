@@ -404,7 +404,13 @@ fn model_insight(calls: &[&RequestOutcome], min_requests: u64) -> ModelInsight {
     let tokens_in: u64 = successes.iter().map(|call| call.tokens_in).sum();
     let (uncached_in, cached_in) = successes
         .iter()
-        .map(|call| split_cached_input(call.tokens_in, call.cache_read_tokens))
+        .map(|call| {
+            split_cached_input(
+                call.tokens_in,
+                call.cache_read_tokens,
+                call.cache_write_tokens,
+            )
+        })
         .fold(
             (0, 0),
             |(uncached, cached), (call_uncached, call_cached)| {
@@ -730,7 +736,11 @@ fn top_errors(calls: &[&RequestOutcome]) -> Vec<ErrorCount> {
 /// Uncached prompt tokens processed per second before the first token.
 fn prefill_tokens_per_sec(call: &RequestOutcome) -> Option<f64> {
     let ttft = call.ttft_ms.filter(|ttft| *ttft > 0)?;
-    let (fresh, _) = split_cached_input(call.tokens_in, call.cache_read_tokens);
+    let (fresh, _) = split_cached_input(
+        call.tokens_in,
+        call.cache_read_tokens,
+        call.cache_write_tokens,
+    );
     (fresh > 0).then(|| to_f64(fresh) * 1000.0 / to_f64(ttft))
 }
 

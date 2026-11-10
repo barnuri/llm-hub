@@ -8,6 +8,40 @@ function usd(amount: number): string {
   return `$${amount.toLocaleString(undefined, { maximumFractionDigits: 3 })}`;
 }
 
+function tokensLabel(tokens: number): string {
+  if (tokens % 1_000_000 === 0) {
+    return `${tokens / 1_000_000}M`;
+  }
+  if (tokens % 1_000 === 0) {
+    return `${tokens / 1_000}K`;
+  }
+  return tokens.toLocaleString();
+}
+
+/** `> 100K: $0.5 / $2.5` for the long-context tier, `undefined` when the model has none. */
+export function longContextLabel(price: HubModelPrice | undefined): string | undefined {
+  const tier = price?.long_context;
+  if (tier === undefined) {
+    return undefined;
+  }
+  return `> ${tokensLabel(tier.threshold_tokens)}: ${usd(tier.input_usd_per_1m)} / ${usd(tier.output_usd_per_1m)}`;
+}
+
+/** All four long-context rates, for a hover title. `undefined` when the model has no tier. */
+export function longContextTitle(price: HubModelPrice | undefined): string | undefined {
+  const tier = price?.long_context;
+  if (tier === undefined) {
+    return undefined;
+  }
+  return [
+    `Above ${tokensLabel(tier.threshold_tokens)} prompt tokens (USD per 1M):`,
+    `input ${usd(tier.input_usd_per_1m)}`,
+    `output ${usd(tier.output_usd_per_1m)}`,
+    `cache read ${usd(tier.cache_read_usd_per_1m)}`,
+    `cache write ${usd(tier.cache_write_usd_per_1m)}`,
+  ].join(", ");
+}
+
 /** `$4 / $20` (USD per 1M input / output tokens), `free` when both are zero, `—` when unknown. */
 export function formatPrice(price: HubModelPrice | undefined): string {
   if (price === undefined) {

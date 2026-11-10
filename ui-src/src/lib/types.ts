@@ -1,9 +1,19 @@
-/** USD per 1M tokens, from `llm_hub_price` on a `/v1/models` entry. All zero for a local model. */
-export interface HubModelPrice {
+/** USD per 1M tokens. */
+export interface HubPriceRates {
   readonly input_usd_per_1m: number;
   readonly output_usd_per_1m: number;
   readonly cache_read_usd_per_1m: number;
   readonly cache_write_usd_per_1m: number;
+}
+
+/** Rates for a prompt strictly above `threshold_tokens`. */
+export interface HubLongContextPrice extends HubPriceRates {
+  readonly threshold_tokens: number;
+}
+
+/** USD per 1M tokens, from `llm_hub_price` on a `/v1/models` entry. All zero for a local model. */
+export interface HubModelPrice extends HubPriceRates {
+  readonly long_context?: HubLongContextPrice;
 }
 
 export interface HubModel {

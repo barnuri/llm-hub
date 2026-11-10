@@ -243,7 +243,8 @@ pub async fn stats(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let mut snapshot = if range == "live" || !persistent {
+    let book = state.pricing_book();
+    let snapshot = if range == "live" || !persistent {
         let mut snap = state.stats().snapshot(
             if persistent && range != "live" {
                 "live"
@@ -265,37 +266,42 @@ pub async fn stats(
             snap.range = "live".into();
             snap.filterable = false;
         }
+        crate::services::pricing::apply_costs(&mut snap, &book);
         snap
     } else {
-        let since_ms = match range {
-            "today" => Some(local_midnight_ms(now_ms())),
-            "1d" => Some(now_ms().saturating_sub(86_400_000)),
-            "7d" => Some(now_ms().saturating_sub(7 * 86_400_000)),
-            "30d" => Some(now_ms().saturating_sub(30 * 86_400_000)),
-            "all" => None,
-            other => {
-                return Err(AppError::BadRequest(format!(
-                    "unknown stats range '{other}' (expected live, today, 1d, 7d, 30d, all)"
-                )));
-            }
-        };
+        let since_ms = since_for_range(range, now_ms())?;
         let store = state.store().expect("persistent checked above");
         store
-            .stats(&StatsFilter {
-                since_ms,
-                profile,
-                model,
-                range_label: range.to_string(),
-            })
+            .stats(
+                &StatsFilter {
+                    since_ms,
+                    profile,
+                    model,
+                    range_label: range.to_string(),
+                },
+                &book,
+            )
             .map_err(AppError::Internal)?
     };
-
-    let book = state.pricing_book();
-    crate::services::pricing::apply_costs(&mut snapshot, &book);
 
     let body = serde_json::to_value(snapshot)
         .map_err(|e| AppError::Internal(format!("serialize stats failed: {e}")))?;
     Ok(Json(body))
+}
+
+/// Lower bound in epoch milliseconds for a range label (`today`, `1d`, `7d`, `30d`, `all`).
+/// `all` has no lower bound.
+pub(crate) fn since_for_range(range: &str, now_ms: u64) -> Result<Option<u64>, AppError> {
+    match range {
+        "today" => Ok(Some(local_midnight_ms(now_ms))),
+        "1d" => Ok(Some(now_ms.saturating_sub(86_400_000))),
+        "7d" => Ok(Some(now_ms.saturating_sub(7 * 86_400_000))),
+        "30d" => Ok(Some(now_ms.saturating_sub(30 * 86_400_000))),
+        "all" => Ok(None),
+        other => Err(AppError::BadRequest(format!(
+            "unknown range '{other}' (expected today, 1d, 7d, 30d, all)"
+        ))),
+    }
 }
 
 /// Epoch milliseconds of the most recent local midnight at or before `now`. Uses the local UTC

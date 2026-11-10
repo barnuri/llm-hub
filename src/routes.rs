@@ -4,5 +4,6 @@ pub mod claude_code;
 pub mod copilot;
 pub mod models;
 pub mod proxy;
+pub mod sessions;
 pub mod smart_auto;
 pub mod ui;

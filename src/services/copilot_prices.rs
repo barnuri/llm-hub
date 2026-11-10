@@ -7,7 +7,7 @@ use arc_swap::ArcSwap;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use crate::configs::TokenRates;
+use crate::configs::{LongContextTier, PriceCard, TokenRates};
 use crate::consts::{
     COPILOT_DESCRIPTIONS_URL, COPILOT_PRICES_MIN_GAP, COPILOT_PRICES_TIMEOUT, COPILOT_PRICES_URL,
     LONG_CONTEXT_SUFFIX,
@@ -19,7 +19,7 @@ use crate::utils::markdown_table;
 /// The last fetched price table, keyed by [`CopilotPrices::normalize_id`].
 #[derive(Debug)]
 pub struct CopilotPrices {
-    table: ArcSwap<HashMap<String, TokenRates>>,
+    table: ArcSwap<HashMap<String, PriceCard>>,
     wake: Notify,
 }
 
@@ -34,16 +34,18 @@ impl Default for CopilotPrices {
 
 impl CopilotPrices {
     const DEFAULT_TIER: &str = "Default";
+    const LONG_TIER: &str = "Long context";
     const FAST_MODE: &str = "(fast mode)";
     const MODEL_COLUMN: &str = "Model";
     const TIER_COLUMN: &str = "Tier";
+    const THRESHOLD_COLUMN: &str = "Threshold (input tokens)";
     const INPUT_COLUMN: &str = "Input";
     const CACHED_INPUT_COLUMN: &str = "Cached input";
     const CACHE_WRITE_COLUMN: &str = "Cache write";
     const OUTPUT_COLUMN: &str = "Output";
 
     /// The fetched table. Empty until the first successful fetch.
-    pub fn snapshot(&self) -> Arc<HashMap<String, TokenRates>> {
+    pub fn snapshot(&self) -> Arc<HashMap<String, PriceCard>> {
         self.table.load_full()
     }
 
@@ -63,16 +65,33 @@ impl CopilotPrices {
             .replace('.', "-")
     }
 
-    /// Default-tier prices from every Markdown table with Model, Input and Output columns.
-    /// The first row for a model wins; a row with an unreadable Input or Output is skipped.
-    pub fn parse(markdown: &str) -> HashMap<String, TokenRates> {
-        let mut prices = HashMap::new();
+    /// Default-tier prices from every Markdown table with Model, Input and Output columns, each with
+    /// its Long context tier when that row has a readable threshold. The first row for a model wins.
+    pub fn parse(markdown: &str) -> HashMap<String, PriceCard> {
+        let mut defaults: HashMap<String, TokenRates> = HashMap::new();
+        let mut long_tiers: HashMap<String, LongContextTier> = HashMap::new();
         markdown_table::for_each_row(markdown, |columns, cells| {
-            if let Some((id, rates)) = Self::price_row(columns, cells) {
-                prices.entry(id).or_insert(rates);
+            match markdown_table::cell(columns, cells, Self::TIER_COLUMN) {
+                None | Some(Self::DEFAULT_TIER) => {
+                    if let Some((id, rates)) = Self::price_row(columns, cells) {
+                        defaults.entry(id).or_insert(rates);
+                    }
+                }
+                Some(Self::LONG_TIER) => {
+                    if let Some((id, tier)) = Self::long_row(columns, cells) {
+                        long_tiers.entry(id).or_insert(tier);
+                    }
+                }
+                Some(_) => {}
             }
         });
-        prices
+        defaults
+            .into_iter()
+            .map(|(id, base)| {
+                let long_context = long_tiers.remove(&id);
+                (id, PriceCard { base, long_context })
+            })
+            .collect()
     }
 
     /// Fetches both pages at startup and every `copilot_prices_refresh` or on request, at least
@@ -115,9 +134,6 @@ impl CopilotPrices {
 
     fn price_row(columns: &[String], cells: &[String]) -> Option<(String, TokenRates)> {
         let cell = |name: &str| markdown_table::cell(columns, cells, name);
-        if cell(Self::TIER_COLUMN).is_some_and(|tier| tier != Self::DEFAULT_TIER) {
-            return None;
-        }
         let name = Self::model_name(cell(Self::MODEL_COLUMN)?);
         if name.is_empty() {
             return None;
@@ -133,6 +149,38 @@ impl CopilotPrices {
                 .unwrap_or(0.0),
         };
         Some((Self::normalize_id(&name), rates))
+    }
+
+    fn long_row(columns: &[String], cells: &[String]) -> Option<(String, LongContextTier)> {
+        let (id, rates) = Self::price_row(columns, cells)?;
+        let threshold = markdown_table::cell(columns, cells, Self::THRESHOLD_COLUMN)
+            .and_then(Self::threshold_cell);
+        let Some(threshold_tokens) = threshold else {
+            tracing::warn!(model = %id, "copilot long-context row has no readable threshold, skipping it");
+            return None;
+        };
+        Some((
+            id,
+            LongContextTier {
+                threshold_tokens,
+                rates,
+            },
+        ))
+    }
+
+    /// `≤ 272K` and `> 100K` → 272,000 and 100,000. Text such as `Not applicable` is `None`.
+    fn threshold_cell(cell: &str) -> Option<u64> {
+        let rest = cell.trim().trim_start_matches(['≤', '>', '<', '=']).trim();
+        let (digits, scale) = match rest.strip_suffix('K') {
+            Some(digits) => (digits, 1_000),
+            None => (rest, 1),
+        };
+        digits
+            .replace(',', "")
+            .trim()
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(scale)
     }
 
     /// Drops footnotes (`[^note]`) and notes in parentheses, except `(fast mode)`, which becomes `fast`.
@@ -192,7 +240,7 @@ impl CopilotPrices {
         }
     }
 
-    fn apply(state: &AppState, fetched: Result<HashMap<String, TokenRates>, String>) -> bool {
+    fn apply(state: &AppState, fetched: Result<HashMap<String, PriceCard>, String>) -> bool {
         let fetched = match fetched {
             Ok(fetched) => fetched,
             Err(error) => {
@@ -220,7 +268,7 @@ impl CopilotPrices {
     async fn fetch(
         client: &reqwest::Client,
         url: &str,
-    ) -> Result<HashMap<String, TokenRates>, String> {
+    ) -> Result<HashMap<String, PriceCard>, String> {
         let body = Self::fetch_body(client, url).await?;
         let prices = Self::parse(&body);
         if prices.is_empty() {
@@ -280,16 +328,67 @@ mod tests {
     #[test]
     fn parse_reads_default_tier_rows_of_every_price_table() {
         let prices = CopilotPrices::parse(SAMPLE);
+        let long_sol = PriceCard {
+            base: rates(2.0, 0.10, 2.50, 10.0),
+            long_context: Some(LongContextTier {
+                threshold_tokens: 272_000,
+                rates: rates(4.0, 0.20, 5.0, 15.0),
+            }),
+        };
         assert_eq!(
             prices,
             HashMap::from([
-                ("gpt-5-3-codex".into(), rates(1.75, 0.175, 0.0, 14.0)),
-                ("gpt-6-1-sol".into(), rates(2.0, 0.10, 2.50, 10.0)),
-                ("claude-opus-4-8".into(), rates(5.0, 0.50, 6.25, 25.0)),
-                ("claude-opus-4-8-fast".into(), rates(10.0, 1.0, 12.50, 50.0)),
-                ("gemini-3-8-flash".into(), rates(0.75, 0.075, 0.0, 3.75)),
-                ("mai-code-1-1-flash".into(), rates(0.20, 0.02, 0.0, 1.20)),
+                (
+                    "gpt-5-3-codex".into(),
+                    PriceCard::flat(rates(1.75, 0.175, 0.0, 14.0))
+                ),
+                ("gpt-6-1-sol".into(), long_sol),
+                (
+                    "claude-opus-4-8".into(),
+                    PriceCard::flat(rates(5.0, 0.50, 6.25, 25.0))
+                ),
+                (
+                    "claude-opus-4-8-fast".into(),
+                    PriceCard::flat(rates(10.0, 1.0, 12.50, 50.0))
+                ),
+                (
+                    "gemini-3-8-flash".into(),
+                    PriceCard::flat(rates(0.75, 0.075, 0.0, 3.75))
+                ),
+                (
+                    "mai-code-1-1-flash".into(),
+                    PriceCard::flat(rates(0.20, 0.02, 0.0, 1.20))
+                ),
             ])
+        );
+    }
+
+    #[test]
+    fn threshold_cell_reads_k_suffix() {
+        assert_eq!(CopilotPrices::threshold_cell("≤ 100K"), Some(100_000));
+        assert_eq!(CopilotPrices::threshold_cell("> 272K"), Some(272_000));
+        assert_eq!(CopilotPrices::threshold_cell("> 1,500"), Some(1_500));
+    }
+
+    #[test]
+    fn threshold_cell_not_applicable_is_none() {
+        assert_eq!(CopilotPrices::threshold_cell("Not applicable"), None);
+        assert_eq!(CopilotPrices::threshold_cell("> K"), None);
+        assert_eq!(CopilotPrices::threshold_cell(""), None);
+    }
+
+    #[test]
+    fn long_row_without_threshold_keeps_default_card() {
+        let markdown = "| Model | Tier | Threshold (input tokens) | Input | Cached input | Cache write | Output |\n\
+                        | --- | --- | --- | --- | --- | --- | --- |\n\
+                        | Demo Model | Default | ≤ 100K | $1.00 | $0.10 | $1.25 | $5.00 |\n\
+                        | Demo Model | Long context | Not applicable | $2.00 | $0.20 | $2.50 | $7.50 |\n";
+        assert_eq!(
+            CopilotPrices::parse(markdown),
+            HashMap::from([(
+                "demo-model".into(),
+                PriceCard::flat(rates(1.0, 0.10, 1.25, 5.0)),
+            )])
         );
     }
 
