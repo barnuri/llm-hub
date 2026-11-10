@@ -268,13 +268,14 @@ pub async fn stats(
         snap
     } else {
         let since_ms = match range {
+            "today" => Some(local_midnight_ms(now_ms())),
             "1d" => Some(now_ms().saturating_sub(86_400_000)),
             "7d" => Some(now_ms().saturating_sub(7 * 86_400_000)),
             "30d" => Some(now_ms().saturating_sub(30 * 86_400_000)),
             "all" => None,
             other => {
                 return Err(AppError::BadRequest(format!(
-                    "unknown stats range '{other}' (expected live, 1d, 7d, 30d, all)"
+                    "unknown stats range '{other}' (expected live, today, 1d, 7d, 30d, all)"
                 )));
             }
         };
@@ -295,6 +296,48 @@ pub async fn stats(
     let body = serde_json::to_value(snapshot)
         .map_err(|e| AppError::Internal(format!("serialize stats failed: {e}")))?;
     Ok(Json(body))
+}
+
+/// Epoch milliseconds of the most recent local midnight at or before `now`. Uses the local UTC
+/// offset from `localtime_r`, so a day that starts in DST is measured from its first hour.
+#[cfg(unix)]
+fn local_midnight_ms(now_ms: u64) -> u64 {
+    let secs = libc::time_t::try_from(now_ms / 1000).unwrap_or(libc::time_t::MAX);
+    // SAFETY: `localtime_r` writes only into `tm`, which lives on this stack frame.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return now_ms.saturating_sub(86_400_000);
+    }
+    let into_day = u64::try_from(tm.tm_hour).unwrap_or(0) * 3600
+        + u64::try_from(tm.tm_min).unwrap_or(0) * 60
+        + u64::try_from(tm.tm_sec).unwrap_or(0);
+    (now_ms / 1000)
+        .saturating_sub(into_day)
+        .saturating_mul(1000)
+}
+
+/// Without a POSIX local clock, the day starts at UTC midnight.
+#[cfg(not(unix))]
+fn local_midnight_ms(now_ms: u64) -> u64 {
+    (now_ms / 86_400_000) * 86_400_000
+}
+
+#[cfg(test)]
+mod local_midnight_tests {
+    use super::local_midnight_ms;
+
+    #[test]
+    fn midnight_is_not_after_now_and_within_a_day() {
+        let now = 1_783_000_000_123_u64;
+        let midnight = local_midnight_ms(now);
+        assert!(midnight <= now, "{midnight} > {now}");
+        assert!(
+            now - midnight < 86_400_000 + 3_600_000,
+            "{}",
+            now - midnight
+        );
+        assert_eq!(midnight % 1000, 0);
+    }
 }
 
 pub async fn usage(State(state): State<AppState>) -> Result<Json<Value>, AppError> {

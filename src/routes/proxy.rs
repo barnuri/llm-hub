@@ -13,8 +13,8 @@ use crate::configs::{HubConfig, ProfileConfig};
 use crate::consts::{
     ANTHROPIC_UPSTREAM_PATH, AUTO_REASON_HEADER_MAX_CHARS, ERROR_REASON_MAX_CHARS,
     ERROR_STATUS_MIN, HEADER_ATTEMPTS, HEADER_AUTO_PICK, HEADER_AUTO_REASON, HEADER_SERVED_MODEL,
-    HEADER_TRANSFORMS, MAX_MULTIPART_BYTES, MAX_TRANSFORM_BUFFER_BYTES, SSE_KEEPALIVE_FRAME,
-    USAGE_SCRAPE_TAIL_BYTES,
+    HEADER_TRANSFORMS, MAX_MULTIPART_BYTES, MAX_TRANSFORM_BUFFER_BYTES,
+    PROMPT_REFUSAL_MARGIN_PERCENT, SSE_KEEPALIVE_FRAME, USAGE_SCRAPE_TAIL_BYTES,
 };
 use crate::dependencies::state::AppState;
 use crate::routes::models::{COPILOT_AUTO_MODEL, advertised_bare_id};
@@ -767,6 +767,7 @@ struct RequestNeeds<'a> {
 }
 
 /// Why `model_id` cannot serve the request, or `None` when it may be tried. Reads memory only.
+/// A prompt within `PROMPT_REFUSAL_MARGIN_PERCENT` of the limit is tried, because the estimate overstates.
 fn refusal(
     state: &AppState,
     config: &HubConfig,
@@ -795,7 +796,7 @@ fn refusal(
         return Some(format!("{qualified}: image input is not supported"));
     }
     let limit = known_prompt_limit(state, model_id, is_copilot, &upstream, descriptor)?;
-    (needs.prompt_tokens > limit).then(|| {
+    (needs.prompt_tokens.saturating_mul(100) > limit.saturating_mul(PROMPT_REFUSAL_MARGIN_PERCENT)).then(|| {
         format!(
             "{qualified}: a prompt of about {} tokens is over the known limit of {limit} tokens",
             needs.prompt_tokens
@@ -5622,6 +5623,33 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn prompt_estimated_within_the_margin_is_sent_upstream() {
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 1_000, 1);
+
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+
+            // 1,400 estimated tokens against a 1,000 limit: over the limit, inside the 150% margin.
+            let (status, _) = send(
+                &copilot,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 1_400),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert_eq!(chat_models(&copilot).await, [PLAIN_ID]);
+        }
+
+        #[tokio::test]
         async fn the_lowest_known_limit_gates_the_request() {
             let copilot = copilot().await;
             copilot
@@ -5639,7 +5667,7 @@ mod tests {
                 MESSAGES_ENDPOINT,
                 RouteKind::Anthropic,
                 &client_headers(),
-                &long_anthropic_body(NATIVE_ID, 600),
+                &long_anthropic_body(NATIVE_ID, 800),
             )
             .await;
 

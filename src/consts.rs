@@ -119,6 +119,13 @@ pub const CONTEXT_TOKENS_1M: u64 = 1_000_000;
 /// Suffix Claude Code appends to treat a gateway model id as 1M context.
 pub const CONTEXT_1M_SUFFIX: &str = "[1m]";
 
+/// The hub refuses a request locally only when its byte-based prompt estimate exceeds the known
+/// limit by this percentage. One token per four bytes overstates real agent bodies (JSON framing,
+/// escaping, tool schemas) by about 1.46x: a session Claude Code measured at 0.75M tokens
+/// estimated at 1.09M and was refused against a 1M limit. Requests inside the margin go to the
+/// upstream, whose real 400 teaches the limit.
+pub const PROMPT_REFUSAL_MARGIN_PERCENT: u64 = 150;
+
 /// `LLM_HUB_<NAME>_AUTH` value for the direct GitHub OAuth bearer flow.
 pub const COPILOT_AUTH_OPENCODE: &str = "github-copilot";
 /// `LLM_HUB_<NAME>_AUTH` value for the VS Code Copilot token-exchange flow.

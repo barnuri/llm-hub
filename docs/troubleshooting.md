@@ -20,6 +20,13 @@ The body is over `LLM_HUB_MAX_REPLAY_BYTES`. Older versions defaulted to 2 MB, a
 Code session exceeds that. Remove a small `LLM_HUB_MAX_REPLAY_BYTES` from `.env`, or raise it.
 The current default is in [Configuration](configuration.md#routing-and-streaming).
 
+## A 400 says a prompt is over the known limit, but the session is under it
+
+The hub estimates a prompt at one token per four request bytes. That overstates agent bodies by
+about 1.46x, so the hub refuses a request locally only when the estimate is over the limit by
+150% (`PROMPT_REFUSAL_MARGIN_PERCENT`). A request inside that margin goes to the upstream, which
+returns its own 400 when the prompt is really too long. The hub learns the limit from that 400.
+
 ## A Copilot Claude model reports a smaller window than it accepts
 
 Copilot's `/models` understates the prompt limit of Claude models. The hub replaces it with a
