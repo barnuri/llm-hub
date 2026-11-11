@@ -13,10 +13,7 @@ interface KeepWarmPanelProps {
   readonly onToast: (message: string, isError?: boolean) => void;
 }
 
-/**
- * Turns the cache keep-warm pings on or off and sets how long a stream may stay idle.
- * Mount with `key` built from the saved values so a server-side change resets the draft.
- */
+/** Mount with a `key` built from the saved values so a server-side change resets the draft. */
 export function KeepWarmPanel({ settings, readonly, onSaved, onToast }: KeepWarmPanelProps) {
   const [enabled, setEnabled] = useState(settings.enabled);
   const [cap, setCap] = useState(String(settings.idle_cap_minutes));

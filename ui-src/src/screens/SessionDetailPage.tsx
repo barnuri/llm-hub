@@ -6,7 +6,7 @@ import { Panel } from "../components/Panel";
 import { PromptSizeChart } from "../components/PromptSizeChart";
 import { ShareBar } from "../components/ShareBar";
 import { shortModel } from "../components/UsageModelChart";
-import { formatDateTime, formatNumber, formatPct, formatUsd } from "../lib/format";
+import { errorText, formatDateTime, formatNumber, formatPct, formatUsd } from "../lib/format";
 import { navigate } from "../lib/router";
 import {
   type CacheWriteCause,
@@ -42,10 +42,6 @@ const CAUSE_LABELS: Readonly<Record<CacheWriteCause, string>> = {
   warm: "Warm cache",
   no_session_id: "No session id",
 };
-
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 export function SessionDetailPage({ worker, range }: SessionDetailPageProps) {
   const [detail, setDetail] = useState<SessionDetail | null>(null);

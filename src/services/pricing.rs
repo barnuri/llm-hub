@@ -316,8 +316,6 @@ fn pricing_meta(book: &PricingBook, overview_cost_usd: f64) -> PricingMeta {
     }
 }
 
-/// Appends the base price (`· $in/$out` or `· free`) to each `display_name` and adds `llm_hub_price`,
-/// with `long_context` when the price has a tier. Returns true when a Copilot model has no price.
 fn rates_json(rates: TokenRates) -> Value {
     json!({
         "input_usd_per_1m": rates.input_per_1m,
@@ -327,6 +325,8 @@ fn rates_json(rates: TokenRates) -> Value {
     })
 }
 
+/// Appends the base price (`· $in/$out` or `· free`) to each `display_name` and adds `llm_hub_price`,
+/// with `long_context` when the price has a tier. Returns true when a Copilot model has no price.
 pub fn annotate_listing(models: &mut [Value], book: &PricingBook) -> bool {
     let mut unpriced_copilot = false;
     for model in models {

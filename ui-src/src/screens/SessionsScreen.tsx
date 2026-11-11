@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { Panel } from "../components/Panel";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
 import { shortModel } from "../components/UsageModelChart";
-import { formatDateTime, formatNumber, formatPct, formatUsd } from "../lib/format";
+import { errorText, formatDateTime, formatNumber, formatPct, formatUsd } from "../lib/format";
 import { navigate, useRoute } from "../lib/router";
 import {
   fetchSessions,
@@ -36,10 +36,6 @@ export function SessionsScreen() {
     return <SessionDetailPage worker={worker} range={range} />;
   }
   return <SessionsList range={range} />;
-}
-
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 function promptCell(value: number | undefined): string {

@@ -7,9 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::configs::{KeepWarmConfig, ProfileConfig, mask_key};
-use crate::consts::{
-    DEFAULT_INSIGHTS_MIN_REQUESTS, DEFAULT_INSIGHTS_RANGE, ENV_FILE, VERSION,
-};
+use crate::consts::{DEFAULT_INSIGHTS_MIN_REQUESTS, DEFAULT_INSIGHTS_RANGE, ENV_FILE, VERSION};
 use crate::dependencies::state::AppState;
 use crate::routes::models::send_models_request;
 use crate::schemas::api_key_input::ApiKeyInput;
@@ -170,8 +168,7 @@ pub async fn set_keep_warm(
     if state.config().config_readonly {
         return Err(AppError::ReadOnly);
     }
-    KeepWarmConfig::check_idle_cap_minutes(input.idle_cap_minutes)
-        .map_err(AppError::BadRequest)?;
+    KeepWarmConfig::check_idle_cap_minutes(input.idle_cap_minutes).map_err(AppError::BadRequest)?;
     env_writer::set_keep_warm(Path::new(ENV_FILE), input.enabled, input.idle_cap_minutes)
         .map_err(AppError::Internal)?;
     reload_config(&state)?;

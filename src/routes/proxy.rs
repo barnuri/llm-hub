@@ -1916,7 +1916,10 @@ fn keep_warm_headers(beta: Option<HeaderValue>) -> HeaderMap {
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    headers.insert(HEADER_X_INITIATOR, HeaderValue::from_static(INITIATOR_AGENT));
+    headers.insert(
+        HEADER_X_INITIATOR,
+        HeaderValue::from_static(INITIATOR_AGENT),
+    );
     with_anthropic_version(&headers)
 }
 
