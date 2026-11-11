@@ -1,5 +1,8 @@
 use serde::Serialize;
 
+use crate::schemas::session_skill_body::SessionSkillBody;
+use crate::schemas::session_tool_result::SessionToolResult;
+
 /// Context composition from a session's newest prompt-shape row. Token figures are estimates (characters or bytes / 4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionComposition {
@@ -18,4 +21,8 @@ pub struct SessionComposition {
     pub claude_md_chars: Option<u64>,
     pub claude_md_estimated_tokens: Option<u64>,
     pub image_count: u64,
+    /// Tool-result families, largest first.
+    pub tool_results: Vec<SessionToolResult>,
+    /// Skill bodies in the user messages, largest first.
+    pub skill_bodies: Vec<SessionSkillBody>,
 }

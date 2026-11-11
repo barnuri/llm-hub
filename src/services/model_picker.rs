@@ -158,6 +158,7 @@ mod tests {
             error: None,
             client: None,
             worker: None,
+            routed_by: None,
         };
         state.store().unwrap().record(&outcome).unwrap();
         refresh_usage(&state).await;

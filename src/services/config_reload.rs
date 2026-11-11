@@ -91,7 +91,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::configs::{ProfileConfig, TokenRates};
+    use crate::configs::{KeepWarmConfig, ProfileConfig, TokenRates};
 
     fn sample(bind: &str, port: u16) -> HubConfig {
         HubConfig {
@@ -126,6 +126,7 @@ mod tests {
             copilot_strip_sampling_models: vec![],
             sse_keepalive: None,
             copilot_prices_refresh: None,
+            keep_warm: KeepWarmConfig::default(),
             pricing: TokenRates::default(),
         }
     }

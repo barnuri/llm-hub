@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
+import { DataTable } from "../components/DataTable";
 import { KpiCard, type KpiTone } from "../components/KpiCard";
 import { Panel } from "../components/Panel";
 import { Pill } from "../components/Pill";
@@ -20,6 +21,8 @@ import type {
   CopilotQuota,
   CopilotUsageReport,
   ErrorsReport,
+  QuotaDailyDelta,
+  QuotaHistory,
   SeriesPoint,
   StatsEntry,
   StatsSnapshot,
@@ -98,6 +101,18 @@ function pickQuota(report: CopilotUsageReport | null): CopilotQuota | null {
   return quotas.find((quota) => quota.id === PREMIUM_QUOTA_ID) ?? quotas[0] ?? null;
 }
 
+/** The burn rows of the quota the card shows, for the profile that reported it. */
+function dailyBurn(
+  history: QuotaHistory | null,
+  report: CopilotUsageReport | null,
+  quota: CopilotQuota | null,
+): readonly QuotaDailyDelta[] {
+  if (!history || !report || !quota) {
+    return [];
+  }
+  return history.daily.filter((row) => row.profile === report.profile && row.quota === quota.id);
+}
+
 function quotaTone(quota: CopilotQuota): KpiTone {
   if (quota.remainingPercentage <= QUOTA_DANGER_PCT) {
     return "danger";
@@ -138,9 +153,29 @@ function hoverReadout(stacks: UpstreamStacks, index: number | null, bucket: Seri
 
 interface QuotaPanelProps {
   readonly quota: CopilotQuota | null;
+  readonly burn: readonly QuotaDailyDelta[];
 }
 
-function QuotaPanel({ quota }: QuotaPanelProps) {
+function QuotaBurnTable({ rows, unit }: { readonly rows: readonly QuotaDailyDelta[]; readonly unit: string }) {
+  return (
+    <DataTable
+      wrapClassName="quota-burn"
+      columns={[{ label: "Day" }, { label: `Used (${unit})`, numeric: true }, { label: "USD", numeric: true }]}
+      rows={rows.map((row) => ({
+        key: row.day,
+        cells: [
+          { content: row.day, className: "mono" },
+          { content: formatNumber(row.used_delta) },
+          { content: row.used_usd_delta === null ? "—" : formatUsd(row.used_usd_delta) },
+        ],
+      }))}
+      empty="No daily burn yet. The hub reads the quota every 15 minutes."
+      emptyClassName="note quota-burn-note"
+    />
+  );
+}
+
+function QuotaPanel({ quota, burn }: QuotaPanelProps) {
   if (!quota) {
     return (
       <Panel title="Copilot quota">
@@ -173,6 +208,7 @@ function QuotaPanel({ quota }: QuotaPanelProps) {
         </span>
         {reset ? <span className="dim">Resets {reset}</span> : null}
       </div>
+      <QuotaBurnTable rows={burn} unit={quotaUnit(quota)} />
     </Panel>
   );
 }
@@ -239,6 +275,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
   const [week, setWeek] = useState<StatsSnapshot | null>(null);
   const [report, setReport] = useState<UsageReport | null>(null);
   const [copilot, setCopilot] = useState<CopilotUsageReport | null>(null);
+  const [quotaHistory, setQuotaHistory] = useState<QuotaHistory | null>(null);
   const [weekErrors, setWeekErrors] = useState<readonly UsageRow[] | null>(null);
   const [loadedAt, setLoadedAt] = useState<Date | null>(null);
   const [historyOff, setHistoryOff] = useState(false);
@@ -255,13 +292,15 @@ export function UsageScreen({ period }: UsageScreenProps) {
     let cancelled = false;
 
     const load = async () => {
-      const [todayResult, weekResult, usageResult, copilotResult, errorsResult] = await Promise.allSettled([
-        api<StatsSnapshot>("/api/stats?range=1d"),
-        api<StatsSnapshot>("/api/stats?range=7d"),
-        api<UsageReport>("/api/usage"),
-        api<CopilotUsageReport>("/api/copilot/usage"),
-        api<ErrorsReport>("/api/errors?range=7d"),
-      ]);
+      const [todayResult, weekResult, usageResult, copilotResult, errorsResult, quotaResult] =
+        await Promise.allSettled([
+          api<StatsSnapshot>("/api/stats?range=1d"),
+          api<StatsSnapshot>("/api/stats?range=7d"),
+          api<UsageReport>("/api/usage"),
+          api<CopilotUsageReport>("/api/copilot/usage"),
+          api<ErrorsReport>("/api/errors?range=7d"),
+          api<QuotaHistory>("/api/copilot/usage/history?range=7d"),
+        ]);
       if (cancelled) {
         return;
       }
@@ -281,6 +320,9 @@ export function UsageScreen({ period }: UsageScreenProps) {
       }
       if (errorsResult.status === "fulfilled") {
         setWeekErrors(errorsResult.value.recent);
+      }
+      if (quotaResult.status === "fulfilled") {
+        setQuotaHistory(quotaResult.value);
       }
       setLoadedAt(new Date());
       setLoading(false);
@@ -382,6 +424,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
     <section className="tab active overview">
       {pageHead}
       {snapshot ? (
+        <>
         <div className="kpi-strip">
           <KpiCard
             label="Requests"
@@ -430,6 +473,19 @@ export function UsageScreen({ period }: UsageScreenProps) {
             <KpiCard label="Copilot quota" value="—" sub="Not connected" />
           )}
         </div>
+        <div className="kpi-strip">
+          <KpiCard
+            label="Keep-warm pings"
+            value={formatNumber(snapshot.overview.keepwarm_pings)}
+            sub={`${formatUsd(snapshot.overview.keepwarm_cost_usd)} ping cost${snapshot.overview.persisted ? "" : " · not persisted"}`}
+          />
+          <KpiCard
+            label="Write saved (est.)"
+            value={formatUsd(snapshot.overview.est_write_saved_usd)}
+            sub={`${formatNumber(snapshot.overview.idle_returns_cached)} returns read the cache`}
+          />
+        </div>
+        </>
       ) : (
         <p className="note" role="status">
           Day filters need persistence — totals for this window are not available.
@@ -478,7 +534,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
             )}
           </Panel>
           <div className="overview-side">
-            <QuotaPanel quota={quota} />
+            <QuotaPanel quota={quota} burn={dailyBurn(quotaHistory, copilot, quota)} />
             <TopModels models={snapshot.models} totalRequests={snapshot.overview.requests} />
           </div>
         </div>

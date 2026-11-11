@@ -171,3 +171,27 @@
 .copilot-prices-hours {
   width: 88px;
 }
+
+.keep-warm-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.keep-warm-toggle,
+.keep-warm-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.keep-warm-cap {
+  width: 88px;
+}
+
+.keep-warm-notice {
+  margin: 10px 0 0;
+  font-size: 12px;
+  font-weight: 600;
+}

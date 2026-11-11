@@ -1,5 +1,6 @@
 import { api } from "./api";
 import { formatNumber } from "./format";
+import type { KeepWarmFigures } from "./types";
 
 export type SessionsRange = "today" | "1d" | "7d" | "30d" | "all";
 
@@ -13,7 +14,7 @@ export interface SessionPromptStats {
   readonly peak_ts_ms: number;
 }
 
-export interface SessionSummary {
+export interface SessionSummary extends KeepWarmFigures {
   readonly worker: string;
   readonly client: string | null;
   readonly project: string | null;
@@ -35,6 +36,15 @@ export interface SessionSummary {
   readonly compactions: number;
   /** Part of `cache_write_usd` written after the cache expired. */
   readonly idle_cache_write_usd: number;
+  /** Successful requests and cost per `routed_by`, most expensive first. */
+  readonly routed_by_spend: readonly SessionRoutedBySpend[];
+}
+
+/** `pinned` is the client's own model; `smart-auto:<tier>` and `copilot-auto` are hub picks; `unknown` predates the column. */
+interface SessionRoutedBySpend {
+  readonly routed_by: string;
+  readonly requests: number;
+  readonly cost_usd: number;
 }
 
 export interface SessionCacheCause {
@@ -65,6 +75,18 @@ export interface SessionCompaction {
   readonly drop_percent: number;
 }
 
+export interface SessionToolResult {
+  readonly family: string;
+  readonly bytes: number;
+  readonly estimated_tokens: number;
+}
+
+export interface SessionSkillBody {
+  readonly name: string;
+  readonly chars: number;
+  readonly estimated_tokens: number;
+}
+
 /** Token figures are estimates: characters or bytes divided by four. */
 export interface SessionComposition {
   readonly system_chars: number;
@@ -82,6 +104,10 @@ export interface SessionComposition {
   readonly claude_md_chars: number | null;
   readonly claude_md_estimated_tokens: number | null;
   readonly image_count: number;
+  /** Tool-result text by tool family, largest first. */
+  readonly tool_results: readonly SessionToolResult[];
+  /** Skill bodies in the user messages, largest first. */
+  readonly skill_bodies: readonly SessionSkillBody[];
 }
 
 export interface SessionDetail {

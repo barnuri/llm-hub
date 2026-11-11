@@ -82,6 +82,8 @@ async fn main() {
     routes::models::restore_catalogs(&state);
     routes::models::spawn_background_refresh(state.clone());
     services::copilot_prices::CopilotPrices::spawn_refresh_loop(state.clone());
+    services::keep_warm::KeepWarm::spawn_refresh_loop(state.clone());
+    services::quota_snapshots::QuotaSnapshots::spawn_poll_loop(state.clone());
     state.managed().spawn_idle_reaper();
     let managed = std::sync::Arc::clone(state.managed());
     let restart_notify = state.restart_notify();
@@ -409,11 +411,16 @@ fn build_router(state: AppState) -> Router {
             get(routes::smart_auto::decisions),
         )
         .route("/api/copilot/usage", get(routes::copilot::usage))
+        .route(
+            "/api/copilot/usage/history",
+            get(routes::copilot::usage_history),
+        )
         .route("/api/fallbacks", post(routes::admin::set_default_fallbacks))
         .route(
             "/api/copilot/prices",
             post(routes::admin::set_copilot_prices),
         )
+        .route("/api/keep-warm", post(routes::admin::set_keep_warm))
         .route("/api/restart", post(routes::admin::restart_server))
         .route("/api/stats", get(routes::admin::stats))
         .route("/api/usage", get(routes::admin::usage))
@@ -583,6 +590,43 @@ mod tests {
         let without_key = client.get(&url).send().await.unwrap();
 
         assert_eq!(with_key.status().as_u16(), 404);
+        assert_eq!(without_key.status().as_u16(), 401);
+    }
+
+    #[tokio::test]
+    async fn copilot_usage_history_route_is_protected() {
+        let base = serve_hub_with_auth().await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/copilot/usage/history?range=7d");
+
+        let with_key = client
+            .get(&url)
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap();
+        let without_key = client.get(&url).send().await.unwrap();
+
+        assert_eq!(with_key.status().as_u16(), 400);
+        assert_eq!(without_key.status().as_u16(), 401);
+    }
+
+    #[tokio::test]
+    async fn keep_warm_route_is_protected() {
+        let base = serve_hub_with_auth().await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/keep-warm");
+
+        let with_key = client
+            .post(&url)
+            .bearer_auth(MASTER_KEY)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let without_key = client.post(&url).json(&json!({})).send().await.unwrap();
+
+        assert_eq!(with_key.status().as_u16(), 422);
         assert_eq!(without_key.status().as_u16(), 401);
     }
 

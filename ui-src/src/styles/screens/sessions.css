@@ -77,6 +77,22 @@
   font-size: 12px;
 }
 
+.sessions-keepwarm {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 16px;
+  margin: 0;
+}
+
+.sessions-keepwarm dt {
+  color: var(--muted);
+}
+
+.sessions-keepwarm dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
 .sessions-split {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));

@@ -7,8 +7,15 @@ use serde::{Deserialize, Serialize};
 use crate::consts::{AUTO_DECISIONS_DEFAULT_LIMIT, AUTO_DECISIONS_MAX_LIMIT};
 use crate::dependencies::state::AppState;
 use crate::schemas::app_error::AppError;
+use crate::schemas::quota_history::QuotaHistory;
+use crate::schemas::quota_snapshot_row::QuotaSnapshotRow;
 use crate::services::copilot_auto_decisions::TieredDecision;
 use crate::services::copilot_usage::{self, CopilotUsage};
+use crate::services::quota_snapshots::QuotaSnapshots;
+use crate::services::stats::SERIES_DAY_MS;
+use crate::services::store::{Store, now_ms};
+
+const DEFAULT_QUOTA_RANGE: &str = "7d";
 
 #[derive(Debug, Deserialize, Default)]
 pub struct UsageQuery {
@@ -20,6 +27,13 @@ struct UsageBody<'a> {
     profile: &'a str,
     #[serde(flatten)]
     usage: &'a CopilotUsage,
+}
+
+/// Query of `GET /api/copilot/usage/history`.
+#[derive(Debug, Deserialize, Default)]
+pub struct QuotaHistoryQuery {
+    /// `7d` (default) or `30d`.
+    pub range: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -87,6 +101,43 @@ pub async fn usage(State(state): State<AppState>, Query(query): Query<UsageQuery
     .into_response()
 }
 
+/// `GET /api/copilot/usage/history?range=7d|30d`: every stored quota reading in the range, and the daily
+/// burn computed from them. Needs the sqlite store.
+pub async fn usage_history(
+    State(state): State<AppState>,
+    Query(query): Query<QuotaHistoryQuery>,
+) -> Result<Json<QuotaHistory>, AppError> {
+    let range = query
+        .range
+        .unwrap_or_else(|| DEFAULT_QUOTA_RANGE.to_owned());
+    let days = match range.as_str() {
+        "7d" => 7,
+        "30d" => 30,
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "range must be 7d or 30d, got {other}"
+            )));
+        }
+    };
+    let since_ms = now_ms().saturating_sub(days * SERIES_DAY_MS);
+    let rows: Vec<QuotaSnapshotRow> = tokio::task::spawn_blocking(move || {
+        let store = state
+            .store()
+            .filter(|store| matches!(store, Store::Sqlite(_)))
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "quota history needs persistence on the sqlite store (LLM_HUB_PERSISTENT=true, LLM_HUB_STORE=sqlite)"
+                        .into(),
+                )
+            })?;
+        QuotaSnapshots::history(store, since_ms).map_err(AppError::Internal)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("quota history task failed: {e}")))??;
+    let daily = QuotaSnapshots::daily_deltas(&rows);
+    Ok(Json(QuotaHistory { range, rows, daily }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -103,15 +154,19 @@ mod tests {
     use crate::services::memory_credential_store::MemoryCredentialStore;
 
     fn state(vars: &[(&str, &str)]) -> AppState {
+        state_with(vars, None, GhOutcome::Token("gho_from_gh".to_string()))
+    }
+
+    fn state_with(vars: &[(&str, &str)], store: Option<Store>, gh: GhOutcome) -> AppState {
         let vars: HashMap<String, String> = vars
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
         AppState::with_seams(
             HubConfig::from_map(&vars).unwrap(),
-            None,
+            store,
             Arc::new(MemoryCredentialStore::default()),
-            Arc::new(FakeGhCli::new(GhOutcome::Token("gho_from_gh".to_string()))),
+            Arc::new(FakeGhCli::new(gh)),
         )
         .unwrap()
     }
@@ -197,5 +252,88 @@ mod tests {
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["type"], "upstream_error");
+    }
+
+    const HOUR_MS: u64 = 3_600_000;
+
+    fn state_with_store(store: Store) -> AppState {
+        state_with(
+            &[
+                ("LLM_HUB_PROFILES", "copilot"),
+                ("LLM_HUB_COPILOT_BASE_URL", "http://127.0.0.1:9"),
+            ],
+            Some(store),
+            GhOutcome::NotInstalled,
+        )
+    }
+
+    fn reading(ts_ms: u64, used: f64) -> QuotaSnapshotRow {
+        QuotaSnapshotRow {
+            ts_ms,
+            profile: "copilot".into(),
+            quota: "premium_interactions".into(),
+            used,
+            entitlement: 300.0,
+            used_usd: None,
+            limit_usd: None,
+        }
+    }
+
+    fn query(range: &str) -> Query<QuotaHistoryQuery> {
+        Query(QuotaHistoryQuery {
+            range: Some(range.into()),
+        })
+    }
+
+    #[tokio::test]
+    async fn history_bounds_rows_by_range_and_sums_the_burn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quota.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let now = now_ms();
+        QuotaSnapshots::save(
+            &store,
+            &[
+                reading(now - 8 * SERIES_DAY_MS, 1.0),
+                reading(now - 2 * HOUR_MS, 10.0),
+                reading(now - HOUR_MS, 13.0),
+            ],
+        )
+        .unwrap();
+        let state = state_with_store(store);
+
+        let Json(week) = usage_history(State(state.clone()), query("7d"))
+            .await
+            .expect("7d is a valid range");
+        assert_eq!(week.range, "7d");
+        assert_eq!(week.rows.len(), 2);
+        let week_burn: f64 = week.daily.iter().map(|day| day.used_delta).sum();
+        assert!((week_burn - 3.0).abs() < 1e-9);
+
+        let Json(month) = usage_history(State(state), query("30d"))
+            .await
+            .expect("30d is a valid range");
+        assert_eq!(month.rows.len(), 3);
+        let month_burn: f64 = month.daily.iter().map(|day| day.used_delta).sum();
+        assert!((month_burn - 12.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn unknown_range_and_json_store_are_bad_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite =
+            Store::open("sqlite", Some(dir.path().join("q.db").to_str().unwrap())).unwrap();
+        let state = state_with_store(sqlite);
+        let unknown = usage_history(State(state), query("2y")).await;
+        assert!(matches!(unknown, Err(AppError::BadRequest(_))));
+
+        let json = Store::open(
+            "json",
+            Some(dir.path().join("stats.json").to_str().unwrap()),
+        )
+        .unwrap();
+        let state = state_with_store(json);
+        let refused = usage_history(State(state), query("7d")).await;
+        assert!(matches!(refused, Err(AppError::BadRequest(_))));
     }
 }

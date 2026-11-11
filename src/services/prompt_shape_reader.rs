@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 
 use serde_json::Value;
@@ -12,6 +13,10 @@ impl PromptShape {
     const WORKING_DIRECTORY: &str = "Primary working directory:";
     const MCP_TOOL_PREFIX: &str = "mcp__";
     const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
+    const SKILL_BODY_OPEN: &str = "Base directory for this skill:";
+    const TOOL_FAMILY_OTHER: &str = "other";
+    const NAMED_TOOLS: [&str; 4] = ["Read", "Bash", "Agent", "Skill"];
+    const TOP_TOOL_FAMILIES: usize = 12;
     const HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -46,6 +51,7 @@ impl PromptShape {
                         .get("content")
                         .is_some_and(|content| Self::text_parts(content).next().is_some())
             });
+            (shape.tool_result_bytes, shape.skill_body_chars) = Self::message_usage(messages);
         }
         let mut tool_names: Vec<&str> = Vec::new();
         if let Some(tools) = fields.get("tools").and_then(Value::as_array) {
@@ -162,13 +168,131 @@ impl PromptShape {
     /// The last path segment of the directory a text block states after `Primary working directory:`.
     fn project_basename(text: &str) -> Option<String> {
         let (_, rest) = text.split_once(Self::WORKING_DIRECTORY)?;
-        let line = rest.lines().next()?.trim();
-        let name = line
+        Self::basename(rest.lines().next()?)
+    }
+
+    /// The last segment of a path, ignoring trailing separators. `None` when nothing is left.
+    fn basename(path: &str) -> Option<String> {
+        let name = path
+            .trim()
             .trim_end_matches(['/', '\\'])
             .rsplit(['/', '\\'])
             .next()?
             .trim();
         (!name.is_empty()).then(|| name.to_owned())
+    }
+
+    /// Tool-result text bytes by tool family and skill-body characters by skill name, over every message.
+    fn message_usage(messages: &[Value]) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
+        let mut tool_names: HashMap<&str, &str> = HashMap::new();
+        for block in messages
+            .iter()
+            .filter_map(|message| message.get("content"))
+            .flat_map(Self::blocks)
+        {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            if let (Some(id), Some(name)) = (
+                block.get("id").and_then(Value::as_str),
+                block.get("name").and_then(Value::as_str),
+            ) {
+                tool_names.insert(id, name);
+            }
+        }
+        let mut families: BTreeMap<String, u64> = BTreeMap::new();
+        let mut skills: BTreeMap<String, u64> = BTreeMap::new();
+        for message in messages {
+            let Some(content) = message.get("content") else {
+                continue;
+            };
+            if message.get("role").and_then(Value::as_str) == Some("user") {
+                for text in Self::text_parts(content) {
+                    if let Some(name) = Self::skill_name(text) {
+                        *skills.entry(name).or_default() += Self::char_count(text);
+                    }
+                }
+            }
+            for block in Self::blocks(content) {
+                if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                    continue;
+                }
+                let name = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| tool_names.get(id))
+                    .copied()
+                    .unwrap_or_default();
+                let bytes = Self::result_text_bytes(block.get("content"));
+                *families.entry(Self::tool_family(name)).or_default() += bytes;
+            }
+        }
+        (Self::top_families(families), skills)
+    }
+
+    /// The family a tool name counts under: `mcp__<server>` for an MCP tool, the named tool, or `other`.
+    fn tool_family(name: &str) -> String {
+        let server = name
+            .strip_prefix(Self::MCP_TOOL_PREFIX)
+            .and_then(|rest| rest.split("__").next())
+            .filter(|server| !server.is_empty());
+        if let Some(server) = server {
+            return format!("{}{server}", Self::MCP_TOOL_PREFIX);
+        }
+        if Self::NAMED_TOOLS.contains(&name) {
+            name.to_owned()
+        } else {
+            Self::TOOL_FAMILY_OTHER.to_owned()
+        }
+    }
+
+    /// Keeps the largest named families, ties by name, and sums the rest into `other`.
+    fn top_families(families: BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+        let other = families.get(Self::TOOL_FAMILY_OTHER).copied();
+        let mut named: Vec<(String, u64)> = families
+            .into_iter()
+            .filter(|(family, _)| family != Self::TOOL_FAMILY_OTHER)
+            .collect();
+        named.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        let mut kept = BTreeMap::new();
+        let mut rest = other.unwrap_or(0);
+        let mut overflowed = false;
+        for (index, (family, bytes)) in named.into_iter().enumerate() {
+            if index < Self::TOP_TOOL_FAMILIES {
+                kept.insert(family, bytes);
+            } else {
+                rest += bytes;
+                overflowed = true;
+            }
+        }
+        if other.is_some() || overflowed {
+            kept.insert(Self::TOOL_FAMILY_OTHER.to_owned(), rest);
+        }
+        kept
+    }
+
+    /// Text bytes of one tool result: a bare string, or the text blocks of a block list. Images count nothing.
+    fn result_text_bytes(content: Option<&Value>) -> u64 {
+        match content {
+            Some(Value::String(text)) => Self::to_u64(text.len()),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(Self::text_of_block)
+                .map(|text| Self::to_u64(text.len()))
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    /// The skill directory name a text block states after `Base directory for this skill:`.
+    fn skill_name(text: &str) -> Option<String> {
+        let rest = text.trim_start().strip_prefix(Self::SKILL_BODY_OPEN)?;
+        Self::basename(rest.lines().next()?)
+    }
+
+    /// The blocks of a message `content` value. A bare string has none.
+    fn blocks(content: &Value) -> impl Iterator<Item = &Value> + '_ {
+        content.as_array().into_iter().flatten()
     }
 
     /// Serialized size of a JSON value in bytes, counted without keeping the output.
@@ -429,5 +553,118 @@ mod tests {
                 first.chars().count() + 1 + second.chars().count()
             ))
         );
+    }
+
+    #[test]
+    fn tool_results_summed_by_family_through_tool_use_ids() {
+        let shape = shape_of(&json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "a", "name": "Read", "input": {}},
+                    {"type": "tool_use", "id": "b", "name": "mcp__files__read", "input": {}},
+                    {"type": "tool_use", "id": "c", "name": "Bash", "input": {}},
+                    {"type": "tool_use", "id": "d", "name": "Agent", "input": {}},
+                    {"type": "tool_use", "id": "e", "name": "Skill", "input": {}},
+                    {"type": "tool_use", "id": "f", "name": "WebFetch", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "a", "content": "abcd"},
+                    {"type": "tool_result", "tool_use_id": "b", "content": [
+                        {"type": "text", "text": "xyz"},
+                        {"type": "image", "source": {"data": "zzzz"}},
+                    ]},
+                    {"type": "tool_result", "tool_use_id": "c", "content": "é"},
+                    {"type": "tool_result", "tool_use_id": "d", "content": ""},
+                    {"type": "tool_result", "tool_use_id": "e", "content": "skillbody"},
+                    {"type": "tool_result", "tool_use_id": "f", "content": "other-result"},
+                    {"type": "tool_result", "tool_use_id": "unknown", "content": "q"},
+                ]},
+            ],
+        }));
+        assert_eq!(
+            shape.tool_result_bytes,
+            BTreeMap::from([
+                ("Agent".to_owned(), 0),
+                ("Bash".to_owned(), 2),
+                ("Read".to_owned(), 4),
+                ("Skill".to_owned(), 9),
+                ("mcp__files".to_owned(), 3),
+                ("other".to_owned(), 13),
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_family_names_mcp_by_server_and_the_rest_by_name() {
+        assert_eq!(PromptShape::tool_family("mcp__files__read"), "mcp__files");
+        assert_eq!(PromptShape::tool_family("mcp__files"), "mcp__files");
+        assert_eq!(PromptShape::tool_family("mcp__"), "other");
+        assert_eq!(PromptShape::tool_family("Read"), "Read");
+        assert_eq!(PromptShape::tool_family("Glob"), "other");
+        assert_eq!(PromptShape::tool_family(""), "other");
+    }
+
+    #[test]
+    fn top_twelve_families_named_and_the_rest_summed_into_other() {
+        let mut families: BTreeMap<String, u64> = (0..14_u64)
+            .map(|index| (format!("mcp__s{index:02}"), (index + 1) * 10))
+            .collect();
+        families.insert("other".to_owned(), 5);
+        let kept = PromptShape::top_families(families);
+        assert_eq!(kept.len(), 13);
+        assert_eq!(kept.get("other"), Some(&35));
+        assert!(!kept.contains_key("mcp__s00"));
+        assert!(!kept.contains_key("mcp__s01"));
+        assert_eq!(kept.get("mcp__s13"), Some(&140));
+    }
+
+    #[test]
+    fn skill_bodies_counted_by_directory_name_across_user_blocks() {
+        let first = "Base directory for this skill: /home/dev/skills/pdf\n\n# PDF SECRET BODY 4471";
+        let second = "Base directory for this skill: /home/dev/skills/pdf/\nmore";
+        let shape = shape_of(&json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": first},
+                    {"type": "text", "text": second},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Base directory for this skill: /home/dev/skills/planner"},
+                ]},
+                {"role": "user", "content": "not a skill: Base directory for this skill: /x/inline"},
+            ],
+        }));
+        assert_eq!(
+            shape.skill_body_chars,
+            BTreeMap::from([(
+                "pdf".to_owned(),
+                PromptShape::char_count(first) + PromptShape::char_count(second),
+            )])
+        );
+        assert!(!format!("{shape:?}").contains("SECRET BODY"));
+    }
+
+    #[test]
+    fn skill_name_is_the_last_path_segment() {
+        assert_eq!(
+            PromptShape::skill_name("Base directory for this skill: /a/b/tool"),
+            Some("tool".to_owned())
+        );
+        assert_eq!(
+            PromptShape::skill_name("  Base directory for this skill: C:\\skills\\win\\"),
+            Some("win".to_owned())
+        );
+        assert_eq!(
+            PromptShape::skill_name("Base directory for this skill:"),
+            None
+        );
+        assert_eq!(PromptShape::skill_name("plain text"), None);
+    }
+
+    #[test]
+    fn usage_maps_are_empty_without_tools_or_skills() {
+        let shape = shape_of(&json!({"messages": [{"role": "user", "content": "hi"}]}));
+        assert!(shape.tool_result_bytes.is_empty());
+        assert!(shape.skill_body_chars.is_empty());
     }
 }

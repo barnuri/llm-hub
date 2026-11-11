@@ -7,6 +7,8 @@ use hdrhistogram::Histogram;
 use serde::Serialize;
 
 use crate::consts::{STATS_MAX_MODEL_KEYS, STATS_OVERFLOW_KEY};
+use crate::schemas::keep_warm_summary::KeepWarmSummary;
+use crate::services::harness::is_keep_warm;
 use crate::services::pricing::split_cached_input;
 
 #[derive(Default)]
@@ -59,6 +61,9 @@ pub struct OverviewSnapshot {
     pub tokens_per_sec_p50: f64,
     pub tokens_per_sec_avg: f64,
     pub cost_usd: f64,
+    /// Keep-warm pings and their estimated savings, flattened into the overview.
+    #[serde(flatten)]
+    pub keep_warm: KeepWarmSummary,
 }
 
 #[derive(Serialize)]
@@ -131,6 +136,8 @@ pub struct RequestOutcome {
     /// Salted Claude Code session key, the same value `selection_events.worker` stores,
     /// so request rows join to selection events. `None` without a session id.
     pub worker: Option<String>,
+    /// How the model was chosen: `smart-auto:<tier>`, `copilot-auto`, or `pinned`. `None` when not recorded.
+    pub routed_by: Option<String>,
 }
 
 impl StatsRegistry {
@@ -241,7 +248,9 @@ pub fn series_from_outcomes(
         let Some(point) = totals.get_mut(&(bucket, outcome.model_key.clone())) else {
             continue;
         };
-        point.requests += 1;
+        if !is_keep_warm(outcome.client.as_deref()) {
+            point.requests += 1;
+        }
         point.tokens_in += outcome.tokens_in;
         point.tokens_out += outcome.tokens_out;
         point.cache_read_tokens += outcome.cache_read_tokens;
@@ -267,9 +276,12 @@ fn record_into(map: &DashMap<String, EntryStats>, key: &str, outcome: &RequestOu
 }
 
 fn record_entry(entry: &EntryStats, outcome: &RequestOutcome) {
-    entry.requests.fetch_add(1, Ordering::Relaxed);
-    if outcome.status >= 400 {
-        entry.errors.fetch_add(1, Ordering::Relaxed);
+    let keep_warm = is_keep_warm(outcome.client.as_deref());
+    if !keep_warm {
+        entry.requests.fetch_add(1, Ordering::Relaxed);
+        if outcome.status >= 400 {
+            entry.errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
     entry
         .tokens_in
@@ -283,6 +295,9 @@ fn record_entry(entry: &EntryStats, outcome: &RequestOutcome) {
     entry
         .cache_write_tokens
         .fetch_add(outcome.cache_write_tokens, Ordering::Relaxed);
+    if keep_warm {
+        return;
+    }
     if let Ok(mut guard) = entry.latency_ms.lock() {
         let histogram = guard.get_or_insert_with(new_histogram);
         let _ = histogram.record(outcome.latency_ms.max(1));
@@ -396,6 +411,7 @@ fn overview_from_entry(stats: &EntryStats) -> OverviewSnapshot {
         tokens_per_sec_p50: snap.tokens_per_sec_p50,
         tokens_per_sec_avg: snap.tokens_per_sec_avg,
         cost_usd: 0.0,
+        keep_warm: KeepWarmSummary::default(),
     }
 }
 
@@ -494,6 +510,19 @@ fn extract_int(text: &str, field: &str) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn keep_warm_ping_adds_tokens_but_not_requests() {
+        let registry = StatsRegistry::default();
+        registry.record(&outcome("copilot", "copilot/claude", 200));
+        let mut ping = outcome("copilot", "copilot/claude", 200);
+        ping.client = Some(crate::consts::KEEP_WARM_CLIENT.into());
+        registry.record(&ping);
+
+        let overview = registry.snapshot("1d", false).overview;
+        assert_eq!(overview.requests, 1);
+        assert_eq!(overview.cache_read_tokens, 8);
+    }
+
     fn outcome(profile: &str, model: &str, status: u16) -> RequestOutcome {
         RequestOutcome {
             profile: profile.into(),
@@ -509,6 +538,7 @@ mod tests {
             error: None,
             client: None,
             worker: None,
+            routed_by: None,
         }
     }
 

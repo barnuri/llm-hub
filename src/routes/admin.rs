@@ -6,8 +6,10 @@ use axum::extract::{Path as UrlPath, Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::configs::{ProfileConfig, mask_key};
-use crate::consts::{DEFAULT_INSIGHTS_MIN_REQUESTS, DEFAULT_INSIGHTS_RANGE, ENV_FILE, VERSION};
+use crate::configs::{KeepWarmConfig, ProfileConfig, mask_key};
+use crate::consts::{
+    DEFAULT_INSIGHTS_MIN_REQUESTS, DEFAULT_INSIGHTS_RANGE, ENV_FILE, VERSION,
+};
 use crate::dependencies::state::AppState;
 use crate::routes::models::send_models_request;
 use crate::schemas::api_key_input::ApiKeyInput;
@@ -19,10 +21,14 @@ use crate::schemas::fallbacks_input::FallbacksInput;
 use crate::schemas::insights::insights_report::InsightsReport;
 use crate::schemas::insights::model_catalog_entry::ModelCatalogEntry;
 use crate::schemas::insights::pick_by::PickBy;
+use crate::schemas::keep_warm_input::KeepWarmInput;
+use crate::schemas::keep_warm_summary::KeepWarmSummary;
 use crate::schemas::profile_input::ProfileInput;
 use crate::schemas::usage_report::UsageReport;
 use crate::services::env_writer;
 use crate::services::insights;
+use crate::services::pricing::PricingBook;
+use crate::services::session_insights;
 use crate::services::stats::RequestOutcome;
 use crate::services::store::{StatsFilter, hash_key, now_ms};
 use crate::utils::hex::to_hex;
@@ -57,6 +63,11 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
         "default_fallbacks": config.default_fallbacks,
         "readonly": config.config_readonly,
         "copilot_prices_refresh_secs": config.copilot_prices_refresh.map_or(0, |d| d.as_secs()),
+        "keep_warm": {
+            "enabled": config.keep_warm.enabled,
+            "idle_cap_minutes": config.keep_warm.idle_cap.as_secs() / 60,
+            "overridden_by_env": keep_warm_pinned_by(|key| std::env::var_os(key).is_some()),
+        },
         "persistent": config.persistent,
         "auth_enabled": config.master_key.is_some() || !state.api_key_hashes().is_empty(),
         "version": VERSION,
@@ -150,6 +161,26 @@ pub async fn set_copilot_prices(
     reload_config(&state)?;
     state.copilot_prices().request_refresh();
     Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn set_keep_warm(
+    State(state): State<AppState>,
+    Json(input): Json<KeepWarmInput>,
+) -> Result<Json<Value>, AppError> {
+    if state.config().config_readonly {
+        return Err(AppError::ReadOnly);
+    }
+    KeepWarmConfig::check_idle_cap_minutes(input.idle_cap_minutes)
+        .map_err(AppError::BadRequest)?;
+    env_writer::set_keep_warm(Path::new(ENV_FILE), input.enabled, input.idle_cap_minutes)
+        .map_err(AppError::Internal)?;
+    reload_config(&state)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// True when the service environment sets a keep-warm variable, which a saved `.env` value cannot override.
+fn keep_warm_pinned_by(is_set: impl Fn(&str) -> bool) -> bool {
+    is_set("LLM_HUB_KEEP_WARM") || is_set("LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES")
 }
 
 pub async fn delete_profile(
@@ -266,12 +297,13 @@ pub async fn stats(
             snap.range = "live".into();
             snap.filterable = false;
         }
+        snap.overview.keep_warm = in_memory_keep_warm(&state, persistent);
         crate::services::pricing::apply_costs(&mut snap, &book);
         snap
     } else {
         let since_ms = since_for_range(range, now_ms())?;
         let store = state.store().expect("persistent checked above");
-        store
+        let mut snapshot = store
             .stats(
                 &StatsFilter {
                     since_ms,
@@ -281,12 +313,40 @@ pub async fn stats(
                 },
                 &book,
             )
-            .map_err(AppError::Internal)?
+            .map_err(AppError::Internal)?;
+        snapshot.overview.keep_warm = stored_keep_warm(state.clone(), since_ms, book).await?;
+        snapshot
     };
 
     let body = serde_json::to_value(snapshot)
         .map_err(|e| AppError::Internal(format!("serialize stats failed: {e}")))?;
     Ok(Json(body))
+}
+
+/// Keep-warm figures since startup, from the in-memory counters.
+fn in_memory_keep_warm(state: &AppState, persisted: bool) -> KeepWarmSummary {
+    let (pings, cost_usd) = state.keep_warm().ping_totals();
+    KeepWarmSummary {
+        keepwarm_pings: pings,
+        keepwarm_cost_usd: cost_usd,
+        persisted,
+        ..KeepWarmSummary::default()
+    }
+}
+
+/// Keep-warm figures for a stored range, read on the blocking pool.
+async fn stored_keep_warm(
+    state: AppState,
+    since_ms: Option<u64>,
+    book: PricingBook,
+) -> Result<KeepWarmSummary, AppError> {
+    tokio::task::spawn_blocking(move || {
+        let store = state.store().ok_or("persistence is off")?;
+        session_insights::keep_warm_summary(store, since_ms, &book)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("keep-warm read task failed: {e}")))?
+    .map_err(AppError::Internal)
 }
 
 /// Lower bound in epoch milliseconds for a range label (`today`, `1d`, `7d`, `30d`, `all`).
@@ -671,6 +731,56 @@ mod tests {
             Arc::new(gh),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn keep_warm_is_pinned_by_either_variable_only() {
+        assert!(keep_warm_pinned_by(|key| key == "LLM_HUB_KEEP_WARM"));
+        assert!(keep_warm_pinned_by(
+            |key| key == "LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES"
+        ));
+        assert!(!keep_warm_pinned_by(|_| false));
+    }
+
+    #[tokio::test]
+    async fn profiles_list_reports_the_keep_warm_settings() {
+        let Json(body) = list_profiles(State(state_for(&[]))).await;
+        assert_eq!(body["keep_warm"]["enabled"], json!(true));
+        assert_eq!(body["keep_warm"]["idle_cap_minutes"], json!(30));
+        assert!(body["keep_warm"]["overridden_by_env"].is_boolean());
+    }
+
+    #[tokio::test]
+    async fn set_keep_warm_refuses_a_cap_below_five_minutes_and_read_only_hubs() {
+        let below_minimum = set_keep_warm(
+            State(state_for(&[])),
+            Json(KeepWarmInput {
+                enabled: true,
+                idle_cap_minutes: 4,
+            }),
+        )
+        .await;
+        assert!(matches!(below_minimum, Err(AppError::BadRequest(_))));
+
+        let above_maximum = set_keep_warm(
+            State(state_for(&[])),
+            Json(KeepWarmInput {
+                enabled: true,
+                idle_cap_minutes: u64::MAX,
+            }),
+        )
+        .await;
+        assert!(matches!(above_maximum, Err(AppError::BadRequest(_))));
+
+        let read_only = set_keep_warm(
+            State(state_for(&[("LLM_HUB_CONFIG_READONLY", "true")])),
+            Json(KeepWarmInput {
+                enabled: true,
+                idle_cap_minutes: 30,
+            }),
+        )
+        .await;
+        assert!(matches!(read_only, Err(AppError::ReadOnly)));
     }
 
     fn token_response(token: &str, copilot: &MockServer) -> ResponseTemplate {

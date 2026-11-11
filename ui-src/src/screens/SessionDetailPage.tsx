@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 
+import { DataTable } from "../components/DataTable";
 import { KpiCard } from "../components/KpiCard";
 import { Panel } from "../components/Panel";
 import { PromptSizeChart } from "../components/PromptSizeChart";
@@ -15,7 +16,9 @@ import {
   type SessionComposition,
   type SessionDetail,
   type SessionsRange,
+  type SessionSkillBody,
   type SessionSummary,
+  type SessionToolResult,
   sessionName,
   shareOf,
 } from "../lib/sessions";
@@ -126,9 +129,20 @@ export function SessionDetailPage({ worker, range }: SessionDetailPageProps) {
         <CacheCausesPanel causes={detail.cache_causes} />
       </div>
 
+      <RoutedByPanel rows={summary.routed_by_spend} />
+
+      <KeepWarmCard summary={summary} />
+
       <CompactionsPanel detail={detail} />
 
       <CompositionPanel composition={detail.composition} />
+
+      {detail.composition ? (
+        <div className="sessions-split">
+          <ToolResultsPanel rows={detail.composition.tool_results} />
+          <SkillBodiesPanel rows={detail.composition.skill_bodies} />
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -217,6 +231,93 @@ function CacheCausesPanel({ causes }: { readonly causes: readonly SessionCacheCa
           </tbody>
         </table>
       </div>
+    </Panel>
+  );
+}
+
+function KeepWarmCard({ summary }: { readonly summary: SessionSummary }) {
+  return (
+    <Panel title="Keep-warm" sub="cache pings for idle Claude streams">
+      <dl className="sessions-keepwarm">
+        <dt>Pings</dt>
+        <dd>{formatNumber(summary.keepwarm_pings)}</dd>
+        <dt>Ping cost</dt>
+        <dd>{formatUsd(summary.keepwarm_cost_usd)}</dd>
+        <dt>Returns read from cache</dt>
+        <dd>{formatNumber(summary.idle_returns_cached)}</dd>
+        <dt>Write cost avoided (est.)</dt>
+        <dd>{formatUsd(summary.est_write_saved_usd)}</dd>
+      </dl>
+      <p className="dim sessions-panel-note">
+        Pings are not counted as requests. The avoided write cost is an estimate from the listed prices.
+      </p>
+    </Panel>
+  );
+}
+
+function RoutedByPanel({ rows }: { readonly rows: SessionSummary["routed_by_spend"] }) {
+  return (
+    <Panel title="Spend by routing" sub="successful requests, by how the model was chosen">
+      <DataTable
+        tableClassName="sessions-routed-by"
+        columns={[{ label: "Routed by" }, { label: "Requests", numeric: true }, { label: "Cost", numeric: true }]}
+        rows={rows.map((row) => ({
+          key: row.routed_by,
+          cells: [
+            { content: row.routed_by, className: "mono" },
+            { content: formatNumber(row.requests) },
+            { content: formatUsd(row.cost_usd), className: "nowrap" },
+          ],
+        }))}
+        empty="No successful requests in this session."
+        emptyClassName="note sessions-empty"
+      />
+      <p className="dim sessions-panel-note">
+        <code>pinned</code> is the model the client named. <code>smart-auto</code> and <code>copilot-auto</code> are hub
+        picks. <code>unknown</code> rows predate the column.
+      </p>
+    </Panel>
+  );
+}
+
+function ToolResultsPanel({ rows }: { readonly rows: readonly SessionToolResult[] }) {
+  return (
+    <Panel title="Tool results" sub="text in the newest prompt, by tool family">
+      <DataTable
+        tableClassName="sessions-tool-results"
+        columns={[{ label: "Family" }, { label: "Bytes", numeric: true }, { label: "Est. tokens", numeric: true }]}
+        rows={rows.map((row) => ({
+          key: row.family,
+          cells: [
+            { content: row.family, className: "mono" },
+            { content: formatNumber(row.bytes) },
+            { content: formatNumber(row.estimated_tokens) },
+          ],
+        }))}
+        empty="No tool results in the newest prompt."
+        emptyClassName="note sessions-empty"
+      />
+    </Panel>
+  );
+}
+
+function SkillBodiesPanel({ rows }: { readonly rows: readonly SessionSkillBody[] }) {
+  return (
+    <Panel title="Skill bodies" sub="skills injected into the newest prompt">
+      <DataTable
+        tableClassName="sessions-skill-bodies"
+        columns={[{ label: "Skill" }, { label: "Chars", numeric: true }, { label: "Est. tokens", numeric: true }]}
+        rows={rows.map((row) => ({
+          key: row.name,
+          cells: [
+            { content: row.name, className: "mono" },
+            { content: formatNumber(row.chars) },
+            { content: formatNumber(row.estimated_tokens) },
+          ],
+        }))}
+        empty="No skill bodies in the newest prompt."
+        emptyClassName="note sessions-empty"
+      />
     </Panel>
   );
 }

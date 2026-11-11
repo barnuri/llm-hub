@@ -56,18 +56,18 @@ pub enum QuotaUnit {
 pub struct CopilotUsage {
     source: &'static str,
     /// Fetch time, unix ms.
-    updated_at: u64,
+    pub(crate) updated_at: u64,
     fetched_at: String,
-    quotas: Vec<CopilotUsageQuota>,
+    pub(crate) quotas: Vec<CopilotUsageQuota>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotUsageQuota {
-    id: String,
+    pub(crate) id: String,
     unit: QuotaUnit,
-    used: f64,
-    entitlement: f64,
+    pub(crate) used: f64,
+    pub(crate) entitlement: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     remaining: Option<f64>,
     remaining_percentage: f64,
@@ -76,9 +76,9 @@ pub struct CopilotUsageQuota {
     #[serde(skip_serializing_if = "Option::is_none")]
     reset_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    used_usd: Option<f64>,
+    pub(crate) used_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    limit_usd: Option<f64>,
+    pub(crate) limit_usd: Option<f64>,
 }
 
 impl CopilotUsageCache {
@@ -151,6 +151,17 @@ pub(crate) async fn usage_at(
         Some(usage) => Some(usage),
         None => pending.await,
     }
+}
+
+/// Fetches `profile`'s quota now, even when the cached snapshot is fresh, and keeps it as the snapshot.
+pub(crate) async fn refresh_now(
+    state: &AppState,
+    client: &reqwest::Client,
+    profile: &str,
+    auth: &CopilotAuth,
+) -> Option<Arc<CopilotUsage>> {
+    let entry = state.copilot_usage().entry_for(profile, auth);
+    start_refresh(state, client, profile, &entry, now_ms()).await
 }
 
 /// The refresh already in flight for `entry`, or a newly spawned one.

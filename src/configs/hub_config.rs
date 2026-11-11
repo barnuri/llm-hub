@@ -2,10 +2,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use super::copilot_auth::CopilotAuth;
+use super::keep_warm_config::KeepWarmConfig;
 use super::managed_command::ManagedCommand;
 use super::profile_config::ProfileConfig;
 use crate::consts::{
-    DEFAULT_BIND, DEFAULT_COPILOT_PRICES_REFRESH_SECS, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_PORT,
+    DEFAULT_BIND, DEFAULT_COPILOT_PRICES_REFRESH_SECS, DEFAULT_KEEP_WARM_ENABLED,
+    DEFAULT_KEEP_WARM_IDLE_CAP_MINUTES, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_PORT,
     DEFAULT_SSE_KEEPALIVE_MS,
 };
 use crate::schemas::hub_selector::HubSelector;
@@ -58,6 +60,8 @@ pub struct HubConfig {
     /// How often the Copilot price table is fetched. `None` when
     /// `LLM_HUB_COPILOT_PRICES_REFRESH_SECS=0`: the hub never fetches it.
     pub copilot_prices_refresh: Option<Duration>,
+    /// Cache keep-warm for idle Copilot Claude streams.
+    pub keep_warm: KeepWarmConfig,
     /// Global USD/1M token defaults when a profile/model has no rates.
     pub pricing: crate::configs::TokenRates,
 }
@@ -131,6 +135,8 @@ impl HubConfig {
             _ => DEFAULT_COPILOT_PRICES_REFRESH_SECS,
         };
 
+        let keep_warm = keep_warm_from_map(&get)?;
+
         let pricing = crate::configs::TokenRates {
             input_per_1m: crate::configs::token_rates::parse_optional_f64(
                 get("INPUT_USD_PER_1M"),
@@ -180,6 +186,7 @@ impl HubConfig {
             sse_keepalive: (sse_keepalive_ms > 0).then(|| Duration::from_millis(sse_keepalive_ms)),
             copilot_prices_refresh: (copilot_prices_refresh_secs > 0)
                 .then(|| Duration::from_secs(copilot_prices_refresh_secs)),
+            keep_warm,
             pricing,
         })
     }
@@ -324,6 +331,24 @@ fn split_list(list: &str) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+fn keep_warm_from_map(get: &impl Fn(&str) -> Option<String>) -> Result<KeepWarmConfig, String> {
+    let enabled = get("KEEP_WARM").map_or(DEFAULT_KEEP_WARM_ENABLED, |v| !is_falsy(&v));
+    let idle_cap_minutes = match get("KEEP_WARM_IDLE_CAP_MINUTES") {
+        Some(v) if !v.is_empty() => {
+            let minutes: u64 = v
+                .parse()
+                .map_err(|_| format!("LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES is not a number: {v}"))?;
+            KeepWarmConfig::check_idle_cap_minutes(minutes)
+                .map_err(|e| format!("LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES: {e}: {v}"))?
+        }
+        _ => DEFAULT_KEEP_WARM_IDLE_CAP_MINUTES,
+    };
+    Ok(KeepWarmConfig {
+        enabled,
+        idle_cap: Duration::from_mins(idle_cap_minutes),
+    })
 }
 
 fn is_truthy(v: &str) -> bool {
@@ -712,6 +737,50 @@ mod tests {
         vars.insert("LLM_HUB_COPILOT_PRICES_REFRESH_SECS".into(), "daily".into());
         let err = HubConfig::from_map(&vars).unwrap_err();
         assert!(err.contains("LLM_HUB_COPILOT_PRICES_REFRESH_SECS"), "{err}");
+    }
+
+    #[test]
+    fn keep_warm_defaults_on_with_a_thirty_minute_cap() {
+        let cfg = HubConfig::from_map(&base_vars()).unwrap();
+        assert_eq!(cfg.keep_warm, KeepWarmConfig::default());
+        assert!(cfg.keep_warm.enabled);
+        assert_eq!(cfg.keep_warm.idle_cap, Duration::from_mins(30));
+    }
+
+    #[test]
+    fn keep_warm_accepts_an_override() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_KEEP_WARM".into(), "false".into());
+        vars.insert("LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES".into(), "45".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert!(!cfg.keep_warm.enabled);
+        assert_eq!(cfg.keep_warm.idle_cap, Duration::from_mins(45));
+    }
+
+    #[test]
+    fn keep_warm_cap_below_five_minutes_is_rejected() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES".into(), "4".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES"), "{err}");
+    }
+
+    #[test]
+    fn keep_warm_cap_above_one_week_is_rejected_instead_of_panicking() {
+        for minutes in ["10081", "18446744073709551615"] {
+            let mut vars = base_vars();
+            vars.insert("LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES".into(), minutes.into());
+            let err = HubConfig::from_map(&vars).unwrap_err();
+            assert!(err.contains("LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES"), "{err}");
+        }
+    }
+
+    #[test]
+    fn keep_warm_cap_that_is_not_a_number_is_rejected() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES".into(), "half".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES"), "{err}");
     }
 
     #[test]

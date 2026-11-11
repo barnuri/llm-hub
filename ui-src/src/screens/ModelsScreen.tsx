@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { CopilotPricesPanel } from "../components/CopilotPricesPanel";
+import { KeepWarmPanel } from "../components/KeepWarmPanel";
 import { MixTable, type MixRow } from "../components/MixTable";
 import { Panel } from "../components/Panel";
 import { PriceHeader } from "../components/PriceHeader";
@@ -240,13 +241,22 @@ export function ModelsScreen({ models, profiles, meta, onCopy, onSaved, onToast 
 
         <div className="models-side">
           {meta !== null && profiles.some((profile) => profile.copilot) ? (
-            <CopilotPricesPanel
-              key={meta.copilot_prices_refresh_secs}
-              refreshSecs={meta.copilot_prices_refresh_secs}
-              readonly={meta.readonly}
-              onSaved={onSaved}
-              onToast={onToast}
-            />
+            <>
+              <CopilotPricesPanel
+                key={meta.copilot_prices_refresh_secs}
+                refreshSecs={meta.copilot_prices_refresh_secs}
+                readonly={meta.readonly}
+                onSaved={onSaved}
+                onToast={onToast}
+              />
+              <KeepWarmPanel
+                key={`${meta.keep_warm.enabled}-${meta.keep_warm.idle_cap_minutes}-${meta.keep_warm.overridden_by_env}`}
+                settings={meta.keep_warm}
+                readonly={meta.readonly}
+                onSaved={onSaved}
+                onToast={onToast}
+              />
+            </>
           ) : null}
           {byProfile.length > 0 ? (
             <Panel title="By profile" sub="models listed">

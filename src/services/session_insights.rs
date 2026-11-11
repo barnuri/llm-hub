@@ -1,8 +1,9 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::consts::ERROR_STATUS_MIN;
+use crate::consts::{ERROR_STATUS_MIN, PROMPT_CACHE_TTL_MS};
 use crate::schemas::cache_write_cause::CacheWriteCause;
 use crate::schemas::cost_parts::CostParts;
+use crate::schemas::keep_warm_summary::KeepWarmSummary;
 use crate::schemas::prompt_shape::PromptShape;
 use crate::schemas::prompt_stats::PromptStats;
 use crate::schemas::session_cache_cause::SessionCacheCause;
@@ -11,15 +12,20 @@ use crate::schemas::session_composition::SessionComposition;
 use crate::schemas::session_detail::SessionDetail;
 use crate::schemas::session_list::SessionList;
 use crate::schemas::session_prompt_point::SessionPromptPoint;
+use crate::schemas::session_routed_by_spend::SessionRoutedBySpend;
+use crate::schemas::session_skill_body::SessionSkillBody;
 use crate::schemas::session_summary::SessionSummary;
+use crate::schemas::session_tool_result::SessionToolResult;
+use crate::services::harness::is_keep_warm;
+use crate::services::keep_warm::{KeepWarm, WarmRequest};
 use crate::services::pricing::{PricingBook, split_cached_input};
 use crate::services::store::Store;
 
-const CACHE_TTL_MS: u64 = 300_000;
 const COMPACTION_MIN_DROP_TOKENS: u64 = 10_000;
 const COMPACTION_MIN_DROP_PERCENT: u64 = 30;
 const SERIES_POINT_CAP: usize = 1_000;
 const SESSION_LIST_LIMIT: usize = 200;
+const UNKNOWN_ROUTED_BY: &str = "unknown";
 const ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const SESSION_CAUSES: [CacheWriteCause; 4] = [
     CacheWriteCause::FirstInSession,
@@ -39,6 +45,7 @@ struct SessionRequest {
     cache_write_tokens: u64,
     client: Option<String>,
     worker: Option<String>,
+    routed_by: Option<String>,
     shape: Option<PromptShape>,
 }
 
@@ -144,7 +151,7 @@ fn load_requests(
                 s.messages, s.turn_start, s.system_chars, s.tool_count, s.tool_bytes,
                 s.mcp_tool_count, s.mcp_tool_bytes, s.deferred_listing_chars,
                 s.skills_listing_chars, s.claude_md_chars, s.image_count, s.project, s.request_id,
-                s.stream_key
+                s.stream_key, r.routed_by, s.tool_result_bytes, s.skill_body_chars
          FROM requests r LEFT JOIN request_shapes s ON s.request_id = r.id WHERE 1=1",
     );
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -185,6 +192,8 @@ fn read_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRequest> {
             image_count: count(row.get(19)?),
             project: row.get(20)?,
             stream_key: row.get(22)?,
+            tool_result_bytes: json_counts(row.get(24)?),
+            skill_body_chars: json_counts(row.get(25)?),
         })
     });
     Ok(SessionRequest {
@@ -197,12 +206,19 @@ fn read_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRequest> {
         cache_write_tokens: count(row.get(6)?),
         client: row.get(7)?,
         worker: row.get(8)?,
+        routed_by: row.get(23)?,
         shape: shape.transpose()?,
     })
 }
 
 fn count(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
+}
+
+/// A JSON object of counts stored as text. A missing or unreadable value reads as empty.
+fn json_counts(text: Option<String>) -> BTreeMap<String, u64> {
+    text.and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 fn count_u64(len: usize) -> u64 {
@@ -245,18 +261,81 @@ fn reports_usage(request: &SessionRequest) -> bool {
         > 0
 }
 
+/// One row as the keep-warm summary reads it. Only pings carry a cost; a user row carries its cache read and saving.
+fn warm_request(row: &SessionRequest, book: &PricingBook) -> WarmRequest {
+    let ping = is_keep_warm(row.client.as_deref());
+    let ping_cost = if ping {
+        book.estimate(
+            &row.model,
+            row.tokens_in,
+            row.tokens_out,
+            row.cache_read_tokens,
+            row.cache_write_tokens,
+        )
+    } else {
+        0.0
+    };
+    WarmRequest::new(
+        row.ts_ms,
+        ping,
+        row.status < ERROR_STATUS_MIN,
+        row.cache_read_tokens,
+        ping_cost,
+        book.rates_for(&row.model),
+    )
+}
+
+/// Keep-warm figures for the stored requests in `since_ms` onward, summed over every session.
+pub fn keep_warm_summary(
+    store: &Store,
+    since_ms: Option<u64>,
+    book: &PricingBook,
+) -> Result<KeepWarmSummary, String> {
+    let rows = load_requests(store, since_ms, None)?;
+    let mut by_worker: HashMap<&str, Vec<WarmRequest>> = HashMap::new();
+    for row in &rows {
+        if let Some(worker) = row.worker.as_deref() {
+            by_worker
+                .entry(worker)
+                .or_default()
+                .push(warm_request(row, book));
+        }
+    }
+    let mut total = KeepWarmSummary {
+        persisted: true,
+        ..KeepWarmSummary::default()
+    };
+    for requests in by_worker.values() {
+        total.absorb(&KeepWarm::summarize(requests));
+    }
+    Ok(total)
+}
+
 fn analyze_session(
     worker: &str,
     rows: &[SessionRequest],
     book: &PricingBook,
 ) -> Option<SessionAnalysis> {
-    let first = rows.first()?;
-    let last = rows.last()?;
+    let user_rows: Vec<&SessionRequest> = rows
+        .iter()
+        .filter(|row| !is_keep_warm(row.client.as_deref()))
+        .collect();
+    let first = user_rows.first()?;
+    let last = user_rows.last()?;
     let priced = price_successful(rows, book);
     let mut cost = CostParts::default();
     for point in &priced {
         cost += point.cost;
     }
+    let routed_by_spend = spend_by_routed_by(&priced);
+    let warm: Vec<WarmRequest> = rows.iter().map(|row| warm_request(row, book)).collect();
+    let keep_warm = KeepWarmSummary {
+        persisted: true,
+        ..KeepWarm::summarize(&warm)
+    };
+    let (_pings, priced): (Vec<Priced<'_>>, Vec<Priced<'_>>) = priced
+        .into_iter()
+        .partition(|point| is_keep_warm(point.request.client.as_deref()));
     let measured: Vec<&Priced<'_>> = priced.iter().filter(|point| point.measured).collect();
     let series: Vec<SessionPromptPoint> = measured
         .iter()
@@ -281,27 +360,27 @@ fn analyze_session(
         .iter()
         .filter(|row| row.shape.as_ref().is_some_and(|shape| shape.turn_start))
         .count();
-    let models: Vec<String> = rows
+    let models: Vec<String> = user_rows
         .iter()
         .map(|row| row.model.as_str())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .map(str::to_string)
         .collect();
-    let streams = rows
+    let streams = user_rows
         .iter()
-        .map(request_stream)
+        .map(|row| request_stream(row))
         .collect::<BTreeSet<_>>()
         .len();
     let total = cost.total();
     let summary = SessionSummary {
         worker: worker.to_string(),
-        client: rows.iter().rev().find_map(|row| row.client.clone()),
-        project: rows
+        client: user_rows.iter().rev().find_map(|row| row.client.clone()),
+        project: user_rows
             .iter()
             .rev()
             .find_map(|row| row.shape.as_ref()?.project.clone()),
-        requests: count_u64(rows.len()),
+        requests: count_u64(user_rows.len()),
         user_turns: count_u64(user_turns),
         first_ts_ms: first.ts_ms,
         last_ts_ms: last.ts_ms,
@@ -322,6 +401,8 @@ fn analyze_session(
         },
         compactions: count_u64(compaction_pairs.len()),
         idle_cache_write_usd,
+        routed_by_spend,
+        keep_warm,
     };
     let composition = rows
         .iter()
@@ -335,6 +416,38 @@ fn analyze_session(
         causes,
         composition,
     })
+}
+
+/// Successful requests and cost per `routed_by`, most expensive first, ties by name.
+fn spend_by_routed_by(priced: &[Priced<'_>]) -> Vec<SessionRoutedBySpend> {
+    let mut groups: BTreeMap<&str, (u64, f64)> = BTreeMap::new();
+    for point in priced {
+        let key = point
+            .request
+            .routed_by
+            .as_deref()
+            .unwrap_or(UNKNOWN_ROUTED_BY);
+        let entry = groups.entry(key).or_default();
+        if !is_keep_warm(point.request.client.as_deref()) {
+            entry.0 += 1;
+        }
+        entry.1 += point.cost.total();
+    }
+    let mut spend: Vec<SessionRoutedBySpend> = groups
+        .into_iter()
+        .map(|(routed_by, (requests, cost_usd))| SessionRoutedBySpend {
+            routed_by: routed_by.to_owned(),
+            requests,
+            cost_usd,
+        })
+        .collect();
+    spend.sort_by(|left, right| {
+        right
+            .cost_usd
+            .total_cmp(&left.cost_usd)
+            .then_with(|| left.routed_by.cmp(&right.routed_by))
+    });
+    spend
 }
 
 fn is_compaction(previous: u64, current: u64) -> bool {
@@ -457,7 +570,7 @@ fn classify_cache_write(previous: Option<&Priced<'_>>, current: &Priced<'_>) -> 
     };
     if previous.request.model != current.request.model {
         CacheWriteCause::ModelSwitch
-    } else if current.request.ts_ms.saturating_sub(previous.request.ts_ms) > CACHE_TTL_MS {
+    } else if current.request.ts_ms.saturating_sub(previous.request.ts_ms) > PROMPT_CACHE_TTL_MS {
         CacheWriteCause::IdleOverTtl
     } else {
         CacheWriteCause::Warm
@@ -494,6 +607,16 @@ fn estimated_tokens(size: u64) -> u64 {
     size / ESTIMATED_BYTES_PER_TOKEN
 }
 
+/// The names of a size map, largest first, ties by name.
+fn largest_first(sizes: &BTreeMap<String, u64>) -> Vec<(&str, u64)> {
+    let mut sorted: Vec<(&str, u64)> = sizes
+        .iter()
+        .map(|(name, size)| (name.as_str(), *size))
+        .collect();
+    sorted.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    sorted
+}
+
 fn composition_from(shape: &PromptShape) -> SessionComposition {
     SessionComposition {
         system_chars: shape.system_chars,
@@ -511,12 +634,28 @@ fn composition_from(shape: &PromptShape) -> SessionComposition {
         claude_md_chars: shape.claude_md_chars,
         claude_md_estimated_tokens: shape.claude_md_chars.map(estimated_tokens),
         image_count: shape.image_count,
+        tool_results: largest_first(&shape.tool_result_bytes)
+            .into_iter()
+            .map(|(family, bytes)| SessionToolResult {
+                family: family.to_owned(),
+                bytes,
+                estimated_tokens: estimated_tokens(bytes),
+            })
+            .collect(),
+        skill_bodies: largest_first(&shape.skill_body_chars)
+            .into_iter()
+            .map(|(name, chars)| SessionSkillBody {
+                name: name.to_owned(),
+                chars,
+                estimated_tokens: estimated_tokens(chars),
+            })
+            .collect(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
 
     use super::*;
@@ -560,6 +699,7 @@ mod tests {
             cache_write_tokens: 0,
             client: Some("demo-client".into()),
             worker: Some("demo-worker".into()),
+            routed_by: None,
             shape: None,
         }
     }
@@ -589,6 +729,8 @@ mod tests {
             image_count: 0,
             project: None,
             stream_key: None,
+            tool_result_bytes: BTreeMap::new(),
+            skill_body_chars: BTreeMap::new(),
         }
     }
 
@@ -798,7 +940,7 @@ mod tests {
     fn same_model_after_gap_over_ttl_idle_over_ttl() {
         let rows = [
             request(0, "demo-model", 200, 10),
-            cache_write(request(CACHE_TTL_MS + 1, "demo-model", 200, 10), 500),
+            cache_write(request(PROMPT_CACHE_TTL_MS + 1, "demo-model", 200, 10), 500),
         ];
         let priced = price_successful(&rows, &PricingBook::default());
         let causes = session_causes(&priced);
@@ -824,7 +966,7 @@ mod tests {
     fn gap_under_ttl_warm() {
         let rows = [
             request(0, "demo-model", 200, 10),
-            cache_write(request(CACHE_TTL_MS, "demo-model", 200, 10), 500),
+            cache_write(request(PROMPT_CACHE_TTL_MS, "demo-model", 200, 10), 500),
         ];
         let priced = price_successful(&rows, &PricingBook::default());
         let causes = session_causes(&priced);
@@ -876,6 +1018,7 @@ mod tests {
             error: None,
             client: Some("demo-client".into()),
             worker: worker.map(str::to_string),
+            routed_by: None,
         };
         let first = store
             .record(&outcome(Some("demo-worker"), 0))
@@ -911,5 +1054,142 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn routed(mut row: SessionRequest, routed_by: Option<&str>) -> SessionRequest {
+        row.routed_by = routed_by.map(str::to_string);
+        row
+    }
+
+    #[test]
+    fn keep_warm_pings_add_cost_and_one_return_is_counted_as_cached() {
+        let book = PricingBook {
+            global: TokenRates {
+                input_per_1m: 1.0,
+                output_per_1m: 2.0,
+                cache_read_per_1m: 0.1,
+                cache_write_per_1m: 1.25,
+            },
+            ..PricingBook::default()
+        };
+        let mut prime = request(0, "demo-model", 200, 0);
+        prime.cache_write_tokens = 5_000;
+        let ping = |ts_ms: u64| {
+            let mut row = request(ts_ms, "demo-model", 200, 0);
+            row.client = Some(crate::consts::KEEP_WARM_CLIENT.into());
+            row.cache_read_tokens = 5_000;
+            row.tokens_out = 1;
+            row
+        };
+        let mut returning = request(600_000, "demo-model", 200, 0);
+        returning.cache_read_tokens = 5_000;
+        let rows = [prime, ping(240_000), ping(480_000), returning];
+
+        let analysis = analyze_session("demo-worker", &rows, &book).expect("rows present");
+        let summary = &analysis.summary;
+        assert_eq!(summary.requests, 2);
+        assert_eq!(summary.keep_warm.keepwarm_pings, 2);
+        assert!((summary.keep_warm.keepwarm_cost_usd - 0.001_004).abs() < 1e-9);
+        assert_eq!(summary.keep_warm.idle_returns_cached, 1);
+        assert!((summary.keep_warm.est_write_saved_usd - 0.005_75).abs() < 1e-9);
+        assert!(summary.keep_warm.persisted);
+        assert!((summary.cost_usd - 0.007_754).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spend_by_routed_by_groups_successful_rows_and_names_unrecorded_ones() {
+        let book = long_tier_book();
+        let mut failed = routed(request(4, LONG_MODEL, 502, 900_000), Some("pinned"));
+        failed.tokens_out = 1;
+        let rows = [
+            routed(
+                request(1, LONG_MODEL, 200, 120_000),
+                Some("smart-auto:intelligence"),
+            ),
+            routed(request(2, LONG_MODEL, 200, 50_000), Some("pinned")),
+            routed(request(3, LONG_MODEL, 200, 50_000), None),
+            failed,
+        ];
+        let analysis = analyze_session("demo-worker", &rows, &book).expect("rows present");
+        let spend = &analysis.summary.routed_by_spend;
+        let names: Vec<&str> = spend.iter().map(|row| row.routed_by.as_str()).collect();
+        assert_eq!(names, ["smart-auto:intelligence", "pinned", "unknown"]);
+        assert!(spend.iter().all(|row| row.requests == 1));
+        let total: f64 = spend.iter().map(|row| row.cost_usd).sum();
+        assert!((total - analysis.summary.cost_usd).abs() < 1e-9);
+    }
+
+    #[test]
+    fn composition_lists_tool_families_and_skill_bodies_largest_first() {
+        let mut newest = shape(true, 400);
+        newest.tool_result_bytes = BTreeMap::from([
+            ("Read".to_owned(), 4_000),
+            ("mcp__files".to_owned(), 9_000),
+            ("other".to_owned(), 10),
+        ]);
+        newest.skill_body_chars =
+            BTreeMap::from([("pdf".to_owned(), 800), ("docx".to_owned(), 2_000)]);
+        let rows = [with_shape(request(1, "demo-model", 200, 10), newest)];
+        let analysis =
+            analyze_session("demo-worker", &rows, &PricingBook::default()).expect("rows present");
+        let composition = analysis.composition.expect("shape rows present");
+        let families: Vec<(&str, u64, u64)> = composition
+            .tool_results
+            .iter()
+            .map(|row| (row.family.as_str(), row.bytes, row.estimated_tokens))
+            .collect();
+        assert_eq!(
+            families,
+            [
+                ("mcp__files", 9_000, 2_250),
+                ("Read", 4_000, 1_000),
+                ("other", 10, 2)
+            ]
+        );
+        let skills: Vec<(&str, u64, u64)> = composition
+            .skill_bodies
+            .iter()
+            .map(|row| (row.name.as_str(), row.chars, row.estimated_tokens))
+            .collect();
+        assert_eq!(skills, [("docx", 2_000, 500), ("pdf", 800, 200)]);
+    }
+
+    #[test]
+    fn sqlite_routed_by_and_json_shape_columns_join_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions-json.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let outcome = RequestOutcome {
+            profile: "demo".into(),
+            model_key: "demo/demo-model".into(),
+            status: 200,
+            ts_ms: 0,
+            latency_ms: 1,
+            ttft_ms: None,
+            tokens_in: 1_000,
+            tokens_out: 10,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            error: None,
+            client: Some("demo-client".into()),
+            worker: Some("demo-worker".into()),
+            routed_by: Some("pinned".into()),
+        };
+        let id = store.record(&outcome).unwrap().unwrap();
+        let mut demo_shape = shape(true, 400);
+        demo_shape.tool_result_bytes = BTreeMap::from([("Bash".to_owned(), 77)]);
+        demo_shape.skill_body_chars = BTreeMap::from([("pdf".to_owned(), 12)]);
+        store.record_shape(id, &demo_shape).unwrap();
+
+        let detail = session_detail(&store, "demo-worker", None, &PricingBook::default())
+            .unwrap()
+            .expect("worker has rows");
+        assert_eq!(detail.summary.routed_by_spend.len(), 1);
+        assert_eq!(detail.summary.routed_by_spend[0].routed_by, "pinned");
+        let composition = detail.composition.expect("shape row present");
+        assert_eq!(composition.tool_results[0].family, "Bash");
+        assert_eq!(composition.tool_results[0].bytes, 77);
+        assert_eq!(composition.skill_bodies[0].name, "pdf");
+        assert_eq!(composition.skill_bodies[0].chars, 12);
     }
 }

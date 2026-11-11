@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::consts::ERROR_STATUS_MIN;
+use crate::consts::{ERROR_STATUS_MIN, KEEP_WARM_CLIENT};
+use crate::services::harness::is_keep_warm;
 use crate::services::model_limits::{LimitSource, ModelLimit};
 use crate::services::pricing::{PricingBook, apply_outcome_costs};
 use crate::services::stats::{RequestOutcome, StatsSnapshot, snapshot_from_outcomes};
@@ -95,6 +96,31 @@ pub struct StatsFilter {
 }
 
 impl Store {
+    /// SQL condition that keeps user requests and drops keep-warm pings (NULL-safe).
+    fn not_keep_warm_sql() -> String {
+        format!("client IS NOT '{KEEP_WARM_CLIENT}'")
+    }
+
+    /// Runs `ddl` unless `existing` already has the column `name`.
+    fn add_missing_column(
+        conn: &Connection,
+        existing: &[String],
+        name: &str,
+        ddl: &str,
+    ) -> Result<(), String> {
+        if existing.iter().any(|col| col == name) {
+            return Ok(());
+        }
+        conn.execute(ddl, [])
+            .map_err(|e| format!("sqlite migrate add {name}: {e}"))?;
+        Ok(())
+    }
+
+    /// The JSON text of a count map. Serializing a map of strings to counts cannot fail; the fallback is an empty object.
+    fn json_text<T: Serialize>(value: &T) -> String {
+        serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned())
+    }
+
     /// kind: "sqlite" | "json". Unknown kinds error at startup.
     pub fn open(kind: &str, path: Option<&str>) -> Result<Store, String> {
         match kind {
@@ -183,6 +209,16 @@ impl Store {
                 claude_md_chars INTEGER,
                 image_count INTEGER NOT NULL,
                 project TEXT
+            );
+            CREATE TABLE IF NOT EXISTS quota_snapshots (
+                ts_ms INTEGER NOT NULL,
+                profile TEXT NOT NULL,
+                quota TEXT NOT NULL,
+                used REAL NOT NULL,
+                entitlement REAL NOT NULL,
+                used_usd REAL,
+                limit_usd REAL,
+                PRIMARY KEY (ts_ms, profile, quota)
             );",
         )
         .map_err(|e| format!("sqlite schema init failed: {e}"))?;
@@ -228,8 +264,9 @@ impl Store {
                     .execute(
                         "INSERT INTO requests (
                             ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker,
+                            routed_by
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                         rusqlite::params![
                             db_i64(row.ts_ms),
                             row.model,
@@ -243,7 +280,8 @@ impl Store {
                             db_i64(row.cache_write_tokens),
                             row.error,
                             row.client,
-                            row.worker
+                            row.worker,
+                            outcome.routed_by.as_deref()
                         ],
                     )
                     .map_err(|e| e.to_string())?;
@@ -251,9 +289,11 @@ impl Store {
             }
             Store::Json(store) => {
                 let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
-                guard.state.totals.requests += 1;
-                if row.status >= ERROR_STATUS_MIN {
-                    guard.state.totals.errors += 1;
+                if !is_keep_warm_row(&row) {
+                    guard.state.totals.requests += 1;
+                    if row.status >= ERROR_STATUS_MIN {
+                        guard.state.totals.errors += 1;
+                    }
                 }
                 guard.state.totals.tokens_in += row.tokens_in;
                 guard.state.totals.tokens_out += row.tokens_out;
@@ -281,8 +321,9 @@ impl Store {
                 "INSERT INTO request_shapes (
                     request_id, system_chars, messages, turn_start, tool_count, tool_bytes,
                     mcp_tool_count, mcp_tool_bytes, deferred_listing_chars, skills_listing_chars,
-                    claude_md_chars, image_count, project, stream_key
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    claude_md_chars, image_count, project, stream_key, tool_result_bytes,
+                    skill_body_chars
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     request_id,
                     db_i64(shape.system_chars),
@@ -297,7 +338,9 @@ impl Store {
                     shape.claude_md_chars.map(db_i64),
                     db_i64(shape.image_count),
                     shape.project.as_deref(),
-                    shape.stream_key.as_deref()
+                    shape.stream_key.as_deref(),
+                    Self::json_text(&shape.tool_result_bytes),
+                    Self::json_text(&shape.skill_body_chars)
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -310,10 +353,13 @@ impl Store {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
                 let (total_requests, total_errors, total_tokens_in, total_tokens_out) = guard
                     .query_row(
-                        "SELECT COUNT(*),
-                                COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0),
-                                COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0)
-                         FROM requests",
+                        &format!(
+                            "SELECT COALESCE(SUM(CASE WHEN {NOT_KEEP_WARM} THEN 1 ELSE 0 END), 0),
+                                    COALESCE(SUM(CASE WHEN {NOT_KEEP_WARM} AND status >= 400 THEN 1 ELSE 0 END), 0),
+                                    COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0)
+                             FROM requests",
+                            NOT_KEEP_WARM = Self::not_keep_warm_sql()
+                        ),
                         [],
                         |r| {
                             Ok((
@@ -326,11 +372,12 @@ impl Store {
                     )
                     .map_err(|e| e.to_string())?;
                 let mut stmt = guard
-                    .prepare(
+                    .prepare(&format!(
                         "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
                                 ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker
-                         FROM requests ORDER BY id DESC LIMIT ?1",
-                    )
+                         FROM requests WHERE {} ORDER BY id DESC LIMIT ?1",
+                        Self::not_keep_warm_sql()
+                    ))
                     .map_err(|e| e.to_string())?;
                 let limit = i64::try_from(USAGE_RECENT_LIMIT).unwrap_or(i64::MAX);
                 let recent = stmt
@@ -354,7 +401,14 @@ impl Store {
                     total_errors: totals.errors,
                     total_tokens_in: totals.tokens_in,
                     total_tokens_out: totals.tokens_out,
-                    recent: guard.state.recent.iter().rev().cloned().collect(),
+                    recent: guard
+                        .state
+                        .recent
+                        .iter()
+                        .rev()
+                        .filter(|row| !is_keep_warm_row(row))
+                        .cloned()
+                        .collect(),
                 })
             }
         }
@@ -365,8 +419,10 @@ impl Store {
         match self {
             Store::Sqlite(conn) => {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
-                let mut count_sql =
-                    format!("SELECT COUNT(*) FROM requests WHERE status >= {ERROR_STATUS_MIN}");
+                let mut count_sql = format!(
+                    "SELECT COUNT(*) FROM requests WHERE status >= {ERROR_STATUS_MIN} AND {}",
+                    Self::not_keep_warm_sql()
+                );
                 let mut params: Vec<rusqlite::types::Value> = Vec::new();
                 if let Some(since) = since_ms {
                     count_sql.push_str(" AND ts_ms >= ?");
@@ -380,7 +436,8 @@ impl Store {
                 let mut list_sql = format!(
                     "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
                             ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker
-                     FROM requests WHERE status >= {ERROR_STATUS_MIN}"
+                     FROM requests WHERE status >= {ERROR_STATUS_MIN} AND {}",
+                    Self::not_keep_warm_sql()
                 );
                 if since_ms.is_some() {
                     list_sql.push_str(" AND ts_ms >= ?");
@@ -410,6 +467,7 @@ impl Store {
                     .rev()
                     .filter(|row| {
                         row.status >= ERROR_STATUS_MIN
+                            && !is_keep_warm_row(row)
                             && since_ms.is_none_or(|since| row.ts_ms >= since)
                     })
                     .cloned()
@@ -432,7 +490,10 @@ impl Store {
             Store::Sqlite(conn) => {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
                 let mut stmt = guard
-                    .prepare("SELECT model, COUNT(*) FROM requests WHERE ts_ms >= ? GROUP BY model")
+                    .prepare(&format!(
+                        "SELECT model, COUNT(*) FROM requests WHERE ts_ms >= ? AND {} GROUP BY model",
+                        Self::not_keep_warm_sql()
+                    ))
                     .map_err(|error| error.to_string())?;
                 let rows = stmt
                     .query_map([db_i64(since_ms)], |row| {
@@ -449,7 +510,7 @@ impl Store {
                     .state
                     .recent
                     .iter()
-                    .filter(|row| row.ts_ms >= since_ms)
+                    .filter(|row| row.ts_ms >= since_ms && !is_keep_warm_row(row))
                 {
                     *counts.entry(row.model.clone()).or_insert(0) += 1;
                 }
@@ -483,7 +544,8 @@ impl Store {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
                 let mut sql = String::from(
                     "SELECT model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error, client, worker
+                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error, client, worker,
+                            routed_by
                      FROM requests WHERE 1=1",
                 );
                 let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -517,6 +579,7 @@ impl Store {
                             error: r.get::<_, Option<String>>(10).unwrap_or(None),
                             client: r.get::<_, Option<String>>(11).unwrap_or(None),
                             worker: r.get::<_, Option<String>>(12).unwrap_or(None),
+                            routed_by: r.get::<_, Option<String>>(13).unwrap_or(None),
                         })
                     })
                     .map_err(|e| e.to_string())?
@@ -555,6 +618,7 @@ impl Store {
                         error: row.error.clone(),
                         client: row.client.clone(),
                         worker: row.worker.clone(),
+                        routed_by: None,
                     })
                     .collect();
                 Ok(rows)
@@ -1128,6 +1192,11 @@ pub fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// True when the row is a keep-warm ping, which counts toward cost but not request totals.
+fn is_keep_warm_row(row: &UsageRow) -> bool {
+    is_keep_warm(row.client.as_deref())
+}
+
 /// `SQLite` stores only `i64`; values here are counters/timestamps, so clamping
 /// at the type bounds is the correct lossy edge behavior.
 fn db_i64(v: u64) -> i64 {
@@ -1149,14 +1218,7 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> 
 
 fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
     let existing = table_columns(conn, "requests")?;
-    let add = |name: &str, ddl: &str| -> Result<(), String> {
-        if existing.iter().any(|col| col == name) {
-            return Ok(());
-        }
-        conn.execute(ddl, [])
-            .map_err(|e| format!("sqlite migrate add {name}: {e}"))?;
-        Ok(())
-    };
+    let add = |name: &str, ddl: &str| Store::add_missing_column(conn, &existing, name, ddl);
     add("ttft_ms", "ALTER TABLE requests ADD COLUMN ttft_ms INTEGER")?;
     add(
         "cache_read_tokens",
@@ -1169,6 +1231,10 @@ fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
     add("error", "ALTER TABLE requests ADD COLUMN error TEXT")?;
     add("client", "ALTER TABLE requests ADD COLUMN client TEXT")?;
     add("worker", "ALTER TABLE requests ADD COLUMN worker TEXT")?;
+    add(
+        "routed_by",
+        "ALTER TABLE requests ADD COLUMN routed_by TEXT",
+    )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_requests_worker ON requests(worker)",
         [],
@@ -1179,10 +1245,19 @@ fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
 
 fn migrate_request_shapes_columns(conn: &Connection) -> Result<(), String> {
     let existing = table_columns(conn, "request_shapes")?;
-    if !existing.iter().any(|col| col == "stream_key") {
-        conn.execute("ALTER TABLE request_shapes ADD COLUMN stream_key TEXT", [])
-            .map_err(|e| format!("sqlite migrate add stream_key: {e}"))?;
-    }
+    let add = |name: &str, ddl: &str| Store::add_missing_column(conn, &existing, name, ddl);
+    add(
+        "stream_key",
+        "ALTER TABLE request_shapes ADD COLUMN stream_key TEXT",
+    )?;
+    add(
+        "tool_result_bytes",
+        "ALTER TABLE request_shapes ADD COLUMN tool_result_bytes TEXT",
+    )?;
+    add(
+        "skill_body_chars",
+        "ALTER TABLE request_shapes ADD COLUMN skill_body_chars TEXT",
+    )?;
     Ok(())
 }
 
@@ -1224,6 +1299,7 @@ mod tests {
             error: None,
             client: None,
             worker: None,
+            routed_by: None,
         }
     }
 
@@ -1248,6 +1324,32 @@ mod tests {
                     .model_request_counts(now_ms() + an_hour)
                     .unwrap()
                     .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn keep_warm_pings_are_not_counted_as_user_requests() {
+        for kind in ["sqlite", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pings");
+            let store = Store::open(kind, Some(path.to_str().unwrap())).unwrap();
+            store.record(&sample_outcome()).unwrap();
+            let mut ping = sample_outcome();
+            ping.client = Some(KEEP_WARM_CLIENT.into());
+            store.record(&ping).unwrap();
+            ping.status = 400;
+            store.record(&ping).unwrap();
+
+            let usage = store.usage().unwrap();
+            assert_eq!(usage.total_requests, 1, "{kind}");
+            assert_eq!(usage.total_errors, 0, "{kind}");
+            assert_eq!(usage.recent.len(), 1, "{kind}");
+            assert_eq!(store.errors(None).unwrap().0, 0, "{kind}");
+            assert_eq!(
+                store.model_request_counts(0).unwrap(),
+                HashMap::from([("openai/gpt-4o".into(), 1)]),
+                "{kind}"
             );
         }
     }
@@ -1418,6 +1520,8 @@ mod tests {
             image_count: 2,
             project: Some("sample-project".into()),
             stream_key: Some("0123456789abcdef".into()),
+            tool_result_bytes: std::collections::BTreeMap::from([("Read".into(), 480_u64)]),
+            skill_body_chars: std::collections::BTreeMap::from([("pdf".into(), 800_u64)]),
         };
         store.record_shape(id, &shape).unwrap();
         let conn = rusqlite::Connection::open(&path).unwrap();
@@ -1425,7 +1529,8 @@ mod tests {
             .query_row(
                 "SELECT system_chars, messages, turn_start, tool_count, tool_bytes,
                         mcp_tool_count, mcp_tool_bytes, deferred_listing_chars,
-                        skills_listing_chars, claude_md_chars, image_count, project, stream_key
+                        skills_listing_chars, claude_md_chars, image_count, project, stream_key,
+                        tool_result_bytes, skill_body_chars
                  FROM request_shapes WHERE request_id = ?1",
                 [id],
                 |r| {
@@ -1443,11 +1548,59 @@ mod tests {
                         image_count: db_u64(r.get(10)?),
                         project: r.get(11)?,
                         stream_key: r.get(12)?,
+                        tool_result_bytes: serde_json::from_str(&r.get::<_, String>(13)?).unwrap(),
+                        skill_body_chars: serde_json::from_str(&r.get::<_, String>(14)?).unwrap(),
                     })
                 },
             )
             .unwrap();
         assert_eq!(read, shape);
+    }
+
+    #[test]
+    fn routed_by_round_trips_and_unrecorded_rows_read_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routed.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let mut routed = sample_outcome();
+        routed.routed_by = Some("smart-auto:balance".into());
+        store.record(&routed).unwrap();
+        store.record(&sample_outcome()).unwrap();
+        let outcomes = store.filtered_outcomes(&StatsFilter::default()).unwrap();
+        assert_eq!(outcomes[0].routed_by.as_deref(), Some("smart-auto:balance"));
+        assert_eq!(outcomes[1].routed_by, None);
+    }
+
+    #[test]
+    fn sqlite_database_from_before_routed_by_gains_the_column_and_keeps_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("before-routed.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_ms INTEGER NOT NULL,
+                    model TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    status INTEGER NOT NULL,
+                    latency_ms INTEGER NOT NULL,
+                    tokens_in INTEGER NOT NULL,
+                    tokens_out INTEGER NOT NULL,
+                    ttft_ms INTEGER,
+                    error TEXT,
+                    client TEXT,
+                    worker TEXT
+                );
+                INSERT INTO requests (ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out)
+                VALUES (1, 'openai/gpt-4o', 'openai', 200, 42, 5, 7);",
+            )
+            .unwrap();
+        }
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let outcomes = store.filtered_outcomes(&StatsFilter::default()).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].routed_by, None);
     }
 
     #[test]

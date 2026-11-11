@@ -13,7 +13,7 @@ use crate::configs::{HubConfig, ProfileConfig};
 use crate::consts::{
     ANTHROPIC_UPSTREAM_PATH, AUTO_REASON_HEADER_MAX_CHARS, ERROR_REASON_MAX_CHARS,
     ERROR_STATUS_MIN, HEADER_ATTEMPTS, HEADER_AUTO_PICK, HEADER_AUTO_REASON, HEADER_SERVED_MODEL,
-    HEADER_TRANSFORMS, MAX_MULTIPART_BYTES, MAX_TRANSFORM_BUFFER_BYTES,
+    HEADER_TRANSFORMS, KEEP_WARM_CLIENT, MAX_MULTIPART_BYTES, MAX_TRANSFORM_BUFFER_BYTES,
     PROMPT_REFUSAL_MARGIN_PERCENT, SSE_KEEPALIVE_FRAME, USAGE_SCRAPE_TAIL_BYTES,
 };
 use crate::dependencies::state::AppState;
@@ -54,10 +54,12 @@ use crate::services::copilot_auto::{
 };
 use crate::services::copilot_auto_decisions::{AutoDecision, TieredDecision};
 use crate::services::copilot_body_fields::BodyField;
+use crate::services::copilot_headers::{HEADER_X_INITIATOR, INITIATOR_AGENT};
 use crate::services::fallback::{
     RetryPolicy, fallback_chain, per_attempt_timeout_ms, retain_eligible,
 };
 use crate::services::harness::client_signature;
+use crate::services::keep_warm::{KeepWarmLease, PingPlan};
 use crate::services::multipart_model;
 use crate::services::request_images::request_has_image;
 use crate::services::responses_item_ids::ResponsesItemIds;
@@ -257,6 +259,7 @@ pub(crate) async fn attempt_loop(
             routed = Some(pick.template.clone());
         }
         let model_id = auto.as_ref().map_or(requested, |pick| &pick.model_id);
+        let routed_by = routed_by_label(auto.is_some(), smart.as_ref().map(|plan| plan.tier));
         let mut attempt = bodies.for_model(state, model_id);
         let effort = match (&smart, &auto) {
             (Some(plan), _) => plan.effort_for(state, model_id),
@@ -294,12 +297,16 @@ pub(crate) async fn attempt_loop(
             attempt_timeout,
             session_token,
         );
-        let result = match sender.send(attempt.body.clone()).await {
+        let mut keep_warm = keep_warm_lease(state, &attempt, model_id, worker.as_deref());
+        let (result, retried_body) = match sender.send(attempt.body.clone()).await {
             Ok(response) if attempt.native_messages => {
-                retry_without_rejected_fields(&bodies, &sender, response).await
+                match retry_without_rejected_fields(&bodies, &sender, response).await {
+                    Ok((response, retried)) => (Ok(response), retried),
+                    Err(reason) => (Err(reason), None),
+                }
             }
-            Ok(response) => Ok(attempt.reply_rewrite.apply(response).await),
-            other => other,
+            Ok(response) => (Ok(attempt.reply_rewrite.apply(response).await), None),
+            other => (other, None),
         };
 
         match result {
@@ -321,6 +328,12 @@ pub(crate) async fn attempt_loop(
                     let commit = smart
                         .as_ref()
                         .and_then(|plan| plan.commit(status, model_id));
+                    let stream_lease = keep_warm.take().filter(|_| succeeded).map(|mut lease| {
+                        let accepted = retried_body.unwrap_or_else(|| attempt.body.clone());
+                        let beta = attempt.headers.get(HEADER_ANTHROPIC_BETA).cloned();
+                        lease.record_stream(accepted, model_id.clone(), started, beta);
+                        lease
+                    });
                     let mut out = match reviewing.filter(|_| succeeded) {
                         Some(plan) => {
                             review_deliver(
@@ -336,6 +349,7 @@ pub(crate) async fn attempt_loop(
                                 worker,
                                 commit,
                                 transition.filter(|_| succeeded),
+                                routed_by.clone(),
                             )
                             .await?
                         }
@@ -353,6 +367,8 @@ pub(crate) async fn attempt_loop(
                                 commit,
                                 transition.filter(|_| succeeded),
                                 shape_body.clone(),
+                                routed_by.clone(),
+                                stream_lease,
                             )
                             .await
                         }
@@ -397,6 +413,7 @@ pub(crate) async fn attempt_loop(
                     format!("HTTP {status}; retried on the next fallback"),
                     client.clone(),
                     worker.clone(),
+                    routed_by.clone(),
                     LogPaths {
                         client: client_path,
                         upstream: attempt.path.as_str(),
@@ -416,6 +433,7 @@ pub(crate) async fn attempt_loop(
                     reason,
                     client.clone(),
                     worker.clone(),
+                    routed_by.clone(),
                     LogPaths {
                         client: client_path,
                         upstream: attempt.path.as_str(),
@@ -431,6 +449,20 @@ pub(crate) async fn attempt_loop(
         }
     }
     unreachable!("attempt loop always returns on the last attempt");
+}
+
+/// `routed_by` of a request the client pinned to one concrete model.
+const ROUTED_BY_PINNED: &str = "pinned";
+/// `routed_by` of a request that Copilot Auto picked.
+const ROUTED_BY_COPILOT_AUTO: &str = "copilot-auto";
+
+/// How a request's model was chosen, for its request row: Copilot Auto, a Smart Auto tier, or the client's own model.
+fn routed_by_label(copilot_auto: bool, smart_tier: Option<SmartAutoTier>) -> String {
+    match (copilot_auto, smart_tier) {
+        (true, _) => ROUTED_BY_COPILOT_AUTO.to_owned(),
+        (false, Some(tier)) => format!("smart-auto:{}", tier.as_str()),
+        (false, None) => ROUTED_BY_PINNED.to_owned(),
+    }
 }
 
 /// What a requested model routes as: a `hub/*` selector resolved to a concrete model, or any
@@ -1298,7 +1330,7 @@ fn default_auto_model<'c>(catalog: &'c [Value], path: &str) -> &'c str {
 /// The SSE decision is the upstream's content-type, not the request's `stream`
 /// flag: an upstream that answers a streaming request with a JSON error must be
 /// translated as a message, not fed to the SSE machinery.
-#[allow(clippy::too_many_arguments)] // eleven inputs, each a separate piece of one delivery
+#[allow(clippy::too_many_arguments)] // fourteen inputs, each a separate piece of one delivery
 async fn deliver(
     state: &AppState,
     response: reqwest::Response,
@@ -1312,6 +1344,8 @@ async fn deliver(
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
     prompt_body: Option<Bytes>,
+    routed_by: String,
+    keep_warm: Option<KeepWarmLease>,
 ) -> Response {
     let (route, plan, upstream_path) = (attempt.route, attempt.plan, attempt.path.as_str());
     let is_sse = is_event_stream(&response);
@@ -1333,6 +1367,7 @@ async fn deliver(
             commit,
             selection,
             prompt_body,
+            routed_by,
         )
         .await
     } else {
@@ -1351,6 +1386,8 @@ async fn deliver(
             commit,
             selection,
             prompt_body,
+            routed_by,
+            keep_warm,
         )
     };
     if let Some(applied) = plan.header_value() {
@@ -1405,6 +1442,7 @@ async fn review_deliver(
     worker: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
+    routed_by: String,
 ) -> Result<Response, AppError> {
     let Some(graph) = plan.review.as_ref() else {
         return Err(AppError::UpstreamUnavailable(
@@ -1520,6 +1558,7 @@ async fn review_deliver(
         error: None,
         client,
         worker,
+        routed_by: Some(routed_by),
     };
     if let Some(commit) = commit {
         commit.apply(state);
@@ -1618,6 +1657,8 @@ async fn attempt_single(
         worker_key(state, headers),
         None,
         None,
+        None,
+        ROUTED_BY_PINNED.to_owned(),
         None,
     ))
 }
@@ -1810,18 +1851,18 @@ impl<'a> AttemptSender<'a> {
 }
 
 /// Learns the fields a Copilot "Extra inputs are not permitted" 400 names and retries once
-/// without them. Any other response comes back unchanged.
+/// without them. Any other response comes back unchanged, with `None`. A retry returns the body it sent.
 async fn retry_without_rejected_fields(
     bodies: &AttemptBodies<'_>,
     sender: &AttemptSender<'_>,
     response: reqwest::Response,
-) -> Result<reqwest::Response, String> {
+) -> Result<(reqwest::Response, Option<Bytes>), String> {
     let compressed = is_compressed(response.headers());
     let large = response
         .content_length()
         .is_some_and(|length| length > MAX_REJECTION_BYTES);
     if response.status() != StatusCode::BAD_REQUEST || compressed || large {
-        return Ok(response);
+        return Ok((response, None));
     }
     let (status, version, headers) = (
         response.status(),
@@ -1836,17 +1877,131 @@ async fn retry_without_rejected_fields(
         if read.len() as u64 > MAX_REJECTION_BYTES {
             let read = futures_util::stream::iter([Ok(Bytes::from(read))]);
             let body = reqwest::Body::wrap_stream(read.chain(chunks));
-            return Ok(rebuilt_response(status, version, headers, body));
+            return Ok((rebuilt_response(status, version, headers, body), None));
         }
     }
     let body = Bytes::from(read);
     let rejected = BodyField::rejected_in(&body);
     if rejected.is_empty() {
-        return Ok(rebuilt_response(status, version, headers, body));
+        return Ok((rebuilt_response(status, version, headers, body), None));
     }
     let (state, model_id) = (sender.state, sender.model_id);
     state.learn_unsupported_body_fields(&model_id.profile, &rejected);
-    sender.send(bodies.for_model(state, model_id).body).await
+    let retried = bodies.for_model(state, model_id).body;
+    let response = sender.send(retried.clone()).await?;
+    Ok((response, Some(retried)))
+}
+
+/// The keep-warm lease for a native Copilot Claude attempt on a session, when keep-warm is on.
+fn keep_warm_lease(
+    state: &AppState,
+    attempt: &Attempt<'_>,
+    model_id: &ModelId,
+    worker: Option<&str>,
+) -> Option<KeepWarmLease> {
+    let worker = worker?;
+    let eligible = attempt.native_messages
+        && model_id.model.starts_with(CLAUDE_MODEL_PREFIX)
+        && state.config().keep_warm.enabled
+        && is_copilot_profile(state, model_id);
+    eligible.then(|| state.keep_warm().begin(worker))
+}
+
+fn keep_warm_headers(beta: Option<HeaderValue>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(beta) = beta {
+        headers.insert(HEADER_ANTHROPIC_BETA, beta);
+    }
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(HEADER_X_INITIATOR, HeaderValue::from_static(INITIATOR_AGENT));
+    with_anthropic_version(&headers)
+}
+
+/// `body` without the fields the profile's upstream is known to reject, as real attempts send it.
+fn without_unsupported_fields(state: &AppState, model_id: &ModelId, body: Bytes) -> Bytes {
+    let rejected = state.unsupported_body_fields(&model_id.profile);
+    if rejected.is_empty() {
+        return body;
+    }
+    let Ok(mut json) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    for field in rejected.iter() {
+        field.strip(&mut json);
+    }
+    serde_json::to_vec(&json).map_or(body, Bytes::from)
+}
+
+/// Sends one keep-warm ping to a stream's upstream. It is recorded as a keep-warm request, not a user request.
+pub(crate) async fn send_keep_warm_ping(state: &AppState, ping: PingPlan) {
+    let PingPlan {
+        worker,
+        stream_key,
+        model_id,
+        body,
+        beta,
+    } = ping;
+    let body = without_unsupported_fields(state, &model_id, body);
+    let headers = keep_warm_headers(beta);
+    let method = Method::POST;
+    let sender = AttemptSender {
+        state,
+        method: &method,
+        path: UpstreamPath::Verbatim(MESSAGES_ENDPOINT),
+        headers: &headers,
+        model_id: &model_id,
+        attempt_timeout: None,
+        force_identity_encoding: true,
+        session_token: None,
+    };
+    let started = Instant::now();
+    let (status, raw, upstream_end) = match sender.send(body).await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let (raw, upstream_end) =
+                read_upstream_capped(response, MAX_TRANSFORM_BUFFER_BYTES).await;
+            (status, raw, upstream_end)
+        }
+        Err(reason) => (
+            StatusCode::BAD_GATEWAY.as_u16(),
+            reason.into_bytes(),
+            UpstreamEnd::Error,
+        ),
+    };
+    let ok = SUCCESS_STATUS_RANGE.contains(&status) && upstream_end == UpstreamEnd::Complete;
+    let usage = scrape_usage(&raw);
+    let model_key = model_id.qualified();
+    let cost_usd = state.pricing_book().estimate(
+        &model_key,
+        usage.tokens_in,
+        usage.tokens_out,
+        usage.cache_read_tokens,
+        usage.cache_write_tokens,
+    );
+    let outcome = RequestOutcome {
+        profile: model_id.profile.clone(),
+        model_key,
+        status,
+        ts_ms: now_ms(),
+        latency_ms: crate::utils::time::elapsed_ms(started),
+        ttft_ms: None,
+        tokens_in: usage.tokens_in,
+        tokens_out: usage.tokens_out,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        error: (!ok).then(|| error_reason(status, &raw)),
+        client: Some(KEEP_WARM_CLIENT.to_string()),
+        worker: Some(worker.clone()),
+        routed_by: Some(ROUTED_BY_PINNED.to_owned()),
+    };
+    state.stats().record(&outcome);
+    record_request(state, &outcome, None).await;
+    state
+        .keep_warm()
+        .ping_finished(&worker, &stream_key, ok, cost_usd);
 }
 
 /// A response whose body the hub already started reading, handed back whole.
@@ -2305,7 +2460,7 @@ fn save_text(
 
 /// Streams the upstream response through, scraping usage from a rolling tail and recording stats at stream end.
 /// `transform` rewrites frames when `Some`; `None` passes bytes through untouched, and `finish()` output ends the body.
-// Eleven inputs, each a separate per-response value, so bundling them would only rename them.
+// Each input is a separate per-response value, so bundling them would only rename them.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the stream-end task records one answer in order; a split would thread the same state through helpers
 fn build_response(
     state: &AppState,
@@ -2321,6 +2476,8 @@ fn build_response(
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
     prompt_body: Option<Bytes>,
+    routed_by: String,
+    keep_warm: Option<KeepWarmLease>,
 ) -> Response {
     let status = upstream.status();
     let limit_model =
@@ -2367,6 +2524,7 @@ fn build_response(
         error: None,
         client,
         worker,
+        routed_by: Some(routed_by),
     };
 
     let (summary_sender, summary_receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
@@ -2429,6 +2587,11 @@ fn build_response(
             .filter(|_| summary.upstream_end == UpstreamEnd::Complete && outcome.error.is_none())
         {
             commit.apply(&state_for_stats);
+        }
+        if let Some(lease) = keep_warm
+            .filter(|_| summary.upstream_end == UpstreamEnd::Complete && outcome.error.is_none())
+        {
+            lease.complete(outcome.cache_read_tokens + outcome.cache_write_tokens);
         }
         if let Some(attempt) = capture_answer {
             save_answer(&state_for_stats, &attempt, &answer);
@@ -2700,7 +2863,7 @@ fn is_event_stream(response: &reqwest::Response) -> bool {
 /// frame-at-a-time translator instead — and it is bounded by
 /// `MAX_TRANSFORM_BUFFER_BYTES`. Every other route keeps the byte-for-byte
 /// streaming path in `build_response`.
-// Ten inputs, each a separate per-response value the translator needs.
+// Each input is a separate per-response value the translator needs.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the buffered answer is read, learned from and recorded in order; a split would thread the same state through helpers
 async fn build_anthropic_response(
     state: &AppState,
@@ -2716,6 +2879,7 @@ async fn build_anthropic_response(
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
     prompt_body: Option<Bytes>,
+    routed_by: String,
 ) -> Response {
     let upstream_status = upstream.status();
     let limit_model = prompt_limit_model(
@@ -2809,6 +2973,7 @@ async fn build_anthropic_response(
         }),
         client,
         worker,
+        routed_by: Some(routed_by),
     };
     log_failure(
         &outcome,
@@ -2961,6 +3126,7 @@ fn record_failure(
     reason: String,
     client: Option<String>,
     worker: Option<String>,
+    routed_by: String,
     paths: LogPaths<'_>,
 ) {
     let latency_ms = crate::utils::time::elapsed_ms(started);
@@ -2978,6 +3144,7 @@ fn record_failure(
         error: Some(reason),
         client,
         worker,
+        routed_by: Some(routed_by),
     };
     let upstream_end = if status == 0 {
         UpstreamEnd::Error
@@ -3071,6 +3238,8 @@ async fn passthrough_oversized(
         worker_key(state, headers),
         None,
         None,
+        None,
+        ROUTED_BY_PINNED.to_owned(),
         None,
     ))
 }
@@ -3459,6 +3628,20 @@ mod tests {
     }
 
     #[test]
+    fn routed_by_label_names_who_chose_the_model() {
+        assert_eq!(routed_by_label(true, None), "copilot-auto");
+        assert_eq!(
+            routed_by_label(false, Some(SmartAutoTier::Balance)),
+            "smart-auto:balance"
+        );
+        assert_eq!(
+            routed_by_label(false, Some(SmartAutoTier::Intelligence)),
+            "smart-auto:intelligence"
+        );
+        assert_eq!(routed_by_label(false, None), "pinned");
+    }
+
+    #[test]
     fn profile_filter_restricts_the_pool_only_when_it_names_a_concrete_profile() {
         let filter = |value: &str| {
             let mut headers = HeaderMap::new();
@@ -3795,6 +3978,273 @@ mod tests {
             assert!(requests_to(&copilot, UPSTREAM_CHAT_PATH).await.is_empty());
         }
 
+        const CLAUDE_SESSION: &str = "keep-warm-session";
+        const CACHED_NATIVE_REPLY: &str = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"native"}],"usage":{"input_tokens":3,"output_tokens":1,"cache_read_input_tokens":4096}}"#;
+        const CACHED_CHAT_REPLY: &str = r#"{"id":"chatcmpl-1","choices":[{"index":0,"message":{"role":"assistant","content":"translated"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":4096}}}"#;
+
+        async fn mount_cached_native_reply(copilot: &Copilot) {
+            Mock::given(method("POST"))
+                .and(path(MESSAGES_ENDPOINT))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(CACHED_NATIVE_REPLY.as_bytes(), "application/json"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+        }
+
+        fn keep_warm_cap() -> Duration {
+            Duration::from_mins(30)
+        }
+
+        /// Polls for a due keep-warm ping, as the loop does once the stream has been idle long enough.
+        async fn due_pings(copilot: &Copilot) -> Vec<crate::services::keep_warm::PingPlan> {
+            for _ in 0..200 {
+                let now = std::time::Instant::now() + crate::consts::KEEP_WARM_PING_INTERVAL;
+                let plans = copilot.state.keep_warm().take_due(now, keep_warm_cap());
+                if !plans.is_empty() {
+                    return plans;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Vec::new()
+        }
+
+        #[tokio::test]
+        async fn native_claude_stream_is_kept_for_the_keep_warm_loop() {
+            let copilot = copilot().await;
+            mount_cached_native_reply(&copilot).await;
+            let body = anthropic_body(NATIVE_ID, false);
+
+            let (status, _) = send(
+                &copilot,
+                &with_caller_version(with_session(CLAUDE_SESSION)),
+                &body,
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            let plans = due_pings(&copilot).await;
+            assert_eq!(plans.len(), 1);
+            assert_eq!(plans[0].model_id.model, NATIVE_ID);
+        }
+
+        #[tokio::test]
+        async fn requests_that_are_not_native_claude_keep_no_stream() {
+            let copilot = copilot().await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(CACHED_CHAT_REPLY.as_bytes(), "application/json"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+            let translated = anthropic_body(TRANSLATED_ID, false);
+            let (status, _) = send(
+                &copilot,
+                &with_caller_version(with_session(CLAUDE_SESSION)),
+                &translated,
+                RouteKind::Anthropic,
+            )
+            .await;
+            assert_eq!(status, 200);
+            let plain = json!({
+                "model": format!("{PROFILE}/{PLAIN_ID}"),
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            let (status, _) = send(
+                &copilot,
+                &with_session(CLAUDE_SESSION),
+                &plain,
+                RouteKind::OpenAi,
+            )
+            .await;
+            assert_eq!(status, 200);
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let now = std::time::Instant::now() + crate::consts::KEEP_WARM_PING_INTERVAL;
+            assert!(
+                copilot
+                    .state
+                    .keep_warm()
+                    .take_due(now, keep_warm_cap())
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn rejected_field_retry_keeps_the_body_that_was_accepted() {
+            let copilot = copilot().await;
+            let rejected =
+                json!({"error": {"message": "context_management: Extra inputs are not permitted"}});
+            Mock::given(method("POST"))
+                .and(path(MESSAGES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(400).set_body_json(rejected))
+                .up_to_n_times(1)
+                .mount(&copilot.upstream)
+                .await;
+            mount_cached_native_reply(&copilot).await;
+            let mut body = anthropic_body(NATIVE_ID, false);
+            body["context_management"] = json!({"edits": []});
+
+            let (status, _) = send(
+                &copilot,
+                &with_caller_version(with_session(CLAUDE_SESSION)),
+                &body,
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            let sent = requests_to(&copilot, MESSAGES_ENDPOINT).await;
+            assert_eq!(sent.len(), 2);
+            assert!(sent_json(&sent[0]).get("context_management").is_some());
+            let plans = due_pings(&copilot).await;
+            assert_eq!(plans.len(), 1);
+            let kept: Value = serde_json::from_slice(&plans[0].body).unwrap();
+            assert!(kept.get("context_management").is_none());
+            assert_eq!(kept["model"], sent_json(&sent[1])["model"]);
+        }
+
+        #[tokio::test]
+        async fn keep_warm_ping_replays_the_stored_body_and_records_a_keep_warm_row() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("hub.db");
+            let copilot = copilot_with_store(Some(
+                Store::open("sqlite", Some(db.to_str().unwrap())).unwrap(),
+            ))
+            .await;
+            mount_cached_native_reply(&copilot).await;
+            let body = anthropic_body(NATIVE_ID, false);
+            let (status, _) = send(
+                &copilot,
+                &with_caller_version(with_session(CLAUDE_SESSION)),
+                &body,
+                RouteKind::Anthropic,
+            )
+            .await;
+            assert_eq!(status, 200);
+            let plan = due_pings(&copilot).await.into_iter().next().unwrap();
+
+            send_keep_warm_ping(&copilot.state, plan).await;
+
+            let sent = requests_to(&copilot, MESSAGES_ENDPOINT).await;
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[1].headers.get("x-initiator").unwrap(), "agent");
+            let mut expected = body.clone();
+            expected["model"] = json!(NATIVE_UPSTREAM_ID);
+            expected["stream"] = json!(false);
+            expected["max_tokens"] = json!(1);
+            assert_eq!(sent_json(&sent[1]), expected);
+            assert_eq!(copilot.state.keep_warm().ping_totals().0, 1);
+            let keep_warm_rows = count_until(
+                &db,
+                "SELECT COUNT(*) FROM requests WHERE client = 'llm-hub/keep-warm'",
+                1,
+            )
+            .await;
+            assert_eq!(keep_warm_rows, 1);
+        }
+
+        #[tokio::test]
+        async fn keep_warm_ping_drops_fields_the_upstream_rejects() {
+            let copilot = copilot().await;
+            mount_cached_native_reply(&copilot).await;
+            let mut body = anthropic_body(NATIVE_ID, false);
+            body["context_management"] = json!({"edits": []});
+            let (status, _) = send(
+                &copilot,
+                &with_caller_version(with_session(CLAUDE_SESSION)),
+                &body,
+                RouteKind::Anthropic,
+            )
+            .await;
+            assert_eq!(status, 200);
+            copilot.state.learn_unsupported_body_fields(
+                PROFILE,
+                &[BodyField::TopLevel("context_management".to_string())],
+            );
+            let plan = due_pings(&copilot).await.into_iter().next().unwrap();
+
+            send_keep_warm_ping(&copilot.state, plan).await;
+
+            let sent = requests_to(&copilot, MESSAGES_ENDPOINT).await;
+            assert_eq!(sent.len(), 2);
+            assert!(sent_json(&sent[1]).get("context_management").is_none());
+        }
+
+        #[tokio::test]
+        async fn keep_warm_ping_sends_the_client_anthropic_beta() {
+            let copilot = copilot().await;
+            mount_cached_native_reply(&copilot).await;
+            let mut headers = with_caller_version(with_session(CLAUDE_SESSION));
+            headers.insert(
+                HEADER_ANTHROPIC_BETA,
+                HeaderValue::from_static("demo-beta-2025-01-01"),
+            );
+            let (status, _) = send(
+                &copilot,
+                &headers,
+                &anthropic_body(NATIVE_ID, false),
+                RouteKind::Anthropic,
+            )
+            .await;
+            assert_eq!(status, 200);
+            let plan = due_pings(&copilot).await.into_iter().next().unwrap();
+
+            send_keep_warm_ping(&copilot.state, plan).await;
+
+            let sent = requests_to(&copilot, MESSAGES_ENDPOINT).await;
+            assert_eq!(sent.len(), 2);
+            assert_eq!(
+                sent[1].headers.get(HEADER_ANTHROPIC_BETA).unwrap(),
+                "demo-beta-2025-01-01"
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_keep_warm_ping_drops_its_stream() {
+            let copilot = copilot().await;
+            Mock::given(method("POST"))
+                .and(path(MESSAGES_ENDPOINT))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(CACHED_NATIVE_REPLY.as_bytes(), "application/json"),
+                )
+                .up_to_n_times(1)
+                .mount(&copilot.upstream)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(MESSAGES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(500).set_body_raw("overloaded", "text/plain"))
+                .mount(&copilot.upstream)
+                .await;
+            let body = anthropic_body(NATIVE_ID, false);
+            let (status, _) = send(
+                &copilot,
+                &with_caller_version(with_session(CLAUDE_SESSION)),
+                &body,
+                RouteKind::Anthropic,
+            )
+            .await;
+            assert_eq!(status, 200);
+            let plan = due_pings(&copilot).await.into_iter().next().unwrap();
+
+            send_keep_warm_ping(&copilot.state, plan).await;
+
+            let now = std::time::Instant::now() + crate::consts::KEEP_WARM_PING_INTERVAL * 2;
+            assert!(
+                copilot
+                    .state
+                    .keep_warm()
+                    .take_due(now, keep_warm_cap())
+                    .is_empty()
+            );
+            assert_eq!(copilot.state.keep_warm().ping_totals().0, 1);
+        }
+
         const SSE_REPLY: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
         /// Reads one count from the sqlite file, retrying while the stream-end task writes.
@@ -3890,6 +4340,38 @@ mod tests {
             assert_eq!(
                 count_until(&db, "SELECT COUNT(*) FROM request_shapes", 0).await,
                 0
+            );
+        }
+
+        #[tokio::test]
+        async fn pinned_request_records_routed_by_pinned() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("hub.db");
+            let copilot = copilot_with_store(Some(
+                Store::open("sqlite", Some(db.to_str().unwrap())).unwrap(),
+            ))
+            .await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+            let body = json!({
+                "model": format!("{PROFILE}/{PLAIN_ID}"),
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+
+            let (status, _) = send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
+
+            assert_eq!(status, 200);
+            assert_eq!(
+                count_until(
+                    &db,
+                    "SELECT COUNT(*) FROM requests WHERE routed_by = 'pinned'",
+                    1
+                )
+                .await,
+                1
             );
         }
 
@@ -4829,6 +5311,36 @@ mod tests {
             assert_eq!(decision.swap_reason.as_deref(), Some(reason.as_str()));
             assert_eq!(decision.selection_reason.as_deref(), Some("test pick"));
             assert_eq!(decision.turn, AutoTurn::Routed);
+        }
+
+        #[tokio::test]
+        async fn copilot_auto_request_records_routed_by_copilot_auto() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("hub.db");
+            let copilot = copilot_with_store(Some(
+                Store::open("sqlite", Some(db.to_str().unwrap())).unwrap(),
+            ))
+            .await;
+            mount_auto(&copilot, CHAT_ONLY_ID).await;
+            mount_native_reply(&copilot).await;
+
+            let _ = send_for_headers(
+                &copilot,
+                &with_session("routed-by-session"),
+                &anthropic_body(COPILOT_AUTO_MODEL, false),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(
+                count_until(
+                    &db,
+                    "SELECT COUNT(*) FROM requests WHERE routed_by = 'copilot-auto'",
+                    1
+                )
+                .await,
+                1
+            );
         }
 
         #[tokio::test]

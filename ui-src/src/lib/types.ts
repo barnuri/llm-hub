@@ -41,6 +41,26 @@ export interface ProfileRow {
   readonly copilot: boolean;
 }
 
+/** `LLM_HUB_KEEP_WARM` and `LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES`, as the hub reads them. */
+export interface KeepWarmSettings {
+  readonly enabled: boolean;
+  readonly idle_cap_minutes: number;
+  /** The service environment sets one of the variables, so a saved value does not take effect. */
+  readonly overridden_by_env: boolean;
+}
+
+/** Keep-warm pings and their estimated savings. Pings are counted in cost, not in requests. */
+export interface KeepWarmFigures {
+  readonly keepwarm_pings: number;
+  readonly keepwarm_cost_usd: number;
+  /** User requests that came back after an idle gap, read the cache, and had a ping in the gap. */
+  readonly idle_returns_cached: number;
+  /** Estimated USD saved on those returns; an estimate, not a bill line. */
+  readonly est_write_saved_usd: number;
+  /** False when the figures are in-memory counters that reset at restart. */
+  readonly persisted: boolean;
+}
+
 export interface HubMeta {
   readonly profiles: readonly ProfileRow[];
   /** Default fallback chain of model ids, tried in order on failure. */
@@ -48,6 +68,7 @@ export interface HubMeta {
   readonly readonly: boolean;
   /** `LLM_HUB_COPILOT_PRICES_REFRESH_SECS`; 0 means the fetch is off. */
   readonly copilot_prices_refresh_secs: number;
+  readonly keep_warm: KeepWarmSettings;
   readonly persistent: boolean;
   readonly auth_enabled: boolean;
   readonly version: string;
@@ -70,7 +91,7 @@ export interface StatsEntry {
   readonly cost_usd: number;
 }
 
-export interface StatsOverview {
+export interface StatsOverview extends KeepWarmFigures {
   readonly requests: number;
   readonly errors: number;
   readonly tokens_in: number;
@@ -274,6 +295,20 @@ export interface CopilotQuota {
   readonly resetDate?: string;
   readonly usedUsd?: number;
   readonly limitUsd?: number;
+}
+
+export interface QuotaDailyDelta {
+  /** UTC day as `YYYY-MM-DD`. */
+  readonly day: string;
+  readonly profile: string;
+  readonly quota: string;
+  readonly used_delta: number;
+  readonly used_usd_delta: number | null;
+}
+
+export interface QuotaHistory {
+  readonly range: string;
+  readonly daily: readonly QuotaDailyDelta[];
 }
 
 export interface CopilotUsageReport {

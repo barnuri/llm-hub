@@ -135,6 +135,37 @@ and Grok models on `/responses`. The hub ships limits measured with oversized pr
 
 A seeded limit never replaces a learned one. The hub never sends probe requests.
 
+## Cache keep-warm
+
+Copilot's prompt cache for Claude models lasts about five minutes after its last use. When a Claude
+Code stream pauses longer than that, the next turn writes the whole prompt to the cache again, at the
+write price. At the listed prices the write price is 12.5 times the read price on Haiku and on the
+older Sonnet and Opus models, and 25 times on Sonnet 5.5 and Opus 5.5.
+
+Keep-warm avoids that rewrite for native Copilot Claude streams:
+
+- The hub keeps the last request body of each stream in memory. It keeps at most 16 streams and
+  64 MB of bodies, and drops the least recently used first.
+- While a stream is idle, the hub replays that body every four minutes with `stream` set to false and
+  `max_tokens` set to 1. The rest of the body is unchanged.
+- The ping sends `x-initiator: agent`, so Copilot records it as agent-initiated, not as a user turn. Whether that avoids premium-request charges is not verified.
+- Pings stop when the stream resumes, when a request for it is in flight, or when the idle cap is reached.
+  The default cap is 30 minutes after the last user request.
+- All pings share one budget of 10 per minute. A ping that gets a non-2xx reply drops its stream until
+  the next user request.
+- Pings are recorded as `llm-hub/keep-warm` requests. They add to cost, but not to request counts.
+
+The cost break-even depends on the model. An idle stream costs less to keep warm than to rewrite
+only up to the break-even idle time. On Haiku that is about 46 minutes at the listed prices, so the
+30-minute default pays on every model in the price table.
+
+Turn it off, or change the cap, with `LLM_HUB_KEEP_WARM` and `LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES`.
+See [Keep-warm](configuration.md#keep-warm).
+
+Warning: each ping is a request to Copilot from a client other than its own. Heavy automated use of
+Copilot outside its own clients can trigger GitHub's abuse detection and suspend your Copilot access.
+Keep-warm adds pings to every idle Claude stream, so leave it off if that risk is not acceptable.
+
 ## Rejected-field stripping
 
 Copilot's `/v1/messages` rejects some Anthropic request fields with
@@ -159,3 +190,7 @@ The hub learns two shapes of path: a top-level key, and a key on every message
 - The hub caches it for 1 minute.
 - It answers 404 when no Copilot profile matches, and 503 when Copilot does not answer. The hub
   log has the reason.
+
+`GET /api/copilot/usage/history?range=7d|30d` returns the readings of every Copilot profile and quota,
+and the quota burned per UTC day. With the sqlite store, the hub reads each enabled Copilot profile every
+15 minutes, starting at boot. The JSON store keeps no readings and answers 400.

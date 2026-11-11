@@ -30,6 +30,7 @@ Routes marked "key" need a key only when [hub auth](#hub-authentication) is on.
 | POST | `/api/fallbacks` | Set the default fallback chain. See [Fallbacks](fallbacks-and-transforms.md#fallbacks). | key |
 | GET | `/api/claude-code/settings` | `claude --settings` JSON with a picker entry for every hub model. | key |
 | GET | `/api/copilot/usage` | Copilot quota. See [Usage API](github-copilot.md#usage-api). | key |
+| GET | `/api/copilot/usage/history` | Stored quota readings and the daily burn. Query: `range` (`7d` default, `30d`). Needs the sqlite store. See [Usage API](github-copilot.md#usage-api). | key |
 | GET | `/api/copilot/auto/decisions` | Recent Copilot Auto decisions. See [Seeing the pick](copilot-auto.md#seeing-the-pick). | key |
 | GET | `/api/smart-auto/current` | A worker's current Smart Auto selection. Query: `worker` or `session`. See [Smart Auto](smart-auto.md#current-selection-and-history). | key |
 | GET | `/api/smart-auto/history` | Smart Auto selection events after `since_seq`. Query: `workflow`, `worker`, `since_seq`, `limit`. See [Smart Auto](smart-auto.md#current-selection-and-history). | key |

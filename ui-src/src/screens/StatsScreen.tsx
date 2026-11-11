@@ -90,6 +90,11 @@ function emptyOverview(): StatsOverview {
     tokens_per_sec_p50: 0,
     tokens_per_sec_avg: 0,
     cost_usd: 0,
+    keepwarm_pings: 0,
+    keepwarm_cost_usd: 0,
+    idle_returns_cached: 0,
+    est_write_saved_usd: 0,
+    persisted: false,
   };
 }
 

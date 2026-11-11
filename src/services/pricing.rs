@@ -680,6 +680,7 @@ mod tests {
             error: None,
             client: None,
             worker: None,
+            routed_by: None,
         });
         let mut snap = registry.snapshot("live", false);
         apply_costs(&mut snap, &book);

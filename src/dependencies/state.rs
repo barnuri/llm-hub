@@ -17,6 +17,7 @@ use crate::services::copilot_sessions::CopilotSessionCache;
 use crate::services::copilot_usage::CopilotUsageCache;
 use crate::services::credential_store::CredentialStore;
 use crate::services::gh_cli::GhCli;
+use crate::services::keep_warm::KeepWarm;
 use crate::services::keyring_credential_store::KeyringCredentialStore;
 use crate::services::managed_process::ProcessManager;
 use crate::services::model_limits::{ModelLimit, ModelLimits};
@@ -76,6 +77,8 @@ struct Inner {
     selection_log: SelectionLog,
     /// The user-editable Smart Auto include and exclude rules.
     smart_auto_rules: SmartAutoRulesStore,
+    /// Idle Copilot Claude streams kept warm with pings.
+    keep_warm: Arc<KeepWarm>,
 }
 
 #[derive(Clone)]
@@ -145,6 +148,7 @@ impl AppState {
             smart_auto_decisions: SmartAutoDecisionLog::default(),
             selection_log,
             smart_auto_rules,
+            keep_warm: Arc::new(KeepWarm::default()),
         }));
         state.refresh_api_key_hashes();
         Ok(state)
@@ -325,6 +329,10 @@ impl AppState {
     /// The Smart Auto include and exclude rules, read at startup and on each save.
     pub fn smart_auto_rules(&self) -> &SmartAutoRulesStore {
         &self.0.smart_auto_rules
+    }
+
+    pub fn keep_warm(&self) -> &Arc<KeepWarm> {
+        &self.0.keep_warm
     }
 
     /// The selection history that Smart Auto and Copilot Auto dispatches are recorded in.

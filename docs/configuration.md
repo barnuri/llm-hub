@@ -28,6 +28,19 @@ Boolean flags accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off`.
 | `LLM_HUB_COPILOT_GUARD_MODELS` | `*` | Models (`<model>`, `<profile>/<model>` or `*`) whose Copilot CLI requests get the tool-loop guard. The guard adds a system-prompt note. It also withholds a tool that the history shows called the same way 3 times in a row. Empty turns it off. |
 | `LLM_HUB_COPILOT_STRIP_SAMPLING_MODELS` | 10 local model ids (`DEFAULT_COPILOT_STRIP_SAMPLING_MODELS` in `src/services/transforms.rs`) | Models whose Copilot CLI requests lose Copilot's fixed `temperature`, `top_p` and penalties, so the model's own sampling applies. Empty turns it off. |
 
+## Keep-warm
+
+Keep-warm sends a one-token ping on an idle Copilot Claude stream so its prompt cache stays warm.
+See [Cache keep-warm](github-copilot.md#cache-keep-warm) for what it sends and what it costs.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_HUB_KEEP_WARM` | `true` | Turns the pings on or off. |
+| `LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES` | `30` | Minutes after a stream's last user request at which the pings stop. The range is `5` to `10080` (one week). A value outside it fails the config load. |
+
+The Models page writes both variables to `.env`. A value set in the process environment wins over
+`.env`, so the page shows its controls disabled when the service environment sets either variable.
+
 ## Persistence
 
 | Variable | Default | Purpose |

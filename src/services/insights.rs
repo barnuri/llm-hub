@@ -21,7 +21,7 @@ use crate::schemas::insights::pick_by::PickBy;
 use crate::schemas::insights::pick_candidate::PickCandidate;
 use crate::schemas::insights::use_case_pick::UseCasePick;
 use crate::schemas::model_context::{max_input_tokens_from_item, strip_1m_suffix};
-use crate::services::harness::classify;
+use crate::services::harness::{classify, is_keep_warm};
 use crate::services::pricing::split_cached_input;
 use crate::services::stats::{RequestOutcome, tokens_per_sec};
 use crate::utils::time::utc_iso8601;
@@ -65,8 +65,12 @@ pub fn build_report(
     min_requests: u64,
     generated_ms: u64,
 ) -> InsightsReport {
+    let calls: Vec<&RequestOutcome> = outcomes
+        .iter()
+        .filter(|outcome| !is_keep_warm(outcome.client.as_deref()))
+        .collect();
     let mut by_model: HashMap<&str, Vec<&RequestOutcome>> = HashMap::new();
-    for outcome in outcomes {
+    for &outcome in &calls {
         by_model
             .entry(&outcome.model_key)
             .or_default()
@@ -90,14 +94,13 @@ pub fn build_report(
     }
     score_ranked(&mut models);
     models.sort_by(report_order);
-    let all_calls: Vec<&RequestOutcome> = outcomes.iter().collect();
     InsightsReport {
         range: range.to_string(),
         min_requests,
         generated_ms,
         leaders: leaders(&models),
         best_for: best_for(&models),
-        harnesses: harness_insights(&all_calls),
+        harnesses: harness_insights(&calls),
         models,
     }
 }
@@ -807,6 +810,7 @@ mod tests {
             error: (status >= ERROR_STATUS_MIN).then(|| format!("boom {status}")),
             client: None,
             worker: None,
+            routed_by: None,
         }
     }
 
@@ -1105,6 +1109,27 @@ mod tests {
             (0, ModelHealth::InsufficientData)
         );
         assert_eq!(idle.context_window, Some(32_768));
+    }
+
+    #[test]
+    fn keep_warm_pings_are_not_user_requests_in_the_report() {
+        let user = call("copilot/claude-haiku", 200, 50, 500);
+        let mut ping = call("copilot/claude-haiku", 200, 50, 500);
+        ping.client = Some(crate::consts::KEEP_WARM_CLIENT.into());
+        let report = build_report(
+            &[user, ping],
+            &std::collections::HashMap::new(),
+            "7d",
+            1,
+            NOW_MS,
+        );
+        let model = report
+            .models
+            .iter()
+            .find(|model| model.model == "copilot/claude-haiku")
+            .expect("the user call's model is reported");
+        assert_eq!(model.requests, 1);
+        assert_eq!(report.harnesses.iter().map(|h| h.requests).sum::<u64>(), 1);
     }
 
     #[test]

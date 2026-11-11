@@ -229,6 +229,7 @@ mod tests {
             error: None,
             client: None,
             worker: None,
+            routed_by: None,
         };
         state.stats().record(&outcome);
         let Json(settings) = super::settings(

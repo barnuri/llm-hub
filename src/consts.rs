@@ -169,3 +169,32 @@ pub const COPILOT_PRICES_TIMEOUT: Duration = Duration::from_secs(20);
 /// Added to the device-flow poll `interval` so polls never arrive early.
 pub const COPILOT_DEVICE_POLL_MARGIN: Duration = Duration::from_secs(1);
 pub const GH_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default for `LLM_HUB_KEEP_WARM`: keep an idle Copilot Claude prompt cache warm.
+pub const DEFAULT_KEEP_WARM_ENABLED: bool = true;
+/// Default for `LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES`: stop pinging a stream this long after its last user request.
+pub const DEFAULT_KEEP_WARM_IDLE_CAP_MINUTES: u64 = 30;
+/// The shortest idle cap an operator can set.
+pub const KEEP_WARM_MIN_IDLE_CAP_MINUTES: u64 = 5;
+/// The longest idle cap an operator can set: one week.
+pub const KEEP_WARM_MAX_IDLE_CAP_MINUTES: u64 = 7 * 24 * 60;
+/// A stream is pinged once it has been quiet this long. The Copilot prompt cache lasts about five minutes.
+pub const KEEP_WARM_PING_INTERVAL: Duration = Duration::from_mins(4);
+/// The Copilot prompt cache lifetime after its last use, in milliseconds.
+pub const PROMPT_CACHE_TTL_MS: u64 = 300_000;
+/// How often the keep-warm loop looks for due streams.
+pub const KEEP_WARM_TICK: Duration = Duration::from_secs(15);
+/// At most this many keep-warm pings start in any one minute, across all streams.
+pub const KEEP_WARM_PINGS_PER_MINUTE: u32 = 10;
+/// Streams kept at once. The least recently used stream is dropped first.
+pub const KEEP_WARM_MAX_STREAMS: usize = 16;
+/// A stream whose request body is larger than this is not kept.
+pub const KEEP_WARM_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Request bodies kept across all streams.
+pub const KEEP_WARM_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+/// A response must have cached at least this many prompt tokens for its stream to be kept.
+pub const KEEP_WARM_MIN_CACHED_TOKENS: u64 = 2_048;
+/// The `client` signature that keep-warm pings record under.
+pub const KEEP_WARM_CLIENT: &str = "llm-hub/keep-warm";
+/// The harness a keep-warm ping classifies as. Pings are not user requests.
+pub const KEEP_WARM_HARNESS: &str = "llm-hub-keep-warm";

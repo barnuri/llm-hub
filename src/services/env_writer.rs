@@ -81,6 +81,22 @@ pub fn set_default_fallbacks(path: &Path, chain: &[String]) -> Result<(), String
     write_atomic(path, &lines)
 }
 
+/// Persists `LLM_HUB_KEEP_WARM` and `LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES`.
+pub fn set_keep_warm(path: &Path, enabled: bool, idle_cap_minutes: u64) -> Result<(), String> {
+    let mut lines = read_lines(path)?;
+    set_var(
+        &mut lines,
+        "KEEP_WARM",
+        if enabled { "true" } else { "false" },
+    );
+    set_var(
+        &mut lines,
+        "KEEP_WARM_IDLE_CAP_MINUTES",
+        &idle_cap_minutes.to_string(),
+    );
+    write_atomic(path, &lines)
+}
+
 /// Persists `LLM_HUB_COPILOT_PRICES_REFRESH_SECS`. `0` turns the price fetch off.
 pub fn set_copilot_prices_refresh(path: &Path, secs: u64) -> Result<(), String> {
     let mut lines = read_lines(path)?;
@@ -172,6 +188,22 @@ mod tests {
             managed: None,
             copilot: None,
         }
+    }
+
+    #[test]
+    fn set_keep_warm_writes_both_keys_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, "# keep\nLLM_HUB_PROFILES=copilot\n").unwrap();
+
+        set_keep_warm(&path, true, 30).unwrap();
+        set_keep_warm(&path, false, 45).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content,
+            "# keep\nLLM_HUB_PROFILES=copilot\nLLM_HUB_KEEP_WARM=false\nLLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES=45\n"
+        );
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 use axum::http::HeaderMap;
 
+use crate::consts::{KEEP_WARM_CLIENT, KEEP_WARM_HARNESS};
+
 const MAX_SIGNATURE_CHARS: usize = 160;
 /// Copilot CLI speaks through the stock `OpenAI/JS` SDK; its `x-initiator`
 /// header is what separates it from any other program using that SDK.
@@ -34,6 +36,12 @@ pub fn is_copilot_cli(headers: &HeaderMap) -> bool {
     classify(client_signature(headers).as_deref()) == COPILOT_HARNESS
 }
 
+/// True for a keep-warm ping. Pings are not user requests.
+#[must_use]
+pub fn is_keep_warm(signature: Option<&str>) -> bool {
+    signature == Some(KEEP_WARM_CLIENT)
+}
+
 /// Harness name for a stored client signature.
 #[must_use]
 pub fn classify(signature: Option<&str>) -> String {
@@ -41,7 +49,9 @@ pub fn classify(signature: Option<&str>) -> String {
         return UNKNOWN_HARNESS.to_string();
     };
     let lower = signature.to_ascii_lowercase();
-    let known = if lower.starts_with("claude-cli/") {
+    let known = if lower == KEEP_WARM_CLIENT {
+        Some(KEEP_WARM_HARNESS)
+    } else if lower.starts_with("claude-cli/") {
         Some(if lower.contains("agent-sdk") {
             "claude-agent-sdk"
         } else if lower.contains("sdk-cli") {
@@ -93,6 +103,14 @@ mod tests {
             map.insert(*name, HeaderValue::from_static(value));
         }
         map
+    }
+
+    #[test]
+    fn keep_warm_pings_classify_as_their_own_harness() {
+        assert!(is_keep_warm(Some("llm-hub/keep-warm")));
+        assert!(!is_keep_warm(Some("claude-cli/2.0.0")));
+        assert!(!is_keep_warm(None));
+        assert_eq!(classify(Some("llm-hub/keep-warm")), "llm-hub-keep-warm");
     }
 
     #[test]
