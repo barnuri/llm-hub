@@ -60,13 +60,19 @@ pub fn chat_to_responses(body: &Value) -> Result<(Value, NameMap), String> {
         .get("max_completion_tokens")
         .or_else(|| body.get("max_tokens"))
     {
-        out.insert("max_output_tokens".into(), clamp_max_output_tokens(max_tokens));
+        out.insert(
+            "max_output_tokens".into(),
+            clamp_max_output_tokens(max_tokens),
+        );
     }
     if let Some(stream) = body.get("stream") {
         out.insert("stream".into(), stream.clone());
     }
     if let Some(effort) = body.get("reasoning_effort") {
-        out.insert("reasoning".into(), json!({ "effort": reasoning_effort(effort)? }));
+        out.insert(
+            "reasoning".into(),
+            json!({ "effort": reasoning_effort(effort)? }),
+        );
     }
     out.insert("store".into(), Value::Bool(false));
     let names = truncate_in_body(&mut out);
@@ -74,7 +80,11 @@ pub fn chat_to_responses(body: &Value) -> Result<(Value, NameMap), String> {
 }
 
 fn refuse_unsupported(body: &Value) -> Result<(), String> {
-    if body.get("n").and_then(Value::as_u64).is_some_and(|n| n != 1) {
+    if body
+        .get("n")
+        .and_then(Value::as_u64)
+        .is_some_and(|n| n != 1)
+    {
         return Err("n other than 1 is not supported on a Responses-only model".into());
     }
     if body.get("logprobs").and_then(Value::as_bool) == Some(true) {
@@ -82,14 +92,19 @@ fn refuse_unsupported(body: &Value) -> Result<(), String> {
     }
     for field in UNSUPPORTED_FIELDS {
         if body.get(*field).is_some_and(|value| !value.is_null()) {
-            return Err(format!("{field} is not supported on a Responses-only model"));
+            return Err(format!(
+                "{field} is not supported on a Responses-only model"
+            ));
         }
     }
     Ok(())
 }
 
 fn push_message(message: &Value, input: &mut Vec<Value>) -> Result<(), String> {
-    let role = message.get("role").and_then(Value::as_str).unwrap_or_default();
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let content = message.get("content").unwrap_or(&Value::Null);
     match role {
         "system" | "developer" => {
@@ -106,7 +121,9 @@ fn push_message(message: &Value, input: &mut Vec<Value>) -> Result<(), String> {
             }));
             Ok(())
         }
-        other => Err(format!("message role {other:?} is not supported on a Responses-only model")),
+        other => Err(format!(
+            "message role {other:?} is not supported on a Responses-only model"
+        )),
     }
 }
 
@@ -227,7 +244,10 @@ fn function_tools(body: &Value) -> Result<Vec<Value>, String> {
             if let Some(description) = function.get("description") {
                 out.insert("description".into(), description.clone());
             }
-            let parameters = function.get("parameters").cloned().unwrap_or_else(|| json!({}));
+            let parameters = function
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             out.insert("parameters".into(), normalize_tool_parameters(&parameters));
             out.insert("strict".into(), Value::Bool(false));
             Ok(Value::Object(out))
@@ -254,7 +274,9 @@ fn tool_choice(choice: &Value) -> Result<Value, String> {
 fn reasoning_effort(effort: &Value) -> Result<&str, String> {
     match effort.as_str() {
         Some(level @ ("minimal" | "low" | "medium" | "high")) => Ok(level),
-        _ => Err(format!("reasoning_effort {effort} is not supported on a Responses-only model")),
+        _ => Err(format!(
+            "reasoning_effort {effort} is not supported on a Responses-only model"
+        )),
     }
 }
 
@@ -278,7 +300,12 @@ pub fn to_chat(body: &[u8], served_model: &str, names: &NameMap) -> Vec<u8> {
     {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => {
-                for part in item.get("content").and_then(Value::as_array).into_iter().flatten() {
+                for part in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
                     if part.get("type").and_then(Value::as_str) == Some("output_text") {
                         text.push_str(string_field(part, "text"));
                     }
@@ -424,11 +451,18 @@ impl ChatStream {
             .get("output_index")
             .and_then(Value::as_u64)
             .unwrap_or_default();
-        match event.get("type").and_then(Value::as_str).unwrap_or_default() {
+        match event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
             "response.created" => {
                 let response = event.get("response").unwrap_or(&Value::Null);
                 self.id = string_field(response, "id").to_string();
-                self.created = response.get("created_at").and_then(Value::as_u64).unwrap_or_default();
+                self.created = response
+                    .get("created_at")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
             }
             "response.output_text.delta" => {
                 let text = string_field(event, "delta");
@@ -443,7 +477,11 @@ impl ChatStream {
             }
             "response.function_call_arguments.delta" => {
                 let fragment = string_field(event, "delta");
-                if let Some(slot) = self.tools.get_mut(&output_index).filter(|_| !fragment.is_empty()) {
+                if let Some(slot) = self
+                    .tools
+                    .get_mut(&output_index)
+                    .filter(|_| !fragment.is_empty())
+                {
                     slot.streamed = true;
                     let index = slot.index;
                     self.emit_arguments(index, fragment, out);
@@ -456,7 +494,11 @@ impl ChatStream {
                     }
                     let slot = self.tools[&output_index];
                     if !slot.streamed {
-                        self.emit_arguments(slot.index, string_field_or(item, "arguments", ""), out);
+                        self.emit_arguments(
+                            slot.index,
+                            string_field_or(item, "arguments", ""),
+                            out,
+                        );
                     }
                 }
             }
@@ -470,9 +512,18 @@ impl ChatStream {
 
     fn open_tool(&mut self, output_index: u64, item: &Value, out: &mut String) {
         let index = u32::try_from(self.tools.len()).unwrap_or(u32::MAX);
-        self.tools.insert(output_index, ToolSlot { index, streamed: false });
+        self.tools.insert(
+            output_index,
+            ToolSlot {
+                index,
+                streamed: false,
+            },
+        );
         self.saw_tool_call = true;
-        let name = self.names.restore_name(string_field(item, "name")).to_string();
+        let name = self
+            .names
+            .restore_name(string_field(item, "name"))
+            .to_string();
         self.emit(
             json!({ "tool_calls": [{
                 "index": index,
@@ -652,7 +703,10 @@ mod tests {
             with("tools", json!([{"type": "web_search"}])),
             with("tool_choice", json!({"type": "custom", "name": "x"})),
             with("reasoning_effort", json!("turbo")),
-            with("messages", json!([{"role": "user", "content": [{"type": "input_audio"}]}])),
+            with(
+                "messages",
+                json!([{"role": "user", "content": [{"type": "input_audio"}]}]),
+            ),
             with("messages", json!([{"role": "function", "content": "x"}])),
         ];
         for body in &refused {
@@ -677,9 +731,11 @@ mod tests {
             "usage": {"input_tokens": 10, "output_tokens": 4,
                       "input_tokens_details": {"cached_tokens": 6}},
         });
-        let out: Value = serde_json::from_slice(
-            &to_chat(reply.to_string().as_bytes(), "copilot/gpt-5.5", &NameMap::default()),
-        )
+        let out: Value = serde_json::from_slice(&to_chat(
+            reply.to_string().as_bytes(),
+            "copilot/gpt-5.5",
+            &NameMap::default(),
+        ))
         .unwrap();
 
         assert_eq!(
@@ -752,26 +808,37 @@ mod tests {
             chunks(&out),
             vec![
                 base(json!({"role": "assistant", "content": "hi"}), Value::Null),
-                base(json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                base(
+                    json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
                                             "function": {"name": "weather", "arguments": ""}}]}),
-                     Value::Null),
-                base(json!({"tool_calls": [{"index": 0, "function": {"arguments": "{\"city\":"}}]}),
-                     Value::Null),
-                base(json!({"tool_calls": [{"index": 0, "function": {"arguments": "\"Oslo\"}"}}]}),
-                     Value::Null),
+                    Value::Null
+                ),
+                base(
+                    json!({"tool_calls": [{"index": 0, "function": {"arguments": "{\"city\":"}}]}),
+                    Value::Null
+                ),
+                base(
+                    json!({"tool_calls": [{"index": 0, "function": {"arguments": "\"Oslo\"}"}}]}),
+                    Value::Null
+                ),
                 base(json!({}), json!("tool_calls")),
                 json!({"id": "resp_s", "object": "chat.completion.chunk", "created": 100,
                        "model": "copilot/gpt-5.5", "choices": [],
                        "usage": {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13}}),
             ]
         );
-        assert!(String::from_utf8(out).unwrap().ends_with("data: [DONE]\n\n"));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .ends_with("data: [DONE]\n\n")
+        );
     }
 
     #[test]
     fn a_stream_cut_short_still_closes_with_done() {
         let mut stream = ChatStream::new("m".into(), NameMap::default(), false);
-        let mut out = stream.push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n");
+        let mut out =
+            stream.push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n");
         out.extend(stream.finish());
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");

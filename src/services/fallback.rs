@@ -162,7 +162,8 @@ pub fn cooldown_wait_until(chain: &[String]) -> Option<Instant> {
     chain
         .iter()
         .filter_map(|profile| {
-            profile_retry_cooldown_deadline(profile).and_then(|deadline| (deadline > now).then_some(deadline))
+            profile_retry_cooldown_deadline(profile)
+                .and_then(|deadline| (deadline > now).then_some(deadline))
         })
         .min()
 }
@@ -176,7 +177,10 @@ fn retry_after_deadline_from_raw(raw: &str) -> Option<Instant> {
     }
     parse_http_date(raw).map(|when| {
         let now = SystemTime::now();
-        let wait = when.duration_since(now).unwrap_or(Duration::ZERO).min(Duration::from_secs(60));
+        let wait = when
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+            .min(Duration::from_secs(60));
         Instant::now() + wait
     })
 }
@@ -206,9 +210,9 @@ fn parse_http_date(raw: &str) -> Option<SystemTime> {
     let minute = raw.get(20..22)?.parse::<u32>().ok()?;
     let second = raw.get(23..25)?.parse::<u32>().ok()?;
     let days = days_from_civil(year as i64, month as i64, day as i64)?;
-    let secs = days.checked_mul(86_400)?.checked_add(
-        hour as i64 * 3_600 + minute as i64 * 60 + second as i64,
-    )?;
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(hour as i64 * 3_600 + minute as i64 * 60 + second as i64)?;
     Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
 }
 
@@ -381,7 +385,10 @@ mod tests {
     #[test]
     fn retry_after_http_date_parses() {
         let mut headers = HeaderMap::new();
-        headers.insert("retry-after", HeaderValue::from_static("Wed, 21 Oct 2099 07:28:00 GMT"));
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Wed, 21 Oct 2099 07:28:00 GMT"),
+        );
         let deadline = retry_after_cooldown_deadline(&headers).expect("deadline");
         assert!(deadline > Instant::now());
     }

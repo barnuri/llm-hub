@@ -9,8 +9,7 @@ use super::usage_source::{BIFROST_KEY_PREFIX, UsageSource};
 use crate::consts::{
     DEFAULT_BIND, DEFAULT_COPILOT_PRICES_REFRESH_SECS, DEFAULT_KEEP_WARM_ENABLED,
     DEFAULT_KEEP_WARM_IDLE_CAP_MINUTES, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_MAX_REQUEST_BODY_BYTES,
-    DEFAULT_PORT,
-    DEFAULT_SSE_KEEPALIVE_MS,
+    DEFAULT_PORT, DEFAULT_SSE_KEEPALIVE_MS,
 };
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
@@ -871,7 +870,10 @@ mod tests {
         vars.insert("LLM_HUB_PROFILES".into(), names.join(","));
         for (name, key, usage) in profiles {
             let upper = env_name(name);
-            vars.insert(format!("LLM_HUB_{upper}_BASE_URL"), "http://127.0.0.1:9/v1".into());
+            vars.insert(
+                format!("LLM_HUB_{upper}_BASE_URL"),
+                "http://127.0.0.1:9/v1".into(),
+            );
             vars.insert(format!("LLM_HUB_{upper}_API_KEY"), (*key).into());
             if let Some(usage) = usage {
                 vars.insert(format!("LLM_HUB_{upper}_USAGE"), (*usage).into());

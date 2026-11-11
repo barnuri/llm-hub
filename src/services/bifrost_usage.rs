@@ -45,7 +45,9 @@ pub(crate) async fn fetch(
     let body: Value = response
         .json()
         .await
-        .inspect_err(|e| tracing::warn!("profile {profile}: the Bifrost quota body is not JSON: {e}"))
+        .inspect_err(|e| {
+            tracing::warn!("profile {profile}: the Bifrost quota body is not JSON: {e}")
+        })
         .ok()?;
     let usage = normalise(&body, now_ms);
     if usage.is_none() {
@@ -66,7 +68,10 @@ fn normalise(body: &Value, fetched_at_ms: u64) -> Option<ProfileUsage> {
         .into_iter()
         .flatten()
     {
-        let provider = config.get("provider").and_then(Value::as_str).unwrap_or("provider");
+        let provider = config
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("provider");
         collect(config, &format!("{provider}:"), &mut quotas);
     }
     if quotas.is_empty() {
@@ -78,9 +83,15 @@ fn normalise(body: &Value, fetched_at_ms: u64) -> Option<ProfileUsage> {
 
 /// The `budgets` array and the `rate_limit` object of `owner`.
 fn collect(owner: &Value, prefix: &str, quotas: &mut Vec<ProfileUsageQuota>) {
-    for budget in owner.get("budgets").and_then(Value::as_array).into_iter().flatten() {
+    for budget in owner
+        .get("budgets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let window = text(budget, "reset_duration").unwrap_or("total");
-        let limit = number(budget, "max_limit").unwrap_or(0.0) + number(budget, "override_amount").unwrap_or(0.0);
+        let limit = number(budget, "max_limit").unwrap_or(0.0)
+            + number(budget, "override_amount").unwrap_or(0.0);
         let used = number(budget, "current_usage").unwrap_or(0.0);
         quotas.extend(ProfileUsageQuota::measured(
             format!("{prefix}budget:{window}"),
@@ -115,7 +126,10 @@ fn number(object: &Value, field: &str) -> Option<f64> {
 }
 
 fn text<'a>(object: &'a Value, field: &str) -> Option<&'a str> {
-    object.get(field).and_then(Value::as_str).filter(|v| !v.is_empty())
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
 }
 
 #[cfg(test)]
@@ -215,9 +229,15 @@ mod tests {
             .await;
         let base_url = format!("{}/v1", server.uri());
 
-        let usage = fetch(&reqwest::Client::new(), "llmgw", &base_url, "sk-bf-secret", NOW_MS)
-            .await
-            .unwrap();
+        let usage = fetch(
+            &reqwest::Client::new(),
+            "llmgw",
+            &base_url,
+            "sk-bf-secret",
+            NOW_MS,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(usage.source, SOURCE);
         assert_eq!(usage.updated_at, NOW_MS);
@@ -232,7 +252,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let usage = fetch(&reqwest::Client::new(), "llmgw", &server.uri(), "sk-bf-bad", NOW_MS).await;
+        let usage = fetch(
+            &reqwest::Client::new(),
+            "llmgw",
+            &server.uri(),
+            "sk-bf-bad",
+            NOW_MS,
+        )
+        .await;
 
         assert!(usage.is_none());
     }
