@@ -1,6 +1,8 @@
 import type { ReactNode } from "react";
 
+import { ModelTag } from "../components/ModelTag";
 import { Panel } from "../components/Panel";
+import { Pill } from "../components/Pill";
 import "../styles/screens/smart-auto.css";
 
 interface Step {
@@ -9,8 +11,7 @@ interface Step {
 }
 
 /**
- * The request path, top to bottom. Each box is HTML so its text wraps inside the box at phone width;
- * only the arrows between the boxes are inline SVG.
+ * The request path, top to bottom, in three phases.
  */
 const STEPS: readonly Step[] = [
   {
@@ -104,35 +105,57 @@ const TIERS: readonly TierRow[] = [
   { tier: "Fast", optimises: "Speed", review: "None", buffering: "Streams" },
 ];
 
-function FlowArrow() {
-  return (
-    <svg className="smart-auto-how-arrow" viewBox="0 0 24 22" aria-hidden="true" focusable="false">
-      <path d="M12 2 V16" />
-      <path d="M7 12 L12 18 L17 12" />
-    </svg>
-  );
+type PhaseTone = "info" | "accent" | "violet";
+
+interface Phase {
+  readonly title: string;
+  readonly hint: string;
+  readonly tone: PhaseTone;
+  readonly count: number;
+}
+
+const PHASES: readonly Phase[] = [
+  { title: "Read the request", hint: "Headers and rules decide what is allowed.", tone: "info", count: 3 },
+  { title: "Choose the model", hint: "The router picks from the eligible pool.", tone: "accent", count: 5 },
+  { title: "Check and deliver", hint: "Review, streaming, fallbacks and history.", tone: "violet", count: 5 },
+];
+
+function phaseSteps(): readonly { readonly phase: Phase; readonly first: number; readonly steps: readonly Step[] }[] {
+  let offset = 0;
+  return PHASES.map((phase) => {
+    const first = offset;
+    offset += phase.count;
+    return { phase, first, steps: STEPS.slice(first, offset) };
+  });
 }
 
 export function SmartAutoHowItWorks() {
   return (
     <Panel title="How Smart Auto works" className="smart-auto-how">
       <h3 className="smart-auto-rules-heading">Request path</h3>
-      <ol className="smart-auto-how-flow" aria-label="Smart Auto request path">
-        {STEPS.map((step, index) => (
-          <li key={step.title} className="smart-auto-how-item">
-            <div className="smart-auto-how-step">
-              <span className="smart-auto-how-num" aria-hidden="true">
-                {index + 1}
-              </span>
-              <div className="smart-auto-how-text">
-                <p className="smart-auto-how-title">{step.title}</p>
-                <p className="smart-auto-how-detail">{step.detail}</p>
-              </div>
-            </div>
-            {index < STEPS.length - 1 ? <FlowArrow /> : null}
-          </li>
+      <div className="smart-auto-how-phases">
+        {phaseSteps().map(({ phase, first, steps }) => (
+          <section key={phase.title} className={`smart-auto-how-phase tone-${phase.tone}`}>
+            <header className="smart-auto-how-phase-head">
+              <h4>{phase.title}</h4>
+              <span className="dim">{phase.hint}</span>
+            </header>
+            <ol className="smart-auto-how-flow" start={first + 1}>
+              {steps.map((step, index) => (
+                <li key={step.title} className="smart-auto-how-step">
+                  <span className="smart-auto-how-num" aria-hidden="true">
+                    {first + index + 1}
+                  </span>
+                  <div className="smart-auto-how-text">
+                    <p className="smart-auto-how-title">{step.title}</p>
+                    <p className="smart-auto-how-detail">{step.detail}</p>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          </section>
         ))}
-      </ol>
+      </div>
 
       <h3 className="smart-auto-rules-heading">Tiers</h3>
       <div className="table-scroll smart-auto-table">
@@ -148,8 +171,9 @@ export function SmartAutoHowItWorks() {
           <tbody>
             {TIERS.map((row) => (
               <tr key={row.tier}>
-                <td className="mono" data-label="Tier">
-                  {row.tier}
+                <td data-label="Tier">
+                  <ModelTag colorKey={row.tier}>{row.tier.replace(" (default)", "")}</ModelTag>
+                  {row.tier.endsWith("(default)") ? <Pill tone="ok">default</Pill> : null}
                 </td>
                 <td data-label="Optimises for">{row.optimises}</td>
                 <td data-label="Review">{row.review}</td>

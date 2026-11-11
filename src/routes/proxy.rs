@@ -984,11 +984,13 @@ impl<'a> AttemptBodies<'a> {
         // A native `/v1/messages` attempt sends the client's own Anthropic body,
         // so keep it before translation replaces it.
         // Server tools are dropped here: Copilot's native endpoint rejects them with a 400.
+        // Enabled thinking becomes adaptive: Copilot's native endpoint rejects it on Haiku 5.5.
         let native = json_body
             .clone()
             .filter(|_| route == RouteKind::Anthropic)
             .map(|mut anthropic_body| {
                 anthropic::request::drop_server_tools(&mut anthropic_body);
+                anthropic::request::adaptive_thinking(&mut anthropic_body);
                 (anthropic_body, with_anthropic_version(headers))
             });
 
@@ -1573,6 +1575,7 @@ async fn review_deliver(
     }
     finish_selection(state, selection, &request_stats, None);
     state.stats().record(&request_stats);
+    state.publish_live(&request_stats);
     if let Some(store) = state.store()
         && let Err(e) = store.record(&request_stats)
     {
@@ -2001,6 +2004,7 @@ pub(crate) async fn send_keep_warm_ping(state: &AppState, ping: PingPlan) {
         routed_by: Some(ROUTED_BY_PINNED.to_owned()),
     };
     state.stats().record(&outcome);
+    state.publish_live(&outcome);
     record_request(state, &outcome, None).await;
     state
         .keep_warm()
@@ -2610,6 +2614,7 @@ fn build_response(
         );
         finish_selection(&state_for_stats, selection, &outcome, stop);
         state_for_stats.stats().record(&outcome);
+        state_for_stats.publish_live(&outcome);
         record_request(&state_for_stats, &outcome, prompt_body).await;
     });
 
@@ -3003,6 +3008,7 @@ async fn build_anthropic_response(
             save_answer(&state_for_stats, &attempt, &raw);
         }
         state_for_stats.stats().record(&outcome);
+        state_for_stats.publish_live(&outcome);
         if let Some(commit) = commit.filter(|_| outcome.error.is_none()) {
             commit.apply(&state_for_stats);
         }
@@ -3156,6 +3162,7 @@ fn record_failure(
     };
     log_failure(&outcome, paths, 0, upstream_end);
     state.stats().record(&outcome);
+    state.publish_live(&outcome);
     if let Some(store) = state.store() {
         let _ = store.record(&outcome);
     }

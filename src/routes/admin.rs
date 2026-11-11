@@ -216,10 +216,18 @@ pub async fn test_profile(
         .ok_or_else(|| AppError::Internal("no client".into()))?;
 
     let started = std::time::Instant::now();
+    // A managed profile's server starts on demand; the probe must not run against a stopped one.
+    if let Err(e) = state.managed().ensure_running(profile).await {
+        state.set_upstream_health(&name, false);
+        return Ok(Json(json!({ "ok": false, "error": e })));
+    }
     let probe = send_models_request(&state, &client, profile);
     match tokio::time::timeout(crate::consts::MODELS_FANOUT_TIMEOUT, probe).await {
         Ok(Ok(response)) => {
-            let healthy = response.status().is_success();
+            // A server with no `/v1/models` (whisper-server) is up when the profile lists its models statically.
+            let no_models_route = response.status() == reqwest::StatusCode::NOT_FOUND
+                && !profile.static_models.is_empty();
+            let healthy = response.status().is_success() || no_models_route;
             state.set_upstream_health(&name, healthy);
             Ok(Json(json!({
                 "ok": healthy,
@@ -252,6 +260,8 @@ pub struct StatsQuery {
     pub range: Option<String>,
     pub profile: Option<String>,
     pub model: Option<String>,
+    /// Keeps requests whose route starts with this text, for example `smart-auto`.
+    pub routed_by: Option<String>,
 }
 
 pub async fn stats(
@@ -267,6 +277,12 @@ pub async fn stats(
         .filter(|s| !s.is_empty());
     let model = query
         .model
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let routed_by_prefix = query
+        .routed_by
         .as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -306,6 +322,7 @@ pub async fn stats(
                     since_ms,
                     profile,
                     model,
+                    routed_by_prefix,
                     range_label: range.to_string(),
                 },
                 &book,
@@ -643,6 +660,7 @@ async fn insights_window(
             since_ms,
             profile: profile.clone(),
             model: None,
+            routed_by_prefix: None,
             range_label: range.to_string(),
         })
         .map_err(AppError::Internal)?;
@@ -794,6 +812,27 @@ mod tests {
             .await
             .unwrap();
         body
+    }
+
+    #[tokio::test]
+    async fn test_profile_counts_a_static_model_server_without_models_route_as_healthy() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(MODELS_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let state = state_for(&[
+            ("LLM_HUB_PROFILES", "whisper"),
+            ("LLM_HUB_WHISPER_BASE_URL", &upstream.uri()),
+            ("LLM_HUB_WHISPER_MODELS", "whisper-large-v3"),
+        ]);
+
+        let body = probe(&state, "whisper").await;
+
+        assert_eq!(body["ok"], true, "{body}");
+        assert_eq!(state.upstream_health().get("whisper").copied(), Some(true));
     }
 
     #[tokio::test]

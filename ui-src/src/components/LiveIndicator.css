@@ -1,0 +1,51 @@
+.live-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 0 12px 0 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font: 500 12px var(--mono);
+  cursor: pointer;
+  transition: background-color var(--ease), border-color var(--ease);
+}
+
+.live-indicator:hover {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.live-indicator.paused {
+  border-color: var(--border-strong);
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: live-pulse 1.8s ease-out infinite;
+}
+
+.live-indicator.paused .live-dot {
+  animation: none;
+}
+
+.live-age {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+@keyframes live-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+  70%,
+  100% {
+    box-shadow: 0 0 0 7px transparent;
+  }
+}

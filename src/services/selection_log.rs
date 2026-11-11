@@ -28,6 +28,8 @@ const CURRENT_STALE_AFTER_MS: u64 = 10 * 60 * 1000;
 const WRITE_QUEUE_CAPACITY: usize = 1_024;
 /// Most events one writer pass saves in a single store call.
 const WRITE_BATCH_MAX: usize = 256;
+/// Rows read from the store per query while a scoped history is filled.
+const STORED_PAGE: usize = 2_000;
 /// Random bytes behind the salt of the scope keys.
 const SALT_BYTES: usize = 24;
 
@@ -159,6 +161,34 @@ impl SelectionLog {
             .take(query.limit)
             .cloned()
             .collect()
+    }
+
+    /// Events saved in `store` at or after `since_ts_ms` that match `query`, oldest first. This reads the saved
+    /// history, which reaches back past the in-memory ring.
+    pub fn stored_history(
+        store: &Store,
+        query: &HistoryQuery,
+        since_ts_ms: u64,
+    ) -> Result<Vec<SelectionEvent>, String> {
+        let mut matched = Vec::new();
+        let mut after_seq = query.since_seq;
+        while matched.len() < query.limit {
+            let page = store.load_selection_events_since(since_ts_ms, after_seq, STORED_PAGE)?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            after_seq = last.seq;
+            let full = page.len() == STORED_PAGE;
+            matched.extend(page.into_iter().filter(|event| {
+                matches_scope(query.workflow.as_deref(), event.workflow.as_deref())
+                    && matches_scope(query.worker.as_deref(), event.worker.as_deref())
+            }));
+            if !full {
+                break;
+            }
+        }
+        matched.truncate(query.limit);
+        Ok(matched)
     }
 
     /// The current selection of the only worker whose scope key starts with `prefix`; `None` when none or several match.

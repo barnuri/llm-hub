@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 
+import { nameColor } from "../lib/colors";
 import { formatNumber, formatUsd } from "../lib/format";
 import { formatBucket, type SeriesBucket, uniqueTimes } from "../lib/series";
 import type { SeriesPoint, StatsEntry } from "../lib/types";
@@ -11,7 +12,6 @@ const PAD = { top: 12, right: 46, bottom: 26, left: 38 } as const;
 const INNER_WIDTH = VIEW_WIDTH - PAD.left - PAD.right;
 const INNER_HEIGHT = VIEW_HEIGHT - PAD.top - PAD.bottom;
 const TICK_COUNT = 3;
-const CHART_COLOR_COUNT = 8;
 
 export function shortModel(key: string): string {
   const slash = key.lastIndexOf("/");
@@ -21,10 +21,8 @@ export function shortModel(key: string): string {
   return key.slice(slash + 1);
 }
 
-export function modelColor(key: string, ranked: readonly string[]): string {
-  const index = ranked.indexOf(key);
-  const safeIndex = index >= 0 ? index : 0;
-  return `var(--chart-${(safeIndex % CHART_COLOR_COUNT) + 1})`;
+export function modelColor(key: string): string {
+  return nameColor(shortModel(key));
 }
 
 export function rankModels(models: readonly StatsEntry[]): string[] {
@@ -97,7 +95,7 @@ export function UsageChartLegend({
               title={key}
               onClick={() => onToggle(key)}
             >
-              <span className="usage-model-chip-swatch" style={{ background: modelColor(key, ranked) }} />
+              <span className="usage-model-chip-swatch" style={{ background: modelColor(key) }} />
               {shortModel(key)}
             </button>
           );
@@ -243,7 +241,7 @@ export function UsageTrendChart({
                 <>
                   <path d={pathFor(key, "requests")} className="usage-chart-hit-line" />
                   <path d={pathFor(key, "requests")} className="usage-chart-line requests"
-                    style={{ stroke: modelColor(key, ranked) }}
+                    style={{ stroke: modelColor(key) }}
                   />
                 </>
               ) : null}
@@ -253,7 +251,7 @@ export function UsageTrendChart({
                   <path
                     d={pathFor(key, "cost")}
                     className="usage-chart-line cost"
-                    style={{ stroke: modelColor(key, ranked) }}
+                    style={{ stroke: modelColor(key) }}
                   />
                 </>
               ) : null}
@@ -277,7 +275,7 @@ export function UsageTrendChart({
                 return (
                   <div key={key}>
                     <svg width="8" height="8" viewBox="0 0 8 8" aria-hidden="true" focusable="false">
-                      <circle cx="4" cy="4" r="4" style={{ fill: modelColor(key, ranked) }} />
+                      <circle cx="4" cy="4" r="4" style={{ fill: modelColor(key) }} />
                     </svg>{" "}
                     <span>{shortModel(key)}</span>
                     {": "}

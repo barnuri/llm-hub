@@ -2,6 +2,9 @@
   display: flex;
   flex-direction: column;
   min-height: 100vh;
+  background:
+    radial-gradient(900px 280px at 72% -120px, color-mix(in srgb, var(--accent) 14%, transparent), transparent 70%),
+    radial-gradient(700px 260px at 18% -140px, color-mix(in srgb, var(--violet) 12%, transparent), transparent 70%);
 }
 
 .topbar {
@@ -140,6 +143,8 @@
 }
 
 .upstream {
+  --tag: var(--accent);
+  border-left: 3px solid var(--tag);
   display: flex;
   align-items: center;
   gap: 9px;
@@ -379,6 +384,16 @@
   --spark-tint: var(--info-soft);
 }
 
+.kpi.tone-violet {
+  --spark-solid: var(--violet);
+  --spark-tint: var(--violet-soft);
+}
+
+.kpi.tone-cyan {
+  --spark-solid: var(--cyan);
+  --spark-tint: var(--cyan-soft);
+}
+
 .kpi.tone-danger {
   --spark-solid: var(--danger);
   --spark-tint: var(--danger-tint);
@@ -472,6 +487,7 @@ button.stat-tile-link:hover {
 }
 
 .table-scroll {
+  position: relative;
   overflow-x: auto;
 }
 
@@ -1081,4 +1097,82 @@ button.stat-tile-link:hover {
 
 .usage-page-btn {
   min-width: 44px;
+}
+
+.kpi-value.flash {
+  animation: value-flash 2.4s ease-out;
+}
+
+@keyframes value-flash {
+  from {
+    background: color-mix(in srgb, var(--accent) 28%, transparent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 28%, transparent);
+  }
+  to {
+    background: transparent;
+    box-shadow: 0 0 0 4px transparent;
+  }
+}
+
+tr.row-new td {
+  animation: row-flash 2.4s ease-out;
+}
+
+@keyframes row-flash {
+  from {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  to {
+    background: transparent;
+  }
+}
+
+.kpi-strip {
+  display: flex;
+  flex-wrap: wrap;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+}
+
+.kpi-strip > .kpi {
+  position: relative;
+  flex: 1 1 180px;
+  min-width: 0;
+  gap: 4px;
+  padding: 16px 16px 14px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: none;
+}
+
+.kpi-strip > .kpi::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: var(--spark-solid);
+  opacity: 0.85;
+}
+
+.kpi-strip .kpi-row {
+  flex-wrap: wrap;
+}
+
+.kpi-strip .kpi-value {
+  font-size: 26px;
+  font-weight: 500;
+}
+
+.kpi-strip > .kpi.tone-danger {
+  background: var(--danger-soft);
+}
+
+.kpi-skeleton {
+  flex: 1 1 180px;
+  height: 92px;
+  border-radius: 0;
 }

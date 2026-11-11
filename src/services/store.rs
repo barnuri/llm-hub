@@ -92,6 +92,8 @@ pub struct StatsFilter {
     pub since_ms: Option<u64>,
     pub profile: Option<String>,
     pub model: Option<String>,
+    /// Keeps requests whose `routed_by` starts with this text, for example `smart-auto`.
+    pub routed_by_prefix: Option<String>,
     pub range_label: String,
 }
 
@@ -527,7 +529,9 @@ impl Store {
             crate::services::stats::series_bucket_for_range(&filter.range_label)
         {
             let until_ms = now_ms();
-            let since_ms = filter.since_ms.unwrap_or(0);
+            let since_ms = filter
+                .since_ms
+                .unwrap_or_else(|| outcomes.first().map_or(until_ms, |row| row.ts_ms));
             snapshot.series_bucket = label.into();
             snapshot.series = crate::services::stats::series_from_outcomes(
                 &outcomes, bucket_ms, since_ms, until_ms,
@@ -560,6 +564,10 @@ impl Store {
                 if let Some(model) = &filter.model {
                     sql.push_str(" AND model = ?");
                     params.push(rusqlite::types::Value::Text(model.clone()));
+                }
+                if let Some(prefix) = &filter.routed_by_prefix {
+                    sql.push_str(" AND routed_by LIKE ?");
+                    params.push(rusqlite::types::Value::Text(format!("{prefix}%")));
                 }
                 sql.push_str(" ORDER BY id");
                 let mut stmt = guard.prepare(&sql).map_err(|e| e.to_string())?;
@@ -603,6 +611,7 @@ impl Store {
                                 .model
                                 .as_ref()
                                 .is_none_or(|model| row.model == *model)
+                            && filter.routed_by_prefix.is_none()
                     })
                     .map(|row| RequestOutcome {
                         profile: row.profile.clone(),
@@ -1132,6 +1141,59 @@ impl Store {
         rows.next().transpose().map_err(|e| e.to_string())
     }
 
+    /// Up to `limit` selection events saved at or after `since_ts_ms` with a seq above `after_seq`, oldest first.
+    pub fn load_selection_events_since(
+        &self,
+        since_ts_ms: u64,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SelectionEvent>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT event FROM selection_events
+                         WHERE ts_ms >= ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows: Vec<String> = stmt
+                    .query_map(
+                        rusqlite::params![
+                            db_i64(since_ts_ms),
+                            db_i64(after_seq),
+                            i64::try_from(limit).unwrap_or(i64::MAX)
+                        ],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .map_err(|e| e.to_string())?
+                    .filter_map(Result::ok)
+                    .collect();
+                Ok(rows
+                    .iter()
+                    .filter_map(|json| {
+                        serde_json::from_str::<SelectionEvent>(json)
+                            .inspect_err(|e| {
+                                tracing::warn!("stored selection event is unreadable: {e}");
+                            })
+                            .ok()
+                    })
+                    .collect())
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                Ok(guard
+                    .state
+                    .selection_events
+                    .iter()
+                    .filter(|event| event.ts_ms >= since_ts_ms && event.seq > after_seq)
+                    .take(limit)
+                    .cloned()
+                    .collect())
+            }
+        }
+    }
+
     /// The newest `limit` selection events, oldest first.
     pub fn load_selection_events(&self, limit: usize) -> Result<Vec<SelectionEvent>, String> {
         match self {
@@ -1439,6 +1501,7 @@ mod tests {
                 since_ms: None,
                 profile: None,
                 model: None,
+                routed_by_prefix: None,
                 range_label: String::new(),
             };
             let read = store.filtered_outcomes(&filter).unwrap();
@@ -1572,6 +1635,29 @@ mod tests {
     }
 
     #[test]
+    fn routed_by_prefix_keeps_only_matching_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefix.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let mut smart = sample_outcome();
+        smart.routed_by = Some("smart-auto:balance".into());
+        let mut pinned = sample_outcome();
+        pinned.routed_by = Some("pinned".into());
+        store.record(&smart).unwrap();
+        store.record(&pinned).unwrap();
+        store.record(&sample_outcome()).unwrap();
+        let filter = StatsFilter {
+            routed_by_prefix: Some("smart-auto".into()),
+            ..StatsFilter::default()
+        };
+
+        let outcomes = store.filtered_outcomes(&filter).unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].routed_by.as_deref(), Some("smart-auto:balance"));
+    }
+
+    #[test]
     fn sqlite_database_from_before_routed_by_gains_the_column_and_keeps_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("before-routed.db");
@@ -1701,6 +1787,7 @@ mod tests {
                     since_ms: None,
                     profile: None,
                     model: None,
+                    routed_by_prefix: None,
                     range_label: "all".into(),
                 },
                 &book,
@@ -1726,6 +1813,7 @@ mod tests {
                     since_ms: None,
                     profile: Some("openai".into()),
                     model: None,
+                    routed_by_prefix: None,
                     range_label: "all".into(),
                 },
                 &PricingBook::default(),
@@ -1940,6 +2028,44 @@ mod tests {
 
         assert_eq!(seqs(&store.load_selection_events(10).unwrap()), [3, 4, 5]);
         assert_eq!(seqs(&store.load_selection_events(2).unwrap()), [4, 5]);
+    }
+
+    fn selection_events_since_filter_by_time_and_seq(kind: &str, file: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        let store = Store::open(kind, Some(path.to_str().unwrap())).unwrap();
+        let now = 10 * MS_PER_DAY;
+        let events: Vec<SelectionEvent> = (1..=5).map(|seq| selection_event(seq, now)).collect();
+        store.save_selection_events(&events, now, -1).unwrap();
+
+        assert_eq!(
+            seqs(&store.load_selection_events_since(0, 0, 10).unwrap()),
+            [1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            seqs(&store.load_selection_events_since(0, 3, 10).unwrap()),
+            [4, 5]
+        );
+        assert_eq!(
+            seqs(&store.load_selection_events_since(0, 0, 2).unwrap()),
+            [1, 2]
+        );
+        assert!(
+            store
+                .load_selection_events_since(now + 1, 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sqlite_selection_events_since_filter_by_time_and_seq() {
+        selection_events_since_filter_by_time_and_seq("sqlite", "t.db");
+    }
+
+    #[test]
+    fn json_selection_events_since_filter_by_time_and_seq() {
+        selection_events_since_filter_by_time_and_seq("json", "s.json");
     }
 
     #[test]

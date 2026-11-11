@@ -37,6 +37,7 @@ Routes marked "key" need a key only when [hub auth](#hub-authentication) is on.
 | GET | `/api/smart-auto/decisions` | Recent Smart Auto routes. Query: `limit`. See [Smart Auto](smart-auto.md#current-selection-and-history). | key |
 | GET | `/api/stats` | Request stats. Query: `range` (`live` default, `1d`, `7d`, `30d`, `all`), `profile`, `model`. | key |
 | GET | `/api/usage` | Usage history with costs. Needs persistence. | key |
+| GET | `/api/live` | Server-sent events: one `data:` line per finished request, as a usage row, with a `: keep-alive` comment every 15 s. Keep-warm pings are skipped. | key |
 | GET | `/api/errors` | Failed requests. Query: `range` (default `7d`). Needs persistence. | key |
 | GET | `/api/insights` | Model rankings. See [Insights](usage-and-insights.md#insights). | key |
 | GET | `/api/insights/pick` | Best model. See [Insights](usage-and-insights.md#insights). | key |

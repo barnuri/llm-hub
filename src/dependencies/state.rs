@@ -19,6 +19,7 @@ use crate::services::credential_store::CredentialStore;
 use crate::services::gh_cli::GhCli;
 use crate::services::keep_warm::KeepWarm;
 use crate::services::keyring_credential_store::KeyringCredentialStore;
+use crate::services::live_feed::LiveFeed;
 use crate::services::managed_process::ProcessManager;
 use crate::services::model_limits::{ModelLimit, ModelLimits};
 use crate::services::pricing::PricingBook;
@@ -27,7 +28,7 @@ use crate::services::selection_log::SelectionLog;
 use crate::services::smart_auto_affinity::SmartAutoAffinity;
 use crate::services::smart_auto_decisions::SmartAutoDecisionLog;
 use crate::services::smart_auto_rules::SmartAutoRulesStore;
-use crate::services::stats::StatsRegistry;
+use crate::services::stats::{RequestOutcome, StatsRegistry};
 use crate::services::store::{Store, now_ms, store_dir};
 use crate::services::upstream::build_clients;
 
@@ -39,6 +40,7 @@ struct Inner {
     config: ArcSwap<HubConfig>,
     clients: ArcSwap<HashMap<String, reqwest::Client>>,
     stats: StatsRegistry,
+    live_feed: LiveFeed,
     store: Option<Arc<Store>>,
     /// SHA-256 hex hashes of enabled hub api keys, refreshed on CRUD.
     api_key_hashes: ArcSwap<HashSet<String>>,
@@ -124,6 +126,7 @@ impl AppState {
             config: ArcSwap::from_pointee(config),
             clients: ArcSwap::from_pointee(clients),
             stats: StatsRegistry::default(),
+            live_feed: LiveFeed::new(),
             store,
             api_key_hashes: ArcSwap::from_pointee(HashSet::new()),
             model_cache: ArcSwap::from_pointee(None),
@@ -192,6 +195,14 @@ impl AppState {
 
     pub fn stats(&self) -> &StatsRegistry {
         &self.0.stats
+    }
+
+    pub fn live_feed(&self) -> &LiveFeed {
+        &self.0.live_feed
+    }
+
+    pub fn publish_live(&self, outcome: &RequestOutcome) {
+        self.0.live_feed.publish(outcome, || self.pricing_book());
     }
 
     pub fn store(&self) -> Option<&Store> {

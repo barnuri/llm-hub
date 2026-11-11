@@ -1,6 +1,7 @@
+import { useChangeFlash } from "../lib/live";
 import { Sparkline } from "./Sparkline";
 
-export type KpiTone = "default" | "info" | "warn" | "danger";
+export type KpiTone = "default" | "info" | "violet" | "cyan" | "warn" | "danger";
 
 interface KpiCardProps {
   readonly label: string;
@@ -15,11 +16,12 @@ interface KpiCardProps {
 
 export function KpiCard({ label, value, sub, series, seriesLabel, tone = "default", onClick }: KpiCardProps) {
   const toneClass = tone === "default" ? "" : ` tone-${tone}`;
+  const flashing = useChangeFlash(value);
   const body = (
     <>
       <span className="kpi-label">{label}</span>
       <span className="kpi-row">
-        <span className="kpi-value">{value}</span>
+        <span className={flashing ? "kpi-value flash" : "kpi-value"}>{value}</span>
         {series && series.length > 0 ? (
           <Sparkline values={series} label={seriesLabel ?? `${label}, last ${series.length} days`} />
         ) : null}

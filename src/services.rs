@@ -27,6 +27,7 @@ pub mod insights;
 pub mod keep_warm;
 pub mod keyring_credential_store;
 pub mod launch;
+pub mod live_feed;
 pub mod managed_process;
 #[cfg(test)]
 pub mod memory_credential_store;

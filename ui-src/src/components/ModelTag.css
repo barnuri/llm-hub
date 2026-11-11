@@ -1,0 +1,15 @@
+.model-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.model-tag-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tag);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--tag) 20%, transparent);
+}

@@ -1,6 +1,9 @@
 import type { StatsEntry } from "../lib/types";
 import { formatMs, formatNumber, formatPct, formatUsd } from "../lib/format";
+import { latencyHeat, rateHeat, ttftHeat } from "../lib/colors";
 import { CompactCount } from "./CompactCount";
+import { Heat } from "./Heat";
+import { ModelTag } from "./ModelTag";
 import { Panel } from "./Panel";
 import { ShareBar } from "./ShareBar";
 
@@ -21,13 +24,16 @@ function formatRate(tokensPerSec: number): string {
 function KeyCell({ entryKey }: { readonly entryKey: string }) {
   const slash = entryKey.indexOf("/");
   if (slash <= 0) {
-    return <>{entryKey}</>;
+    return <ModelTag colorKey={entryKey}>{entryKey}</ModelTag>;
   }
+  const name = entryKey.slice(slash + 1);
   return (
-    <>
-      <span className="stats-key-prefix">{entryKey.slice(0, slash + 1)}</span>
-      {entryKey.slice(slash + 1)}
-    </>
+    <ModelTag colorKey={name}>
+      <span>
+        <span className="stats-key-prefix">{entryKey.slice(0, slash + 1)}</span>
+        {name}
+      </span>
+    </ModelTag>
   );
 }
 
@@ -97,12 +103,20 @@ export function StatsTable({ label, rows }: StatsTableProps) {
                     </td>
                     <td className="num">{formatUsd(entry.cost_usd)}</td>
                     <td className={entry.errors > 0 ? "num t-err" : "num"}>{formatNumber(entry.errors)}</td>
-                    <td className="num">{formatMs(entry.ttft_p50_ms)}</td>
-                    <td className="num">{formatRate(entry.tokens_per_sec_p50)}</td>
+                    <td className="num">
+                      <Heat level={ttftHeat(entry.ttft_p50_ms)}>{formatMs(entry.ttft_p50_ms)}</Heat>
+                    </td>
+                    <td className="num">
+                      <Heat level={rateHeat(entry.tokens_per_sec_p50)}>
+                        {formatRate(entry.tokens_per_sec_p50)}
+                      </Heat>
+                    </td>
                     <td className="num">
                       <CompactCount value={entry.cache_read_tokens} />
                     </td>
-                    <td className="num">{formatMs(entry.p50_ms)}</td>
+                    <td className="num">
+                      <Heat level={latencyHeat(entry.p50_ms)}>{formatMs(entry.p50_ms)}</Heat>
+                    </td>
                     <td className="num">
                       <CompactCount value={entry.tokens_in} />
                     </td>

@@ -16,6 +16,7 @@ use crate::schemas::scope_kind::ScopeKind;
 use crate::schemas::selection_event::SelectionEvent;
 use crate::schemas::smart_auto_decision::SmartAutoDecision;
 use crate::schemas::smart_auto_rules::SmartAutoRules;
+use crate::services::selection_log::SelectionLog;
 use crate::services::smart_auto_rules::{LoadedRules, RuleEffect, RulesSource, rule_effects};
 use crate::services::store::now_ms;
 
@@ -30,6 +31,8 @@ pub struct HistoryParams {
     pub workflow: Option<String>,
     pub worker: Option<String>,
     pub since_seq: Option<u64>,
+    /// Read the saved history from this time on, instead of the in-memory ring.
+    pub since_ts_ms: Option<u64>,
     pub limit: Option<usize>,
 }
 
@@ -118,10 +121,23 @@ pub async fn history(
             .unwrap_or(SELECTION_HISTORY_DEFAULT_LIMIT)
             .clamp(1, SELECTION_HISTORY_MAX_LIMIT),
     };
-    Json(HistoryBody {
-        events: log.history(&query),
-    })
-    .into_response()
+    let events = match (params.since_ts_ms, state.store()) {
+        (Some(since_ts_ms), Some(_)) => {
+            let saved = state.clone();
+            let read = tokio::task::spawn_blocking(move || {
+                let store = saved.store().ok_or("persistence is off")?;
+                SelectionLog::stored_history(store, &query, since_ts_ms)
+            })
+            .await;
+            match read {
+                Ok(Ok(events)) => events,
+                Ok(Err(e)) => return AppError::Internal(e).into_response(),
+                Err(e) => return AppError::Internal(e.to_string()).into_response(),
+            }
+        }
+        _ => log.history(&query),
+    };
+    Json(HistoryBody { events }).into_response()
 }
 
 /// `GET /api/smart-auto/decisions?limit=N`: the newest Smart Auto routes, newest first.

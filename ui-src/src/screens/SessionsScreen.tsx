@@ -4,6 +4,7 @@ import { Panel } from "../components/Panel";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
 import { shortModel } from "../components/UsageModelChart";
 import { errorText, formatDateTime, formatNumber, formatPct, formatUsd } from "../lib/format";
+import { useLive } from "../lib/live";
 import { navigate, useRoute } from "../lib/router";
 import {
   fetchSessions,
@@ -45,6 +46,7 @@ function promptCell(value: number | undefined): string {
 function SessionsList({ range }: { readonly range: SessionsRange }) {
   const [list, setList] = useState<SessionList | null>(null);
   const [unavailable, setUnavailable] = useState<string | null>(null);
+  const { tick } = useLive();
 
   useEffect(() => {
     let cancelled = false;
@@ -64,7 +66,7 @@ function SessionsList({ range }: { readonly range: SessionsRange }) {
     return () => {
       cancelled = true;
     };
-  }, [range]);
+  }, [range, tick]);
 
   const rows = [...(list?.sessions ?? [])].sort((left, right) => right.cost_usd - left.cost_usd);
 

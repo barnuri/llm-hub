@@ -199,7 +199,7 @@ pub fn snapshot_from_outcomes(
 pub fn series_bucket_for_range(range: &str) -> Option<(&'static str, u64)> {
     match range {
         "1d" => Some(("hour", SERIES_HOUR_MS)),
-        "7d" => Some(("day", SERIES_DAY_MS)),
+        "7d" | "30d" | "all" => Some(("day", SERIES_DAY_MS)),
         _ => None,
     }
 }
@@ -686,5 +686,20 @@ mod tests {
         o.tokens_out = 50;
         // 50 tokens in 100ms => 500 tok/s
         assert!((tokens_per_sec(&o).unwrap() - 500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn long_ranges_bucket_by_day_and_live_has_no_series() {
+        assert_eq!(
+            series_bucket_for_range("1d").map(|(label, _)| label),
+            Some("hour")
+        );
+        for range in ["7d", "30d", "all"] {
+            assert_eq!(
+                series_bucket_for_range(range).map(|(label, _)| label),
+                Some("day")
+            );
+        }
+        assert!(series_bucket_for_range("live").is_none());
     }
 }

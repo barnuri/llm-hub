@@ -6,6 +6,7 @@ import { Pill } from "./components/Pill";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { Toasts, type ToastItem } from "./components/Toasts";
 import { api, saveKey, UnauthorizedError } from "./lib/api";
+import { nameColor } from "./lib/colors";
 import { formatNumber } from "./lib/format";
 import { pricesById } from "./lib/pricing";
 import { navigate, useRoute } from "./lib/router";
@@ -80,6 +81,7 @@ export function App() {
   const [meta, setMeta] = useState<HubMeta | null>(null);
   const [modelEntries, setModelEntries] = useState<readonly HubModel[]>([]);
   const models = modelEntries.map((model) => model.id);
+  const enabledProfiles = (meta?.profiles ?? []).filter((profile) => profile.enabled);
   const [toasts, setToasts] = useState<readonly ToastItem[]>([]);
   const [askKey, setAskKey] = useState(false);
   const [confirmRestart, setConfirmRestart] = useState(false);
@@ -245,12 +247,12 @@ export function App() {
               Upstreams
               {meta ? (
                 <span className="side-count">
-                  {meta.profiles.filter((profile) => profile.healthy === true).length} of {meta.profiles.length} up
+                  {enabledProfiles.filter((profile) => profile.healthy === true).length} of {enabledProfiles.length} up
                 </span>
               ) : null}
             </div>
             <ul className="upstream-list">
-              {(meta?.profiles ?? []).map((profile) => {
+              {enabledProfiles.map((profile) => {
                 const led = profile.healthy === true ? "up" : profile.healthy === false ? "down" : "off";
                 const health = led === "up" ? "healthy" : led === "down" ? "unhealthy" : "unknown";
                 return (
@@ -258,6 +260,7 @@ export function App() {
                     <button
                       type="button"
                       className="upstream"
+                      style={{ ["--tag" as string]: nameColor(profile.name) }}
                       title={`${profile.label}: ${health}`}
                       onClick={() => navigate("/profiles")}
                     >
@@ -269,7 +272,7 @@ export function App() {
                 );
               })}
             </ul>
-            {meta && meta.profiles.length === 0 ? <div className="upstream-empty">No profiles yet</div> : null}
+            {meta && enabledProfiles.length === 0 ? <div className="upstream-empty">No enabled profiles</div> : null}
           </aside>
 
           <main className="content">

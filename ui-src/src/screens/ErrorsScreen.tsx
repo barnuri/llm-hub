@@ -6,6 +6,7 @@ import { Segmented, type SegmentedOption } from "../components/Segmented";
 import { ShareBar } from "../components/ShareBar";
 import { api } from "../lib/api";
 import { formatDateTime, formatMs, formatNumber, formatPct } from "../lib/format";
+import { useLive } from "../lib/live";
 import { navigate, useRoute } from "../lib/router";
 import type { ErrorsRange, ErrorsReport, StatsSnapshot, UsageRow } from "../lib/types";
 import "../styles/screens/errors.css";
@@ -82,6 +83,7 @@ export function ErrorsScreen() {
   const [reasonFilter, setReasonFilter] = useState<string | null>(null);
   const [showAllReasons, setShowAllReasons] = useState(false);
   const [calls, setCalls] = useState<StatsSnapshot | null>(null);
+  const { tick } = useLive();
 
   useEffect(() => {
     let cancelled = false;
@@ -91,7 +93,6 @@ export function ErrorsScreen() {
         if (!cancelled) {
           setReport(body);
           setLoadedAtMs(Date.now());
-          setPage(0);
         }
       })
       .catch(() => {
@@ -115,6 +116,10 @@ export function ErrorsScreen() {
     return () => {
       cancelled = true;
     };
+  }, [range, tick]);
+
+  useEffect(() => {
+    setPage(0);
   }, [range]);
 
   if (unavailable) {

@@ -1,0 +1,42 @@
+.cost-over-time-readout {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.cost-over-time-frame {
+  width: 100%;
+}
+
+.cost-over-time-chart {
+  display: block;
+}
+
+.cost-over-time-grid {
+  stroke: var(--border);
+  stroke-dasharray: 3 4;
+}
+
+.cost-over-time-tick {
+  fill: var(--muted);
+  font: 10.5px var(--mono);
+}
+
+.cost-over-time-bar {
+  fill: var(--cyan);
+  opacity: 0.75;
+  transition: opacity var(--ease);
+}
+
+.cost-over-time-bar.hot {
+  fill: var(--violet);
+  opacity: 1;
+}
+
+.cost-over-time-hit {
+  fill: transparent;
+}
+
+.cost-over-time-skeleton {
+  height: 190px;
+}

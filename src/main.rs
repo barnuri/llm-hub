@@ -424,6 +424,7 @@ fn build_router(state: AppState) -> Router {
         .route("/api/restart", post(routes::admin::restart_server))
         .route("/api/stats", get(routes::admin::stats))
         .route("/api/usage", get(routes::admin::usage))
+        .route("/api/live", get(routes::live::stream))
         .route("/api/errors", get(routes::admin::errors))
         .route("/api/sessions", get(routes::sessions::list))
         .route("/api/sessions/{worker}", get(routes::sessions::detail))
@@ -573,6 +574,69 @@ mod tests {
             assert_eq!(with_key.status().as_u16(), 400, "{url}");
             assert_eq!(without_key.status().as_u16(), 401, "{url}");
         }
+    }
+
+    #[tokio::test]
+    async fn live_route_requires_master_key() {
+        let base = serve_hub_with_auth().await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/live");
+
+        let with_key = client
+            .get(&url)
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap();
+        let without_key = client.get(&url).send().await.unwrap();
+
+        assert_eq!(with_key.status().as_u16(), 200);
+        assert!(
+            with_key.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/event-stream")
+        );
+        assert_eq!(without_key.status().as_u16(), 401);
+    }
+
+    #[tokio::test]
+    async fn live_route_streams_each_finished_request() {
+        let (base, state) = serve_hub_with_auth_state().await;
+        let client = reqwest::Client::new();
+        let mut response = client
+            .get(format!("{base}/api/live"))
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap();
+        state.publish_live(&crate::services::stats::RequestOutcome {
+            profile: "copilot".into(),
+            model_key: "copilot/claude-opus-4-5".into(),
+            status: 200,
+            ts_ms: 0,
+            latency_ms: 5,
+            ttft_ms: None,
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            error: None,
+            client: Some("claude-code".into()),
+            worker: None,
+            routed_by: None,
+        });
+
+        let chunk = response.chunk().await.unwrap().unwrap();
+        let text = String::from_utf8(chunk.to_vec()).unwrap();
+        let payload = text
+            .strip_prefix("data: ")
+            .unwrap()
+            .strip_suffix("\n\n")
+            .unwrap();
+        let row: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(row["model"], "copilot/claude-opus-4-5");
+        assert_eq!(row["status"], 200);
     }
 
     #[tokio::test]

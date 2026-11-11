@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { DataTable } from "../components/DataTable";
+import { Heat } from "../components/Heat";
+import { LiveFeed } from "../components/LiveFeed";
+import { LiveIndicator } from "../components/LiveIndicator";
 import { KpiCard, type KpiTone } from "../components/KpiCard";
+import { ModelTag } from "../components/ModelTag";
 import { Panel } from "../components/Panel";
 import { Pill } from "../components/Pill";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
@@ -14,7 +18,9 @@ import {
   shortModel,
 } from "../components/UsageModelChart";
 import { api } from "../lib/api";
+import { latencyHeat, ttftHeat } from "../lib/colors";
 import { formatDate, formatDateTime, formatMs, formatNumber, formatPct, formatUsd } from "../lib/format";
+import { useFreshKeys, useLive } from "../lib/live";
 import { navigate, setQueryParam } from "../lib/router";
 import { formatBucket, type SeriesBucket, stackByUpstream, type UpstreamStacks } from "../lib/series";
 import type {
@@ -270,6 +276,10 @@ interface UsageScreenProps {
   readonly period: OverviewPeriod;
 }
 
+function rowKey(row: UsageRow): string {
+  return `${row.ts_ms}-${row.model}-${row.status}-${row.latency_ms}`;
+}
+
 export function UsageScreen({ period }: UsageScreenProps) {
   const [today, setToday] = useState<StatsSnapshot | null>(null);
   const [week, setWeek] = useState<StatsSnapshot | null>(null);
@@ -287,6 +297,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
   const [showCost, setShowCost] = useState(true);
   const [view, setView] = useState<ChartView>("upstreams");
   const [hoveredBar, setHoveredBar] = useState<number | null>(null);
+  const { tick } = useLive();
 
   useEffect(() => {
     let cancelled = false;
@@ -332,7 +343,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [tick]);
 
   const weekReady = periodUsable(week, "7d");
   const todayReady = periodUsable(today, "1d");
@@ -357,6 +368,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
   const stacks = useMemo(() => stackByUpstream(series ?? []), [series]);
 
   const rows = report?.recent ?? [];
+  const freshKeys = useFreshKeys(rows.map(rowKey));
   const pageCount = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
   const pageRows = rows.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
@@ -402,6 +414,9 @@ export function UsageScreen({ period }: UsageScreenProps) {
       <span className="page-sub mono">
         {isWeek ? "last 7 days" : "today"}
         {loadedAt ? ` · updated ${formatClock(loadedAt)}` : ""}
+      </span>
+      <span className="page-live">
+        <LiveIndicator updatedAt={loadedAt ? loadedAt.getTime() : null} />
       </span>
     </div>
   );
@@ -449,18 +464,21 @@ export function UsageScreen({ period }: UsageScreenProps) {
             value={formatNumber(snapshot.overview.tokens_in)}
             sub={weekSub(daily.tokensIn, formatNumber)}
             series={daily.tokensIn}
+            tone="info"
           />
           <KpiCard
             label="Tokens out"
             value={formatNumber(snapshot.overview.tokens_out)}
             sub={weekSub(daily.tokensOut, formatNumber)}
             series={daily.tokensOut}
+            tone="violet"
           />
           <KpiCard
             label="Cost"
             value={formatUsd(snapshot.overview.cost_usd)}
             sub={weekSub(daily.cost, formatUsd)}
             series={daily.cost}
+            tone="cyan"
           />
           {quota ? (
             <KpiCard
@@ -534,6 +552,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
             )}
           </Panel>
           <div className="overview-side">
+            <LiveFeed />
             <QuotaPanel quota={quota} burn={dailyBurn(quotaHistory, copilot, quota)} />
             <TopModels models={snapshot.models} totalRequests={snapshot.overview.requests} />
           </div>
@@ -596,9 +615,11 @@ export function UsageScreen({ period }: UsageScreenProps) {
                   </tr>
                 ) : (
                   pageRows.map((row) => (
-                    <tr key={`${row.ts_ms}-${row.model}-${row.status}-${row.latency_ms}`}>
+                    <tr key={rowKey(row)} className={freshKeys.has(rowKey(row)) ? "row-new" : undefined}>
                       <td className="mono nowrap">{formatDateTime(row.ts_ms)}</td>
-                      <td className="mono">{row.model}</td>
+                      <td className="mono">
+                        <ModelTag colorKey={shortModel(row.model)}>{row.model}</ModelTag>
+                      </td>
                       <td className="client" title={row.client ?? undefined}>
                         {row.client ?? <span className="dim">—</span>}
                       </td>
@@ -607,8 +628,12 @@ export function UsageScreen({ period }: UsageScreenProps) {
                           {row.status}
                         </Pill>
                       </td>
-                      <td className="num">{formatMs(row.ttft_ms ?? 0)}</td>
-                      <td className="num">{formatMs(row.latency_ms)}</td>
+                      <td className="num">
+                        <Heat level={ttftHeat(row.ttft_ms ?? 0)}>{formatMs(row.ttft_ms ?? 0)}</Heat>
+                      </td>
+                      <td className="num">
+                        <Heat level={latencyHeat(row.latency_ms)}>{formatMs(row.latency_ms)}</Heat>
+                      </td>
                       <td className="num nowrap">
                         {formatNumber(row.tokens_in)} / {formatNumber(row.tokens_out)}
                       </td>

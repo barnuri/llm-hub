@@ -1,5 +1,8 @@
 import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { CostOverTimePanel } from "../components/CostOverTimePanel";
+import { Segmented, type SegmentedOption } from "../components/Segmented";
+import { SmartAutoFeaturesPanel } from "../components/SmartAutoFeaturesPanel";
 import { KpiCard } from "../components/KpiCard";
 import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
@@ -25,7 +28,7 @@ import type {
   SmartAutoRulesResponse,
   SmartAutoRulesSource,
 } from "../lib/types";
-import { MAX_EVENTS, REFRESH_MS, useSelectionEvents } from "../lib/useSelectionEvents";
+import { MAX_EVENTS, REFRESH_MS, type SelectionRange, useSelectionEvents } from "../lib/useSelectionEvents";
 import "../styles/screens/smart-auto.css";
 import { SmartAutoHowItWorks } from "./SmartAutoHowItWorks";
 import { SmartAutoTracePage } from "./SmartAutoTracePage";
@@ -778,8 +781,15 @@ function SmartAutoRulesPanel({
   const locked = isReadonly || saving || resultBusy !== null || draft === null;
   const dirty = draft !== null && saved !== null && serializeRules(draft) !== serializeRules(saved);
   const known = new Set(profiles.map((profile) => profile.name));
+  const enabledNames = new Set(profiles.filter((profile) => profile.enabled).map((profile) => profile.name));
   // Profiles from the hub first, then any name the rules mention or the user added by hand.
-  const names = [...new Set([...profiles.map((profile) => profile.name), ...Object.keys(draft?.profiles ?? {})])];
+  const allNames = [...new Set([...profiles.map((profile) => profile.name), ...Object.keys(draft?.profiles ?? {})])];
+  const hasRules = (name: string): boolean => {
+    const globs = draft?.profiles[name];
+    return (globs?.include.length ?? 0) + (globs?.exclude.length ?? 0) > 0;
+  };
+  const names = allNames.filter((name) => enabledNames.has(name) || !known.has(name) || hasRules(name));
+  const hiddenProfiles = allNames.length - names.length;
 
   const edit = (next: SmartAutoRules) => {
     setDraft(next);
@@ -905,8 +915,9 @@ function SmartAutoRulesPanel({
         ) : null}
 
         <div className="smart-auto-rules-global">
-          <div className="smart-auto-rules-group">
+          <div className="smart-auto-rules-group tone-include">
             <h3 className="smart-auto-rules-heading">Global include</h3>
+            <p className="dim smart-auto-rules-hint">Only models that match one of these are eligible.</p>
             <GlobList
               label="global include"
               globs={draft.include}
@@ -914,9 +925,10 @@ function SmartAutoRulesPanel({
               onChange={(value) => setGlobal("include", value)}
             />
           </div>
-          <div className="smart-auto-rules-group">
+          <div className="smart-auto-rules-group tone-exclude">
             <h3 className="smart-auto-rules-heading">Global exclude</h3>
-            <button type="button" className="btn" disabled={locked} onClick={excludeNonCopilot}>
+            <p className="dim smart-auto-rules-hint">Models that match are never eligible.</p>
+            <button type="button" className="btn small" disabled={locked} onClick={excludeNonCopilot}>
               Exclude all non-Copilot profiles
             </button>
             <GlobList
@@ -925,7 +937,10 @@ function SmartAutoRulesPanel({
               disabled={locked}
               onChange={(value) => setGlobal("exclude", value)}
             />
-            <h3 className="smart-auto-rules-heading smart-auto-rules-subheading">Global allow</h3>
+          </div>
+          <div className="smart-auto-rules-group tone-allow">
+            <h3 className="smart-auto-rules-heading">Global allow</h3>
+            <p className="dim smart-auto-rules-hint">Models that match skip the exclude list.</p>
             <GlobList
               label="global allow"
               globs={draft.allow}
@@ -1026,6 +1041,13 @@ function SmartAutoRulesPanel({
           </table>
         </div>
 
+        {hiddenProfiles > 0 ? (
+          <p className="dim smart-auto-rules-hidden">
+            {formatNumber(hiddenProfiles)} disabled {hiddenProfiles === 1 ? "profile" : "profiles"} without rules{" "}
+            {hiddenProfiles === 1 ? "is" : "are"} hidden.
+          </p>
+        ) : null}
+
         <div className="smart-auto-rules-save">
           <button type="button" className="btn primary" disabled={locked || !dirty} onClick={() => void save()}>
             {saving ? "Saving…" : "Save rules"}
@@ -1106,6 +1128,13 @@ function SubNav({ active }: { readonly active: SubPageId }) {
   );
 }
 
+const RANGE_OPTIONS: readonly SegmentedOption<SelectionRange>[] = [
+  { value: "1d", label: "24 h" },
+  { value: "7d", label: "7 days" },
+  { value: "30d", label: "30 days" },
+  { value: "all", label: "All time" },
+];
+
 function LivePill({ unavailable }: { readonly unavailable: boolean }) {
   return unavailable ? (
     <Pill tone="warn" dot>
@@ -1119,7 +1148,8 @@ function LivePill({ unavailable }: { readonly unavailable: boolean }) {
 }
 
 export function SmartAutoScreen({ profiles, prices }: SmartAutoScreenProps) {
-  const { events, unavailable } = useSelectionEvents();
+  const [range, setRange] = useState<SelectionRange>("1d");
+  const { events, unavailable } = useSelectionEvents(range);
   const [filters, setFilters] = useState<Filters>(NO_FILTERS);
   const route = useRoute();
   const sub = subPageOf(route.path.split("/")[1]);
@@ -1141,11 +1171,15 @@ export function SmartAutoScreen({ profiles, prices }: SmartAutoScreenProps) {
   const tokensIn = filtered.reduce((sum, event) => sum + (event.tokens_in ?? 0), 0);
   const tokensOut = filtered.reduce((sum, event) => sum + (event.tokens_out ?? 0), 0);
   const totals = sumCost(filtered, prices);
-  const wasteUsd = filtered.reduce((sum, event) => {
-    const kind: CostKind | undefined = kinds.get(event);
-    const cost = eventCost(event, prices);
-    return kind !== undefined && WASTE_KINDS.includes(kind) && cost !== null ? sum + cost : sum;
-  }, 0);
+  const costOfKinds = (wanted: readonly CostKind[]): number =>
+    filtered.reduce((sum, event) => {
+      const kind: CostKind | undefined = kinds.get(event);
+      const cost = eventCost(event, prices);
+      return kind !== undefined && wanted.includes(kind) && cost !== null ? sum + cost : sum;
+    }, 0);
+  const wasteUsd = costOfKinds(WASTE_KINDS);
+  const checkerUsd = costOfKinds(["checker"]);
+  const featuresUsd = wasteUsd + checkerUsd;
   const setFilter = (key: keyof Filters) => (value: string) => setFilters((current) => ({ ...current, [key]: value }));
 
   let body: ReactNode;
@@ -1277,11 +1311,13 @@ export function SmartAutoScreen({ profiles, prices }: SmartAutoScreenProps) {
             <>
               Counting from <strong>{`${formatDate(countedSince)} ${formatTime(countedSince)}`}</strong> ({formatAge(Date.now() - countedSince)}),{" "}
               {formatNumber(filtered.length)} events
-              {windowCapped ? `. Capped at ${formatNumber(MAX_EVENTS)} events held in this tab.` : "."}
+              {windowCapped
+                ? `. The newest ${formatNumber(MAX_EVENTS)} events are loaded. Pick a shorter range for older ones.`
+                : "."}
             </>
           )}
         </p>
-        <div className="smart-auto-kpis">
+        <div className="kpi-strip smart-auto-kpis">
           <KpiCard label="Events" value={formatNumber(filtered.length)} sub={`${formatNumber(all.length)} kept in this tab`} />
           <KpiCard
             label="Failures"
@@ -1296,17 +1332,27 @@ export function SmartAutoScreen({ profiles, prices }: SmartAutoScreenProps) {
             sub="Reported by upstreams"
           />
           <KpiCard
-            label="Cost"
+            label="Smart Auto cost"
             value={formatUsd(totals.usd)}
-            sub={`${formatNumber(totals.unpriced)} completed calls unpriced`}
+            sub={`All Smart Auto calls · ${formatNumber(totals.unpriced)} completed calls unpriced`}
           />
           <KpiCard
-            label="Waste"
-            value={formatUsd(wasteUsd)}
-            sub={totals.usd > 0 ? `${((wasteUsd / totals.usd) * 100).toFixed(2)}% of cost` : "No cost yet"}
-            tone={wasteUsd > 0 ? "danger" : "default"}
+            label="Smart Auto features cost"
+            value={formatUsd(featuresUsd)}
+            sub={
+              totals.usd > 0
+                ? `${((featuresUsd / totals.usd) * 100).toFixed(1)}% of cost · reviews ${formatUsd(checkerUsd)}, waste ${formatUsd(wasteUsd)}`
+                : "No cost yet"
+            }
+            tone={featuresUsd > 0 ? "violet" : "default"}
           />
         </div>
+        <p className="note smart-auto-features-note">
+          Features cost is what Smart Auto adds on top of the delivered answers: review checks by a judge or critic,
+          plus waste. Waste is repair calls, failed or cancelled calls, and drafts a reviewer rejected.
+        </p>
+        <SmartAutoFeaturesPanel events={filtered} kinds={kinds} prices={prices} />
+        <CostOverTimePanel />
       </>
     );
   }
@@ -1314,6 +1360,12 @@ export function SmartAutoScreen({ profiles, prices }: SmartAutoScreenProps) {
   return (
     <section className="tab active smart-auto" aria-busy={events === null && !unavailable}>
       <SubNav active={sub} />
+      {sub === "rules" || sub === "how" ? null : (
+        <div className="toolbar smart-auto-range">
+          <Segmented label="Events range" options={RANGE_OPTIONS} value={range} onChange={setRange} />
+          {events === null ? <span className="dim">Loading events from the saved history…</span> : null}
+        </div>
+      )}
       {body}
     </section>
   );
