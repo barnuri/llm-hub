@@ -23,10 +23,27 @@ pub async fn serve(uri: Uri) -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
+const HASHED_ASSET_PREFIX: &str = "assets/";
+const CACHE_HASHED_ASSET: &str = "public, max-age=31536000, immutable";
+const CACHE_REVALIDATE: &str = "no-cache";
+
+/// Hashed bundle files never change under one name. Every other file (index.html) is
+/// revalidated, so a rebuilt UI shows on the next load without a hard refresh.
+fn cache_control(file: &str) -> &'static str {
+    if file.starts_with(HASHED_ASSET_PREFIX) {
+        CACHE_HASHED_ASSET
+    } else {
+        CACHE_REVALIDATE
+    }
+}
+
 fn asset_response(file: &str, content: rust_embed::EmbeddedFile) -> Response {
     let mime = mime_guess::from_path(file).first_or_octet_stream();
     (
-        [(header::CONTENT_TYPE, mime.as_ref().to_string())],
+        [
+            (header::CONTENT_TYPE, mime.as_ref().to_string()),
+            (header::CACHE_CONTROL, cache_control(file).to_string()),
+        ],
         content.data,
     )
         .into_response()
@@ -51,6 +68,16 @@ mod tests {
         assert!(spa_eligible("profiles"));
         assert!(spa_eligible("stats"));
         assert!(spa_eligible("keys/some-name"));
+    }
+
+    #[test]
+    fn index_is_revalidated_and_hashed_assets_are_immutable() {
+        assert_eq!(cache_control("index.html"), CACHE_REVALIDATE);
+        assert_eq!(cache_control("favicon.ico"), CACHE_REVALIDATE);
+        assert_eq!(
+            cache_control("assets/index-DauIu9FG.js"),
+            CACHE_HASHED_ASSET
+        );
     }
 
     #[test]
