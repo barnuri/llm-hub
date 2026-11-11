@@ -1,0 +1,40 @@
+.panel.disclosure {
+  padding: 0;
+}
+
+.disclosure-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 16px;
+  border: 0;
+  border-radius: var(--radius-lg);
+  background: none;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--ease);
+}
+
+.disclosure-trigger:hover {
+  background: var(--panel-hover);
+}
+
+.disclosure-trigger:focus-visible {
+  outline-offset: -2px;
+}
+
+.disclosure-chevron {
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  transition: transform var(--ease);
+}
+
+.disclosure-trigger[aria-expanded="true"] .disclosure-chevron {
+  transform: rotate(90deg);
+}

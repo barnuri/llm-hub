@@ -93,7 +93,7 @@
   margin-bottom: 10px;
 }
 
-.fallbacks-add select {
+.fallbacks-add .select {
   flex: 1;
   min-width: 0;
 }
@@ -154,23 +154,6 @@
 
 .profiles .input[aria-invalid="true"] {
   border-color: var(--danger);
-}
-
-.profiles label.field-check {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0;
-  color: var(--text);
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.profiles .field-check input {
-  width: 15px;
-  height: 15px;
-  margin: 0;
-  accent-color: var(--accent);
 }
 
 @media (max-width: 1100px) {

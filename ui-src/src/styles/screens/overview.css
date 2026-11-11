@@ -32,7 +32,12 @@
 }
 
 .kpi-strip .kpi-value {
-  font-size: 24px;
+  font-size: 26px;
+  font-weight: 500;
+}
+
+.kpi-strip > .kpi.tone-danger {
+  background: var(--danger-soft);
 }
 
 .kpi-skeleton {

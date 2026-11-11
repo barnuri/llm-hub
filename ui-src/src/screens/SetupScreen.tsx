@@ -2,6 +2,7 @@ import { useState } from "react";
 
 import { Panel } from "../components/Panel";
 import { Pill } from "../components/Pill";
+import { Select } from "../components/Select";
 import { savedKey } from "../lib/api";
 import { formatNumber } from "../lib/format";
 import { SETUP_TARGETS, snippetFor } from "../lib/snippets";
@@ -116,11 +117,7 @@ export function SetupScreen({ models, authEnabled, onCopy }: SetupScreenProps) {
           </div>
           <div className="field">
             <label htmlFor="setup-model">Model</label>
-            <select id="setup-model" className="input" value={model} onChange={(event) => setModel(event.target.value)}>
-              {models.map((id) => (
-                <option key={id}>{id}</option>
-              ))}
-            </select>
+            <Select id="setup-model" value={model} options={models.map((id) => ({ value: id, label: id }))} onChange={setModel} />
           </div>
           <div className="field">
             <label htmlFor="setup-fallbacks">Fallbacks (optional), tried in order</label>
@@ -142,24 +139,18 @@ export function SetupScreen({ models, authEnabled, onCopy }: SetupScreenProps) {
                 ))}
               </div>
             ) : null}
-            <select
+            <Select
               id="setup-fallbacks"
-              className="input"
               value=""
+              placeholder="Add fallback model…"
               disabled={available.length === 0}
-              onChange={(event) => {
-                if (event.target.value) {
-                  setFallbacks([...fallbacks, event.target.value]);
+              options={available.map((id) => ({ value: id, label: id }))}
+              onChange={(next) => {
+                if (next) {
+                  setFallbacks([...fallbacks, next]);
                 }
               }}
-            >
-              <option value="">Add fallback model…</option>
-              {available.map((id) => (
-                <option key={id} value={id}>
-                  {id}
-                </option>
-              ))}
-            </select>
+            />
           </div>
           <div className="setup-auth">
             <Pill tone={authEnabled ? "ok" : "neutral"}>{authEnabled ? "Auth on" : "Auth off"}</Pill>

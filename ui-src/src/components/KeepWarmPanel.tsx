@@ -2,6 +2,8 @@ import { type FormEvent, useState } from "react";
 
 import { api } from "../lib/api";
 import type { KeepWarmSettings } from "../lib/types";
+import { Checkbox } from "./Checkbox";
+import { NumberField } from "./NumberField";
 import { Panel } from "./Panel";
 
 const MIN_IDLE_CAP_MINUTES = 5;
@@ -44,28 +46,17 @@ export function KeepWarmPanel({ settings, readonly, onSaved, onToast }: KeepWarm
   return (
     <Panel title="Cache keep-warm" sub="Copilot Claude prompt cache">
       <form className="keep-warm-form" onSubmit={(event) => void save(event)}>
-        <label className="keep-warm-toggle">
-          <input
-            type="checkbox"
-            checked={enabled}
-            disabled={locked || saving}
-            onChange={(event) => setEnabled(event.target.checked)}
-          />
-          <span>Keep idle streams warm</span>
-        </label>
+        <Checkbox checked={enabled} disabled={locked || saving} onChange={setEnabled} label="Keep idle streams warm" />
         <label className="keep-warm-field">
           <span>Stop after idle for</span>
-          <input
-            className="input keep-warm-cap"
-            type="number"
+          <NumberField
+            className="keep-warm-cap"
             min={MIN_IDLE_CAP_MINUTES}
-            step={1}
-            inputMode="numeric"
-            aria-label="Idle cap in minutes"
-            aria-invalid={!capValid}
+            ariaLabel="Idle cap in minutes"
+            invalid={!capValid}
             value={cap}
             disabled={locked || saving}
-            onChange={(event) => setCap(event.target.value)}
+            onChange={setCap}
           />
           <span>minutes</span>
         </label>

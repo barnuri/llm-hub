@@ -4,6 +4,7 @@ import { KpiCard } from "../components/KpiCard";
 import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
 import { PriceHeader } from "../components/PriceHeader";
+import { Select } from "../components/Select";
 import { api } from "../lib/api";
 import { formatDate, formatDateTime, formatMs, formatNumber, formatTime, formatUsd } from "../lib/format";
 import { formatPrice, type PriceSort, sortByPrice } from "../lib/pricing";
@@ -148,17 +149,15 @@ function FilterSelect({
   readonly onChange: (value: string) => void;
 }) {
   return (
-    <label className="smart-auto-filter">
+    <div className="smart-auto-filter">
       <span>{label}</span>
-      <select className="input" value={value} onChange={(event) => onChange(event.target.value)}>
-        <option value={ALL}>All</option>
-        {options.map((option) => (
-          <option key={option} value={option}>
-            {format(option)}
-          </option>
-        ))}
-      </select>
-    </label>
+      <Select
+        ariaLabel={label}
+        value={value}
+        options={[{ value: ALL, label: "All" }, ...options.map((option) => ({ value: option, label: format(option) }))]}
+        onChange={onChange}
+      />
+    </div>
   );
 }
 
@@ -548,16 +547,15 @@ function EffectResults({
           format={(value) => value}
           onChange={setProfile}
         />
-        <label className="smart-auto-filter">
+        <div className="smart-auto-filter">
           <span>Result</span>
-          <select className="input" value={result} onChange={(event) => setResult(event.target.value as ResultFilter)}>
-            {RESULT_FILTERS.map((option) => (
-              <option key={option} value={option}>
-                {RESULT_FILTER_TEXT[option]}
-              </option>
-            ))}
-          </select>
-        </label>
+          <Select
+            ariaLabel="Result"
+            value={result}
+            options={RESULT_FILTERS.map((option) => ({ value: option, label: RESULT_FILTER_TEXT[option] }))}
+            onChange={(next) => setResult(next as ResultFilter)}
+          />
+        </div>
       </div>
       {note !== null ? (
         <p className="note" role="status">

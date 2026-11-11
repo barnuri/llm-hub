@@ -241,7 +241,14 @@ export function App() {
 
         <div className="shell-body">
           <aside className="side" aria-label="Upstreams">
-            <div className="side-title">Upstreams</div>
+            <div className="side-title">
+              Upstreams
+              {meta ? (
+                <span className="side-count">
+                  {meta.profiles.filter((profile) => profile.healthy === true).length} of {meta.profiles.length} up
+                </span>
+              ) : null}
+            </div>
             <ul className="upstream-list">
               {(meta?.profiles ?? []).map((profile) => {
                 const led = profile.healthy === true ? "up" : profile.healthy === false ? "down" : "off";

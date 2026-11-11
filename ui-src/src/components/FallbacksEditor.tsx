@@ -3,6 +3,7 @@ import { useState } from "react";
 import { api } from "../lib/api";
 import { Panel } from "./Panel";
 import { Pill } from "./Pill";
+import { Select } from "./Select";
 
 interface FallbacksEditorProps {
   readonly chain: readonly string[];
@@ -109,24 +110,18 @@ export function FallbacksEditor({ chain, models, readonly, onSaved, onToast }: F
         <label className="dim" htmlFor="fallbacks-add">
           Add model
         </label>
-        <select
+        <Select
           id="fallbacks-add"
-          className="input"
           value=""
+          placeholder="Add a model to the chain…"
           disabled={readonly || available.length === 0}
-          onChange={(event) => {
-            if (event.target.value) {
-              setDraft([...draft, event.target.value]);
+          options={available.map((id) => ({ value: id, label: id }))}
+          onChange={(next) => {
+            if (next) {
+              setDraft([...draft, next]);
             }
           }}
-        >
-          <option value="">Add a model to the chain…</option>
-          {available.map((id) => (
-            <option key={id} value={id}>
-              {id}
-            </option>
-          ))}
-        </select>
+        />
         <button type="button" className="btn primary" onClick={save} disabled={readonly || !dirty || saving}>
           {saving ? "Saving…" : "Save fallbacks"}
         </button>

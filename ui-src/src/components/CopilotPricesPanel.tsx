@@ -1,6 +1,7 @@
 import { type FormEvent, useState } from "react";
 
 import { api } from "../lib/api";
+import { NumberField } from "./NumberField";
 import { Panel } from "./Panel";
 
 const SECONDS_PER_HOUR = 3600;
@@ -45,17 +46,15 @@ export function CopilotPricesPanel({ refreshSecs, readonly, onSaved, onToast }: 
       <form className="copilot-prices-form" onSubmit={(event) => void save(event)}>
         <label className="copilot-prices-field">
           <span>Refresh every</span>
-          <input
-            className="input copilot-prices-hours"
-            type="number"
+          <NumberField
+            className="copilot-prices-hours"
             min={0}
-            step="any"
             inputMode="decimal"
-            aria-label="Refresh interval in hours"
-            aria-invalid={!valid}
+            ariaLabel="Refresh interval in hours"
+            invalid={!valid}
             value={hours}
             disabled={readonly || saving}
-            onChange={(event) => setHours(event.target.value)}
+            onChange={setHours}
           />
           <span>hours</span>
         </label>

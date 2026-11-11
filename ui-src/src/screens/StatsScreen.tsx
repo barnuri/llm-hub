@@ -1,10 +1,12 @@
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 
 import { CompactCount } from "../components/CompactCount";
+import { Disclosure } from "../components/Disclosure";
 import { KpiCard } from "../components/KpiCard";
 import { Panel } from "../components/Panel";
 import { Pill } from "../components/Pill";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
+import { Select } from "../components/Select";
 import { StatsTable } from "../components/StatsTable";
 import { api } from "../lib/api";
 import { formatMs, formatNumber, formatPct, formatTps, formatUsd } from "../lib/format";
@@ -184,35 +186,27 @@ export function StatsScreen({ onError }: StatsScreenProps) {
     <section className="tab active stats">
       <div className="toolbar stats-toolbar" role="group" aria-label="Stats filters">
         <Segmented label="Time range" options={rangeOptions} value={range} onChange={setRange} />
-        <label className="stats-filter">
+        <div className="stats-filter">
           <span>Profile</span>
-          <select
-            className="input"
+          <Select
+            ariaLabel="Profile"
             value={profile}
-            onChange={(event) => {
-              setProfile(event.target.value);
+            options={[{ value: "", label: "All profiles" }, ...profileOptions.map((name) => ({ value: name, label: name }))]}
+            onChange={(next) => {
+              setProfile(next);
               setModel("");
             }}
-          >
-            <option value="">All profiles</option>
-            {profileOptions.map((name) => (
-              <option key={name} value={name}>
-                {name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="stats-filter">
+          />
+        </div>
+        <div className="stats-filter">
           <span>Model</span>
-          <select className="input" value={model} onChange={(event) => setModel(event.target.value)}>
-            <option value="">All models</option>
-            {modelOptions.map((name) => (
-              <option key={name} value={name}>
-                {name}
-              </option>
-            ))}
-          </select>
-        </label>
+          <Select
+            ariaLabel="Model"
+            value={model}
+            options={[{ value: "", label: "All models" }, ...modelOptions.map((name) => ({ value: name, label: name }))]}
+            onChange={setModel}
+          />
+        </div>
         <span className="stats-refresh">
           <Pill tone="ok" dot title="Stats refresh on a timer">
             {REFRESH_LABEL}
@@ -317,8 +311,7 @@ export function StatsScreen({ onError }: StatsScreenProps) {
       <StatsTable label="Profile" rows={snapshot?.profiles ?? []} />
       <StatsTable label="Model" rows={snapshot?.models ?? []} />
 
-      <details className="panel stats-help">
-        <summary>What do these numbers mean?</summary>
+      <Disclosure className="stats-help" title="What do these numbers mean?">
         <dl>
           {METRIC_HELP.map((item) => (
             <div key={item.title} className="stats-help-item">
@@ -327,7 +320,7 @@ export function StatsScreen({ onError }: StatsScreenProps) {
             </div>
           ))}
         </dl>
-      </details>
+      </Disclosure>
     </section>
   );
 }

@@ -2,6 +2,7 @@ import { type FormEvent, useEffect, useRef, useState } from "react";
 
 import { api } from "../lib/api";
 import type { ProfileRow } from "../lib/types";
+import { Checkbox } from "./Checkbox";
 import { Panel } from "./Panel";
 import { Pill } from "./Pill";
 
@@ -162,10 +163,7 @@ export function ProfileFormPanel({ existing, onSaved, onCancel, onToast }: Profi
           />
         </div>
         <div className="profile-form-foot">
-          <label className="field-check">
-            <input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />
-            Enabled
-          </label>
+          <Checkbox checked={enabled} onChange={setEnabled} label="Enabled" />
           <div className="profile-form-buttons">
             <button type="button" className="btn small" onClick={onCancel}>
               Cancel
