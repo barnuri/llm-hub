@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { KpiCard } from "../components/KpiCard";
+import { ModelName } from "../components/ModelName";
 import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
 import { api } from "../lib/api";
@@ -268,7 +269,7 @@ function TurnDetail({
                   </td>
                   <td data-label="Stage">{event.stage}</td>
                   <td className="mono" data-label="Model">
-                    {event.model}
+                    <ModelName id={event.model} />
                   </td>
                   <td data-label="State">{event.state}</td>
                   <td data-label="Kind">

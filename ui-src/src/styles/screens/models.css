@@ -132,10 +132,7 @@
 }
 
 .models .mix-label {
-  max-width: 140px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .models-side-note {

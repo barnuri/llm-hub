@@ -1,6 +1,5 @@
 use axum::Json;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +9,7 @@ use crate::schemas::app_error::AppError;
 use crate::schemas::quota_history::QuotaHistory;
 use crate::schemas::quota_snapshot_row::QuotaSnapshotRow;
 use crate::services::copilot_auto_decisions::TieredDecision;
-use crate::services::copilot_usage::{self, CopilotUsage};
+use crate::services::profile_usage::UsageKey;
 use crate::services::quota_snapshots::QuotaSnapshots;
 use crate::services::stats::SERIES_DAY_MS;
 use crate::services::store::{Store, now_ms};
@@ -20,13 +19,6 @@ const DEFAULT_QUOTA_RANGE: &str = "7d";
 #[derive(Debug, Deserialize, Default)]
 pub struct UsageQuery {
     pub profile: Option<String>,
-}
-
-#[derive(Serialize)]
-struct UsageBody<'a> {
-    profile: &'a str,
-    #[serde(flatten)]
-    usage: &'a CopilotUsage,
 }
 
 /// Query of `GET /api/copilot/usage/history`.
@@ -73,32 +65,18 @@ pub async fn usage(State(state): State<AppState>, Query(query): Query<UsageQuery
             .iter()
             .find(|p| p.enabled && p.copilot.is_some()),
     };
-    let Some((profile, auth)) = selected.and_then(|p| p.copilot.as_ref().map(|auth| (p, auth)))
-    else {
+    let Some(profile) = selected.filter(|p| p.copilot.is_some()) else {
         let message = query.profile.map_or_else(
             || "no enabled profile uses Copilot auth".to_string(),
             |name| format!("no Copilot profile named {name}"),
         );
         return AppError::NotFound(message).into_response();
     };
-    let Some(client) = state.client(&profile.name) else {
-        return AppError::Internal(format!("profile {} has no client", profile.name))
+    let Some(key) = UsageKey::for_profile(&config, &profile.name) else {
+        return AppError::Internal(format!("profile {} has no usage source", profile.name))
             .into_response();
     };
-    let Some(usage) = copilot_usage::usage(&state, &client, &profile.name, auth).await else {
-        let mut response = AppError::UpstreamUnavailable(format!(
-            "profile {}: the hub could not fetch the Copilot quota. The hub log has the reason",
-            profile.name
-        ))
-        .into_response();
-        *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-        return response;
-    };
-    Json(UsageBody {
-        profile: &profile.name,
-        usage: &usage,
-    })
-    .into_response()
+    crate::routes::profile_usage::respond(&state, &profile.name, &key).await
 }
 
 /// `GET /api/copilot/usage/history?range=7d|30d`: every stored quota reading in the range, and the daily
@@ -143,6 +121,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use axum::http::StatusCode;
     use serde_json::{Value, json};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

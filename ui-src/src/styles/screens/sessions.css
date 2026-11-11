@@ -37,10 +37,7 @@
 }
 
 .sessions-models {
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .sessions-table .sessions-note-row td {

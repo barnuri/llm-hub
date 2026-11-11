@@ -1,6 +1,8 @@
 pub mod answer_text;
 pub mod anthropic;
+pub mod attempt_outcomes;
 pub mod auth;
+pub mod bifrost_usage;
 pub mod body_transform;
 pub mod bounded_ring;
 pub mod buffered_reply_stream;
@@ -13,7 +15,6 @@ pub mod copilot_headers;
 pub mod copilot_login;
 pub mod copilot_prices;
 pub mod copilot_sessions;
-pub mod copilot_usage;
 pub mod credential_store;
 pub mod env_writer;
 #[cfg(test)]
@@ -27,6 +28,7 @@ pub mod insights;
 pub mod keep_warm;
 pub mod keyring_credential_store;
 pub mod launch;
+pub mod listed_prices;
 pub mod live_feed;
 pub mod managed_process;
 #[cfg(test)]
@@ -37,9 +39,11 @@ pub(crate) mod model_picker;
 pub mod multipart_model;
 pub mod pricing;
 pub mod process_gh_cli;
+pub mod profile_usage;
 pub mod prompt_shape_reader;
 pub mod quota_snapshots;
 pub mod request_images;
+pub mod responses_chat;
 pub mod responses_item_ids;
 pub mod restart;
 pub mod review_graph;

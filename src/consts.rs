@@ -3,6 +3,8 @@ use std::time::Duration;
 pub const MODELS_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MODELS_CACHE_TTL: Duration = Duration::from_mins(1);
 pub const DEFAULT_MAX_REPLAY_BYTES: usize = 256 * 1024 * 1024;
+/// Largest request body the proxy accepts, judged by `Content-Length` before it is buffered.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// The `OpenAI` audio upload limit: multipart bodies are buffered up to this so
 /// their `model` field can be rewritten per attempt.
 pub const MAX_MULTIPART_BYTES: usize = 25 * 1024 * 1024;

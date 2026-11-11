@@ -113,6 +113,19 @@ export interface StatsPricing {
   readonly note: string;
 }
 
+/** One Smart Auto tier and role group of `GET /api/stats` `by_tier_role`. */
+export interface TierRoleRow {
+  readonly tier: string;
+  readonly role: string;
+  readonly requests: number;
+  readonly cost_usd: number;
+  readonly completed_attempts: number;
+  /** Null when the group has no completed attempt. */
+  readonly cost_per_completed_usd: number | null;
+  /** Verified outcome code to the number of the group's attempts that carry it. */
+  readonly outcomes: Readonly<Record<string, number>>;
+}
+
 export interface StatsSnapshot {
   readonly range: string;
   readonly persistent: boolean;
@@ -123,6 +136,7 @@ export interface StatsSnapshot {
   readonly pricing: StatsPricing;
   readonly series_bucket?: string;
   readonly series?: readonly SeriesPoint[];
+  readonly by_tier_role: readonly TierRoleRow[];
 }
 
 export interface SeriesPoint {
@@ -163,10 +177,20 @@ export interface UsageReport {
   readonly recent: readonly UsageRow[];
 }
 
+export interface ErrorEntry extends UsageRow {
+  /** Request id for `POST /api/errors/resolve`. Null for the JSON store, which cannot mark rows. */
+  readonly id: number | null;
+  /** Unix ms when the error was marked solved. Null while open. */
+  readonly resolved_ms: number | null;
+}
+
 export interface ErrorsReport {
   readonly range: string;
+  /** All failed calls in the window, solved included. */
   readonly total_errors: number;
-  readonly recent: readonly UsageRow[];
+  /** Failed calls in the window not yet marked solved. */
+  readonly open_errors: number;
+  readonly recent: readonly ErrorEntry[];
 }
 
 export type ErrorsRange = "1d" | "7d" | "30d" | "all";
@@ -285,8 +309,8 @@ export interface ModelPick {
 
 export interface CopilotQuota {
   readonly id: string;
-  /** `aic` is AI credits (100 AIC = $1). */
-  readonly unit: "aic" | "requests";
+  /** `aic` is AI credits (100 AIC = $1). `usd` is a spend budget. */
+  readonly unit: "aic" | "requests" | "tokens" | "usd";
   readonly used: number;
   readonly entitlement: number;
   readonly remaining?: number;
@@ -313,10 +337,23 @@ export interface QuotaHistory {
 
 export interface CopilotUsageReport {
   readonly profile: string;
+  /** `copilot` or `bifrost`. */
+  readonly kind?: string;
   readonly source: string;
   readonly updatedAt: number;
   readonly fetchedAt: string;
   readonly quotas: readonly CopilotQuota[];
+}
+
+/** A profile with a quota source, from `GET /api/usage/sources`. */
+export interface UsageSource {
+  readonly profile: string;
+  readonly label: string;
+  readonly kind: string;
+}
+
+export interface UsageSourcesReport {
+  readonly sources: readonly UsageSource[];
 }
 
 /** Where one Smart Auto dispatch stands; a dispatch emits selected, started, then one terminal state. */

@@ -133,11 +133,15 @@ pub struct RequestOutcome {
     pub error: Option<String>,
     /// Caller signature (see `services::harness::client_signature`).
     pub client: Option<String>,
-    /// Salted Claude Code session key, the same value `selection_events.worker` stores,
-    /// so request rows join to selection events. `None` without a session id.
+    /// Salted worker key: the caller's worker id, else its Claude Code session. The same value
+    /// `selection_events.worker` stores, so request rows join to selection events. `None` without either.
     pub worker: Option<String>,
     /// How the model was chosen: `smart-auto:<tier>`, `copilot-auto`, or `pinned`. `None` when not recorded.
     pub routed_by: Option<String>,
+    /// Salted dispatch attempt key, the same value `selection_events.attempt` stores. `None` off a selection.
+    pub attempt: Option<String>,
+    /// The `snake_case` work role of a Smart Auto turn. `None` when the route has no role.
+    pub role: Option<String>,
 }
 
 impl StatsRegistry {
@@ -539,6 +543,8 @@ mod tests {
             client: None,
             worker: None,
             routed_by: None,
+            attempt: None,
+            role: None,
         }
     }
 

@@ -403,6 +403,10 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/api/smart-auto/history", get(routes::smart_auto::history))
         .route(
+            "/api/smart-auto/outcome",
+            post(routes::smart_auto::report_outcome),
+        )
+        .route(
             "/api/smart-auto/attempt",
             get(routes::smart_auto::attempt_text),
         )
@@ -411,6 +415,11 @@ fn build_router(state: AppState) -> Router {
             get(routes::smart_auto::decisions),
         )
         .route("/api/copilot/usage", get(routes::copilot::usage))
+        .route("/api/usage/sources", get(routes::profile_usage::sources))
+        .route(
+            "/api/profiles/{name}/usage",
+            get(routes::profile_usage::usage),
+        )
         .route(
             "/api/copilot/usage/history",
             get(routes::copilot::usage_history),
@@ -426,6 +435,7 @@ fn build_router(state: AppState) -> Router {
         .route("/api/usage", get(routes::admin::usage))
         .route("/api/live", get(routes::live::stream))
         .route("/api/errors", get(routes::admin::errors))
+        .route("/api/errors/resolve", post(routes::admin::resolve_errors))
         .route("/api/sessions", get(routes::sessions::list))
         .route("/api/sessions/{worker}", get(routes::sessions::detail))
         .route("/api/insights", get(routes::admin::insights))
@@ -625,6 +635,8 @@ mod tests {
             client: Some("claude-code".into()),
             worker: None,
             routed_by: None,
+            attempt: None,
+            role: None,
         });
 
         let chunk = response.chunk().await.unwrap().unwrap();
@@ -843,6 +855,108 @@ mod tests {
         let router = build_router(state);
         tokio::spawn(async move { axum::serve(listener, router).await });
         base
+    }
+
+    #[tokio::test]
+    async fn client_outcome_lands_on_the_workers_last_completed_attempt_in_history() {
+        use crate::schemas::scope_kind::ScopeKind;
+        use crate::schemas::selection_event::SelectionEvent;
+        use crate::schemas::selection_stage::SelectionStage;
+        use crate::schemas::selection_state::SelectionState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let vars: HashMap<String, String> = [
+            ("LLM_HUB_PROFILES", "copilot"),
+            ("LLM_HUB_COPILOT_BASE_URL", "http://127.0.0.1:9"),
+            ("LLM_HUB_MASTER_KEY", MASTER_KEY),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .chain([
+            (
+                "LLM_HUB_STORE_PATH".to_string(),
+                dir.path().join("hub.db").to_string_lossy().into_owned(),
+            ),
+            ("LLM_HUB_PERSISTENT".to_string(), "1".to_string()),
+        ])
+        .collect();
+        let store = crate::services::store::Store::open(
+            "sqlite",
+            Some(dir.path().join("hub.db").to_str().unwrap()),
+        )
+        .unwrap();
+        let state = AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            Some(store),
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router = build_router(state.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+
+        let log = state.selection_log();
+        let worker = log.scope_key(ScopeKind::Worker, "session-9");
+        log.record(SelectionEvent {
+            worker: Some(worker.clone()),
+            attempt: Some("attempt-1".into()),
+            ..SelectionEvent::new(
+                SelectionStage::Solver,
+                SelectionState::Completed,
+                "copilot/claude-opus-4-5",
+            )
+        });
+        state.attempt_tracker().note_completed(&worker, "attempt-1");
+        let client = reqwest::Client::new();
+        let outcome_url = format!("{base}/api/smart-auto/outcome");
+
+        let missing = client
+            .post(&outcome_url)
+            .bearer_auth(MASTER_KEY)
+            .json(&serde_json::json!({"session_id": "other", "code": "user_accepted"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+        let bad_code = client
+            .post(&outcome_url)
+            .bearer_auth(MASTER_KEY)
+            .json(&serde_json::json!({"session_id": "session-9", "code": "great"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(bad_code.status().is_client_error());
+        let saved = client
+            .post(&outcome_url)
+            .bearer_auth(MASTER_KEY)
+            .json(&serde_json::json!({"session_id": "session-9", "code": "user_corrected"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(saved.status().as_u16(), 200);
+        let unauthenticated = client
+            .post(&outcome_url)
+            .json(&serde_json::json!({"attempt": "attempt-1", "code": "user_accepted"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status().as_u16(), 401);
+
+        let history: serde_json::Value = client
+            .get(format!("{base}/api/smart-auto/history"))
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let event = &history["events"][0];
+        assert_eq!(event["attempt"], "attempt-1");
+        assert_eq!(event["outcome"]["code"], "user_corrected");
+        assert_eq!(event["outcome"]["source"], "client");
     }
 
     #[tokio::test]

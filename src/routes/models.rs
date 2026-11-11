@@ -26,6 +26,7 @@ use crate::services::copilot_auto::{
     AUTO_MODEL, AutoTier, CHAT_ENDPOINT, MESSAGES_ENDPOINT, RESPONSES_ENDPOINT,
 };
 use crate::services::copilot_prices::CopilotPrices;
+use crate::services::listed_prices;
 use crate::services::model_descriptors::ModelDescriptors;
 use crate::services::model_limits::ModelLimit;
 use crate::services::smart_auto_pool::SmartAutoPool;
@@ -204,6 +205,9 @@ async fn fetch_profile_models(
         .filter(|item| profile.copilot.is_none() || is_copilot_model_usable(item))
         .collect();
     if profile.copilot.is_none() {
+        state
+            .listed_prices()
+            .replace_profile(&profile.name, &listed_prices::from_listing(&usable));
         return Ok(describe_and_rewrite(profile, &usable, None));
     }
     state.update_copilot_catalog(

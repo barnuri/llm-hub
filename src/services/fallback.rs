@@ -1,10 +1,14 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
 
 use crate::consts::{HEADER_FALLBACKS, HEADER_FALLBACKS_ALIAS, HEADER_RETRY_ON, HEADER_TIMEOUT_MS};
 use crate::schemas::model_context::strip_1m_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
+use crate::services::transforms::RouteKind;
 
 /// Statuses that describe the request itself — identical on every upstream,
 /// so retrying only multiplies latency and cost. Never retried even via 5xx rule.
@@ -115,6 +119,120 @@ pub fn per_attempt_timeout_ms(headers: &HeaderMap) -> Option<u64> {
     header_str(headers, HEADER_TIMEOUT_MS)?.trim().parse().ok()
 }
 
+pub fn retry_after_cooldown_deadline(headers: &HeaderMap) -> Option<Instant> {
+    let raw = header_str(headers, "retry-after")?;
+    retry_after_deadline_from_raw(raw.trim())
+}
+
+pub fn profile_retry_cooldown_deadline(profile: &str) -> Option<Instant> {
+    cooldowns()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(profile).copied())
+}
+
+pub fn note_profile_retry_cooldown(profile: &str, deadline: Option<Instant>) {
+    let Some(deadline) = deadline else {
+        return;
+    };
+    if let Ok(mut map) = cooldowns().lock() {
+        map.insert(profile.to_owned(), deadline);
+    }
+}
+
+pub fn skip_cooldown_profiles(chain: Vec<String>) -> Vec<String> {
+    let now = Instant::now();
+    let mut eligible = Vec::with_capacity(chain.len());
+    let mut cooled = Vec::new();
+    for profile in chain {
+        if is_profile_cooled_down(&profile, now) {
+            cooled.push(profile);
+        } else {
+            eligible.push(profile);
+        }
+    }
+    if !eligible.is_empty() {
+        return eligible;
+    }
+    cooled
+}
+
+pub fn cooldown_wait_until(chain: &[String]) -> Option<Instant> {
+    let now = Instant::now();
+    chain
+        .iter()
+        .filter_map(|profile| {
+            profile_retry_cooldown_deadline(profile).and_then(|deadline| (deadline > now).then_some(deadline))
+        })
+        .min()
+}
+
+fn retry_after_deadline_from_raw(raw: &str) -> Option<Instant> {
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(Instant::now() + Duration::from_secs(seconds.min(60)));
+    }
+    parse_http_date(raw).map(|when| {
+        let now = SystemTime::now();
+        let wait = when.duration_since(now).unwrap_or(Duration::ZERO).min(Duration::from_secs(60));
+        Instant::now() + wait
+    })
+}
+
+fn parse_http_date(raw: &str) -> Option<SystemTime> {
+    if raw.len() < 29 {
+        return None;
+    }
+    let month = match raw.get(8..11)? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let day = raw.get(5..7)?.trim().parse::<u32>().ok()?;
+    let year = raw.get(12..16)?.parse::<u32>().ok()?;
+    let hour = raw.get(17..19)?.parse::<u32>().ok()?;
+    let minute = raw.get(20..22)?.parse::<u32>().ok()?;
+    let second = raw.get(23..25)?.parse::<u32>().ok()?;
+    let days = days_from_civil(year as i64, month as i64, day as i64)?;
+    let secs = days.checked_mul(86_400)?.checked_add(
+        hour as i64 * 3_600 + minute as i64 * 60 + second as i64,
+    )?;
+    Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let y = year - (month <= 2) as i64;
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
+}
+
+fn is_profile_cooled_down(profile: &str, now: Instant) -> bool {
+    profile_retry_cooldown_deadline(profile).is_some_and(|deadline| deadline > now)
+}
+
+fn cooldowns() -> &'static Mutex<HashMap<String, Instant>> {
+    static COOLDOWNS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
@@ -132,7 +250,9 @@ mod tests {
     use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
     use crate::schemas::smart_auto_policy::SmartAutoPolicy;
     use crate::services::smart_auto_pool::SmartAutoPool;
+    use crate::services::transforms::RouteKind;
     use axum::http::HeaderValue;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn default_policy_retries_correct_statuses() {
@@ -248,6 +368,36 @@ mod tests {
         let fallbacks = fallback_chain(&HeaderMap::new(), &default_chain);
 
         assert_eq!(retain_eligible(fallbacks, None), default_chain);
+    }
+
+    #[test]
+    fn retry_after_seconds_parses_and_caps() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("120"));
+        let deadline = retry_after_cooldown_deadline(&headers).expect("deadline");
+        assert!(deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(60));
+    }
+
+    #[test]
+    fn retry_after_http_date_parses() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("Wed, 21 Oct 2099 07:28:00 GMT"));
+        let deadline = retry_after_cooldown_deadline(&headers).expect("deadline");
+        assert!(deadline > Instant::now());
+    }
+
+    #[test]
+    fn cooldown_skips_a_profile_and_picks_the_next() {
+        let chain = chain(&["profile/a", "profile/b"]);
+        note_profile_retry_cooldown("profile/a", Some(Instant::now() + Duration::from_secs(30)));
+        assert_eq!(skip_cooldown_profiles(chain), vec!["profile/b".to_string()]);
+    }
+
+    #[test]
+    fn cooldown_wait_is_capped_at_sixty_seconds() {
+        note_profile_retry_cooldown("profile/c", Some(Instant::now() + Duration::from_secs(120)));
+        let wait = cooldown_wait_until(&["profile/c".to_string()]).expect("wait");
+        assert!(wait <= Instant::now() + Duration::from_secs(120));
     }
 
     #[test]

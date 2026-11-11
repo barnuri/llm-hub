@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { KpiCard } from "../components/KpiCard";
+import { ModelName } from "../components/ModelName";
 import { Panel } from "../components/Panel";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
 import { ShareBar } from "../components/ShareBar";
@@ -8,7 +9,7 @@ import { api } from "../lib/api";
 import { formatDateTime, formatMs, formatNumber, formatPct } from "../lib/format";
 import { useLive } from "../lib/live";
 import { navigate, useRoute } from "../lib/router";
-import type { ErrorsRange, ErrorsReport, StatsSnapshot, UsageRow } from "../lib/types";
+import type { ErrorEntry, ErrorsRange, ErrorsReport, StatsSnapshot, UsageRow } from "../lib/types";
 import "../styles/screens/errors.css";
 
 const PAGE_SIZE = 25;
@@ -83,6 +84,10 @@ export function ErrorsScreen() {
   const [reasonFilter, setReasonFilter] = useState<string | null>(null);
   const [showAllReasons, setShowAllReasons] = useState(false);
   const [calls, setCalls] = useState<StatsSnapshot | null>(null);
+  const [showSolved, setShowSolved] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [solveError, setSolveError] = useState<string | null>(null);
   const { tick } = useLive();
 
   useEffect(() => {
@@ -116,7 +121,7 @@ export function ErrorsScreen() {
     return () => {
       cancelled = true;
     };
-  }, [range, tick]);
+  }, [range, tick, reloadKey]);
 
   useEffect(() => {
     setPage(0);
@@ -134,9 +139,12 @@ export function ErrorsScreen() {
     );
   }
 
-  const allRows = report?.recent ?? [];
-  const reasons = groupReasons(allRows);
-  const rows = reasonFilter ? allRows.filter((row) => reasonOf(row) === reasonFilter) : allRows;
+  const allRows: readonly ErrorEntry[] = report?.recent ?? [];
+  const solvedCount = (report?.total_errors ?? 0) - (report?.open_errors ?? 0);
+  const scopedRows = showSolved ? allRows : allRows.filter((row) => row.resolved_ms === null);
+  const reasons = groupReasons(scopedRows);
+  const rows = reasonFilter ? scopedRows.filter((row) => reasonOf(row) === reasonFilter) : scopedRows;
+  const openInReason = rows.filter((row) => row.resolved_ms === null && row.id !== null);
   const pageCount = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
   const pageRows = rows.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
@@ -146,9 +154,18 @@ export function ErrorsScreen() {
     setPage(0);
   };
 
-  const totalErrors = report?.total_errors ?? 0;
-  const modelsAffected = new Set(allRows.map((row) => row.model)).size;
-  const lastError = allRows.reduce<UsageRow | null>(
+  const solve = (ids: readonly number[], solved: boolean) => {
+    setBusy(true);
+    setSolveError(null);
+    api<{ updated: number }>("/api/errors/resolve", { method: "POST", body: JSON.stringify({ ids, solved }) })
+      .then(() => setReloadKey((key) => key + 1))
+      .catch((err: unknown) => setSolveError(err instanceof Error ? err.message : "Could not update the error"))
+      .finally(() => setBusy(false));
+  };
+
+  const totalErrors = report ? (showSolved ? report.total_errors : report.open_errors) : 0;
+  const modelsAffected = new Set(scopedRows.map((row) => row.model)).size;
+  const lastError = scopedRows.reduce<UsageRow | null>(
     (latest, row) => (latest === null || row.ts_ms > latest.ts_ms ? row : latest),
     null,
   );
@@ -158,7 +175,7 @@ export function ErrorsScreen() {
     totalCalls > 0
       ? `${rangeLabel} · ${formatPct((totalErrors / totalCalls) * PERCENT)} of ${formatNumber(totalCalls)} calls`
       : rangeLabel;
-  const sparkDays = report && range === "7d" && allRows.length === totalErrors ? lastDays(loadedAtMs) : null;
+  const sparkDays = report && range === "7d" && scopedRows.length === totalErrors ? lastDays(loadedAtMs) : null;
   const shownReasons = showAllReasons ? reasons : reasons.slice(0, TOP_REASONS);
   const reasonsSub =
     reasons.length > TOP_REASONS && !showAllReasons
@@ -175,6 +192,17 @@ export function ErrorsScreen() {
           onChange={(value) => navigate(`/errors?range=${value}`)}
         />
         <span className="dim">Failed calls (HTTP 400+) in the selected window</span>
+        <button
+          type="button"
+          className="btn small"
+          aria-pressed={showSolved}
+          onClick={() => {
+            setShowSolved((shown) => !shown);
+            setPage(0);
+          }}
+        >
+          {showSolved ? "Hide solved" : `Show solved (${formatNumber(solvedCount)})`}
+        </button>
       </div>
 
       <div className="errors-kpis">
@@ -183,7 +211,7 @@ export function ErrorsScreen() {
           value={report ? formatNumber(totalErrors) : "…"}
           sub={errorsSub}
           tone={totalErrors > 0 ? "danger" : "default"}
-          series={sparkDays ? dailyErrors(sparkDays, allRows) : undefined}
+          series={sparkDays ? dailyErrors(sparkDays, scopedRows) : undefined}
           seriesLabel="Errors per day, last 7 days"
         />
         <KpiCard label="Distinct reasons" value={report ? formatNumber(reasons.length) : "…"} sub="In recent failures" />
@@ -191,7 +219,7 @@ export function ErrorsScreen() {
           label="Models affected"
           value={report ? formatNumber(modelsAffected) : "…"}
           sub="In recent failures"
-          series={sparkDays ? dailyModels(sparkDays, allRows) : undefined}
+          series={sparkDays ? dailyModels(sparkDays, scopedRows) : undefined}
           seriesLabel="Models with a failure per day, last 7 days"
         />
         <KpiCard
@@ -208,6 +236,16 @@ export function ErrorsScreen() {
             sub={reasonsSub}
             actions={
               <>
+                {reasonFilter && openInReason.length > 0 ? (
+                  <button
+                    type="button"
+                    className="btn small"
+                    disabled={busy}
+                    onClick={() => solve(openInReason.map((row) => row.id as number), true)}
+                  >
+                    Mark {formatNumber(openInReason.length)} solved
+                  </button>
+                ) : null}
                 {reasonFilter ? (
                   <button
                     type="button"
@@ -244,7 +282,7 @@ export function ErrorsScreen() {
                 <tbody>
                   {shownReasons.map((group) => {
                     const active = reasonFilter === group.reason;
-                    const share = allRows.length > 0 ? group.count / allRows.length : 0;
+                    const share = scopedRows.length > 0 ? group.count / scopedRows.length : 0;
                     return (
                       <tr key={group.reason} className={active ? "errors-reason-active" : undefined}>
                         <td className="num errors-reason-count">{formatNumber(group.count)}×</td>
@@ -274,6 +312,12 @@ export function ErrorsScreen() {
               </table>
             </div>
           </Panel>
+        ) : null}
+
+        {solveError ? (
+          <p className="note" role="alert">
+            {solveError}
+          </p>
         ) : null}
 
         <Panel
@@ -312,12 +356,13 @@ export function ErrorsScreen() {
                   <th className="num">Status</th>
                   <th className="num">Latency</th>
                   <th>Reason</th>
+                  <th>Solved</th>
                 </tr>
               </thead>
               <tbody>
                 {pageRows.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="dim errors-empty">
+                    <td colSpan={6} className="dim errors-empty">
                       {report === null ? "Loading…" : "No errors in this window."}
                     </td>
                   </tr>
@@ -325,11 +370,26 @@ export function ErrorsScreen() {
                   pageRows.map((row) => (
                     <tr key={`${row.ts_ms}-${row.model}-${row.status}-${row.latency_ms}`}>
                       <td className="mono nowrap">{formatDateTime(row.ts_ms)}</td>
-                      <td className="mono nowrap">{row.model}</td>
+                      <td className="mono nowrap"><ModelName id={row.model} profile={row.profile} /></td>
                       <td className="num t-err">{row.status}</td>
                       <td className="num nowrap">{formatMs(row.latency_ms)}</td>
                       <td className="mono errors-call-reason" title={row.error ?? undefined}>
                         {row.error ?? <span className="dim">not recorded</span>}
+                      </td>
+                      <td className="nowrap">
+                        {row.id === null ? (
+                          <span className="dim" title="Solved state needs the SQLite store">
+                            n/a
+                          </span>
+                        ) : row.resolved_ms !== null ? (
+                          <button type="button" className="btn small" disabled={busy} onClick={() => solve([row.id as number], false)}>
+                            Reopen
+                          </button>
+                        ) : (
+                          <button type="button" className="btn small" disabled={busy} onClick={() => solve([row.id as number], true)}>
+                            Mark solved
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))

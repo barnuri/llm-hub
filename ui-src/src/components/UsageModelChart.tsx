@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 
 import { nameColor } from "../lib/colors";
 import { formatNumber, formatUsd } from "../lib/format";
+import { ModelName } from "./ModelName";
 import { formatBucket, type SeriesBucket, uniqueTimes } from "../lib/series";
 import type { SeriesPoint, StatsEntry } from "../lib/types";
 
@@ -96,7 +97,7 @@ export function UsageChartLegend({
               onClick={() => onToggle(key)}
             >
               <span className="usage-model-chip-swatch" style={{ background: modelColor(key) }} />
-              {shortModel(key)}
+              <ModelName id={key} />
             </button>
           );
         })}
@@ -277,7 +278,7 @@ export function UsageTrendChart({
                     <svg width="8" height="8" viewBox="0 0 8 8" aria-hidden="true" focusable="false">
                       <circle cx="4" cy="4" r="4" style={{ fill: modelColor(key) }} />
                     </svg>{" "}
-                    <span>{shortModel(key)}</span>
+                    <ModelName id={key} />
                     {": "}
                     {requestsOn ? `${formatNumber(row?.requests ?? 0)} req` : ""}
                     {requestsOn && costOn ? " · " : ""}

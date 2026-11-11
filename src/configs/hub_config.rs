@@ -5,9 +5,11 @@ use super::copilot_auth::CopilotAuth;
 use super::keep_warm_config::KeepWarmConfig;
 use super::managed_command::ManagedCommand;
 use super::profile_config::ProfileConfig;
+use super::usage_source::{BIFROST_KEY_PREFIX, UsageSource};
 use crate::consts::{
     DEFAULT_BIND, DEFAULT_COPILOT_PRICES_REFRESH_SECS, DEFAULT_KEEP_WARM_ENABLED,
-    DEFAULT_KEEP_WARM_IDLE_CAP_MINUTES, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_PORT,
+    DEFAULT_KEEP_WARM_IDLE_CAP_MINUTES, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_MAX_REQUEST_BODY_BYTES,
+    DEFAULT_PORT,
     DEFAULT_SSE_KEEPALIVE_MS,
 };
 use crate::schemas::hub_selector::HubSelector;
@@ -26,6 +28,8 @@ const PREFIX: &str = "LLM_HUB_";
 #[derive(Debug, Clone)]
 pub struct HubConfig {
     pub profiles: Vec<ProfileConfig>,
+    /// Quota source per non-Copilot profile name, from `LLM_HUB_<NAME>_USAGE` or the key prefix.
+    pub usage_sources: HashMap<String, UsageSource>,
     /// Operator Smart Auto presets from `LLM_HUB_SMART_AUTO_PRESETS`, served as `hub/<name>`.
     pub smart_auto_presets: BTreeMap<String, SmartAutoPolicy>,
     /// Smart Auto include and exclude rules from `LLM_HUB_SMART_AUTO_RULES`; set, they replace the saved file.
@@ -33,6 +37,8 @@ pub struct HubConfig {
     pub master_key: Option<String>,
     pub default_fallbacks: Vec<String>,
     pub max_replay_bytes: usize,
+    /// Largest proxy request body, by `Content-Length`; over it the proxy answers 413.
+    pub max_request_body_bytes: usize,
     pub config_readonly: bool,
     pub bind: String,
     pub port: u16,
@@ -80,6 +86,10 @@ impl HubConfig {
         self.profiles.iter().find(|p| p.name == name)
     }
 
+    pub fn usage_source(&self, profile: &str) -> Option<UsageSource> {
+        self.usage_sources.get(profile).copied()
+    }
+
     pub fn from_map(vars: &HashMap<String, String>) -> Result<HubConfig, String> {
         let get = |key: &str| {
             vars.get(&format!("{PREFIX}{key}"))
@@ -101,6 +111,8 @@ impl HubConfig {
             profiles.push(Self::parse_profile(name, vars)?);
         }
 
+        let usage_sources = usage_sources_from_map(&profiles, vars)?;
+
         let master_key = get("MASTER_KEY").filter(|k| !k.is_empty());
         let default_fallbacks: Vec<String> = get("DEFAULT_FALLBACKS")
             .unwrap_or_default()
@@ -113,6 +125,12 @@ impl HubConfig {
                 .parse()
                 .map_err(|_| format!("LLM_HUB_MAX_REPLAY_BYTES is not a number: {v}"))?,
             None => DEFAULT_MAX_REPLAY_BYTES,
+        };
+        let max_request_body_bytes = match get("MAX_REQUEST_BODY_BYTES") {
+            Some(v) => v
+                .parse()
+                .map_err(|_| format!("LLM_HUB_MAX_REQUEST_BODY_BYTES is not a number: {v}"))?,
+            None => DEFAULT_MAX_REQUEST_BODY_BYTES,
         };
         let port = match get("PORT") {
             Some(v) => v
@@ -160,9 +178,11 @@ impl HubConfig {
             smart_auto_presets: smart_auto_presets_from_map(vars)?,
             smart_auto_rules_env: get("SMART_AUTO_RULES").filter(|v| !v.trim().is_empty()),
             profiles,
+            usage_sources,
             master_key,
             default_fallbacks,
             max_replay_bytes,
+            max_request_body_bytes,
             config_readonly: get("CONFIG_READONLY").is_some_and(|v| is_truthy(&v)),
             bind: get("BIND").unwrap_or_else(|| DEFAULT_BIND.to_string()),
             port,
@@ -269,6 +289,39 @@ impl HubConfig {
             copilot,
         })
     }
+}
+
+/// Quota source per profile: `LLM_HUB_<NAME>_USAGE` (`bifrost` or `none`) wins, and an unset var
+/// falls back to the key prefix. Copilot profiles are skipped, their auth is the source.
+fn usage_sources_from_map(
+    profiles: &[ProfileConfig],
+    vars: &HashMap<String, String>,
+) -> Result<HashMap<String, UsageSource>, String> {
+    let mut sources = HashMap::new();
+    for profile in profiles.iter().filter(|p| p.copilot.is_none()) {
+        let upper = env_name(&profile.name);
+        let explicit = vars
+            .get(&format!("{PREFIX}{upper}_USAGE"))
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty());
+        let source = match explicit.as_deref() {
+            Some("bifrost") => Some(UsageSource::Bifrost),
+            Some("none") => None,
+            Some(other) => {
+                return Err(format!(
+                    "LLM_HUB_{upper}_USAGE must be bifrost or none, not {other:?}"
+                ));
+            }
+            None => profile
+                .api_key
+                .starts_with(BIFROST_KEY_PREFIX)
+                .then_some(UsageSource::Bifrost),
+        };
+        if let Some(source) = source {
+            sources.insert(profile.name.clone(), source);
+        }
+    }
+    Ok(sources)
 }
 
 /// Operator Smart Auto presets from `LLM_HUB_SMART_AUTO_PRESETS`, a JSON object of name to policy.
@@ -401,6 +454,7 @@ mod tests {
         assert_eq!(cfg.profiles[0].base_url, "https://api.openai.com/v1");
         assert!(cfg.profiles[0].enabled);
         assert_eq!(cfg.max_replay_bytes, DEFAULT_MAX_REPLAY_BYTES);
+        assert_eq!(cfg.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES);
         assert_eq!(cfg.master_key, None);
         assert!(!cfg.config_readonly);
         assert_eq!(cfg.bind, DEFAULT_BIND);
@@ -426,6 +480,22 @@ mod tests {
         let cfg = HubConfig::from_map(&vars).unwrap();
         assert_eq!(cfg.profiles.len(), 1);
         assert_eq!(cfg.profiles[0].name, "openai");
+    }
+
+    #[test]
+    fn max_request_body_limit_defaults_and_parses() {
+        let mut vars = base_vars();
+        assert_eq!(
+            HubConfig::from_map(&vars).unwrap().max_request_body_bytes,
+            32 * 1024 * 1024
+        );
+        vars.insert("LLM_HUB_MAX_REQUEST_BODY_BYTES".into(), "1024".into());
+        assert_eq!(
+            HubConfig::from_map(&vars).unwrap().max_request_body_bytes,
+            1024
+        );
+        vars.insert("LLM_HUB_MAX_REQUEST_BODY_BYTES".into(), "lots".into());
+        assert!(HubConfig::from_map(&vars).is_err());
     }
 
     #[test]
@@ -793,5 +863,43 @@ mod tests {
         assert_eq!(mask_key(""), "");
         assert_eq!(mask_key("short"), "***");
         assert_eq!(mask_key("sk-abcdefgh1234"), "sk-a...1234");
+    }
+
+    fn usage_vars(profiles: &[(&str, &str, Option<&str>)]) -> HashMap<String, String> {
+        let mut vars = HashMap::new();
+        let names: Vec<&str> = profiles.iter().map(|(name, _, _)| *name).collect();
+        vars.insert("LLM_HUB_PROFILES".into(), names.join(","));
+        for (name, key, usage) in profiles {
+            let upper = env_name(name);
+            vars.insert(format!("LLM_HUB_{upper}_BASE_URL"), "http://127.0.0.1:9/v1".into());
+            vars.insert(format!("LLM_HUB_{upper}_API_KEY"), (*key).into());
+            if let Some(usage) = usage {
+                vars.insert(format!("LLM_HUB_{upper}_USAGE"), (*usage).into());
+            }
+        }
+        vars
+    }
+
+    #[test]
+    fn usage_source_follows_the_env_var_then_the_key_prefix() {
+        let cfg = HubConfig::from_map(&usage_vars(&[
+            ("prefixed", "sk-bf-abc", None),
+            ("plain", "sk-other", None),
+            ("opted_out", "sk-bf-abc", Some("none")),
+            ("opted_in", "sk-other", Some("Bifrost")),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.usage_source("prefixed"), Some(UsageSource::Bifrost));
+        assert_eq!(cfg.usage_source("plain"), None);
+        assert_eq!(cfg.usage_source("opted_out"), None);
+        assert_eq!(cfg.usage_source("opted_in"), Some(UsageSource::Bifrost));
+    }
+
+    #[test]
+    fn unknown_usage_value_is_rejected() {
+        let err = HubConfig::from_map(&usage_vars(&[("gw", "k", Some("datadog"))])).unwrap_err();
+
+        assert!(err.contains("LLM_HUB_GW_USAGE"), "{err}");
     }
 }

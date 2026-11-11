@@ -811,6 +811,8 @@ mod tests {
             client: None,
             worker: None,
             routed_by: None,
+            attempt: None,
+            role: None,
         }
     }
 

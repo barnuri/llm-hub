@@ -92,10 +92,6 @@
   overflow-y: auto;
 }
 
-.stats-table .stats-key-prefix {
-  color: var(--muted);
-}
-
 .stats-table .share-bar {
   display: block;
   flex: none;

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { KpiCard } from "../components/KpiCard";
 import { MixTable, type MixRow } from "../components/MixTable";
+import { ModelName } from "../components/ModelName";
 import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
 import { api } from "../lib/api";
@@ -281,7 +282,7 @@ export function AutoScreen({ models }: { readonly models: readonly HubModel[] })
                       <span className="mono nowrap">{row.auto_pick}</span>
                       {row.selection_reason ? <span className="auto-reason">{row.selection_reason}</span> : null}
                     </td>
-                    <td className="mono nowrap">{row.model}</td>
+                    <td className="mono nowrap"><ModelName id={row.model} /></td>
                     <td className="error-reason">{row.swap_reason ?? <span className="dim">none</span>}</td>
                     <td className="mono nowrap">
                       {row.complexity ?? <span className="dim">{UNKNOWN_COMPLEXITY}</span>}

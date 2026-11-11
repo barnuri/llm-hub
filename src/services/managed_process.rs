@@ -22,6 +22,11 @@ struct ManagedEntry {
     command: ManagedCommand,
     child: tokio::sync::Mutex<Option<Child>>,
     last_used: Mutex<Instant>,
+    // Backoff state to avoid rapid respawn attempts when a process repeatedly fails.
+    backoff_until: Mutex<Option<Instant>>,
+    backoff_secs: Mutex<u64>,
+    // Last observed exit reason (if any) to help operators diagnose failures.
+    last_exit_reason: Mutex<Option<String>>,
 }
 
 impl ProcessManager {
@@ -39,6 +44,8 @@ impl ProcessManager {
     /// # Errors
     /// A message naming the profile and its log file when the process cannot
     /// be spawned, exits early, or does not listen within the start timeout.
+    /// After a failed start, requests fail fast with the last reason until a
+    /// backoff (5s doubling to 60s) passes, so a broken command is not respawned per request.
     pub async fn ensure_running(&self, profile: &ProfileConfig) -> Result<(), String> {
         let Some(command) = &profile.managed else {
             return Ok(());
@@ -49,23 +56,32 @@ impl ProcessManager {
         if child.as_mut().is_some_and(is_alive) {
             return Ok(());
         }
+        if let Some(reason) = entry.backoff_reason() {
+            return Err(reason);
+        }
         *child = None;
         if accepts_connections(&command.address).await {
+            entry.reset_backoff();
             return Ok(());
         }
         let log_path = self.log_path(&profile.name);
-        let started = start(&profile.name, command, &log_path)
-            .await
-            .map_err(|reason| {
-                format!(
+        match start(&profile.name, command, &log_path).await {
+            Ok(started) => {
+                *child = Some(started);
+                entry.reset_backoff();
+                entry.touch();
+                Ok(())
+            }
+            Err(reason) => {
+                let message = format!(
                     "managed process for profile {} did not start: {reason}; see {}",
                     profile.name,
                     log_path.display()
-                )
-            })?;
-        *child = Some(started);
-        entry.touch();
-        Ok(())
+                );
+                entry.record_exit_reason(message.clone());
+                Err(message)
+            }
+        }
     }
 
     /// Records a use so the idle timer restarts, e.g. when a long response arrives.
@@ -173,6 +189,9 @@ impl ManagedEntry {
             command: command.clone(),
             child: tokio::sync::Mutex::new(None),
             last_used: Mutex::new(Instant::now()),
+            backoff_until: Mutex::new(None),
+            backoff_secs: Mutex::new(5),
+            last_exit_reason: Mutex::new(None),
         }
     }
 
@@ -189,6 +208,47 @@ impl ManagedEntry {
         self.last_used
             .lock()
             .is_ok_and(|last_used| last_used.elapsed() >= idle_timeout)
+    }
+
+    fn backoff_reason(&self) -> Option<String> {
+        let now = Instant::now();
+        let should_wait = self
+            .backoff_until
+            .lock()
+            .ok()
+            .and_then(|until| *until)
+            .is_some_and(|until| until > now);
+        if !should_wait {
+            return None;
+        }
+        self.last_exit_reason
+            .lock()
+            .ok()
+            .and_then(|reason| reason.clone())
+    }
+
+    fn record_exit_reason(&self, reason: String) {
+        if let Ok(mut last_exit_reason) = self.last_exit_reason.lock() {
+            *last_exit_reason = Some(reason);
+        }
+        if let Ok(mut backoff_secs) = self.backoff_secs.lock() {
+            if let Ok(mut until) = self.backoff_until.lock() {
+                *until = Some(Instant::now() + std::time::Duration::from_secs(*backoff_secs));
+            }
+            *backoff_secs = (*backoff_secs).saturating_mul(2).clamp(5, 60);
+        }
+    }
+
+    fn reset_backoff(&self) {
+        if let Ok(mut until) = self.backoff_until.lock() {
+            *until = None;
+        }
+        if let Ok(mut backoff_secs) = self.backoff_secs.lock() {
+            *backoff_secs = 5;
+        }
+        if let Ok(mut last_exit_reason) = self.last_exit_reason.lock() {
+            *last_exit_reason = None;
+        }
     }
 
     async fn stop(&self) {

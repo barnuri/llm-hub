@@ -20,6 +20,7 @@ use crate::dependencies::state::AppState;
 use crate::routes::models::{COPILOT_AUTO_MODEL, advertised_bare_id};
 use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::app_error::AppError;
+use crate::schemas::attempt_outcome::{AttemptOutcome, OutcomeCode, OutcomeSource};
 use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::profile_filter::ProfileFilter;
@@ -46,6 +47,7 @@ use crate::schemas::work_role::WorkRole;
 use crate::services::anthropic;
 use crate::services::anthropic::native_reply::NativeReplyRepair;
 use crate::services::anthropic::responses_stream::ResponsesStream;
+use crate::services::attempt_outcomes::{classify_test_output, last_tool_result_text};
 use crate::services::body_transform::BodyTransform;
 use crate::services::buffered_reply_stream::BufferedReplyStream;
 use crate::services::copilot_auto::{
@@ -62,6 +64,7 @@ use crate::services::harness::client_signature;
 use crate::services::keep_warm::{KeepWarmLease, PingPlan};
 use crate::services::multipart_model;
 use crate::services::request_images::request_has_image;
+use crate::services::responses_chat::{self, ChatStream};
 use crate::services::responses_item_ids::ResponsesItemIds;
 use crate::services::review_graph::ReviewGraph;
 use crate::services::review_orchestrator::ReviewOrchestrator;
@@ -105,6 +108,11 @@ const SUCCESS_STATUS_RANGE: std::ops::Range<u16> = 200..300;
 /// Catch-all /v1/* passthrough with header-driven fallbacks.
 pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Response, AppError> {
     let (parts, body) = req.into_parts();
+    if let Some(refused) =
+        oversized_body_response(&parts.headers, state.config().max_request_body_bytes)
+    {
+        return Ok(refused);
+    }
     let path_and_query = parts.uri.path_and_query().map_or_else(
         || parts.uri.path().to_string(),
         |pq| pq.as_str().to_string(),
@@ -233,7 +241,11 @@ pub(crate) async fn attempt_loop(
 
     let client_path = bare_path(path_and_query);
     let client = client_signature(headers);
-    let worker = worker_key(state, headers);
+    // The Smart Auto template already holds the worker key of the caller's worker id, else its session.
+    let worker = smart
+        .as_ref()
+        .and_then(|plan| plan.template.worker.clone())
+        .or_else(|| worker_key(state, headers));
     let retry_policy = RetryPolicy::from_headers(headers);
     // The raw client body, kept only for the Anthropic route's prompt shape row.
     let shape_body = (bodies.route == RouteKind::Anthropic).then(|| body.clone());
@@ -260,7 +272,9 @@ pub(crate) async fn attempt_loop(
         }
         let model_id = auto.as_ref().map_or(requested, |pick| &pick.model_id);
         let routed_by = routed_by_label(auto.is_some(), smart.as_ref().map(|plan| plan.tier));
-        let mut attempt = bodies.for_model(state, model_id);
+        let mut attempt = bodies
+            .for_model(state, model_id)
+            .map_err(AppError::BadRequest)?;
         let effort = match (&smart, &auto) {
             (Some(plan), _) => plan.effort_for(state, model_id),
             (None, Some(pick)) => pick.effort,
@@ -414,6 +428,7 @@ pub(crate) async fn attempt_loop(
                     client.clone(),
                     worker.clone(),
                     routed_by.clone(),
+                    selection.as_ref(),
                     LogPaths {
                         client: client_path,
                         upstream: attempt.path.as_str(),
@@ -434,6 +449,7 @@ pub(crate) async fn attempt_loop(
                     client.clone(),
                     worker.clone(),
                     routed_by.clone(),
+                    selection.as_ref(),
                     LogPaths {
                         client: client_path,
                         upstream: attempt.path.as_str(),
@@ -669,6 +685,13 @@ fn resolve_hub(
     let worker = worker_raw
         .as_deref()
         .map(|raw| log.scope_key(ScopeKind::Worker, raw));
+    if signals.tool_continuation
+        && let Some(worker_key) = &worker
+        && let Some(attempt) = state.attempt_tracker().last_completed(worker_key)
+        && let Some(text) = last_tool_result_text(body)
+    {
+        classify_outcome_later(state, attempt, worker_key.clone(), text);
+    }
     let template = SelectionEvent {
         workflow: caller
             .parent
@@ -949,6 +972,13 @@ enum ReplyRewrite {
         served_model: String,
         names: NameMap,
     },
+    /// A chat-completions request bridged to a Responses-only Copilot model; see
+    /// [`chat_from_responses`].
+    ChatFromResponses {
+        served_model: String,
+        names: NameMap,
+        include_usage: bool,
+    },
 }
 
 impl ReplyRewrite {
@@ -961,6 +991,11 @@ impl ReplyRewrite {
                 served_model,
                 names,
             } => anthropic_from_responses(response, served_model, names).await,
+            ReplyRewrite::ChatFromResponses {
+                served_model,
+                names,
+                include_usage,
+            } => chat_from_responses(response, served_model, names, *include_usage).await,
         }
     }
 }
@@ -985,12 +1020,14 @@ impl<'a> AttemptBodies<'a> {
         // so keep it before translation replaces it.
         // Server tools are dropped here: Copilot's native endpoint rejects them with a 400.
         // Enabled thinking becomes adaptive: Copilot's native endpoint rejects it on Haiku 5.5.
+        // Placeholder-signed thinking is dropped: Copilot rejects it as an invalid signature.
         let native = json_body
             .clone()
             .filter(|_| route == RouteKind::Anthropic)
             .map(|mut anthropic_body| {
                 anthropic::request::drop_server_tools(&mut anthropic_body);
                 anthropic::request::adaptive_thinking(&mut anthropic_body);
+                anthropic::request::drop_placeholder_thinking(&mut anthropic_body);
                 (anthropic_body, with_anthropic_version(headers))
             });
 
@@ -1054,7 +1091,8 @@ impl<'a> AttemptBodies<'a> {
         Ok((bodies, primary_id))
     }
 
-    fn for_model(&self, state: &AppState, model_id: &ModelId) -> Attempt<'_> {
+    /// Errors only for a chat-completions request a Responses-only model cannot carry.
+    fn for_model(&self, state: &AppState, model_id: &ModelId) -> Result<Attempt<'_>, String> {
         let catalog = state.upstream_model(&model_id.profile, &model_id.model);
         // Copilot lists Claude ids dotted, the hub advertises them dashed; an
         // id missing from the catalog is sent as the client wrote it.
@@ -1073,7 +1111,14 @@ impl<'a> AttemptBodies<'a> {
             .as_ref()
             .filter(|_| native.is_none() && serves_only_responses(state, &sent_id));
         if let Some((anthropic_body, _)) = bridged {
-            return self.responses_attempt(anthropic_body, &sent_id, model_id);
+            return Ok(self.responses_attempt(anthropic_body, &sent_id, model_id));
+        }
+        if let Some(chat) = self
+            .json_body
+            .as_ref()
+            .filter(|_| self.bridges_chat_completions(state, &sent_id))
+        {
+            return self.chat_responses_attempt(chat, &sent_id, model_id);
         }
         let path = native_count_tokens_path(self.upstream_path, catalog.as_ref())
             .unwrap_or(UpstreamPath::Strip(self.upstream_path));
@@ -1084,7 +1129,7 @@ impl<'a> AttemptBodies<'a> {
         } else {
             ReplyRewrite::None
         };
-        match native {
+        let attempt = match native {
             // The request transforms only ever touched the translated body,
             // and the response, error bodies included, goes back untouched.
             Some((anthropic_body, native_headers)) => Attempt {
@@ -1120,7 +1165,44 @@ impl<'a> AttemptBodies<'a> {
                 native_messages: false,
                 reply_rewrite,
             },
-        }
+        };
+        Ok(attempt)
+    }
+
+    /// True for a chat-completions request to a Copilot model that serves only `/responses`.
+    fn bridges_chat_completions(&self, state: &AppState, sent_id: &ModelId) -> bool {
+        self.native.is_none()
+            && bare_path(self.upstream_path).ends_with(CHAT_ENDPOINT)
+            && serves_only_responses(state, sent_id)
+    }
+
+    /// The chat-completions request as a Responses request, for a Responses-only
+    /// Copilot model. A feature the Responses API cannot carry is an error, not a drop.
+    fn chat_responses_attempt(
+        &self,
+        chat: &Value,
+        sent_id: &ModelId,
+        model_id: &ModelId,
+    ) -> Result<Attempt<'_>, String> {
+        let (responses_body, names) = responses_chat::chat_to_responses(chat)?;
+        let include_usage = chat
+            .pointer("/stream_options/include_usage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok(Attempt {
+            path: UpstreamPath::Verbatim(RESPONSES_ENDPOINT),
+            headers: &self.headers,
+            body: json_for_attempt(&responses_body, self.original, sent_id, &[]),
+            force_identity_encoding: true,
+            route: RouteKind::OpenAi,
+            plan: &self.passthrough_plan,
+            native_messages: false,
+            reply_rewrite: ReplyRewrite::ChatFromResponses {
+                served_model: model_id.qualified(),
+                names,
+                include_usage,
+            },
+        })
     }
 
     /// The Anthropic request as a Responses request, for a Copilot model that
@@ -1532,6 +1614,19 @@ async fn review_deliver(
                 ..event.in_state(SelectionState::Completed)
             });
         }
+        if let Some(code) = review_outcome_code(outcome.rejected, outcome.review_failed.is_some())
+            && let Some(attempt) = event.attempt.clone()
+        {
+            save_outcome_later(
+                state,
+                attempt,
+                event.worker.clone(),
+                AttemptOutcome {
+                    code,
+                    source: OutcomeSource::Review,
+                },
+            );
+        }
     }
     if outcome.rejected {
         return Err(AppError::UpstreamUnavailable(
@@ -1546,6 +1641,7 @@ async fn review_deliver(
             .and_then(Value::as_u64)
             .unwrap_or(0)
     };
+    let (attempt, role) = outcome_attempt(selection.as_ref());
     let request_stats = RequestOutcome {
         profile: solver.profile.clone(),
         model_key: outcome.served.qualified(),
@@ -1561,6 +1657,8 @@ async fn review_deliver(
         client,
         worker,
         routed_by: Some(routed_by),
+        attempt,
+        role,
     };
     if let Some(commit) = commit {
         commit.apply(state);
@@ -1890,7 +1988,7 @@ async fn retry_without_rejected_fields(
     }
     let (state, model_id) = (sender.state, sender.model_id);
     state.learn_unsupported_body_fields(&model_id.profile, &rejected);
-    let retried = bodies.for_model(state, model_id).body;
+    let retried = bodies.for_model(state, model_id)?.body;
     let response = sender.send(retried.clone()).await?;
     Ok((response, Some(retried)))
 }
@@ -2002,6 +2100,8 @@ pub(crate) async fn send_keep_warm_ping(state: &AppState, ping: PingPlan) {
         client: Some(KEEP_WARM_CLIENT.to_string()),
         worker: Some(worker.clone()),
         routed_by: Some(ROUTED_BY_PINNED.to_owned()),
+        attempt: None,
+        role: None,
     };
     state.stats().record(&outcome);
     state.publish_live(&outcome);
@@ -2116,6 +2216,33 @@ async fn anthropic_from_responses(
     rebuilt_response(status, version, headers, body)
 }
 
+/// Puts a successful Copilot `/responses` reply into chat-completion shape. An error or
+/// a compressed body is left alone, as for [`anthropic_from_responses`].
+async fn chat_from_responses(
+    response: reqwest::Response,
+    served_model: &str,
+    names: &NameMap,
+    include_usage: bool,
+) -> reqwest::Response {
+    if !is_rewritable(&response) {
+        return response;
+    }
+    if is_event_stream(&response) {
+        let translator = ChatStream::new(served_model.to_string(), names.clone(), include_usage);
+        return rewrite_body(response, translator);
+    }
+    let (status, version, headers) = parts_for_rewrite(&response);
+    let (raw, upstream_end) = read_upstream_capped(response, MAX_TRANSFORM_BUFFER_BYTES).await;
+    if upstream_end == UpstreamEnd::Open {
+        let body = responses_chat::chat_error_body(
+            "upstream response is too large to translate into the chat completion shape",
+        );
+        return rebuilt_response(StatusCode::BAD_GATEWAY, version, headers, body);
+    }
+    let body = responses_chat::to_chat(&raw, served_model, names);
+    rebuilt_response(status, version, headers, body)
+}
+
 /// A successful, uncompressed reply, whose bytes the hub can rewrite.
 fn is_rewritable(response: &reqwest::Response) -> bool {
     response.status().is_success() && !is_compressed(response.headers())
@@ -2163,6 +2290,16 @@ impl UpstreamRewrite for ResponsesItemIds {
 
     fn finish(&mut self) -> Vec<u8> {
         ResponsesItemIds::finish(self)
+    }
+}
+
+impl UpstreamRewrite for ChatStream {
+    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        ChatStream::push(self, bytes)
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        ChatStream::finish(self)
     }
 }
 
@@ -2352,6 +2489,15 @@ fn record_transition(
     moved
 }
 
+/// The attempt key and `snake_case` work role of a dispatch's selection, which a request row carries to join its events.
+fn outcome_attempt(selection: Option<&SelectionEvent>) -> (Option<String>, Option<String>) {
+    let attempt = selection.and_then(|event| event.attempt.clone());
+    let role = selection
+        .and_then(|event| event.role)
+        .map(|role| role.as_str().to_owned());
+    (attempt, role)
+}
+
 /// Records how a delivered attempt ended: completed once the upstream body ended, cancelled when the stream stopped first.
 fn finish_selection(
     state: &AppState,
@@ -2367,6 +2513,9 @@ fn finish_selection(
     } else {
         SelectionState::Cancelled
     };
+    if let Some((worker, attempt)) = completed_solver_attempt(&event, next) {
+        state.attempt_tracker().note_completed(worker, attempt);
+    }
     state.selection_log().record(SelectionEvent {
         status: Some(outcome.status),
         latency_ms: Some(outcome.latency_ms),
@@ -2376,6 +2525,14 @@ fn finish_selection(
         cache_write_tokens: reported(outcome.cache_write_tokens),
         ..event.in_state(next)
     });
+}
+
+/// The worker and attempt of a solver event that ends in `next` as Completed, the pair the outcome tracker keys on.
+fn completed_solver_attempt(event: &SelectionEvent, next: SelectionState) -> Option<(&str, &str)> {
+    if next != SelectionState::Completed || event.stage != SelectionStage::Solver {
+        return None;
+    }
+    Some((event.worker.as_deref()?, event.attempt.as_deref()?))
 }
 
 /// Why a delivered answer ended before its upstream body did.
@@ -2445,6 +2602,54 @@ fn save_prompt(state: &AppState, selection: &SelectionEvent, body: &Bytes) {
 }
 
 /// Saves the answer of one dispatch from its raw upstream reply, read with `answer_text`. Callers on the request path spawn it.
+/// The outcome a finished review gives the solver attempt. A review that failed to run judged nothing.
+fn review_outcome_code(rejected: bool, review_failed: bool) -> Option<OutcomeCode> {
+    if rejected {
+        Some(OutcomeCode::ReviewRejected)
+    } else if review_failed {
+        None
+    } else {
+        Some(OutcomeCode::ReviewPassed)
+    }
+}
+
+/// Classifies `tool_text` as test output and saves the result for `attempt`, off the request path.
+fn classify_outcome_later(state: &AppState, attempt: String, worker: String, tool_text: String) {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let Some(code) = classify_test_output(&tool_text) else {
+            return;
+        };
+        let outcome = AttemptOutcome {
+            code,
+            source: OutcomeSource::Heuristic,
+        };
+        write_outcome(&state, &attempt, Some(&worker), &outcome);
+    });
+}
+
+/// Saves `outcome` for `attempt` on a blocking thread, so the store lock never holds up a response.
+fn save_outcome_later(
+    state: &AppState,
+    attempt: String,
+    worker: Option<String>,
+    outcome: AttemptOutcome,
+) {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        write_outcome(&state, &attempt, worker.as_deref(), &outcome);
+    });
+}
+
+fn write_outcome(state: &AppState, attempt: &str, worker: Option<&str>, outcome: &AttemptOutcome) {
+    let Some(store) = state.store() else {
+        return;
+    };
+    if let Err(e) = store.save_attempt_outcome(attempt, worker, outcome, now_ms()) {
+        tracing::warn!("attempt outcome write failed: {e}");
+    }
+}
+
 fn save_answer(state: &AppState, attempt: &str, raw: &[u8]) {
     let text = crate::services::answer_text::answer_text(raw);
     save_text(state, |store| {
@@ -2517,6 +2722,7 @@ fn build_response(
     let client_path = client_path.to_owned();
     let path = upstream_path.to_owned();
     let learn_model = model_id.clone();
+    let (attempt, role) = outcome_attempt(selection.as_ref());
     let outcome_seed = RequestOutcome {
         profile: model_id.profile.clone(),
         model_key: model_id.qualified(),
@@ -2532,6 +2738,8 @@ fn build_response(
         client,
         worker,
         routed_by: Some(routed_by),
+        attempt,
+        role,
     };
 
     let (summary_sender, summary_receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
@@ -2960,6 +3168,7 @@ async fn build_anthropic_response(
     // the upstream shape remains the primary source.
     let usage = scrape_usage(&raw);
     let latency_ms = crate::utils::time::elapsed_ms(started);
+    let (attempt, role) = outcome_attempt(selection.as_ref());
     let outcome = RequestOutcome {
         profile: model_id.profile.clone(),
         model_key: model_id.qualified(),
@@ -2982,6 +3191,8 @@ async fn build_anthropic_response(
         client,
         worker,
         routed_by: Some(routed_by),
+        attempt,
+        role,
     };
     log_failure(
         &outcome,
@@ -3136,9 +3347,11 @@ fn record_failure(
     client: Option<String>,
     worker: Option<String>,
     routed_by: String,
+    selection: Option<&SelectionEvent>,
     paths: LogPaths<'_>,
 ) {
     let latency_ms = crate::utils::time::elapsed_ms(started);
+    let (attempt, role) = outcome_attempt(selection);
     let outcome = RequestOutcome {
         profile: model_id.profile.clone(),
         model_key: model_id.qualified(),
@@ -3154,6 +3367,8 @@ fn record_failure(
         client,
         worker,
         routed_by: Some(routed_by),
+        attempt,
+        role,
     };
     let upstream_end = if status == 0 {
         UpstreamEnd::Error
@@ -3270,6 +3485,28 @@ pub(crate) async fn read_body_capped(
         }
     }
     Ok((Bytes::from(buffered), None))
+}
+
+/// The 413 for a request whose declared `Content-Length` is over `limit`. Checked before the body is buffered.
+/// A missing or unparsable length passes here; `read_body_capped` still bounds it by the replay cap.
+fn oversized_body_response(headers: &HeaderMap, limit: usize) -> Option<Response> {
+    let declared: u64 = header_value(headers, "content-length")
+        .trim()
+        .parse()
+        .ok()?;
+    if declared <= u64::try_from(limit).unwrap_or(u64::MAX) {
+        return None;
+    }
+    let body = serde_json::json!({ "error": {
+        "message": format!(
+            "request body is {declared} bytes, over the {limit} byte limit (LLM_HUB_MAX_REQUEST_BODY_BYTES)"
+        ),
+        "type": "request_too_large",
+    }});
+    Some(axum::response::IntoResponse::into_response((
+        StatusCode::PAYLOAD_TOO_LARGE,
+        axum::Json(body),
+    )))
 }
 
 fn extract_model_prefix(buffered: &Bytes) -> Option<String> {
@@ -3394,6 +3631,39 @@ mod tests {
 
     use super::*;
     use crate::services::store::Store;
+
+    #[test]
+    fn body_limit_refuses_oversized_content_length() {
+        let mut headers = HeaderMap::new();
+        let limit = crate::consts::DEFAULT_MAX_REQUEST_BODY_BYTES;
+        headers.insert(
+            "content-length",
+            HeaderValue::from_str(&(limit + 1).to_string()).unwrap(),
+        );
+        let refused = oversized_body_response(&headers, limit)
+            .expect("an over-limit Content-Length is refused");
+        assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn body_limit_passes_undersized_and_missing_content_length() {
+        let limit = crate::consts::DEFAULT_MAX_REQUEST_BODY_BYTES;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-length",
+            HeaderValue::from_str(&limit.to_string()).unwrap(),
+        );
+        assert!(
+            oversized_body_response(&headers, limit).is_none(),
+            "exactly at the limit passes"
+        );
+        headers.insert("content-length", HeaderValue::from_static("1024"));
+        assert!(oversized_body_response(&headers, limit).is_none());
+        assert!(
+            oversized_body_response(&HeaderMap::new(), limit).is_none(),
+            "no length header passes"
+        );
+    }
 
     const KEEPALIVE: Duration = Duration::from_millis(25);
     /// Comfortably longer than `KEEPALIVE`, so the idle branch fires at least
@@ -3980,6 +4250,8 @@ mod tests {
             assert_eq!(sent.len(), 1);
             let mut expected = body.clone();
             expected["model"] = json!(NATIVE_UPSTREAM_ID);
+            expected["thinking"] = json!({"type": "adaptive"});
+            expected["output_config"] = json!({"effort": "low"});
             assert_eq!(sent_json(&sent[0]), expected);
             assert_eq!(
                 sent[0].headers.get(HEADER_ANTHROPIC_VERSION).unwrap(),
@@ -4147,6 +4419,8 @@ mod tests {
             expected["model"] = json!(NATIVE_UPSTREAM_ID);
             expected["stream"] = json!(false);
             expected["max_tokens"] = json!(1);
+            expected["thinking"] = json!({"type": "adaptive"});
+            expected["output_config"] = json!({"effort": "low"});
             assert_eq!(sent_json(&sent[1]), expected);
             assert_eq!(copilot.state.keep_warm().ping_totals().0, 1);
             let keep_warm_rows = count_until(
@@ -5775,6 +6049,125 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn responses_only_model_on_chat_completions_is_bridged_to_responses() {
+            let copilot = copilot().await;
+            list_responses_only_model(&copilot);
+            mount_responses_reply(&copilot, &responses_text_reply("bridged")).await;
+            let body = json!({
+                "model": format!("{PROFILE}/{RESPONSES_ONLY_ID}"),
+                "temperature": 0.5,
+                "messages": [
+                    {"role": "system", "content": "be terse"},
+                    {"role": "user", "content": "hi"},
+                ],
+            });
+
+            let (status, bytes) = send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
+
+            assert_eq!(status, 200);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap(),
+                json!({
+                    "id": "resp_1",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": format!("{PROFILE}/{RESPONSES_ONLY_ID}"),
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                                 "message": {"role": "assistant", "content": "bridged"}}],
+                    "usage": {"prompt_tokens": 9, "completion_tokens": 2, "total_tokens": 11},
+                })
+            );
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
+            assert_eq!(
+                sent_json(&sent[0]),
+                json!({
+                    "model": RESPONSES_ONLY_ID,
+                    "input": [
+                        {"type": "message", "role": "developer",
+                         "content": [{"type": "input_text", "text": "be terse"}]},
+                        {"type": "message", "role": "user",
+                         "content": [{"type": "input_text", "text": "hi"}]},
+                    ],
+                    "store": false,
+                })
+            );
+            assert!(requests_to(&copilot, UPSTREAM_CHAT_PATH).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn bridged_chat_stream_becomes_chat_chunks_ending_in_done() {
+            let copilot = copilot().await;
+            list_responses_only_model(&copilot);
+            let upstream: String = [
+                json!({"type": "response.created", "response": {"id": "resp_s", "created_at": 7}}),
+                json!({"type": "response.output_text.delta", "output_index": 0, "delta": "hi"}),
+                json!({"type": "response.completed", "response": {"id": "resp_s", "status": "completed",
+                       "usage": {"input_tokens": 4, "output_tokens": 2}}}),
+            ]
+            .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
+            .concat();
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(upstream, "text/event-stream"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+            let mut body = chat_body(RESPONSES_ONLY_ID, true);
+            body["stream_options"] = json!({"include_usage": true});
+
+            let (status, bytes) = send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
+
+            assert_eq!(status, 200);
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+            let chunks: Vec<Value> = text
+                .split("\n\n")
+                .filter_map(|frame| frame.strip_prefix("data: "))
+                .filter(|payload| *payload != "[DONE]")
+                .map(|payload| serde_json::from_str(payload).unwrap())
+                .collect();
+            let served = format!("{PROFILE}/{RESPONSES_ONLY_ID}");
+            assert_eq!(chunks.len(), 3, "{text}");
+            assert_eq!(
+                chunks[0]["choices"][0]["delta"],
+                json!({"role": "assistant", "content": "hi"})
+            );
+            assert_eq!(chunks[1]["choices"][0]["finish_reason"], "stop");
+            assert_eq!(chunks[2]["choices"], json!([]));
+            assert_eq!(chunks[2]["usage"]["prompt_tokens"], 4);
+            assert_eq!(chunks[2]["model"], served.as_str());
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
+            assert_eq!(sent_json(&sent[0])["stream"], true);
+            assert!(requests_to(&copilot, UPSTREAM_CHAT_PATH).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn chat_feature_a_responses_only_model_cannot_carry_is_a_400_not_a_drop() {
+            let copilot = copilot().await;
+            list_responses_only_model(&copilot);
+            let mut body = chat_body(RESPONSES_ONLY_ID, false);
+            body["response_format"] = json!({"type": "json_object"});
+
+            let refused = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/chat/completions",
+                &client_headers(),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await;
+
+            assert!(
+                matches!(&refused, Err(AppError::BadRequest(message)) if message.contains("response_format")),
+                "the unsupported field must be refused before any upstream call"
+            );
+            assert!(requests_to(&copilot, RESPONSES_ENDPOINT).await.is_empty());
+            assert!(requests_to(&copilot, UPSTREAM_CHAT_PATH).await.is_empty());
+        }
+
+        #[tokio::test]
         async fn bridged_stream_pins_item_ids_and_streams_anthropic_events() {
             let copilot = copilot().await;
             list_responses_only_model(&copilot);
@@ -6374,16 +6767,37 @@ mod tests {
     async fn a_ping_is_never_fed_through_the_transform() {
         let (sender, receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
         let delta = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
-        let mut state = state_for(
-            slow_stream(vec![(SILENCE_MS, delta), (0, "data: [DONE]\n\n")]),
-            Some(KEEPALIVE),
-            Some(sender),
-        );
+        // The upstream stays silent until the test has seen two pings, so the
+        // count never depends on how long the scheduler stalls the test. The
+        // gate is flipped between `pump` calls on this single-task runtime.
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = std::sync::Arc::clone(&released);
+        let mut frames: std::vec::IntoIter<reqwest::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(delta.as_bytes())),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ]
+        .into_iter();
+        let upstream: TestStream = stream::poll_fn(move |_cx| {
+            if !gate.load(std::sync::atomic::Ordering::SeqCst) {
+                return std::task::Poll::Pending;
+            }
+            std::task::Poll::Ready(frames.next())
+        })
+        .boxed();
+        let mut state = state_for(upstream, Some(KEEPALIVE), Some(sender));
         state.transform = Some(BodyTransform::anthropic_stream(
             "p/m".to_string(),
             crate::services::tool_names::NameMap::default(),
         ));
-        let chunks = drain(state).await;
+        let mut chunks = Vec::new();
+        while let Some((item, next)) = pump(state).await {
+            let chunk = String::from_utf8(item.unwrap().to_vec()).unwrap();
+            if chunk == SSE_KEEPALIVE_FRAME && ping_count(&chunks) + 1 == 2 {
+                released.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            chunks.push(chunk);
+            state = next;
+        }
 
         assert!(ping_count(&chunks) >= 2, "{chunks:?}");
         // The translator only ever saw the upstream frame, so it produced a
@@ -6422,11 +6836,52 @@ mod review_body_tests {
     }
 
     #[test]
+    fn only_a_completed_solver_event_with_worker_and_attempt_is_tracked() {
+        let mut event =
+            SelectionEvent::new(SelectionStage::Solver, SelectionState::Selected, "alpha/m1");
+        event.worker = Some("worker-a".to_owned());
+        event.attempt = Some("attempt-1".to_owned());
+
+        assert_eq!(
+            completed_solver_attempt(&event, SelectionState::Completed),
+            Some(("worker-a", "attempt-1"))
+        );
+        assert_eq!(
+            completed_solver_attempt(&event, SelectionState::Cancelled),
+            None
+        );
+        event.stage = SelectionStage::Judge;
+        assert_eq!(
+            completed_solver_attempt(&event, SelectionState::Completed),
+            None
+        );
+        event.stage = SelectionStage::Solver;
+        event.worker = None;
+        assert_eq!(
+            completed_solver_attempt(&event, SelectionState::Completed),
+            None
+        );
+    }
+
+    #[test]
     fn responses_endpoints_match_with_or_without_the_v1_prefix() {
         assert!(is_responses_endpoint("/responses"));
         assert!(is_responses_endpoint("/v1/responses"));
         assert!(!is_responses_endpoint("/v1/chat/completions"));
         assert!(!is_responses_endpoint("/v1/messages"));
+    }
+
+    #[test]
+    fn review_outcome_code_judges_only_a_review_that_ran() {
+        assert_eq!(
+            review_outcome_code(true, false),
+            Some(OutcomeCode::ReviewRejected)
+        );
+        assert_eq!(
+            review_outcome_code(false, false),
+            Some(OutcomeCode::ReviewPassed)
+        );
+        assert_eq!(review_outcome_code(false, true), None);
     }
 
     #[test]

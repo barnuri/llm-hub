@@ -159,6 +159,8 @@ mod tests {
             client: None,
             worker: None,
             routed_by: None,
+            attempt: None,
+            role: None,
         };
         state.store().unwrap().record(&outcome).unwrap();
         refresh_usage(&state).await;

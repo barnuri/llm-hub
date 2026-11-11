@@ -15,6 +15,7 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::consts::ANTHROPIC_THINKING_SIGNATURE;
 use crate::schemas::app_error::AppError;
 
 /// Translates an Anthropic Messages body into the `OpenAI` chat-completions
@@ -248,6 +249,46 @@ pub(crate) fn drop_server_tools(body: &mut Value) {
     if tools.is_empty() {
         object.remove("tools");
     }
+}
+
+/// Copilot's native `/v1/messages` rejects `thinking.type: enabled` on Haiku 5.5 and
+/// wants `adaptive` with `output_config.effort`. An enabled budget becomes the effort
+/// tier the Responses bridge picks for the same budget. An effort the client set wins.
+pub(crate) fn adaptive_thinking(body: &mut Value) {
+    if body.pointer("/thinking/type").and_then(Value::as_str) != Some("enabled") {
+        return;
+    }
+    let effort = super::responses_request::reasoning_effort(body);
+    body["thinking"] = json!({"type": "adaptive"});
+    if let Some(effort) = effort {
+        if body.pointer("/output_config/effort").is_none() {
+            body["output_config"]["effort"] = json!(effort);
+        }
+    }
+}
+
+/// Removes `thinking` blocks signed with the hub's placeholder. The hub writes that
+/// signature onto reasoning from a non-Claude reply, and Copilot's native `/v1/messages`
+/// rejects it as an invalid signature. A message left with no content is dropped too.
+pub(crate) fn drop_placeholder_thinking(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let is_placeholder = |block: &Value| {
+        block_type(block) == "thinking"
+            && block.get("signature").and_then(Value::as_str) == Some(ANTHROPIC_THINKING_SIGNATURE)
+    };
+    for message in messages.iter_mut() {
+        if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+            blocks.retain(|block| !is_placeholder(block));
+        }
+    }
+    messages.retain(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_none_or(|blocks| !blocks.is_empty())
+    });
 }
 
 /// Custom tools carry an `input_schema`; server tools (`web_search_*`,
@@ -579,6 +620,25 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_thinking_turns_an_enabled_budget_into_an_effort_tier() {
+        let mut body = json!({"thinking": {"type": "enabled", "budget_tokens": 4096}});
+        adaptive_thinking(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"]["effort"], "high");
+
+        let mut kept = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "output_config": {"effort": "medium"}
+        });
+        adaptive_thinking(&mut kept);
+        assert_eq!(kept["output_config"]["effort"], "medium");
+
+        let mut untouched = json!({"thinking": {"type": "adaptive"}});
+        adaptive_thinking(&mut untouched);
+        assert_eq!(untouched, json!({"thinking": {"type": "adaptive"}}));
+    }
+
+    #[test]
     fn drop_server_tools_keeps_custom_tools_and_drops_empty_list() {
         let mut body = json!({
             "tools": [
@@ -690,6 +750,38 @@ mod tests {
         assert_eq!(message["tool_calls"][0]["function"]["name"], "bash");
         assert!(
             !out.to_string()
+                .contains(crate::consts::ANTHROPIC_THINKING_SIGNATURE)
+        );
+    }
+
+    #[test]
+    fn placeholder_thinking_is_dropped_from_native_body_and_real_signatures_are_kept() {
+        let mut body = json!({"messages": [
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "gpt reasoning", "signature": crate::consts::ANTHROPIC_THINKING_SIGNATURE},
+                {"type": "text", "text": "answer"}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "only placeholder", "signature": crate::consts::ANTHROPIC_THINKING_SIGNATURE}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "claude", "signature": "EqoBreal"},
+                {"type": "text", "text": "ok"}
+            ]},
+            {"role": "user", "content": "plain string stays"}
+        ]});
+        drop_placeholder_thinking(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[0]["content"],
+            json!([{"type": "text", "text": "answer"}])
+        );
+        assert_eq!(messages[1]["content"][0]["signature"], "EqoBreal");
+        assert_eq!(messages[2]["content"], "plain string stays");
+        assert!(
+            !body
+                .to_string()
                 .contains(crate::consts::ANTHROPIC_THINKING_SIGNATURE)
         );
     }

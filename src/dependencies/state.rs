@@ -9,21 +9,23 @@ use crate::consts::LOGS_DIR;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
 use crate::schemas::upstream_model::UpstreamModel;
+use crate::services::attempt_outcomes::AttemptTracker;
 use crate::services::copilot_auto::CopilotAutoRouter;
 use crate::services::copilot_body_fields::{BodyField, UnsupportedBodyFields};
 use crate::services::copilot_descriptions::CopilotDescriptions;
 use crate::services::copilot_prices::CopilotPrices;
 use crate::services::copilot_sessions::CopilotSessionCache;
-use crate::services::copilot_usage::CopilotUsageCache;
 use crate::services::credential_store::CredentialStore;
 use crate::services::gh_cli::GhCli;
 use crate::services::keep_warm::KeepWarm;
 use crate::services::keyring_credential_store::KeyringCredentialStore;
+use crate::services::listed_prices::ListedPrices;
 use crate::services::live_feed::LiveFeed;
 use crate::services::managed_process::ProcessManager;
 use crate::services::model_limits::{ModelLimit, ModelLimits};
 use crate::services::pricing::PricingBook;
 use crate::services::process_gh_cli::ProcessGhCli;
+use crate::services::profile_usage::ProfileUsageCache;
 use crate::services::selection_log::SelectionLog;
 use crate::services::smart_auto_affinity::SmartAutoAffinity;
 use crate::services::smart_auto_decisions::SmartAutoDecisionLog;
@@ -61,8 +63,10 @@ struct Inner {
     managed: Arc<ProcessManager>,
     copilot_sessions: CopilotSessionCache,
     copilot_auto: CopilotAutoRouter,
-    copilot_usage: CopilotUsageCache,
+    profile_usage: ProfileUsageCache,
+    attempt_tracker: AttemptTracker,
     copilot_prices: CopilotPrices,
+    listed_prices: ListedPrices,
     copilot_descriptions: CopilotDescriptions,
     /// Real prompt limits per Copilot model, shared with `copilot_auto`.
     model_limits: Arc<ModelLimits>,
@@ -117,6 +121,18 @@ impl AppState {
             now_ms(),
         ));
         let unsupported_body_fields = UnsupportedBodyFields::load(store.as_deref());
+        // Image refusals learned in earlier runs are loaded once here, never read on the request path.
+        let vision_unsupported = DashSet::new();
+        if let Some(store) = store.as_deref() {
+            match store.load_vision_refusals() {
+                Ok(pairs) => {
+                    for (profile, model) in pairs {
+                        vision_unsupported.insert(format!("{profile}/{model}"));
+                    }
+                }
+                Err(e) => tracing::warn!("cannot load the learned image refusals: {e}"),
+            }
+        }
         let selection_log = SelectionLog::open(store.clone());
         let smart_auto_rules = SmartAutoRulesStore::open(
             &store_dir(config.store_path.as_deref()),
@@ -140,12 +156,14 @@ impl AppState {
             managed: Arc::new(ProcessManager::new(LOGS_DIR)),
             copilot_sessions: CopilotSessionCache::new(Arc::clone(&credentials), Arc::clone(&gh)),
             copilot_auto: CopilotAutoRouter::with_limits(Arc::clone(&model_limits)),
-            copilot_usage: CopilotUsageCache::new(credentials, gh),
+            profile_usage: ProfileUsageCache::new(credentials, gh),
+            attempt_tracker: AttemptTracker::default(),
             copilot_prices: CopilotPrices::default(),
+            listed_prices: ListedPrices::default(),
             copilot_descriptions: CopilotDescriptions::default(),
             model_limits,
             unsupported_body_fields,
-            vision_unsupported: DashSet::new(),
+            vision_unsupported,
             rejected_prompt_limits: DashMap::new(),
             smart_auto_affinity: SmartAutoAffinity::new(),
             smart_auto_decisions: SmartAutoDecisionLog::default(),
@@ -168,7 +186,7 @@ impl AppState {
         self.0.clients.store(Arc::new(clients));
         self.0.managed.reconcile(&config);
         self.0.copilot_sessions.reconcile(&config);
-        self.0.copilot_usage.reconcile(&config);
+        self.0.profile_usage.reconcile(&config);
         let is_copilot = |name: &String| {
             config
                 .profiles
@@ -372,7 +390,7 @@ impl AppState {
         }
     }
 
-    /// Whether `model` on `profile` refused image input before. Held in memory until restart.
+    /// Whether `model` on `profile` refused image input before. Loaded from the store at startup, then held in memory.
     pub fn vision_unsupported(&self, profile: &str, model: &str) -> bool {
         self.0
             .vision_unsupported
@@ -380,6 +398,7 @@ impl AppState {
     }
 
     /// Records that `model` on `profile` refused image input, so later image requests skip it.
+    /// A new refusal is logged once and saved to the store off the calling task.
     pub fn learn_vision_unsupported(&self, profile: &str, model: &str) {
         if self
             .0
@@ -389,6 +408,17 @@ impl AppState {
             tracing::info!(
                 "profile {profile}: model {model} refuses image input; image requests skip it"
             );
+            if self.store().is_some() {
+                let state = self.clone();
+                let (profile, model) = (profile.to_string(), model.to_string());
+                tokio::task::spawn_blocking(move || {
+                    if let Some(store) = state.store()
+                        && let Err(e) = store.save_vision_refusal(&profile, &model, now_ms())
+                    {
+                        tracing::warn!(profile, model, "cannot save the image refusal: {e}");
+                    }
+                });
+            }
         }
     }
 
@@ -471,21 +501,31 @@ impl AppState {
         &self.0.copilot_sessions
     }
 
-    pub fn copilot_usage(&self) -> &CopilotUsageCache {
-        &self.0.copilot_usage
+    pub fn profile_usage(&self) -> &ProfileUsageCache {
+        &self.0.profile_usage
+    }
+
+    pub fn attempt_tracker(&self) -> &AttemptTracker {
+        &self.0.attempt_tracker
     }
 
     pub fn copilot_prices(&self) -> &CopilotPrices {
         &self.0.copilot_prices
     }
 
+    pub fn listed_prices(&self) -> &ListedPrices {
+        &self.0.listed_prices
+    }
+
     pub fn copilot_descriptions(&self) -> &CopilotDescriptions {
         &self.0.copilot_descriptions
     }
 
-    /// Rates from the current config and the last fetched Copilot price table.
+    /// Rates from the current config, the last fetched Copilot price table and the prices upstreams list.
     pub fn pricing_book(&self) -> PricingBook {
-        PricingBook::from_hub(&self.config()).with_copilot_prices(self.copilot_prices().snapshot())
+        PricingBook::from_hub(&self.config())
+            .with_copilot_prices(self.copilot_prices().snapshot())
+            .with_listed_prices(self.listed_prices().snapshot())
     }
 
     pub fn restart_notify(&self) -> Arc<tokio::sync::Notify> {

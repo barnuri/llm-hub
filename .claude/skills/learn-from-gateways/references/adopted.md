@@ -1,6 +1,6 @@
 # Adopted and Rejected Gateway Findings
 
-Last run: 2026-11-01 (public routing, catalog, and orchestration research)
+Last run: 2026-11-11 (per-model price and quota visibility)
 
 The `learn-from-gateways` skill appends to this file. Skip each item listed here in a new report.
 
@@ -47,3 +47,15 @@ This review shipped one runtime change: L6 below. The D1-D5 directions are not i
 | Id | Item | Notes |
 |---|---|---|
 | L6 | Parse Copilot's "exceeds the limit of M" rejection and seed measured limits for 19 Copilot models | Live probes returned the ceilings. Every catalog was wrong for several models. |
+
+## 2026-11-11 — Per-model price and quota visibility (pending, not adopted)
+
+Pending recommendations only. No user acceptance is implied.
+
+| Id | Recommendation | Reason | Evidence |
+|---|---|---|---|
+| P1 | Key bare `model_prices` overrides by profile, or stop the bare fallback when two profiles name the same model | `pricing.rs:81` stores bare ids with no profile; `pricing.rs:110` returns the last profile's rate for every profile | source-verified |
+| P2 | Read OpenRouter `input_cache_write_1h` (and a 1h cache-write rate in config) | Live list has it on 36 models; `listed_prices.rs:71-72` drops it | live-observed |
+| P3 | Read OpenRouter `pricing.overrides[].min_prompt_tokens` as long-context tiers | Live `openai/gpt-6.1-terra-pro` has a 272000 tier; `listed_prices.rs:56-74` reads only top-level fields | live-observed |
+| P4 | Use Copilot `/models` `billing.token_prices` (batch-scaled, `cache_read_price` or `cache_price`) as a fallback when the docs table lacks a model | `pricing.rs:572-581` never reads it; OpenCode reads it live | source-verified |
+| P5 | Per-model budget or TPM/RPM visibility, only if a quota source reports it | LiteLLM budget table has `model_tpm_limit`/`model_rpm_limit`; llm-hub has none | source-verified |

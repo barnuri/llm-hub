@@ -28,7 +28,7 @@ use crate::services::insights;
 use crate::services::pricing::PricingBook;
 use crate::services::session_insights;
 use crate::services::stats::RequestOutcome;
-use crate::services::store::{StatsFilter, hash_key, now_ms};
+use crate::services::store::{StatsFilter, TierRoleRow, hash_key, now_ms};
 use crate::utils::hex::to_hex;
 use crate::utils::time::elapsed_ms;
 
@@ -288,7 +288,7 @@ pub async fn stats(
         .filter(|s| !s.is_empty());
 
     let book = state.pricing_book();
-    let snapshot = if range == "live" || !persistent {
+    let (snapshot, by_tier_role): (_, Vec<TierRoleRow>) = if range == "live" || !persistent {
         let mut snap = state.stats().snapshot(
             if persistent && range != "live" {
                 "live"
@@ -312,28 +312,28 @@ pub async fn stats(
         }
         snap.overview.keep_warm = in_memory_keep_warm(&state, persistent);
         crate::services::pricing::apply_costs(&mut snap, &book);
-        snap
+        (snap, Vec::new())
     } else {
         let since_ms = since_for_range(range, now_ms())?;
         let store = state.store().expect("persistent checked above");
-        let mut snapshot = store
-            .stats(
-                &StatsFilter {
-                    since_ms,
-                    profile,
-                    model,
-                    routed_by_prefix,
-                    range_label: range.to_string(),
-                },
-                &book,
-            )
+        let filter = StatsFilter {
+            since_ms,
+            profile,
+            model,
+            routed_by_prefix,
+            range_label: range.to_string(),
+        };
+        let mut snapshot = store.stats(&filter, &book).map_err(AppError::Internal)?;
+        let by_tier_role = store
+            .by_tier_role(&filter, &book)
             .map_err(AppError::Internal)?;
         snapshot.overview.keep_warm = stored_keep_warm(state.clone(), since_ms, book).await?;
-        snapshot
+        (snapshot, by_tier_role)
     };
 
-    let body = serde_json::to_value(snapshot)
+    let mut body = serde_json::to_value(snapshot)
         .map_err(|e| AppError::Internal(format!("serialize stats failed: {e}")))?;
+    body["by_tier_role"] = json!(by_tier_role);
     Ok(Json(body))
 }
 
@@ -462,24 +462,66 @@ pub async fn errors(
             )));
         }
     };
-    let (total_errors, recent) = store.errors(since_ms).map_err(AppError::Internal)?;
+    let (total_errors, mut recent) = store.errors(since_ms).map_err(AppError::Internal)?;
+    let solved_errors = store
+        .solved_error_count(since_ms)
+        .map_err(AppError::Internal)?;
     let mut priced = UsageReport {
         total_requests: total_errors,
         total_errors,
         total_tokens_in: 0,
         total_tokens_out: 0,
-        recent,
+        recent: recent.iter().map(|entry| entry.row.clone()).collect(),
     };
     let book = state.pricing_book();
     crate::services::pricing::apply_usage_costs(&mut priced, &book);
+    for (entry, row) in recent.iter_mut().zip(priced.recent) {
+        entry.row = row;
+    }
     let body = serde_json::to_value(ErrorsReport {
         range: range.to_string(),
         total_errors,
-        recent: priced.recent,
+        open_errors: total_errors.saturating_sub(solved_errors),
+        recent,
     })
     .map_err(|e| AppError::Internal(format!("serialize errors report failed: {e}")))?;
     Ok(Json(body))
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ResolveErrorsInput {
+    /// Request ids from `/api/errors` `recent[].id`.
+    pub ids: Vec<i64>,
+    /// `true` marks the errors solved, `false` reopens them.
+    pub solved: bool,
+}
+
+/// Marks failed requests solved (or reopens them). Solved errors stay in the DB for history.
+pub async fn resolve_errors(
+    State(state): State<AppState>,
+    Json(input): Json<ResolveErrorsInput>,
+) -> Result<Json<Value>, AppError> {
+    let Some(store) = state.store() else {
+        return Err(AppError::BadRequest(
+            "persistence is off — set LLM_HUB_PERSISTENT=true to track solved errors".into(),
+        ));
+    };
+    if input.ids.is_empty() {
+        return Err(AppError::BadRequest("ids must not be empty".into()));
+    }
+    if input.ids.len() > MAX_RESOLVE_IDS {
+        return Err(AppError::BadRequest(format!(
+            "at most {MAX_RESOLVE_IDS} ids per request"
+        )));
+    }
+    let resolved_ms = input.solved.then(now_ms);
+    let updated = store
+        .set_errors_resolved(&input.ids, resolved_ms)
+        .map_err(AppError::Internal)?;
+    Ok(Json(json!({ "updated": updated, "solved": input.solved })))
+}
+
+const MAX_RESOLVE_IDS: usize = 500;
 
 // --- hub api keys ---
 

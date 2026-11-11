@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { KpiCard } from "../components/KpiCard";
+import { ModelName } from "../components/ModelName";
 import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
@@ -65,12 +66,8 @@ function parseMinCalls(value: string | null): number {
   return MIN_CALL_OPTIONS.includes(parsed) ? parsed : DEFAULT_MIN_CALLS;
 }
 
-function shortName(model: string | null): string {
-  if (!model) {
-    return "—";
-  }
-  const slash = model.indexOf("/");
-  return slash >= 0 ? model.slice(slash + 1) : model;
+function fullName(model: string | null): string {
+  return model || "—";
 }
 
 function formatContext(tokens: number | null): string {
@@ -188,14 +185,14 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
             <div role="status" className="insights-pick-body">
               <div className="insights-pick-title">
                 <span>Use</span>
-                <span className="mono insights-pick-model">{pick.model}</span>
+                <span className="mono insights-pick-model"><ModelName id={pick.model} /></span>
                 {pickHealth ? <HealthPill health={pickHealth} /> : null}
               </div>
               <div className="insights-pick-reason">{pick.reason}</div>
               {pick.alternatives.length > 0 ? (
                 <div className="dim insights-pick-next">
                   Next best:{" "}
-                  <span className="mono">{pick.alternatives.map((alt) => shortName(alt.model)).join(", ")}</span>
+                  <span className="mono">{pick.alternatives.map((alt) => fullName(alt.model)).join(", ")}</span>
                 </div>
               ) : null}
             </div>
@@ -337,7 +334,7 @@ function BestFor({ picks }: { readonly picks: readonly UseCasePick[] }) {
               className={pick.ranked ? "insights-card-model" : "insights-card-model declared"}
               title={pick.model ?? undefined}
             >
-              {shortName(pick.model)}
+              {fullName(pick.model)}
             </span>
             <span className="kpi-sub">{pick.ranked ? "Ranked from calls" : "Declared only, not enough calls yet"}</span>
           </div>
@@ -418,7 +415,7 @@ function Leaders({ report }: { readonly report: InsightsReport }) {
           key={label}
           label={label}
           value={model ? value : "—"}
-          sub={model ? shortName(model) : "No ranked model yet"}
+          sub={model ? fullName(model) : "No ranked model yet"}
         />
       ))}
     </div>
@@ -431,8 +428,8 @@ function RankingRow({ model, position }: { readonly model: ModelInsight; readonl
   return (
     <tr>
       <td className="num insights-rank">{position}</td>
-      <td className="mono nowrap insights-rank-name" title={model.model}>
-        {shortName(model.model)}
+      <td className="mono nowrap insights-rank-name">
+        <ModelName id={model.model} />
       </td>
       <td>
         <HealthPill health={model.health} />
@@ -462,7 +459,7 @@ function DetailRow({ model }: { readonly model: ModelInsight }) {
         className={model.ranked ? "mono nowrap" : "mono nowrap insights-unranked"}
         title={model.summary ?? model.model}
       >
-        {shortName(model.model)}
+        {fullName(model.model)}
       </td>
       <td className="nowrap">
         {model.use_cases.length > 0 ? (

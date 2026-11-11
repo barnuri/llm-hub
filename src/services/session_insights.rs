@@ -1019,6 +1019,8 @@ mod tests {
             client: Some("demo-client".into()),
             worker: worker.map(str::to_string),
             routed_by: None,
+            attempt: None,
+            role: None,
         };
         let first = store
             .record(&outcome(Some("demo-worker"), 0))
@@ -1174,6 +1176,8 @@ mod tests {
             client: Some("demo-client".into()),
             worker: Some("demo-worker".into()),
             routed_by: Some("pinned".into()),
+            attempt: None,
+            role: None,
         };
         let id = store.record(&outcome).unwrap().unwrap();
         let mut demo_shape = shape(true, 400);

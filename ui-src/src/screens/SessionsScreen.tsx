@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 
+import { ModelName } from "../components/ModelName";
 import { Panel } from "../components/Panel";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
-import { shortModel } from "../components/UsageModelChart";
 import { errorText, formatDateTime, formatNumber, formatPct, formatUsd } from "../lib/format";
 import { useLive } from "../lib/live";
 import { navigate, useRoute } from "../lib/router";
@@ -146,7 +146,7 @@ function SessionsList({ range }: { readonly range: SessionsRange }) {
 }
 
 function SessionRow({ session, range }: { readonly session: SessionSummary; readonly range: SessionsRange }) {
-  const modelNames = session.models.map(shortModel).join(", ");
+  const modelNames = session.models.join(", ");
   const prompt = session.prompt;
   return (
     <tr>
@@ -165,7 +165,14 @@ function SessionRow({ session, range }: { readonly session: SessionSummary; read
       <td className="num">{formatNumber(session.requests)}</td>
       <td className="num">{formatNumber(session.user_turns)}</td>
       <td className="sessions-models mono" title={modelNames}>
-        {modelNames || "—"}
+        {session.models.length === 0
+          ? "—"
+          : session.models.map((model, index) => (
+              <span key={model}>
+                {index > 0 ? ", " : null}
+                <ModelName id={model} />
+              </span>
+            ))}
       </td>
       <td className="num">{promptCell(prompt?.median)}</td>
       <td className="num">{promptCell(prompt?.p90)}</td>

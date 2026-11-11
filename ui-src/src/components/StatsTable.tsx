@@ -3,6 +3,7 @@ import { formatMs, formatNumber, formatPct, formatUsd } from "../lib/format";
 import { latencyHeat, rateHeat, ttftHeat } from "../lib/colors";
 import { CompactCount } from "./CompactCount";
 import { Heat } from "./Heat";
+import { ModelName } from "./ModelName";
 import { ModelTag } from "./ModelTag";
 import { Panel } from "./Panel";
 import { ShareBar } from "./ShareBar";
@@ -23,16 +24,10 @@ function formatRate(tokensPerSec: number): string {
 
 function KeyCell({ entryKey }: { readonly entryKey: string }) {
   const slash = entryKey.indexOf("/");
-  if (slash <= 0) {
-    return <ModelTag colorKey={entryKey}>{entryKey}</ModelTag>;
-  }
-  const name = entryKey.slice(slash + 1);
+  const name = slash > 0 ? entryKey.slice(slash + 1) : entryKey;
   return (
     <ModelTag colorKey={name}>
-      <span>
-        <span className="stats-key-prefix">{entryKey.slice(0, slash + 1)}</span>
-        {name}
-      </span>
+      <ModelName id={entryKey} />
     </ModelTag>
   );
 }

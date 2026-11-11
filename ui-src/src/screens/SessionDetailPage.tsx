@@ -2,10 +2,10 @@ import { useEffect, useState } from "react";
 
 import { DataTable } from "../components/DataTable";
 import { KpiCard } from "../components/KpiCard";
+import { ModelName } from "../components/ModelName";
 import { Panel } from "../components/Panel";
 import { PromptSizeChart } from "../components/PromptSizeChart";
 import { ShareBar } from "../components/ShareBar";
-import { shortModel } from "../components/UsageModelChart";
 import { errorText, formatDateTime, formatNumber, formatPct, formatUsd } from "../lib/format";
 import { navigate } from "../lib/router";
 import {
@@ -339,7 +339,7 @@ function CompactionsPanel({ detail }: { readonly detail: SessionDetail }) {
               {detail.compactions.map((compaction) => (
                 <tr key={`${compaction.ts_ms}-${compaction.prompt_tokens}`}>
                   <td className="nowrap">{formatDateTime(compaction.ts_ms)}</td>
-                  <td className="mono nowrap">{shortModel(compaction.model)}</td>
+                  <td className="mono nowrap"><ModelName id={compaction.model} /></td>
                   <td className="num">{formatNumber(compaction.previous_prompt_tokens)}</td>
                   <td className="num">{formatNumber(compaction.prompt_tokens)}</td>
                   <td className="num">{formatPct(compaction.drop_percent)}</td>

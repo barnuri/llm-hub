@@ -1,8 +1,8 @@
 //! Estimated USD cost from token counts.
 //!
 //! Rates are USD per 1M tokens. Lookup order for a qualified `profile/model`:
-//! 1. Exact model override from env
-//! 2. Bare model id override
+//! 1. Exact model override from env, stored under its own profile only
+//! 2. Price the upstream lists for that model in its `/v1/models`
 //! 3. Profile default rates
 //! 4. $0 for a local profile
 //! 5. Copilot's published price, for a Copilot profile
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::configs::{HubConfig, PriceCard, TokenRates};
+use crate::configs::{HubConfig, LongContextTier, PriceCard, ProfileConfig, TokenRates};
 use crate::consts::{LONG_CONTEXT_SUFFIX, STATS_OVERFLOW_KEY};
 use crate::schemas::cost_parts::CostParts;
 use crate::schemas::usage_report::UsageReport;
@@ -34,12 +34,16 @@ const LIVE_TIER_NOTE: &str = " The hub does not price long-context tiers in this
 pub struct PricingBook {
     pub global: TokenRates,
     pub by_profile: HashMap<String, TokenRates>,
-    /// Keys may be qualified (`profile/model`) or bare model ids.
+    /// Keys are qualified `profile/model`. A profile's `model_prices` entry only ever prices
+    /// that profile, so a bare id is never stored here.
     pub by_model: HashMap<String, TokenRates>,
     pub local_profiles: HashSet<String>,
     pub copilot_profiles: HashSet<String>,
     /// Fetched from GitHub; wins over [`COPILOT_PRICES`].
     pub copilot_published: Arc<HashMap<String, PriceCard>>,
+    /// Prices an upstream lists in its own `/v1/models`, keyed `profile/model`. An explicit
+    /// `by_model` entry wins over them.
+    pub listed: Arc<HashMap<String, PriceCard>>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -51,15 +55,20 @@ pub struct PricingMeta {
 impl PricingBook {
     #[must_use]
     pub fn from_hub(config: &HubConfig) -> Self {
+        Self::from_profiles(config.pricing.with_cache_defaults(), &config.profiles)
+    }
+
+    fn from_profiles(global: TokenRates, profiles: &[ProfileConfig]) -> Self {
         let mut book = Self {
-            global: config.pricing.with_cache_defaults(),
+            global,
             by_profile: HashMap::new(),
             by_model: HashMap::new(),
             local_profiles: HashSet::new(),
             copilot_profiles: HashSet::new(),
             copilot_published: Arc::default(),
+            listed: Arc::default(),
         };
-        for profile in &config.profiles {
+        for profile in profiles {
             if profile.is_local() {
                 book.local_profiles.insert(profile.name.clone());
             }
@@ -74,7 +83,6 @@ impl PricingBook {
                 let rates = model_rates.with_cache_defaults();
                 book.by_model
                     .insert(format!("{}/{}", profile.name, model), rates);
-                book.by_model.insert(model.clone(), rates);
             }
         }
         book
@@ -83,6 +91,12 @@ impl PricingBook {
     #[must_use]
     pub fn with_copilot_prices(mut self, published: Arc<HashMap<String, PriceCard>>) -> Self {
         self.copilot_published = published;
+        self
+    }
+
+    #[must_use]
+    pub fn with_listed_prices(mut self, listed: Arc<HashMap<String, PriceCard>>) -> Self {
+        self.listed = listed;
         self
     }
 
@@ -96,10 +110,8 @@ impl PricingBook {
             return PriceCard::flat(*rates);
         }
         let (profile, bare) = split_model_key(model_key);
-        if let Some(bare) = bare
-            && let Some(rates) = self.by_model.get(bare)
-        {
-            return PriceCard::flat(*rates);
+        if let Some(card) = self.listed.get(model_key) {
+            return card.with_cache_defaults();
         }
         if let Some(profile) = profile
             && let Some(rates) = self.by_profile.get(profile)
@@ -182,11 +194,12 @@ impl PricingBook {
         .total()
     }
 
-    /// True when a fetched Copilot price carries a long-context tier.
+    /// True when a fetched Copilot price or a listed price carries a long-context tier.
     #[must_use]
     fn has_long_context(&self) -> bool {
         self.copilot_published
             .values()
+            .chain(self.listed.values())
             .any(|card| card.long_context.is_some())
     }
 
@@ -247,6 +260,18 @@ pub fn apply_costs(snapshot: &mut StatsSnapshot, book: &PricingBook) {
     }
 }
 
+/// Prices one stored request at its own tier. Every per-request cost sum goes through this.
+#[must_use]
+pub fn outcome_cost_parts(book: &PricingBook, outcome: &RequestOutcome) -> CostParts {
+    book.estimate_parts(
+        &outcome.model_key,
+        outcome.tokens_in,
+        outcome.tokens_out,
+        outcome.cache_read_tokens,
+        outcome.cache_write_tokens,
+    )
+}
+
 /// Prices each stored request at its own tier and sums the parts into the model, profile,
 /// overview and series rows. A model missing from the snapshot lands in the overflow row.
 pub fn apply_outcome_costs(
@@ -260,13 +285,7 @@ pub fn apply_outcome_costs(
     let mut by_profile: HashMap<&str, CostParts> = HashMap::new();
     let mut by_point: HashMap<(u64, &str), CostParts> = HashMap::new();
     for outcome in outcomes {
-        let parts = book.estimate_parts(
-            &outcome.model_key,
-            outcome.tokens_in,
-            outcome.tokens_out,
-            outcome.cache_read_tokens,
-            outcome.cache_write_tokens,
-        );
+        let parts = outcome_cost_parts(book, outcome);
         let model = if listed.contains(outcome.model_key.as_str()) {
             outcome.model_key.as_str()
         } else {
@@ -573,6 +592,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn listed_price_beats_the_name_fallback_and_loses_to_an_explicit_model_price() {
+        let rate = |input: f64| TokenRates {
+            input_per_1m: input,
+            output_per_1m: input * 4.0,
+            ..TokenRates::default()
+        };
+        let listed = Arc::new(HashMap::from([(
+            "gw/azure/gpt-4.1-nano".to_string(),
+            PriceCard::flat(rate(0.1)),
+        )]));
+        let mut book = PricingBook::default().with_listed_prices(listed);
+
+        assert_eq!(book.rates_for("gw/azure/gpt-4.1-nano").input_per_1m, 0.1);
+        assert_eq!(book.rates_for("gw/azure/gpt-4.1-nano").output_per_1m, 0.4);
+
+        book.by_model
+            .insert("gw/azure/gpt-4.1-nano".to_string(), rate(5.0));
+        assert_eq!(book.rates_for("gw/azure/gpt-4.1-nano").input_per_1m, 5.0);
+    }
+
+    #[test]
+    fn bare_model_price_from_one_profile_does_not_price_another() {
+        let profile = |name: &str, model_prices: HashMap<String, TokenRates>| ProfileConfig {
+            name: name.to_string(),
+            display_name: None,
+            base_url: String::new(),
+            api_key: String::new(),
+            extra_headers: Vec::new(),
+            timeout_ms: None,
+            enabled: true,
+            static_models: Vec::new(),
+            pricing: TokenRates::default(),
+            model_prices,
+            managed: None,
+            copilot: None,
+        };
+        let shared = TokenRates {
+            input_per_1m: 5.0,
+            ..TokenRates::default()
+        };
+        let profiles = [
+            profile("a", HashMap::from([("m".to_string(), shared)])),
+            profile("b", HashMap::new()),
+        ];
+        let book = PricingBook::from_profiles(TokenRates::default(), &profiles);
+
+        assert_eq!(book.rates_for("a/m").input_per_1m, 5.0);
+        assert!(book.rates_for("b/m").input_per_1m.abs() < f64::EPSILON);
+        assert!(book.rates_for("b/m").is_zero());
+    }
+
+    #[test]
+    fn listed_tier_prices_only_prompts_above_its_threshold() {
+        let rate = |input: f64| TokenRates {
+            input_per_1m: input,
+            output_per_1m: input,
+            ..TokenRates::default()
+        };
+        let card = PriceCard {
+            base: rate(1.0),
+            long_context: Some(LongContextTier {
+                threshold_tokens: 271_999,
+                rates: rate(2.0),
+            }),
+        };
+        let book = PricingBook::default()
+            .with_listed_prices(Arc::new(HashMap::from([("gw/long".to_string(), card)])));
+
+        let below = book.estimate_parts("gw/long", 271_999, 0, 0, 0);
+        let at = book.estimate_parts("gw/long", 272_000, 0, 0, 0);
+
+        assert!((below.input - 271_999.0 / PER_MILLION).abs() < 1e-12);
+        assert!((at.input - 544_000.0 / PER_MILLION).abs() < 1e-12);
+        assert!(at.long_tier > 0.0);
+        assert!(book.has_long_context());
+    }
+
+    #[test]
     fn openai_style_cache_is_subset_of_prompt() {
         let rates = TokenRates {
             input_per_1m: 1.0,
@@ -681,6 +778,8 @@ mod tests {
             client: None,
             worker: None,
             routed_by: None,
+            attempt: None,
+            role: None,
         });
         let mut snap = registry.snapshot("live", false);
         apply_costs(&mut snap, &book);

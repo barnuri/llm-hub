@@ -4,6 +4,7 @@ pub mod anthropic_error;
 pub mod api_key_input;
 pub mod api_key_record;
 pub mod app_error;
+pub mod attempt_outcome;
 pub mod cache_write_cause;
 pub mod copilot_auto_response;
 pub mod copilot_endpoints;

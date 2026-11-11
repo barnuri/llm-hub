@@ -2,6 +2,8 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::consts::{
@@ -10,10 +12,13 @@ use crate::consts::{
 };
 use crate::dependencies::state::AppState;
 use crate::schemas::app_error::AppError;
+use crate::schemas::attempt_outcome::{AttemptOutcome, OutcomeCode, OutcomeSource};
 use crate::schemas::current_selection::CurrentSelection;
 use crate::schemas::history_query::HistoryQuery;
 use crate::schemas::scope_kind::ScopeKind;
 use crate::schemas::selection_event::SelectionEvent;
+use crate::schemas::selection_stage::SelectionStage;
+use crate::schemas::selection_state::SelectionState;
 use crate::schemas::smart_auto_decision::SmartAutoDecision;
 use crate::schemas::smart_auto_rules::SmartAutoRules;
 use crate::services::selection_log::SelectionLog;
@@ -61,7 +66,27 @@ struct CurrentBody {
 
 #[derive(Serialize)]
 struct HistoryBody {
-    events: Vec<SelectionEvent>,
+    events: Vec<HistoryEvent>,
+}
+
+/// A history event, with the verified outcome of its attempt on completed solver events.
+#[derive(Serialize)]
+struct HistoryEvent {
+    #[serde(flatten)]
+    event: SelectionEvent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<AttemptOutcome>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OutcomeBody {
+    /// The salted attempt key, as history shows it.
+    pub attempt: Option<String>,
+    /// The caller's raw Claude Code session id; the hub salts it into a worker key.
+    pub session_id: Option<String>,
+    /// An already-salted worker key, as history shows it.
+    pub worker: Option<String>,
+    pub code: OutcomeCode,
 }
 
 #[derive(Serialize)]
@@ -137,7 +162,100 @@ pub async fn history(
         }
         _ => log.history(&query),
     };
+    let events = match with_outcomes(&state, events).await {
+        Ok(events) => events,
+        Err(e) => return AppError::Internal(e).into_response(),
+    };
     Json(HistoryBody { events }).into_response()
+}
+
+/// Attaches stored outcomes to completed solver events. Without a store, no event has one.
+async fn with_outcomes(
+    state: &AppState,
+    events: Vec<SelectionEvent>,
+) -> Result<Vec<HistoryEvent>, String> {
+    let attempts: Vec<String> = events
+        .iter()
+        .filter(|event| {
+            event.stage == SelectionStage::Solver && event.state == SelectionState::Completed
+        })
+        .filter_map(|event| event.attempt.clone())
+        .collect();
+    let outcomes = if attempts.is_empty() || state.store().is_none() {
+        HashMap::new()
+    } else {
+        let saved = state.clone();
+        tokio::task::spawn_blocking(move || {
+            saved.store().map_or_else(
+                || Ok(HashMap::new()),
+                |store| store.load_attempt_outcomes(&attempts),
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())??
+    };
+    Ok(events
+        .into_iter()
+        .map(|event| {
+            let outcome = (event.stage == SelectionStage::Solver
+                && event.state == SelectionState::Completed)
+                .then(|| {
+                    event
+                        .attempt
+                        .as_ref()
+                        .and_then(|a| outcomes.get(a).cloned())
+                })
+                .flatten();
+            HistoryEvent { event, outcome }
+        })
+        .collect())
+}
+
+/// `POST /api/smart-auto/outcome`: records a client-reported outcome for an attempt, or for the
+/// worker's last completed attempt. A client outcome overrides review and heuristic ones.
+pub async fn report_outcome(
+    State(state): State<AppState>,
+    Json(body): Json<OutcomeBody>,
+) -> Response {
+    let log = state.selection_log();
+    let worker = non_empty(body.worker)
+        .or_else(|| non_empty(body.session_id).map(|raw| log.scope_key(ScopeKind::Worker, &raw)));
+    let attempt = match (non_empty(body.attempt), &worker) {
+        (Some(attempt), _) => attempt,
+        (None, Some(worker)) => match state.attempt_tracker().last_completed(worker) {
+            Some(attempt) => attempt,
+            None => {
+                return AppError::NotFound("this worker has no completed attempt".to_owned())
+                    .into_response();
+            }
+        },
+        (None, None) => {
+            return AppError::BadRequest("name an attempt, session_id or worker".to_owned())
+                .into_response();
+        }
+    };
+    let Some(_) = state.store() else {
+        return AppError::BadRequest("persistence is off".to_owned()).into_response();
+    };
+    let outcome = AttemptOutcome {
+        code: body.code,
+        source: OutcomeSource::Client,
+    };
+    let saved = state.clone();
+    let key = attempt.clone();
+    let stored = outcome.clone();
+    let write = tokio::task::spawn_blocking(move || {
+        let store = saved.store().ok_or("persistence is off")?;
+        store.save_attempt_outcome(&key, worker.as_deref(), &stored, now_ms())
+    })
+    .await;
+    match write {
+        Ok(Ok(())) => {
+            Json(serde_json::json!({ "attempt": attempt, "outcome": outcome })).into_response()
+        }
+        Ok(Err(e)) => AppError::Internal(e).into_response(),
+        Err(e) => AppError::Internal(e.to_string()).into_response(),
+    }
 }
 
 /// `GET /api/smart-auto/decisions?limit=N`: the newest Smart Auto routes, newest first.

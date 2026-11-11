@@ -1,17 +1,16 @@
-//! Copilot quota readings kept every 15 minutes, and the daily burn between them.
+//! Quota readings of every usage-source profile kept every 15 minutes, and the daily burn between them.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::configs::CopilotAuth;
 use crate::dependencies::state::AppState;
 use crate::schemas::quota_daily_delta::QuotaDailyDelta;
 use crate::schemas::quota_snapshot_row::QuotaSnapshotRow;
-use crate::services::copilot_usage;
+use crate::services::profile_usage::{self, UsageKey};
 use crate::services::store::Store;
 use crate::utils::time::utc_iso8601;
 
-/// Copilot quota readings: the 15-minute poll, the stored rows, and the daily burn.
+/// Quota readings: the 15-minute poll, the stored rows, and the daily burn.
 #[derive(Debug)]
 pub struct QuotaSnapshots;
 
@@ -19,7 +18,7 @@ impl QuotaSnapshots {
     const POLL_INTERVAL: Duration = Duration::from_mins(15);
     const UTC_DAY_CHARS: usize = "2026-11-10".len();
 
-    /// Polls every enabled Copilot profile on a 15-minute tick, starting at boot. Runs only on the sqlite store.
+    /// Polls every enabled profile with a usage source on a 15-minute tick, starting at boot. Runs only on the sqlite store.
     pub fn spawn_poll_loop(state: AppState) {
         if !matches!(state.store(), Some(Store::Sqlite(_))) {
             return;
@@ -36,22 +35,19 @@ impl QuotaSnapshots {
 
     async fn poll_once(state: &AppState) {
         let config = state.config();
-        let targets: Vec<(String, CopilotAuth)> = config
+        let targets: Vec<(String, UsageKey)> = config
             .profiles
             .iter()
             .filter(|profile| profile.enabled)
             .filter_map(|profile| {
-                profile
-                    .copilot
-                    .clone()
-                    .map(|auth| (profile.name.clone(), auth))
+                UsageKey::for_profile(&config, &profile.name).map(|key| (profile.name.clone(), key))
             })
             .collect();
-        for (profile, auth) in targets {
+        for (profile, key) in targets {
             let Some(client) = state.client(&profile) else {
                 continue;
             };
-            let Some(usage) = copilot_usage::refresh_now(state, &client, &profile, &auth).await
+            let Some(usage) = profile_usage::refresh_now(state, &client, &profile, &key).await
             else {
                 continue;
             };
@@ -76,8 +72,8 @@ impl QuotaSnapshots {
             .await;
             match saved {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!("copilot quota snapshot not stored: {error}"),
-                Err(error) => tracing::warn!("copilot quota snapshot task failed: {error}"),
+                Ok(Err(error)) => tracing::warn!("{profile} quota snapshot not stored: {error}"),
+                Err(error) => tracing::warn!("{profile} quota snapshot task failed: {error}"),
             }
         }
     }

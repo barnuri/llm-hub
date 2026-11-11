@@ -88,6 +88,8 @@ mod tests {
             client: client.map(str::to_string),
             worker: Some("worker-1".into()),
             routed_by: None,
+            attempt: None,
+            role: None,
         }
     }
 

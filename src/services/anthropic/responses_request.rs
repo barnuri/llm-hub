@@ -11,6 +11,16 @@ use crate::services::tool_names::{NameMap, short_name, truncate_in_body};
 
 const LOW_EFFORT_MAX_BUDGET: u64 = 1024;
 const MEDIUM_EFFORT_MAX_BUDGET: u64 = 2048;
+/// The smallest `max_output_tokens` the Responses API accepts; it rejects 8 with a 400.
+const MIN_MAX_OUTPUT_TOKENS: u64 = 16;
+
+/// Raises a `max_tokens` below the Responses minimum to that minimum. A non-integer is kept as sent.
+pub(crate) fn clamp_max_output_tokens(max_tokens: &Value) -> Value {
+    max_tokens.as_u64().map_or_else(
+        || max_tokens.clone(),
+        |tokens| json!(tokens.max(MIN_MAX_OUTPUT_TOKENS)),
+    )
+}
 
 /// Translates an Anthropic Messages body into a Responses body, and returns
 /// the mapping that undoes any tool name cut to the 64-byte limit.
@@ -45,7 +55,10 @@ pub fn to_responses(body: &Value) -> (Value, NameMap) {
         insert_tool_choice(choice, &mut out);
     }
     if let Some(max_tokens) = body.get("max_tokens") {
-        out.insert("max_output_tokens".into(), max_tokens.clone());
+        out.insert(
+            "max_output_tokens".into(),
+            clamp_max_output_tokens(max_tokens),
+        );
     }
     if let Some(stream) = body.get("stream") {
         out.insert("stream".into(), stream.clone());
@@ -198,7 +211,7 @@ fn insert_tool_choice(choice: &Value, out: &mut Map<String, Value>) {
 
 /// `output_config.effort` wins. Otherwise an enabled `thinking` budget picks
 /// the effort tier.
-fn reasoning_effort(body: &Value) -> Option<&'static str> {
+pub(crate) fn reasoning_effort(body: &Value) -> Option<&'static str> {
     let effort = body
         .pointer("/output_config/effort")
         .and_then(Value::as_str);
@@ -259,6 +272,16 @@ mod tests {
                 "store": false,
             })
         );
+    }
+
+    #[test]
+    fn max_output_tokens_below_the_responses_minimum_is_raised_to_it() {
+        let max_output = |tokens: u64| {
+            translate(&json!({"max_tokens": tokens, "messages": []}))["max_output_tokens"].clone()
+        };
+        assert_eq!(max_output(8), json!(16));
+        assert_eq!(max_output(16), json!(16));
+        assert_eq!(max_output(512), json!(512));
     }
 
     #[test]

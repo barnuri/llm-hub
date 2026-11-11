@@ -7,6 +7,7 @@ import { useLive } from "../lib/live";
 import type { UsageRow } from "../lib/types";
 import { shortModel } from "./UsageModelChart";
 import { Heat } from "./Heat";
+import { ModelName } from "./ModelName";
 import { ModelTag } from "./ModelTag";
 import { Panel } from "./Panel";
 import { Pill } from "./Pill";
@@ -129,8 +130,10 @@ export function LiveFeed() {
           {events.map(({ id, row }) => (
             <li key={id} className="live-feed-row">
               <span className="live-feed-time mono">{formatTime(row.ts_ms)}</span>
-              <span className="live-feed-model mono" title={row.model}>
-                <ModelTag colorKey={shortModel(row.model)}>{shortModel(row.model)}</ModelTag>
+              <span className="live-feed-model mono">
+                <ModelTag colorKey={shortModel(row.model)}>
+                  <ModelName id={row.model} profile={row.profile} />
+                </ModelTag>
               </span>
               <Pill tone={row.status >= ERROR_STATUS ? "danger" : "ok"} title={row.error ?? undefined}>
                 {row.status}

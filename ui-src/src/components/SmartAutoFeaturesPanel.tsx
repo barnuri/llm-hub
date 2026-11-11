@@ -2,6 +2,7 @@ import { COST_KIND_TEXT, type CostKind, eventCost } from "../lib/smartAutoCost";
 import { formatNumber, formatUsd } from "../lib/format";
 import type { HubModelPrice, SelectionEvent } from "../lib/types";
 import { DataTable } from "./DataTable";
+import { ModelName } from "./ModelName";
 import { ModelTag } from "./ModelTag";
 import { Panel } from "./Panel";
 import { ShareBar } from "./ShareBar";
@@ -76,7 +77,7 @@ export function SmartAutoFeaturesPanel({ events, kinds, prices }: SmartAutoFeatu
         rows={rows.map((row) => ({
           key: row.model,
           cells: [
-            { content: <ModelTag colorKey={shortModel(row.model)}>{row.model}</ModelTag>, className: "mono" },
+            { content: <ModelTag colorKey={shortModel(row.model)}><ModelName id={row.model} /></ModelTag>, className: "mono" },
             { content: formatNumber(row.calls) },
             ...(["checker", "repair", "failed", "rejected_draft"] as const).map((kind) => ({
               content: formatUsd(row.byKind[kind]),

@@ -1,14 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::schemas::api_key_record::ApiKeyRecord;
+use crate::schemas::attempt_outcome::{AttemptOutcome, OutcomeCode, OutcomeSource};
+use crate::schemas::cost_parts::CostParts;
+use crate::schemas::errors_report::ErrorEntry;
 use crate::schemas::prompt_shape::PromptShape;
 use crate::schemas::selection_event::SelectionEvent;
 use crate::schemas::usage_report::UsageReport;
 use crate::schemas::usage_row::UsageRow;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -16,7 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::consts::{ERROR_STATUS_MIN, KEEP_WARM_CLIENT};
 use crate::services::harness::is_keep_warm;
 use crate::services::model_limits::{LimitSource, ModelLimit};
-use crate::services::pricing::{PricingBook, apply_outcome_costs};
+use crate::services::pricing::{PricingBook, apply_outcome_costs, outcome_cost_parts};
 use crate::services::stats::{RequestOutcome, StatsSnapshot, snapshot_from_outcomes};
 
 const DEFAULT_SQLITE_PATH: &str = "llm-hub.db";
@@ -68,6 +71,9 @@ struct JsonState {
     /// Profile -> stored body fields its upstream rejects. Absent from older files.
     #[serde(default)]
     unsupported_body_fields: HashMap<String, Vec<String>>,
+    /// Profile -> upstream models that refused image input. Absent from older files.
+    #[serde(default)]
+    vision_refusals: HashMap<String, Vec<String>>,
     /// Smart Auto selection events, oldest first. Absent from older files.
     #[serde(default)]
     selection_events: Vec<SelectionEvent>,
@@ -95,6 +101,85 @@ pub struct StatsFilter {
     /// Keeps requests whose `routed_by` starts with this text, for example `smart-auto`.
     pub routed_by_prefix: Option<String>,
     pub range_label: String,
+}
+
+/// One `(tier, role)` group of Smart Auto requests: its cost and the verified outcomes of its attempts.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TierRoleRow {
+    pub tier: String,
+    pub role: String,
+    pub requests: u64,
+    pub cost_usd: f64,
+    pub completed_attempts: u64,
+    /// `None` when the group has no completed attempt.
+    pub cost_per_completed_usd: Option<f64>,
+    /// Verified outcome code to the number of the group's attempts that carry it.
+    pub outcomes: BTreeMap<String, u64>,
+}
+
+#[derive(Default)]
+struct TierRoleAcc {
+    requests: u64,
+    cost: CostParts,
+    attempts: HashSet<String>,
+}
+
+/// The tier of a `smart-auto:<tier>` route, or `None` for any other route.
+fn smart_auto_tier(routed_by: &str) -> Option<&str> {
+    routed_by
+        .strip_prefix("smart-auto:")
+        .filter(|tier| !tier.is_empty())
+}
+
+/// Groups Smart Auto request rows by tier and role. A missing role groups as `unknown`.
+/// `completed` holds the attempts with a completed solver event; `verdicts` maps an attempt to its outcome code.
+pub(crate) fn group_tier_role(
+    requests: &[RequestOutcome],
+    cost_of: impl Fn(&RequestOutcome) -> CostParts,
+    completed: &HashSet<String>,
+    verdicts: &HashMap<String, String>,
+) -> Vec<TierRoleRow> {
+    let mut groups: BTreeMap<(&str, &str), TierRoleAcc> = BTreeMap::new();
+    for request in requests {
+        let Some(tier) = request.routed_by.as_deref().and_then(smart_auto_tier) else {
+            continue;
+        };
+        let role = request.role.as_deref().unwrap_or("unknown");
+        let group = groups.entry((tier, role)).or_default();
+        group.requests += 1;
+        group.cost += cost_of(request);
+        if let Some(attempt) = &request.attempt {
+            group.attempts.insert(attempt.clone());
+        }
+    }
+    groups
+        .into_iter()
+        .map(|((tier, role), group)| {
+            let completed_attempts = group
+                .attempts
+                .iter()
+                .filter(|attempt| completed.contains(*attempt))
+                .count();
+            let completed_attempts = u64::try_from(completed_attempts).unwrap_or(u64::MAX);
+            let mut outcomes = BTreeMap::new();
+            for attempt in &group.attempts {
+                if let Some(code) = verdicts.get(attempt) {
+                    *outcomes.entry(code.clone()).or_insert(0) += 1;
+                }
+            }
+            let cost_usd = group.cost.total();
+            TierRoleRow {
+                tier: tier.into(),
+                role: role.into(),
+                requests: group.requests,
+                cost_usd,
+                completed_attempts,
+                cost_per_completed_usd: (completed_attempts > 0)
+                    .then(|| cost_usd / completed_attempts as f64),
+                outcomes,
+            }
+        })
+        .collect()
 }
 
 impl Store {
@@ -180,6 +265,14 @@ impl Store {
                 learned_at INTEGER NOT NULL,
                 PRIMARY KEY (profile, field)
             );
+            CREATE TABLE IF NOT EXISTS vision_refusals (
+                profile TEXT NOT NULL,
+                model TEXT NOT NULL,
+                source TEXT NOT NULL,
+                learned_at INTEGER NOT NULL,
+                PRIMARY KEY (profile, model),
+                CONSTRAINT ck_vision_refusals_source CHECK (source IN ('learned'))
+            );
             CREATE TABLE IF NOT EXISTS selection_events (
                 seq INTEGER PRIMARY KEY,
                 ts_ms INTEGER NOT NULL,
@@ -193,6 +286,16 @@ impl Store {
                 answer TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_selection_texts_ts ON selection_texts(ts_ms);
+            CREATE TABLE IF NOT EXISTS attempt_outcomes (
+                attempt TEXT PRIMARY KEY,
+                worker TEXT,
+                code TEXT NOT NULL,
+                source TEXT NOT NULL,
+                ts_ms INTEGER NOT NULL,
+                CONSTRAINT ck_attempt_outcomes_code CHECK (code IN ('tests_passed', 'tests_failed', 'review_passed', 'review_rejected', 'user_accepted', 'user_corrected')),
+                CONSTRAINT ck_attempt_outcomes_source CHECK (source IN ('heuristic', 'review', 'client'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_ts ON attempt_outcomes(ts_ms);
             CREATE TABLE IF NOT EXISTS install_settings (
                 name TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -267,8 +370,8 @@ impl Store {
                         "INSERT INTO requests (
                             ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
                             ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker,
-                            routed_by
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                            routed_by, attempt, role
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                         rusqlite::params![
                             db_i64(row.ts_ms),
                             row.model,
@@ -283,7 +386,9 @@ impl Store {
                             row.error,
                             row.client,
                             row.worker,
-                            outcome.routed_by.as_deref()
+                            outcome.routed_by.as_deref(),
+                            outcome.attempt.as_deref(),
+                            outcome.role.as_deref()
                         ],
                     )
                     .map_err(|e| e.to_string())?;
@@ -417,7 +522,7 @@ impl Store {
     }
 
     /// Failed requests (`status >= 400`) newest first, optional `since_ms` window.
-    pub fn errors(&self, since_ms: Option<u64>) -> Result<(u64, Vec<UsageRow>), String> {
+    pub fn errors(&self, since_ms: Option<u64>) -> Result<(u64, Vec<ErrorEntry>), String> {
         match self {
             Store::Sqlite(conn) => {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
@@ -437,7 +542,9 @@ impl Store {
                     .map_err(|e| e.to_string())?;
                 let mut list_sql = format!(
                     "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker
+                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker,
+                            id, COALESCE(resolved_ms, (SELECT e.resolved_ms FROM error_resolutions e
+                                WHERE e.reason = COALESCE(requests.error, '') AND e.resolved_ms >= requests.ts_ms))
                      FROM requests WHERE status >= {ERROR_STATUS_MIN} AND {}",
                     Self::not_keep_warm_sql()
                 );
@@ -454,7 +561,13 @@ impl Store {
                 ));
                 let mut stmt = guard.prepare(&list_sql).map_err(|e| e.to_string())?;
                 let recent = stmt
-                    .query_map(rusqlite::params_from_iter(list_params), map_usage_row)
+                    .query_map(rusqlite::params_from_iter(list_params), |r| {
+                        Ok(ErrorEntry {
+                            id: Some(r.get(13)?),
+                            resolved_ms: r.get::<_, Option<i64>>(14)?.map(db_u64),
+                            row: map_usage_row(r)?,
+                        })
+                    })
                     .map_err(|e| e.to_string())?
                     .filter_map(Result::ok)
                     .collect();
@@ -462,7 +575,7 @@ impl Store {
             }
             Store::Json(store) => {
                 let guard = store.lock().map_err(|_| "json store lock poisoned")?;
-                let recent: Vec<UsageRow> = guard
+                let recent: Vec<ErrorEntry> = guard
                     .state
                     .recent
                     .iter()
@@ -473,6 +586,11 @@ impl Store {
                             && since_ms.is_none_or(|since| row.ts_ms >= since)
                     })
                     .cloned()
+                    .map(|row| ErrorEntry {
+                        id: None,
+                        resolved_ms: None,
+                        row,
+                    })
                     .collect();
                 let total_errors = if since_ms.is_none() {
                     guard.state.totals.errors
@@ -481,6 +599,85 @@ impl Store {
                 };
                 Ok((total_errors, recent))
             }
+        }
+    }
+
+    /// Count of failed rows in the window that are marked solved.
+    pub fn solved_error_count(&self, since_ms: Option<u64>) -> Result<u64, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut sql = format!(
+                    "SELECT COUNT(*) FROM requests WHERE status >= {ERROR_STATUS_MIN}
+                     AND (resolved_ms IS NOT NULL OR EXISTS (SELECT 1 FROM error_resolutions e
+                         WHERE e.reason = COALESCE(requests.error, '') AND e.resolved_ms >= requests.ts_ms))
+                     AND {}",
+                    Self::not_keep_warm_sql()
+                );
+                let mut params: Vec<rusqlite::types::Value> = Vec::new();
+                if let Some(since) = since_ms {
+                    sql.push_str(" AND ts_ms >= ?");
+                    params.push(rusqlite::types::Value::Integer(db_i64(since)));
+                }
+                guard
+                    .query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| {
+                        Ok(db_u64(r.get::<_, i64>(0)?))
+                    })
+                    .map_err(|e| e.to_string())
+            }
+            Store::Json(_) => Ok(0),
+        }
+    }
+
+    /// Sets or clears `resolved_ms` on failed rows by id. Returns rows updated.
+    /// Only the SQLite store keeps row ids, so the JSON store refuses.
+    pub fn set_errors_resolved(
+        &self,
+        ids: &[i64],
+        resolved_ms: Option<u64>,
+    ) -> Result<u64, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let value = resolved_ms.map(|ms| rusqlite::types::Value::Integer(db_i64(ms)));
+                let mut updated = 0_u64;
+                let mut stmt = guard
+                    .prepare(&format!(
+                        "UPDATE requests SET resolved_ms = ?1
+                         WHERE id = ?2 AND status >= {ERROR_STATUS_MIN}"
+                    ))
+                    .map_err(|e| e.to_string())?;
+                for id in ids {
+                    let changed = stmt
+                        .execute(rusqlite::params![value.clone(), id])
+                        .map_err(|e| e.to_string())?;
+                    updated += u64::try_from(changed).unwrap_or(0);
+                    match resolved_ms {
+                        Some(ms) => {
+                            guard
+                                .execute(
+                                    "INSERT INTO error_resolutions (reason, resolved_ms)
+                                     SELECT COALESCE(error, ''), ?1 FROM requests
+                                     WHERE id = ?2 AND status >= 400
+                                     ON CONFLICT(reason) DO UPDATE SET resolved_ms = excluded.resolved_ms",
+                                    rusqlite::params![db_i64(ms), id],
+                                )
+                                .map_err(|e| e.to_string())?;
+                        }
+                        None => {
+                            guard
+                                .execute(
+                                    "DELETE FROM error_resolutions WHERE reason IN
+                                     (SELECT COALESCE(error, '') FROM requests WHERE id = ?1 AND status >= 400)",
+                                    rusqlite::params![id],
+                                )
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+                Ok(updated)
+            }
+            Store::Json(_) => Err("error resolution needs the SQLite store".into()),
         }
     }
 
@@ -541,6 +738,124 @@ impl Store {
         Ok(snapshot)
     }
 
+    /// Smart Auto requests grouped by tier and role, with their cost and verified attempt outcomes.
+    /// The json store keeps no attempts, so it returns no rows.
+    pub fn by_tier_role(
+        &self,
+        filter: &StatsFilter,
+        book: &PricingBook,
+    ) -> Result<Vec<TierRoleRow>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let requests = self.filtered_outcomes(filter)?;
+                let since_ms = db_i64(filter.since_ms.unwrap_or(0));
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let completed: HashSet<String> = {
+                    let mut stmt = guard
+                        .prepare(
+                            "SELECT DISTINCT json_extract(event, '$.attempt') FROM selection_events
+                             WHERE ts_ms >= ?1
+                               AND json_extract(event, '$.state') = 'completed'
+                               AND json_extract(event, '$.stage') = 'solver'
+                               AND json_extract(event, '$.attempt') IS NOT NULL",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map([since_ms], |r| r.get::<_, String>(0))
+                        .map_err(|e| e.to_string())?;
+                    rows.filter_map(Result::ok).collect()
+                };
+                let verdicts: HashMap<String, String> = {
+                    let mut stmt = guard
+                        .prepare("SELECT attempt, code FROM attempt_outcomes WHERE ts_ms >= ?1")
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map([since_ms], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .map_err(|e| e.to_string())?;
+                    rows.filter_map(Result::ok).collect()
+                };
+                Ok(group_tier_role(
+                    &requests,
+                    |request| outcome_cost_parts(book, request),
+                    &completed,
+                    &verdicts,
+                ))
+            }
+            Store::Json(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Saves an attempt's outcome. A lower-precedence source never replaces a higher one; an equal one does.
+    /// The json store keeps no outcomes.
+    pub fn save_attempt_outcome(
+        &self,
+        attempt: &str,
+        worker: Option<&str>,
+        outcome: &AttemptOutcome,
+        ts_ms: u64,
+    ) -> Result<(), String> {
+        let Store::Sqlite(conn) = self else {
+            return Ok(());
+        };
+        let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+        guard
+            .execute(
+                "INSERT INTO attempt_outcomes (attempt, worker, code, source, ts_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(attempt) DO UPDATE SET
+                    worker = COALESCE(excluded.worker, attempt_outcomes.worker),
+                    code = excluded.code,
+                    source = excluded.source,
+                    ts_ms = excluded.ts_ms
+                 WHERE (CASE excluded.source WHEN 'client' THEN 2 WHEN 'review' THEN 1 ELSE 0 END)
+                    >= (CASE attempt_outcomes.source WHEN 'client' THEN 2 WHEN 'review' THEN 1 ELSE 0 END)",
+                rusqlite::params![
+                    attempt,
+                    worker,
+                    outcome.code.as_str(),
+                    outcome.source.as_str(),
+                    db_i64(ts_ms)
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Stored outcomes for `attempts`, keyed by attempt. Unknown attempts are absent.
+    pub fn load_attempt_outcomes(
+        &self,
+        attempts: &[String],
+    ) -> Result<HashMap<String, AttemptOutcome>, String> {
+        let Store::Sqlite(conn) = self else {
+            return Ok(HashMap::new());
+        };
+        if attempts.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+        let mut stmt = guard
+            .prepare_cached("SELECT code, source FROM attempt_outcomes WHERE attempt = ?1")
+            .map_err(|e| e.to_string())?;
+        let mut found = HashMap::new();
+        for attempt in attempts {
+            let row = stmt
+                .query_row([attempt], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if let Some((code, source)) = row
+                && let (Some(code), Some(source)) =
+                    (OutcomeCode::parse(&code), OutcomeSource::parse(&source))
+            {
+                found.insert(attempt.clone(), AttemptOutcome { code, source });
+            }
+        }
+        Ok(found)
+    }
+
     /// Request outcomes matching `filter`, oldest first.
     pub fn filtered_outcomes(&self, filter: &StatsFilter) -> Result<Vec<RequestOutcome>, String> {
         match self {
@@ -549,7 +864,7 @@ impl Store {
                 let mut sql = String::from(
                     "SELECT model, profile, status, latency_ms, tokens_in, tokens_out,
                             ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error, client, worker,
-                            routed_by
+                            routed_by, attempt, role
                      FROM requests WHERE 1=1",
                 );
                 let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -588,6 +903,8 @@ impl Store {
                             client: r.get::<_, Option<String>>(11).unwrap_or(None),
                             worker: r.get::<_, Option<String>>(12).unwrap_or(None),
                             routed_by: r.get::<_, Option<String>>(13).unwrap_or(None),
+                            attempt: r.get::<_, Option<String>>(14).unwrap_or(None),
+                            role: r.get::<_, Option<String>>(15).unwrap_or(None),
                         })
                     })
                     .map_err(|e| e.to_string())?
@@ -628,6 +945,8 @@ impl Store {
                         client: row.client.clone(),
                         worker: row.worker.clone(),
                         routed_by: None,
+                        attempt: None,
+                        role: None,
                     })
                     .collect();
                 Ok(rows)
@@ -975,6 +1294,72 @@ impl Store {
             }
         }
     }
+
+    /// Every `(profile, model)` that refused image input, as learned and saved.
+    pub fn load_vision_refusals(&self) -> Result<Vec<(String, String)>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut stmt = guard
+                    .prepare("SELECT profile, model FROM vision_refusals ORDER BY learned_at")
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(Result::ok)
+                    .collect();
+                Ok(rows)
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                Ok(guard
+                    .state
+                    .vision_refusals
+                    .iter()
+                    .flat_map(|(profile, models)| {
+                        models.iter().map(|m| (profile.clone(), m.clone()))
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    /// Saves that `model` on `profile` refused image input. Saving a known pair is a no-op.
+    pub fn save_vision_refusal(
+        &self,
+        profile: &str,
+        model: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                guard
+                    .execute(
+                        "INSERT INTO vision_refusals (profile, model, source, learned_at)
+                         VALUES (?1, ?2, 'learned', ?3)
+                         ON CONFLICT(profile, model) DO NOTHING",
+                        rusqlite::params![profile, model, db_i64(now_ms)],
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                let models = guard
+                    .state
+                    .vision_refusals
+                    .entry(profile.to_string())
+                    .or_default();
+                if models.iter().any(|known| known == model) {
+                    return Ok(());
+                }
+                models.push(model.to_string());
+                guard.flush()
+            }
+        }
+    }
+
     /// The salt of the selection scope keys. Stores `fresh` when none is saved yet, and returns the saved salt.
     pub fn install_salt(&self, fresh: &str) -> Result<String, String> {
         match self {
@@ -1279,6 +1664,14 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> 
 }
 
 fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
+    // A solved reason stays solved only for failures at or before its solve time.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS error_resolutions (
+            reason TEXT PRIMARY KEY,
+            resolved_ms INTEGER NOT NULL
+        );",
+    )
+    .map_err(|e| e.to_string())?;
     let existing = table_columns(conn, "requests")?;
     let add = |name: &str, ddl: &str| Store::add_missing_column(conn, &existing, name, ddl);
     add("ttft_ms", "ALTER TABLE requests ADD COLUMN ttft_ms INTEGER")?;
@@ -1297,11 +1690,25 @@ fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
         "routed_by",
         "ALTER TABLE requests ADD COLUMN routed_by TEXT",
     )?;
+    add("attempt", "ALTER TABLE requests ADD COLUMN attempt TEXT")?;
+    add(
+        "role",
+        "ALTER TABLE requests ADD COLUMN role TEXT CONSTRAINT ck_requests_role CHECK (role IS NULL OR role IN ('planning', 'investigation', 'implementation', 'validation', 'conversation'))",
+    )?;
+    add(
+        "resolved_ms",
+        "ALTER TABLE requests ADD COLUMN resolved_ms INTEGER",
+    )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_requests_worker ON requests(worker)",
         [],
     )
     .map_err(|e| format!("sqlite migrate idx_requests_worker: {e}"))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_requests_attempt ON requests(attempt)",
+        [],
+    )
+    .map_err(|e| format!("sqlite migrate idx_requests_attempt: {e}"))?;
     Ok(())
 }
 
@@ -1362,6 +1769,8 @@ mod tests {
             client: None,
             worker: None,
             routed_by: None,
+            attempt: None,
+            role: None,
         }
     }
 
@@ -1635,6 +2044,33 @@ mod tests {
     }
 
     #[test]
+    fn attempt_and_role_round_trip_on_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attempt.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let mut routed = sample_outcome();
+        routed.attempt = Some("attempt-key".into());
+        routed.role = Some("investigation".into());
+        store.record(&routed).unwrap();
+        store.record(&sample_outcome()).unwrap();
+        let outcomes = store.filtered_outcomes(&StatsFilter::default()).unwrap();
+        assert_eq!(outcomes[0].attempt.as_deref(), Some("attempt-key"));
+        assert_eq!(outcomes[0].role.as_deref(), Some("investigation"));
+        assert_eq!(outcomes[1].attempt, None);
+        assert_eq!(outcomes[1].role, None);
+    }
+
+    #[test]
+    fn role_check_rejects_values_outside_the_work_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("role-check.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let mut bad = sample_outcome();
+        bad.role = Some("janitor".into());
+        assert!(store.record(&bad).is_err());
+    }
+
+    #[test]
     fn routed_by_prefix_keeps_only_matching_routes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prefix.db");
@@ -1739,7 +2175,7 @@ mod tests {
         let (total, recent) = store.errors(None).unwrap();
         assert_eq!(total, 1);
         assert_eq!(
-            recent[0].error.as_deref(),
+            recent[0].row.error.as_deref(),
             Some("exceeds the available context size")
         );
     }
@@ -1837,8 +2273,86 @@ mod tests {
         let (total, rows) = store.errors(None).unwrap();
         assert_eq!(total, 1);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, 502);
-        assert_eq!(rows[0].model, "openai/fail");
+        assert_eq!(rows[0].row.status, 502);
+        assert_eq!(rows[0].row.model, "openai/fail");
+        assert_eq!(rows[0].resolved_ms, None);
+    }
+
+    #[test]
+    fn sqlite_errors_mark_solved_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        store.record(&sample_outcome()).unwrap();
+        let mut failed = sample_outcome();
+        failed.status = 502;
+        store.record(&failed).unwrap();
+        let (_, rows) = store.errors(None).unwrap();
+        let id = rows[0].id.expect("sqlite rows carry ids");
+
+        assert_eq!(
+            store
+                .set_errors_resolved(&[id], Some(1_700_000_000_000))
+                .unwrap(),
+            1
+        );
+        let (_, rows) = store.errors(None).unwrap();
+        assert_eq!(rows[0].resolved_ms, Some(1_700_000_000_000));
+
+        // A successful request id is not an error, so it cannot be marked.
+        let ok_id: i64 = {
+            let Store::Sqlite(conn) = &store else {
+                unreachable!()
+            };
+            conn.lock()
+                .unwrap()
+                .query_row(
+                    "SELECT id FROM requests WHERE status < 400 LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(store.set_errors_resolved(&[ok_id], Some(1)).unwrap(), 0);
+
+        assert_eq!(store.set_errors_resolved(&[id], None).unwrap(), 1);
+        let (_, rows) = store.errors(None).unwrap();
+        assert_eq!(rows[0].resolved_ms, None);
+    }
+
+    #[test]
+    fn sqlite_recurring_error_reopens_after_solve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let mut failed = sample_outcome();
+        failed.status = 502;
+        failed.error = Some("boom".into());
+        store.record(&failed).unwrap();
+        let (_, rows) = store.errors(None).unwrap();
+        let first = rows[0].id.expect("sqlite rows carry ids");
+        store.set_errors_resolved(&[first], Some(now_ms())).unwrap();
+
+        // The same reason recurs after the solve: the newer row is open, the old one stays solved.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store.record(&failed).unwrap();
+        let (_, rows) = store.errors(None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].resolved_ms, None, "newer occurrence must be open");
+        assert!(
+            rows[1].resolved_ms.is_some(),
+            "older occurrence stays solved"
+        );
+        assert_eq!(store.solved_error_count(None).unwrap(), 1);
+
+        // Solving the newer occurrence covers the whole reason again.
+        let second = rows[0].id.expect("sqlite rows carry ids");
+        store
+            .set_errors_resolved(&[second], Some(now_ms()))
+            .unwrap();
+        let (_, rows) = store.errors(None).unwrap();
+        assert!(rows.iter().all(|r| r.resolved_ms.is_some()));
+        assert_eq!(store.solved_error_count(None).unwrap(), 2);
     }
 
     #[test]
@@ -1987,6 +2501,38 @@ mod tests {
     #[test]
     fn json_unsupported_body_fields_survive_reopen_once_each() {
         body_fields_round_trip("json", "s.json");
+    }
+
+    fn vision_refusals_round_trip(kind: &str, file: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        let path_str = path.to_str().unwrap();
+        {
+            let store = Store::open(kind, Some(path_str)).unwrap();
+            store.save_vision_refusal("copilot", "gpt-4o", 1).unwrap();
+            store.save_vision_refusal("copilot", "gpt-4o", 2).unwrap();
+            store.save_vision_refusal("other", "mini", 3).unwrap();
+        }
+        let store = Store::open(kind, Some(path_str)).unwrap();
+        let mut refusals = store.load_vision_refusals().unwrap();
+        refusals.sort();
+        assert_eq!(
+            refusals,
+            [
+                ("copilot".to_string(), "gpt-4o".to_string()),
+                ("other".to_string(), "mini".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlite_image_refusals_survive_reopen() {
+        vision_refusals_round_trip("sqlite", "t.db");
+    }
+
+    #[test]
+    fn json_image_refusals_survive_reopen() {
+        vision_refusals_round_trip("json", "s.json");
     }
 
     #[test]
@@ -2223,5 +2769,339 @@ mod tests {
     #[test]
     fn json_install_salt_is_created_once() {
         install_salt_survives_reopen("json", "s.json");
+    }
+}
+
+#[cfg(test)]
+mod tier_role_tests {
+    use super::*;
+    use crate::configs::TokenRates;
+    use crate::schemas::selection_stage::SelectionStage;
+    use crate::schemas::selection_state::SelectionState;
+
+    fn request(
+        routed_by: Option<&str>,
+        role: Option<&str>,
+        attempt: Option<&str>,
+    ) -> RequestOutcome {
+        RequestOutcome {
+            profile: "acme".into(),
+            model_key: "acme/m".into(),
+            status: 200,
+            latency_ms: 1,
+            ttft_ms: None,
+            tokens_in: 1_000_000,
+            tokens_out: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            ts_ms: 0,
+            error: None,
+            client: None,
+            worker: None,
+            routed_by: routed_by.map(Into::into),
+            attempt: attempt.map(Into::into),
+            role: role.map(Into::into),
+        }
+    }
+
+    /// Each request costs $1 in this test, whatever its tokens.
+    fn flat_dollar(_: &RequestOutcome) -> CostParts {
+        CostParts {
+            input: 1.0,
+            ..CostParts::default()
+        }
+    }
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    #[test]
+    fn groups_smart_auto_rows_by_tier_and_role_and_skips_other_routes() {
+        let requests = [
+            request(
+                Some("smart-auto:balance"),
+                Some("implementation"),
+                Some("a1"),
+            ),
+            request(Some("smart-auto:balance"), None, Some("a2")),
+            request(
+                Some("smart-auto:balance"),
+                Some("implementation"),
+                Some("a3"),
+            ),
+            request(Some("smart-auto:intelligence"), Some("planning"), None),
+            request(Some("pinned"), Some("implementation"), Some("a4")),
+            request(Some("smart-auto:"), None, None),
+            request(None, None, None),
+        ];
+        let rows = group_tier_role(&requests, flat_dollar, &set(&["a1"]), &HashMap::new());
+
+        let keys: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| (row.tier.as_str(), row.role.as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("balance", "implementation"),
+                ("balance", "unknown"),
+                ("intelligence", "planning"),
+            ]
+        );
+        assert_eq!(rows[0].requests, 2);
+        assert_eq!(rows[0].cost_usd, 2.0);
+        assert_eq!(rows[0].completed_attempts, 1);
+        assert_eq!(rows[0].cost_per_completed_usd, Some(2.0));
+        assert_eq!(rows[1].completed_attempts, 0);
+        assert_eq!(rows[1].cost_per_completed_usd, None);
+        assert_eq!(rows[2].requests, 1);
+        assert_eq!(rows[2].completed_attempts, 0);
+    }
+
+    #[test]
+    fn outcomes_count_each_attempt_once_per_group() {
+        let requests = [
+            request(Some("smart-auto:balance"), Some("validation"), Some("a1")),
+            request(Some("smart-auto:balance"), Some("validation"), Some("a1")),
+            request(Some("smart-auto:balance"), Some("validation"), Some("a2")),
+            request(Some("smart-auto:balance"), Some("validation"), Some("a3")),
+        ];
+        let verdicts = HashMap::from([
+            ("a1".to_string(), "tests_passed".to_string()),
+            ("a2".to_string(), "tests_failed".to_string()),
+            ("a9".to_string(), "review_passed".to_string()),
+        ]);
+        let rows = group_tier_role(&requests, flat_dollar, &set(&["a1", "a2", "a9"]), &verdicts);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].requests, 4);
+        assert_eq!(rows[0].cost_usd, 4.0);
+        assert_eq!(rows[0].completed_attempts, 2);
+        assert_eq!(rows[0].cost_per_completed_usd, Some(2.0));
+        assert_eq!(rows[0].outcomes.get("tests_passed"), Some(&1));
+        assert_eq!(rows[0].outcomes.get("tests_failed"), Some(&1));
+        assert_eq!(rows[0].outcomes.get("review_passed"), None);
+    }
+
+    #[test]
+    fn group_row_serializes_null_cost_per_completed_without_completions() {
+        let rows = group_tier_role(
+            &[request(Some("smart-auto:balance"), None, None)],
+            flat_dollar,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let json = serde_json::to_value(&rows).unwrap();
+        assert!(json[0]["cost_per_completed_usd"].is_null());
+        assert_eq!(json[0]["role"], "unknown");
+        assert_eq!(json[0]["outcomes"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn attempt_outcome_precedence_keeps_the_strongest_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outcomes.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let outcome = |code, source| AttemptOutcome { code, source };
+
+        store
+            .save_attempt_outcome(
+                "a1",
+                Some("w1"),
+                &outcome(OutcomeCode::TestsFailed, OutcomeSource::Heuristic),
+                1,
+            )
+            .unwrap();
+        store
+            .save_attempt_outcome(
+                "a1",
+                None,
+                &outcome(OutcomeCode::TestsPassed, OutcomeSource::Heuristic),
+                2,
+            )
+            .unwrap();
+        store
+            .save_attempt_outcome(
+                "a1",
+                None,
+                &outcome(OutcomeCode::UserCorrected, OutcomeSource::Client),
+                3,
+            )
+            .unwrap();
+        store
+            .save_attempt_outcome(
+                "a1",
+                None,
+                &outcome(OutcomeCode::ReviewPassed, OutcomeSource::Review),
+                4,
+            )
+            .unwrap();
+
+        let loaded = store
+            .load_attempt_outcomes(&["a1".to_string(), "missing".to_string()])
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded["a1"],
+            outcome(OutcomeCode::UserCorrected, OutcomeSource::Client)
+        );
+        let Store::Sqlite(conn) = &store else {
+            panic!("expected sqlite store");
+        };
+        let worker: Option<String> = conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT worker FROM attempt_outcomes WHERE attempt = 'a1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(worker.as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn attempt_outcome_check_rejects_unknown_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outcomes-check.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let Store::Sqlite(conn) = &store else {
+            panic!("expected sqlite store");
+        };
+        let inserted = conn.lock().unwrap().execute(
+            "INSERT INTO attempt_outcomes (attempt, code, source, ts_ms) VALUES ('a', 'nope', 'client', 1)",
+            [],
+        );
+        assert!(inserted.is_err());
+    }
+
+    #[test]
+    fn json_store_keeps_no_attempt_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+        let store = Store::open("json", Some(path.to_str().unwrap())).unwrap();
+        let outcome = AttemptOutcome {
+            code: OutcomeCode::TestsPassed,
+            source: OutcomeSource::Heuristic,
+        };
+        store.save_attempt_outcome("a1", None, &outcome, 1).unwrap();
+        assert!(
+            store
+                .load_attempt_outcomes(&["a1".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sqlite_by_tier_role_joins_completed_solver_attempts_and_verdicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tier.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let Store::Sqlite(conn) = &store else {
+            panic!("expected sqlite store");
+        };
+        conn.lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS attempt_outcomes (
+                    attempt TEXT PRIMARY KEY,
+                    worker TEXT,
+                    code TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    ts_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO attempt_outcomes (attempt, worker, code, source, ts_ms)
+                 VALUES ('a1', NULL, 'tests_passed', 'heuristic', 1),
+                        ('a2', NULL, 'tests_failed', 'heuristic', 1);",
+            )
+            .unwrap();
+
+        let book = PricingBook {
+            global: TokenRates {
+                input_per_1m: 2.0,
+                ..TokenRates::default()
+            },
+            ..PricingBook::default()
+        };
+        for (routed_by, role, attempt) in [
+            ("smart-auto:balance", Some("implementation"), "a1"),
+            ("smart-auto:balance", Some("implementation"), "a4"),
+            ("smart-auto:balance", None, "a2"),
+            ("pinned", Some("implementation"), "a5"),
+        ] {
+            let mut row = request(Some(routed_by), role, Some(attempt));
+            row.ts_ms = now_ms();
+            store.record(&row).unwrap();
+        }
+
+        let now = now_ms();
+        let event = |seq: u64, attempt: &str, stage, state| SelectionEvent {
+            seq,
+            ts_ms: now,
+            attempt: Some(attempt.into()),
+            ..SelectionEvent::new(stage, state, "acme/m")
+        };
+        store
+            .save_selection_events(
+                &[
+                    event(1, "a1", SelectionStage::Solver, SelectionState::Completed),
+                    event(2, "a2", SelectionStage::Solver, SelectionState::Completed),
+                    event(3, "a4", SelectionStage::Solver, SelectionState::Selected),
+                    event(4, "a4", SelectionStage::Judge, SelectionState::Completed),
+                ],
+                now,
+                -1,
+            )
+            .unwrap();
+
+        let filter = StatsFilter {
+            range_label: "all".into(),
+            ..StatsFilter::default()
+        };
+        let rows = store.by_tier_role(&filter, &book).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].tier, "balance");
+        assert_eq!(rows[0].role, "implementation");
+        assert_eq!(rows[0].requests, 2);
+        assert!((rows[0].cost_usd - 4.0).abs() < 1e-9);
+        assert_eq!(rows[0].completed_attempts, 1);
+        assert_eq!(rows[0].outcomes.get("tests_passed"), Some(&1));
+        assert!((rows[0].cost_per_completed_usd.unwrap() - 4.0).abs() < 1e-9);
+        assert_eq!(rows[1].role, "unknown");
+        assert_eq!(rows[1].completed_attempts, 1);
+        assert_eq!(rows[1].outcomes.get("tests_failed"), Some(&1));
+
+        let narrowed = store
+            .by_tier_role(
+                &StatsFilter {
+                    since_ms: Some(now + 1),
+                    ..filter
+                },
+                &book,
+            )
+            .unwrap();
+        assert!(narrowed.is_empty());
+    }
+
+    #[test]
+    fn json_store_has_no_tier_role_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tier.json");
+        let store = Store::open("json", Some(path.to_str().unwrap())).unwrap();
+        let mut row = request(
+            Some("smart-auto:balance"),
+            Some("implementation"),
+            Some("a1"),
+        );
+        row.ts_ms = now_ms();
+        store.record(&row).unwrap();
+
+        let rows = store
+            .by_tier_role(&StatsFilter::default(), &PricingBook::default())
+            .unwrap();
+        assert!(rows.is_empty());
     }
 }

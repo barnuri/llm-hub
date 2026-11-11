@@ -148,11 +148,20 @@
   font-size: 12px;
 }
 
+.quota-row + .quota-row {
+  margin-top: 14px;
+}
+
+.quota-row-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
 .top-models .table td:first-child {
-  max-width: 150px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .recent-requests {

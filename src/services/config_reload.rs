@@ -95,6 +95,9 @@ mod tests {
 
     fn sample(bind: &str, port: u16) -> HubConfig {
         HubConfig {
+            bind: bind.into(),
+            port,
+            usage_sources: HashMap::new(),
             profiles: vec![ProfileConfig {
                 name: "local".into(),
                 display_name: None,
@@ -114,9 +117,8 @@ mod tests {
             smart_auto_rules_env: None,
             default_fallbacks: vec![],
             max_replay_bytes: 1,
+            max_request_body_bytes: crate::consts::DEFAULT_MAX_REQUEST_BODY_BYTES,
             config_readonly: false,
-            bind: bind.into(),
-            port,
             persistent: false,
             store_kind: "sqlite".into(),
             store_path: None,

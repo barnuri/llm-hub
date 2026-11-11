@@ -1,5 +1,6 @@
-//! Each Copilot profile's quota from `copilot_internal/user`, cached and
-//! normalised to the quota shape the Claude Code status line reads.
+//! Each usage-source profile's quota, cached and normalised to one shape. Copilot reads
+//! `copilot_internal/user`, Bifrost reads its virtual-key quota endpoint. A snapshot is served
+//! stale-while-revalidate, so a poller never waits on the upstream once a first snapshot exists.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -8,11 +9,12 @@ use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
 use serde::Serialize;
 
-use crate::configs::{CopilotAuth, CopilotFlow, HubConfig};
+use crate::configs::{CopilotAuth, CopilotFlow, HubConfig, UsageSource};
 use crate::consts::COPILOT_USAGE_TTL;
 use crate::dependencies::state::AppState;
 use crate::schemas::copilot_quota_snapshot::CopilotQuotaSnapshot;
 use crate::schemas::copilot_user_response::CopilotUserResponse;
+use crate::services::bifrost_usage;
 use crate::services::copilot_sessions::fetch_user;
 use crate::services::credential_store::CredentialStore;
 use crate::services::gh_cli::GhCli;
@@ -20,25 +22,55 @@ use crate::services::github_token_resolver;
 use crate::services::store::now_ms;
 use crate::utils::time::utc_iso8601;
 
-const USAGE_SOURCE: &str = "copilot_internal/user";
+const COPILOT_SOURCE: &str = "copilot_internal/user";
 const AIC_PER_USD: f64 = 100.0;
 const FULL_PERCENT: f64 = 100.0;
 const DATE_ONLY_LEN: usize = "2026-11-01".len();
 const MIDNIGHT_UTC: &str = "T00:00:00Z";
 
-type PendingRefresh = Shared<BoxFuture<'static, Option<Arc<CopilotUsage>>>>;
+type PendingRefresh = Shared<BoxFuture<'static, Option<Arc<ProfileUsage>>>>;
 
-/// Quota snapshots per Copilot profile, served stale-while-revalidate so a
-/// poller never waits on GitHub once a first snapshot exists.
-pub struct CopilotUsageCache {
+/// What a profile's quota is read from. It keys a cache entry, so a changed key drops the snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsageKey {
+    Copilot(CopilotAuth),
+    Bifrost { base_url: String, api_key: String },
+}
+
+impl UsageKey {
+    /// The quota source of `profile`, or `None` when it has none.
+    pub fn for_profile(config: &HubConfig, profile: &str) -> Option<UsageKey> {
+        let found = config.profile(profile)?;
+        if let Some(auth) = &found.copilot {
+            return Some(UsageKey::Copilot(auth.clone()));
+        }
+        match config.usage_source(profile)? {
+            UsageSource::Bifrost => Some(UsageKey::Bifrost {
+                base_url: found.base_url.clone(),
+                api_key: found.api_key.clone(),
+            }),
+        }
+    }
+
+    /// The source name shown to clients.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            UsageKey::Copilot(_) => "copilot",
+            UsageKey::Bifrost { .. } => UsageSource::Bifrost.as_str(),
+        }
+    }
+}
+
+/// Quota snapshots per usage-source profile.
+pub struct ProfileUsageCache {
     credentials: Arc<dyn CredentialStore>,
     gh: Arc<dyn GhCli>,
     entries: DashMap<String, Arc<UsageEntry>>,
 }
 
 struct UsageEntry {
-    auth: CopilotAuth,
-    snapshot: Mutex<Option<Arc<CopilotUsage>>>,
+    key: UsageKey,
+    snapshot: Mutex<Option<Arc<ProfileUsage>>>,
     /// The refresh in flight. Every caller that needs it awaits the same task.
     refresh: Mutex<Option<PendingRefresh>>,
 }
@@ -49,70 +81,117 @@ pub enum QuotaUnit {
     /// AI credits: 100 AIC = $1.
     Aic,
     Requests,
+    Tokens,
+    Usd,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CopilotUsage {
-    source: &'static str,
+pub struct ProfileUsage {
+    pub(crate) source: &'static str,
     /// Fetch time, unix ms.
     pub(crate) updated_at: u64,
-    fetched_at: String,
-    pub(crate) quotas: Vec<CopilotUsageQuota>,
+    pub(crate) fetched_at: String,
+    pub(crate) quotas: Vec<ProfileUsageQuota>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CopilotUsageQuota {
+pub struct ProfileUsageQuota {
     pub(crate) id: String,
-    unit: QuotaUnit,
+    pub(crate) unit: QuotaUnit,
     pub(crate) used: f64,
     pub(crate) entitlement: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    remaining: Option<f64>,
-    remaining_percentage: f64,
+    pub(crate) remaining: Option<f64>,
+    pub(crate) remaining_percentage: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    overage_permitted: Option<bool>,
+    pub(crate) overage_permitted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reset_date: Option<String>,
+    pub(crate) reset_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) used_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) limit_usd: Option<f64>,
 }
 
-impl CopilotUsageCache {
-    pub fn new(credentials: Arc<dyn CredentialStore>, gh: Arc<dyn GhCli>) -> CopilotUsageCache {
-        CopilotUsageCache {
+impl ProfileUsage {
+    pub(crate) fn new(
+        source: &'static str,
+        fetched_at_ms: u64,
+        quotas: Vec<ProfileUsageQuota>,
+    ) -> ProfileUsage {
+        ProfileUsage {
+            source,
+            updated_at: fetched_at_ms,
+            fetched_at: utc_iso8601(fetched_at_ms),
+            quotas,
+        }
+    }
+}
+
+impl ProfileUsageQuota {
+    /// A quota of `used` out of `entitlement`. `None` when the limit is not positive.
+    pub(crate) fn measured(
+        id: String,
+        unit: QuotaUnit,
+        used: f64,
+        entitlement: f64,
+        reset_date: Option<String>,
+    ) -> Option<ProfileUsageQuota> {
+        if entitlement <= 0.0 {
+            return None;
+        }
+        let remaining_percentage =
+            ((entitlement - used) / entitlement * FULL_PERCENT).clamp(0.0, FULL_PERCENT);
+        let usd = (unit == QuotaUnit::Usd).then_some((used, entitlement));
+        Some(ProfileUsageQuota {
+            id,
+            unit,
+            used,
+            entitlement,
+            remaining: Some((entitlement - used).max(0.0)),
+            remaining_percentage,
+            overage_permitted: None,
+            reset_date,
+            used_usd: usd.map(|(used, _)| used),
+            limit_usd: usd.map(|(_, limit)| limit),
+        })
+    }
+}
+
+impl ProfileUsageCache {
+    pub fn new(credentials: Arc<dyn CredentialStore>, gh: Arc<dyn GhCli>) -> ProfileUsageCache {
+        ProfileUsageCache {
             credentials,
             gh,
             entries: DashMap::new(),
         }
     }
 
-    /// Drops the snapshots of profiles that `config` removed or whose Copilot auth changed.
+    /// Drops the snapshots of profiles that `config` removed or whose usage source changed.
     pub fn reconcile(&self, config: &HubConfig) {
         self.entries.retain(|profile, entry| {
-            config.profile(profile).and_then(|p| p.copilot.as_ref()) == Some(&entry.auth)
+            UsageKey::for_profile(config, profile).as_ref() == Some(&entry.key)
         });
     }
 
-    fn entry_for(&self, profile: &str, auth: &CopilotAuth) -> Arc<UsageEntry> {
+    fn entry_for(&self, profile: &str, key: &UsageKey) -> Arc<UsageEntry> {
         let mut slot = self
             .entries
             .entry(profile.to_string())
-            .or_insert_with(|| Arc::new(UsageEntry::new(auth)));
-        if slot.auth != *auth {
-            *slot.value_mut() = Arc::new(UsageEntry::new(auth));
+            .or_insert_with(|| Arc::new(UsageEntry::new(key)));
+        if slot.key != *key {
+            *slot.value_mut() = Arc::new(UsageEntry::new(key));
         }
         Arc::clone(slot.value())
     }
 }
 
 impl UsageEntry {
-    fn new(auth: &CopilotAuth) -> UsageEntry {
+    fn new(key: &UsageKey) -> UsageEntry {
         UsageEntry {
-            auth: auth.clone(),
+            key: key.clone(),
             snapshot: Mutex::new(None),
             refresh: Mutex::new(None),
         }
@@ -125,9 +204,9 @@ pub async fn usage(
     state: &AppState,
     client: &reqwest::Client,
     profile: &str,
-    auth: &CopilotAuth,
-) -> Option<Arc<CopilotUsage>> {
-    usage_at(state, client, profile, auth, now_ms()).await
+    key: &UsageKey,
+) -> Option<Arc<ProfileUsage>> {
+    usage_at(state, client, profile, key, now_ms()).await
 }
 
 /// [`usage`] with the clock passed in as unix milliseconds.
@@ -135,10 +214,10 @@ pub(crate) async fn usage_at(
     state: &AppState,
     client: &reqwest::Client,
     profile: &str,
-    auth: &CopilotAuth,
+    key: &UsageKey,
     now_ms: u64,
-) -> Option<Arc<CopilotUsage>> {
-    let entry = state.copilot_usage().entry_for(profile, auth);
+) -> Option<Arc<ProfileUsage>> {
+    let entry = state.profile_usage().entry_for(profile, key);
     let cached = lock(&entry.snapshot).clone();
     let ttl_ms = u64::try_from(COPILOT_USAGE_TTL.as_millis()).unwrap_or(u64::MAX);
     if let Some(usage) = &cached
@@ -158,9 +237,9 @@ pub(crate) async fn refresh_now(
     state: &AppState,
     client: &reqwest::Client,
     profile: &str,
-    auth: &CopilotAuth,
-) -> Option<Arc<CopilotUsage>> {
-    let entry = state.copilot_usage().entry_for(profile, auth);
+    key: &UsageKey,
+) -> Option<Arc<ProfileUsage>> {
+    let entry = state.profile_usage().entry_for(profile, key);
     start_refresh(state, client, profile, &entry, now_ms()).await
 }
 
@@ -195,8 +274,8 @@ async fn refresh(
     profile: String,
     entry: Arc<UsageEntry>,
     now_ms: u64,
-) -> Option<Arc<CopilotUsage>> {
-    let usage = fetch(&state, &client, &profile, &entry.auth, now_ms)
+) -> Option<Arc<ProfileUsage>> {
+    let usage = fetch(&state, &client, &profile, &entry.key, now_ms)
         .await
         .map(Arc::new);
     if let Some(usage) = &usage {
@@ -206,15 +285,30 @@ async fn refresh(
     usage
 }
 
+async fn fetch(
+    state: &AppState,
+    client: &reqwest::Client,
+    profile: &str,
+    key: &UsageKey,
+    now_ms: u64,
+) -> Option<ProfileUsage> {
+    match key {
+        UsageKey::Copilot(auth) => fetch_copilot(state, client, profile, auth, now_ms).await,
+        UsageKey::Bifrost { base_url, api_key } => {
+            bifrost_usage::fetch(client, profile, base_url, api_key, now_ms).await
+        }
+    }
+}
+
 /// Flow B reuses the session bearer, which is the GitHub token. Flow A's
 /// session holds the exchanged Copilot token, so the GitHub token is resolved again.
-async fn fetch(
+async fn fetch_copilot(
     state: &AppState,
     client: &reqwest::Client,
     profile: &str,
     auth: &CopilotAuth,
     now_ms: u64,
-) -> Option<CopilotUsage> {
+) -> Option<ProfileUsage> {
     let github_token = match auth.flow {
         CopilotFlow::Opencode => state
             .copilot_sessions()
@@ -222,7 +316,7 @@ async fn fetch(
             .await
             .map(|(bearer, _)| bearer),
         CopilotFlow::Vscode => {
-            let cache = state.copilot_usage();
+            let cache = state.profile_usage();
             github_token_resolver::resolve(
                 profile,
                 auth,
@@ -253,13 +347,13 @@ async fn fetch(
 }
 
 /// The limited quotas in `user`, sorted by id. `None` when it reports none.
-fn normalise(user: &CopilotUserResponse, fetched_at_ms: u64) -> Option<CopilotUsage> {
+fn normalise(user: &CopilotUserResponse, fetched_at_ms: u64) -> Option<ProfileUsage> {
     let reset_date = user
         .quota_reset_date_utc
         .as_deref()
         .or(user.quota_reset_date.as_deref())
         .map(utc_reset_date);
-    let mut quotas: Vec<CopilotUsageQuota> = user
+    let mut quotas: Vec<ProfileUsageQuota> = user
         .quota_snapshots
         .as_ref()?
         .iter()
@@ -269,12 +363,7 @@ fn normalise(user: &CopilotUserResponse, fetched_at_ms: u64) -> Option<CopilotUs
         return None;
     }
     quotas.sort_by(|a, b| a.id.cmp(&b.id));
-    Some(CopilotUsage {
-        source: USAGE_SOURCE,
-        updated_at: fetched_at_ms,
-        fetched_at: utc_iso8601(fetched_at_ms),
-        quotas,
-    })
+    Some(ProfileUsage::new(COPILOT_SOURCE, fetched_at_ms, quotas))
 }
 
 /// `credits_used` and `percent_remaining` are kept as reported: the API's
@@ -283,7 +372,7 @@ fn normalise_quota(
     id: &str,
     snapshot: &CopilotQuotaSnapshot,
     reset_date: Option<&str>,
-) -> Option<CopilotUsageQuota> {
+) -> Option<ProfileUsageQuota> {
     if snapshot.unlimited == Some(true) {
         return None;
     }
@@ -301,7 +390,7 @@ fn normalise_quota(
         QuotaUnit::Requests
     };
     let in_usd = |amount: f64| (unit == QuotaUnit::Aic).then_some(amount / AIC_PER_USD);
-    Some(CopilotUsageQuota {
+    Some(ProfileUsageQuota {
         id: id.to_string(),
         unit,
         used,
@@ -376,11 +465,11 @@ mod tests {
         serde_json::from_value(body).unwrap()
     }
 
-    fn quotas(usage: &CopilotUsage) -> Value {
+    fn quotas(usage: &ProfileUsage) -> Value {
         serde_json::to_value(usage).unwrap()["quotas"].clone()
     }
 
-    fn state_with(auth_value: &str, api_url: &str) -> (AppState, CopilotAuth) {
+    fn state_with(auth_value: &str, api_url: &str) -> (AppState, UsageKey) {
         let vars: HashMap<String, String> = [
             ("LLM_HUB_PROFILES", PROFILE),
             ("LLM_HUB_COPILOT_BASE_URL", "http://127.0.0.1:9"),
@@ -406,10 +495,10 @@ mod tests {
             Arc::new(FakeGhCli::new(GhOutcome::Token(GH_TOKEN.to_string()))),
         )
         .unwrap();
-        (state, auth)
+        (state, UsageKey::Copilot(auth))
     }
 
-    fn vscode_state(server: &MockServer) -> (AppState, CopilotAuth) {
+    fn vscode_state(server: &MockServer) -> (AppState, UsageKey) {
         state_with("github-copilot-vscode", &server.uri())
     }
 
@@ -423,15 +512,15 @@ mod tests {
             .await;
     }
 
-    async fn settle(state: &AppState, auth: &CopilotAuth) {
-        let entry = state.copilot_usage().entry_for(PROFILE, auth);
+    async fn settle(state: &AppState, auth: &UsageKey) {
+        let entry = state.profile_usage().entry_for(PROFILE, auth);
         let pending = lock(&entry.refresh).clone();
         if let Some(pending) = pending {
             pending.await;
         }
     }
 
-    fn used(usage: &CopilotUsage) -> Value {
+    fn used(usage: &ProfileUsage) -> Value {
         quotas(usage)[0]["used"].clone()
     }
 
@@ -604,7 +693,7 @@ mod tests {
         usage_at(&state, &client, PROFILE, &auth, NOW_MS).await;
         usage_at(&state, &client, PROFILE, &auth, stale_at).await;
         settle(&state, &auth).await;
-        let entry = state.copilot_usage().entry_for(PROFILE, &auth);
+        let entry = state.profile_usage().entry_for(PROFILE, &auth);
         let kept = lock(&entry.snapshot).clone();
 
         assert_eq!(kept.unwrap().updated_at, NOW_MS);
@@ -646,13 +735,13 @@ mod tests {
     async fn reconcile_drops_removed_profiles() {
         let server = MockServer::start().await;
         let (state, auth) = vscode_state(&server);
-        state.copilot_usage().entry_for("removed", &auth);
-        state.copilot_usage().entry_for(PROFILE, &auth);
+        state.profile_usage().entry_for("removed", &auth);
+        state.profile_usage().entry_for(PROFILE, &auth);
 
-        state.copilot_usage().reconcile(&state.config());
+        state.profile_usage().reconcile(&state.config());
 
         let remaining: Vec<String> = state
-            .copilot_usage()
+            .profile_usage()
             .entries
             .iter()
             .map(|e| e.key().clone())

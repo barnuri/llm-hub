@@ -103,10 +103,8 @@
 }
 
 .insights-card-model {
-  overflow: hidden;
   font: 600 13.5px/1.5 var(--mono);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .insights-card-model.declared {

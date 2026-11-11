@@ -5,6 +5,7 @@ import { Heat } from "../components/Heat";
 import { LiveFeed } from "../components/LiveFeed";
 import { LiveIndicator } from "../components/LiveIndicator";
 import { KpiCard, type KpiTone } from "../components/KpiCard";
+import { ModelName } from "../components/ModelName";
 import { ModelTag } from "../components/ModelTag";
 import { Panel } from "../components/Panel";
 import { Pill } from "../components/Pill";
@@ -34,6 +35,7 @@ import type {
   StatsSnapshot,
   UsageReport,
   UsageRow,
+  UsageSourcesReport,
 } from "../lib/types";
 import "../styles/screens/overview.css";
 
@@ -130,7 +132,35 @@ function quotaTone(quota: CopilotQuota): KpiTone {
 }
 
 function quotaUnit(quota: CopilotQuota): string {
-  return quota.unit === "aic" ? "AIC" : "requests";
+  switch (quota.unit) {
+    case "aic":
+      return "AIC";
+    case "usd":
+      return "USD";
+    case "tokens":
+      return "tokens";
+    default:
+      return "requests";
+  }
+}
+
+/** A quota amount in its own unit: dollars for a budget, a plain count otherwise. */
+function quotaAmount(quota: CopilotQuota, value: number): string {
+  return quota.unit === "usd" ? formatUsd(value) : formatNumber(value);
+}
+
+const QUOTA_WORDS: Readonly<Record<string, string>> = {
+  budget: "Budget",
+  requests: "Requests",
+  tokens: "Tokens",
+};
+
+/** `openai:budget:1M` reads as `openai · Budget · 1M`. */
+function quotaLabel(id: string): string {
+  return id
+    .split(":")
+    .map((part) => QUOTA_WORDS[part] ?? part)
+    .join(" · ");
 }
 
 function quotaUsedPct(quota: CopilotQuota): number {
@@ -219,6 +249,67 @@ function QuotaPanel({ quota, burn }: QuotaPanelProps) {
   );
 }
 
+interface GatewayQuota {
+  readonly label: string;
+  readonly report: CopilotUsageReport;
+}
+
+/** The quota of every non-Copilot profile that has a usage source. A failed profile is left out. */
+async function loadGatewayQuotas(): Promise<readonly GatewayQuota[]> {
+  const { sources } = await api<UsageSourcesReport>("/api/usage/sources");
+  const results = await Promise.allSettled(
+    sources
+      .filter((source) => source.kind !== "copilot")
+      .map(async (source) => ({
+        label: source.label,
+        report: await api<CopilotUsageReport>(`/api/profiles/${encodeURIComponent(source.profile)}/usage`),
+      })),
+  );
+  return results.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
+}
+
+function QuotaRow({ quota }: { readonly quota: CopilotQuota }) {
+  const used = quotaUsedPct(quota);
+  const tone = quotaTone(quota);
+  const reset = quotaReset(quota);
+  const suffix = quota.unit === "usd" ? "" : ` ${quotaUnit(quota)}`;
+  return (
+    <div className="quota-row">
+      <div className="quota-row-head">
+        <span>{quotaLabel(quota.id)}</span>
+        <span className="mono">{formatPct(used)}</span>
+      </div>
+      <div
+        className={tone === "default" ? "quota-bar" : `quota-bar tone-${tone}`}
+        role="meter"
+        aria-label={`${quotaLabel(quota.id)} used`}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(used)}
+      >
+        <span className="quota-fill" style={{ width: `${used}%` }} />
+      </div>
+      <div className="quota-meta">
+        <span className="mono">
+          {quotaAmount(quota, quota.used)} / {quotaAmount(quota, quota.entitlement)}
+          {suffix}
+        </span>
+        {reset ? <span className="dim">Resets {reset}</span> : null}
+      </div>
+    </div>
+  );
+}
+
+function GatewayQuotaPanel({ label, report }: GatewayQuota) {
+  return (
+    <Panel title={`${label} quota`} sub={report.kind === "bifrost" ? "Bifrost virtual key" : report.kind} className="quota">
+      {report.quotas.map((quota) => (
+        <QuotaRow key={quota.id} quota={quota} />
+      ))}
+    </Panel>
+  );
+}
+
 interface TopModelsProps {
   readonly models: readonly StatsEntry[];
   readonly totalRequests: number;
@@ -250,7 +341,7 @@ function TopModels({ models, totalRequests }: TopModelsProps) {
                 return (
                   <tr key={entry.key}>
                     <td className="mono" title={`${entry.key} · ${formatUsd(entry.cost_usd)}`}>
-                      {shortModel(entry.key)}
+                      <ModelName id={entry.key} />
                     </td>
                     <td className="num">{formatNumber(entry.requests)}</td>
                     <td>
@@ -285,6 +376,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
   const [week, setWeek] = useState<StatsSnapshot | null>(null);
   const [report, setReport] = useState<UsageReport | null>(null);
   const [copilot, setCopilot] = useState<CopilotUsageReport | null>(null);
+  const [gateways, setGateways] = useState<readonly GatewayQuota[]>([]);
   const [quotaHistory, setQuotaHistory] = useState<QuotaHistory | null>(null);
   const [weekErrors, setWeekErrors] = useState<readonly UsageRow[] | null>(null);
   const [loadedAt, setLoadedAt] = useState<Date | null>(null);
@@ -303,7 +395,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
     let cancelled = false;
 
     const load = async () => {
-      const [todayResult, weekResult, usageResult, copilotResult, errorsResult, quotaResult] =
+      const [todayResult, weekResult, usageResult, copilotResult, errorsResult, quotaResult, gatewayResult] =
         await Promise.allSettled([
           api<StatsSnapshot>("/api/stats?range=1d"),
           api<StatsSnapshot>("/api/stats?range=7d"),
@@ -311,6 +403,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
           api<CopilotUsageReport>("/api/copilot/usage"),
           api<ErrorsReport>("/api/errors?range=7d"),
           api<QuotaHistory>("/api/copilot/usage/history?range=7d"),
+          loadGatewayQuotas(),
         ]);
       if (cancelled) {
         return;
@@ -334,6 +427,9 @@ export function UsageScreen({ period }: UsageScreenProps) {
       }
       if (quotaResult.status === "fulfilled") {
         setQuotaHistory(quotaResult.value);
+      }
+      if (gatewayResult.status === "fulfilled") {
+        setGateways(gatewayResult.value);
       }
       setLoadedAt(new Date());
       setLoading(false);
@@ -554,6 +650,9 @@ export function UsageScreen({ period }: UsageScreenProps) {
           <div className="overview-side">
             <LiveFeed />
             <QuotaPanel quota={quota} burn={dailyBurn(quotaHistory, copilot, quota)} />
+            {gateways.map((gateway) => (
+              <GatewayQuotaPanel key={gateway.report.profile} label={gateway.label} report={gateway.report} />
+            ))}
             <TopModels models={snapshot.models} totalRequests={snapshot.overview.requests} />
           </div>
         </div>
@@ -618,7 +717,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
                     <tr key={rowKey(row)} className={freshKeys.has(rowKey(row)) ? "row-new" : undefined}>
                       <td className="mono nowrap">{formatDateTime(row.ts_ms)}</td>
                       <td className="mono">
-                        <ModelTag colorKey={shortModel(row.model)}>{row.model}</ModelTag>
+                        <ModelTag colorKey={shortModel(row.model)}><ModelName id={row.model} profile={row.profile} /></ModelTag>
                       </td>
                       <td className="client" title={row.client ?? undefined}>
                         {row.client ?? <span className="dim">—</span>}

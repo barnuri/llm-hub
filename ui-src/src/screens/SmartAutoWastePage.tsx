@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 
 import { KpiCard } from "../components/KpiCard";
+import { ModelName } from "../components/ModelName";
 import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
 import { formatDateTime, formatNumber, formatUsd } from "../lib/format";
@@ -182,7 +183,7 @@ export function SmartAutoWastePage({ events, prices }: SmartAutoWastePageProps) 
                 modelRows.map((row) => (
                   <tr key={row.model}>
                     <td className="mono" data-label="Model">
-                      {row.model}
+                      <ModelName id={row.model} />
                     </td>
                     <td className="num" data-label="Wasted calls">
                       {formatNumber(row.wasteCalls)}
@@ -227,7 +228,7 @@ export function SmartAutoWastePage({ events, prices }: SmartAutoWastePageProps) 
                     <td data-label="Time">{formatDateTime(event.ts_ms)}</td>
                     <td data-label="Stage">{event.stage}</td>
                     <td className="mono" data-label="Model">
-                      {event.model}
+                      <ModelName id={event.model} />
                     </td>
                     <td data-label="Kind">
                       <Pill tone={KIND_TONE[kind]}>{COST_KIND_TEXT[kind]}</Pill>

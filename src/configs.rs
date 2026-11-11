@@ -8,6 +8,7 @@ pub mod managed_command;
 pub mod price_card;
 pub mod profile_config;
 pub mod token_rates;
+pub mod usage_source;
 
 pub use copilot_auth::CopilotAuth;
 pub use copilot_flow::CopilotFlow;
@@ -19,3 +20,4 @@ pub use managed_command::ManagedCommand;
 pub use price_card::PriceCard;
 pub use profile_config::ProfileConfig;
 pub use token_rates::TokenRates;
+pub use usage_source::UsageSource;

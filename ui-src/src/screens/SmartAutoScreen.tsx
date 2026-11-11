@@ -4,12 +4,14 @@ import { CostOverTimePanel } from "../components/CostOverTimePanel";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
 import { SmartAutoFeaturesPanel } from "../components/SmartAutoFeaturesPanel";
 import { KpiCard } from "../components/KpiCard";
+import { ModelName } from "../components/ModelName";
 import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
 import { PriceHeader } from "../components/PriceHeader";
 import { Select } from "../components/Select";
 import { api } from "../lib/api";
 import { formatDate, formatDateTime, formatMs, formatNumber, formatTime, formatUsd } from "../lib/format";
+import { useLive } from "../lib/live";
 import { formatPrice, type PriceSort, sortByPrice } from "../lib/pricing";
 import { navigate, useRoute } from "../lib/router";
 import { classifyEvents, type CostKind, eventCost, sumCost, WASTE_KINDS } from "../lib/smartAutoCost";
@@ -27,6 +29,8 @@ import type {
   SmartAutoRules,
   SmartAutoRulesResponse,
   SmartAutoRulesSource,
+  StatsSnapshot,
+  TierRoleRow,
 } from "../lib/types";
 import { MAX_EVENTS, REFRESH_MS, type SelectionRange, useSelectionEvents } from "../lib/useSelectionEvents";
 import "../styles/screens/smart-auto.css";
@@ -189,7 +193,7 @@ function EventRow({
       </td>
       <td data-label="Stage">{event.stage}</td>
       <td className="mono" data-label="Model">
-        {event.model}
+        <ModelName id={event.model} />
       </td>
       <td data-label="State">
         <Pill tone={STATE_TONE[event.state]} dot>
@@ -613,7 +617,7 @@ function EffectResults({
                     }
                   >
                     <td className="mono" data-label="Model">
-                      {row.qualified_id}
+                      <ModelName id={row.qualified_id} />
                     </td>
                     <td data-label="Result">
                       {busy ? (
@@ -1147,6 +1151,104 @@ function LivePill({ unavailable }: { readonly unavailable: boolean }) {
   );
 }
 
+/** Verified outcomes over all attempts in the group: tests passed plus review passed, as 'n of m'. */
+function verifiedText(row: TierRoleRow): string {
+  const total = Object.values(row.outcomes).reduce((sum, count) => sum + count, 0);
+  if (total === 0) {
+    return UNSET;
+  }
+  const verified = (row.outcomes.tests_passed ?? 0) + (row.outcomes.review_passed ?? 0);
+  return `${formatNumber(verified)} of ${formatNumber(total)}`;
+}
+
+/** Smart Auto cost per tier and role over the screen's range, from the stats endpoint. */
+function CostByTierRolePanel({ range }: { readonly range: SelectionRange }) {
+  const { tick } = useLive();
+  const [rows, setRows] = useState<readonly TierRoleRow[] | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api<StatsSnapshot>(`/api/stats?range=${range}`)
+      .then((snapshot) => {
+        if (!cancelled) {
+          setRows(snapshot.by_tier_role);
+          setFailed(false);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFailed(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [range, tick]);
+
+  let body: ReactNode;
+  if (failed) {
+    body = (
+      <p className="note" role="status">
+        Cost by tier and role is unavailable. Check that the stats endpoint responds.
+      </p>
+    );
+  } else {
+    body = (
+      <div className="table-scroll smart-auto-table">
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Tier</th>
+              <th>Role</th>
+              <th className="num">Requests</th>
+              <th className="num">Cost</th>
+              <th className="num">Completed</th>
+              <th className="num">Cost per completed</th>
+              <th className="num">Verified</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows === null ? (
+              <tr>
+                <td colSpan={7} className="table-empty">
+                  Loading…
+                </td>
+              </tr>
+            ) : rows.length === 0 ? (
+              <tr>
+                <td colSpan={7} className="table-empty">
+                  No Smart Auto requests with a tier and role in this window. These rows come from the SQLite store only.
+                </td>
+              </tr>
+            ) : (
+              rows.map((row) => (
+                <tr key={`${row.tier}/${row.role}`}>
+                  <td>{row.tier}</td>
+                  <td>{row.role}</td>
+                  <td className="num">{formatNumber(row.requests)}</td>
+                  <td className="num">{formatUsd(row.cost_usd)}</td>
+                  <td className="num">{formatNumber(row.completed_attempts)}</td>
+                  <td className="num">
+                    {row.cost_per_completed_usd === null ? UNSET : formatUsd(row.cost_per_completed_usd)}
+                  </td>
+                  <td className="num">{verifiedText(row)}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  return (
+    <Panel title="Cost by tier and role" sub={`${formatNumber(rows?.length ?? 0)} groups`} className="smart-auto-panel">
+      {body}
+    </Panel>
+  );
+}
+
 export function SmartAutoScreen({ profiles, prices }: SmartAutoScreenProps) {
   const [range, setRange] = useState<SelectionRange>("1d");
   const { events, unavailable } = useSelectionEvents(range);
@@ -1353,6 +1455,7 @@ export function SmartAutoScreen({ profiles, prices }: SmartAutoScreenProps) {
         </p>
         <SmartAutoFeaturesPanel events={filtered} kinds={kinds} prices={prices} />
         <CostOverTimePanel />
+        <CostByTierRolePanel range={range} />
       </>
     );
   }
