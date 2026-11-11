@@ -1,18 +1,30 @@
 .kpi-strip {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 1px;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  background: var(--border);
+  background: var(--panel);
 }
 
 .kpi-strip > .kpi {
+  position: relative;
   gap: 4px;
-  padding: 14px 16px;
+  padding: 16px 16px 14px;
   border: 0;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
   border-radius: 0;
+  background: none;
+}
+
+.kpi-strip > .kpi::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: var(--spark-solid);
+  opacity: 0.85;
 }
 
 .kpi-strip .kpi-row {

@@ -14,7 +14,9 @@ body {
   background: var(--bg);
   color: var(--text);
   font: 13px/1.5 var(--sans);
+  font-feature-settings: "tnum" 1;
   -webkit-font-smoothing: antialiased;
+  text-wrap: pretty;
   transition: background-color var(--ease), color var(--ease);
 }
 
@@ -47,11 +49,15 @@ h3 {
 }
 
 h2 {
-  font-size: 11px;
+  font-size: 12.5px;
   color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
   margin: 20px 0 8px;
+}
+
+h1,
+h2,
+h3 {
+  text-wrap: balance;
 }
 
 h3 {

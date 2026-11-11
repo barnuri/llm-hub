@@ -1,15 +1,15 @@
 :root,
 [data-theme="dark"] {
   color-scheme: dark;
-  --bg: #0d1117;
-  --side: #0a0e14;
+  --bg: #0a0d12;
+  --side: #0a0d12;
   --panel: #10151c;
-  --panel-2: #151b23;
-  --panel-hover: #18202a;
-  --border: #1c232d;
-  --border-strong: #2a3340;
-  --text: #e6e8eb;
-  --muted: #8b95a1;
+  --panel-2: #151b24;
+  --panel-hover: #1a212c;
+  --border: #1d2531;
+  --border-strong: #2b3544;
+  --text: #e7eaee;
+  --muted: #98a2b0;
   --accent: #3fb27f;
   --accent-text: #4cc58e;
   --accent-tint: #1f4a37;
@@ -43,15 +43,15 @@
 
 [data-theme="light"] {
   color-scheme: light;
-  --bg: #f6f6f3;
-  --side: #efefeb;
+  --bg: #f3f5f8;
+  --side: #edf0f4;
   --panel: #ffffff;
-  --panel-2: #f3f3ef;
-  --panel-hover: #ecece7;
-  --border: #e6e6e1;
-  --border-strong: #d2d2cb;
-  --text: #16181b;
-  --muted: #5d636b;
+  --panel-2: #eef1f5;
+  --panel-hover: #e8ecf1;
+  --border: #e1e5eb;
+  --border-strong: #cdd4dd;
+  --text: #17202e;
+  --muted: #566170;
   --accent: #1f8a5b;
   --accent-text: #1a7a50;
   --accent-tint: #cfe9dc;
@@ -86,15 +86,15 @@
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
     color-scheme: light;
-    --bg: #f6f6f3;
-    --side: #efefeb;
+    --bg: #f3f5f8;
+    --side: #edf0f4;
     --panel: #ffffff;
-    --panel-2: #f3f3ef;
-    --panel-hover: #ecece7;
-    --border: #e6e6e1;
-    --border-strong: #d2d2cb;
-    --text: #16181b;
-    --muted: #5d636b;
+    --panel-2: #eef1f5;
+    --panel-hover: #e8ecf1;
+    --border: #e1e5eb;
+    --border-strong: #cdd4dd;
+    --text: #17202e;
+    --muted: #566170;
     --accent: #1f8a5b;
     --accent-text: #1a7a50;
     --accent-tint: #cfe9dc;
@@ -128,8 +128,9 @@
 }
 
 :root {
-  --sans: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
-  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --radius-xs: 4px;
   --radius-sm: 6px;
   --radius: 8px;
   --radius-lg: 10px;

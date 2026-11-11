@@ -10,10 +10,10 @@
   z-index: 10;
   display: flex;
   align-items: stretch;
-  gap: 20px;
+  gap: 14px;
   height: var(--topbar-height);
   padding: 0 16px;
-  background: var(--side);
+  background: var(--bg);
   border-bottom: 1px solid var(--border);
 }
 
@@ -30,12 +30,17 @@
   width: 11px;
   height: 11px;
   margin: 0 2px;
-  border-radius: 2px;
+  border-radius: 3px;
   background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
   transform: rotate(45deg);
 }
 
 .version {
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--muted);
   font: 11px var(--mono);
   font-weight: 400;
@@ -55,12 +60,12 @@
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
-  padding: 0 10px;
+  padding: 0 8px;
   border: 0;
   border-bottom: 2px solid transparent;
   background: none;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 12.5px;
   white-space: nowrap;
   cursor: pointer;
   transition: color var(--ease), border-color var(--ease);
@@ -113,10 +118,8 @@
 .side-title {
   padding: 0 8px 6px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 11.5px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
 }
 
 .upstream-list {
@@ -259,7 +262,7 @@
 
 .panel {
   margin-top: 16px;
-  padding: 12px 14px;
+  padding: 14px 16px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--panel);
@@ -474,11 +477,9 @@ button.stat-tile-link:hover {
   border-bottom: 1px solid var(--border);
   background: var(--panel);
   color: var(--muted);
-  font-size: 11px;
-  font-weight: 600;
+  font-size: 11.5px;
+  font-weight: 500;
   text-align: left;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
   white-space: nowrap;
 }
 
@@ -543,11 +544,12 @@ button.stat-tile-link:hover {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-width: 90px;
+  min-width: 0;
 }
 
 .share-bar {
   flex: 1;
+  min-width: 28px;
   height: 6px;
   border-radius: 3px;
   background: var(--panel-2);
@@ -562,7 +564,7 @@ button.stat-tile-link:hover {
 }
 
 .share-value {
-  min-width: 36px;
+  min-width: 44px;
   color: var(--muted);
   font: 11px var(--mono);
   font-variant-numeric: tabular-nums;
