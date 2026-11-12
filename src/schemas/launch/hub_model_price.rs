@@ -35,6 +35,12 @@ impl HubModelPrice {
         })
     }
 
+    /// True when the input rate is zero, which opencode's model picker counts as a free model.
+    #[must_use]
+    pub fn has_free_input(&self) -> bool {
+        self.input == 0.0
+    }
+
     /// The price as an opencode model `cost` object.
     #[must_use]
     pub fn to_opencode_cost(&self) -> Value {

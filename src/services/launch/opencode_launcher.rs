@@ -106,7 +106,10 @@ impl OpencodeLauncher {
         if let (Some(context), Some(output)) = (model.context_window(), model.max_output_tokens()) {
             entry["limit"] = json!({ "context": context, "output": output });
         }
-        if let Some(price) = model.price() {
+        // opencode counts a model with a zero input rate as free and sorts it first, or into a
+        // "Free" group. Such a model gets no cost, so it keeps its place in the hub order. Its
+        // name still shows the hub price.
+        if let Some(price) = model.price().filter(|price| !price.has_free_input()) {
             entry["cost"] = price.to_opencode_cost();
         }
         if model.takes_attachments() {
@@ -199,6 +202,37 @@ mod tests {
                     "attachment": true,
                 },
             })
+        );
+    }
+
+    #[test]
+    fn models_keep_the_hub_catalog_order() {
+        let catalog = [
+            HubModel::new("hub/smart-auto-balance", None),
+            HubModel::new("copilot/auto", None),
+            HubModel::new("anthropic/a-model", None),
+        ];
+
+        let models = config_of(&spec_for(&[], &catalog))["provider"]["llm-hub"]["models"].clone();
+        let ids: Vec<&String> = models.as_object().unwrap().keys().collect();
+
+        assert_eq!(ids, ["hub/smart-auto-balance", "copilot/auto", "anthropic/a-model"]);
+    }
+
+    #[test]
+    fn a_model_with_free_input_gets_no_cost_so_it_stays_in_place() {
+        let catalog = [
+            HubModel::new("llama_swap/qwen", None)
+                .with_display_name("qwen · llama-swap · free", false)
+                .with_price(HubModelPrice::new(0.0, 0.0)),
+            HubModel::new("llmgw/pegasus", None).with_price(HubModelPrice::new(0.0, 7.5)),
+        ];
+
+        let models = config_of(&spec_for(&[], &catalog))["provider"]["llm-hub"]["models"].clone();
+
+        assert_eq!(
+            models,
+            json!({"llama_swap/qwen": {"name": "qwen · llama-swap · free"}, "llmgw/pegasus": {}})
         );
     }
 

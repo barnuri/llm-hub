@@ -34,3 +34,7 @@ Then confirm `http://127.0.0.1:8888/healthz` is 200. `service install` is reinst
 | `npm run build:ui` | Typecheck + Vite build into `ui/` |
 | `./target/release/llm-hub service install` | Reload LaunchAgent to the new release binary |
 | `./target/release/llm-hub service status` | launchd status |
+
+## Public repo
+
+llm-hub is public on GitHub. Keep measured spend, quotas, session or project names and local paths out of docs/, comments, tests, fixtures and commit messages. Put private reports in the gitignored agent-spec/. Check git status for stray reports before a commit.
