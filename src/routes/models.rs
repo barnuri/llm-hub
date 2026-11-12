@@ -1600,6 +1600,8 @@ mod tests {
             model_prices: HashMap::new(),
             managed: None,
             copilot: None,
+            keep_warm: true,
+            first_byte_timeout_ms: None,
         }
     }
 

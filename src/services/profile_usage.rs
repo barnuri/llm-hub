@@ -176,6 +176,12 @@ impl ProfileUsageCache {
         });
     }
 
+    /// The last snapshot of `profile`, or `None` before the first fetch. Never touches the network.
+    pub fn cached(&self, profile: &str) -> Option<Arc<ProfileUsage>> {
+        let entry = Arc::clone(self.entries.get(profile)?.value());
+        lock(&entry.snapshot).clone()
+    }
+
     fn entry_for(&self, profile: &str, key: &UsageKey) -> Arc<UsageEntry> {
         let mut slot = self
             .entries

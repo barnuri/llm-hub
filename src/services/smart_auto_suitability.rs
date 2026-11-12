@@ -1,3 +1,4 @@
+use crate::schemas::live_signals::ModelSignal;
 use crate::schemas::model_context::strip_1m_suffix;
 use crate::schemas::smart_auto_tier::SmartAutoTier;
 use crate::schemas::work_role::WorkRole;
@@ -99,21 +100,58 @@ impl SmartAutoSuitability {
         FamilySeed::contains(&["mai-", "code"], [6, 6, 7, 8, 6, 6], 6, 7),
     ];
 
-    /// The weighted seed score of `model_id` for one turn. `model_id` may be qualified,
-    /// nested or carry `[1m]`. Capable models add [`Self::CAPABLE_BONUS`].
+    /// Points lost at a 100% error rate. A 5% rate costs 5 points, one quality step at Balance.
+    const ERROR_PENALTY_MAX: f64 = 100.0;
+    /// A profile with more quota left than this loses nothing.
+    const QUOTA_COMFORT_PCT: f64 = 30.0;
+    const FULL_PCT: f64 = 100.0;
+    /// Weight of the measured speed against the seed, out of 3: two parts measured, one seed.
+    const MEASURED_SPEED_PARTS: u32 = 2;
+    const SPEED_BLEND_PARTS: u32 = 3;
+
+    /// The weighted score of `model_id` for one turn: quality from the seed table, cost and
+    /// speed from the live `signal` when it has them (else from the seed), minus a penalty for
+    /// a high error rate and for a profile that is running out of quota. `model_id` may be
+    /// qualified, nested or carry `[1m]`. Capable models add [`Self::CAPABLE_BONUS`].
     #[must_use]
-    pub fn score(model_id: &str, role: WorkRole, plan_backed: bool, tier: SmartAutoTier) -> u32 {
+    pub fn score(
+        model_id: &str,
+        role: WorkRole,
+        plan_backed: bool,
+        tier: SmartAutoTier,
+        signal: ModelSignal,
+    ) -> u32 {
         let seed = Self::seed(model_id);
         let quality = seed.quality[Self::column(role, plan_backed)];
         let weights = Self::weights(tier);
+        let cost = signal.cost.unwrap_or(seed.cheapness);
+        let speed = signal.speed.map_or(u32::from(seed.speed), |measured| {
+            (u32::from(seed.speed) * (Self::SPEED_BLEND_PARTS - Self::MEASURED_SPEED_PARTS)
+                + u32::from(measured) * Self::MEASURED_SPEED_PARTS
+                + Self::SPEED_BLEND_PARTS / 2)
+                / Self::SPEED_BLEND_PARTS
+        });
         let weighted = weights.quality * u32::from(quality)
-            + weights.cheapness * u32::from(seed.cheapness)
-            + weights.speed * u32::from(seed.speed);
-        if quality >= Self::CAPABLE_FLOOR {
+            + weights.cheapness * u32::from(cost)
+            + weights.speed * speed;
+        let weighted = if quality >= Self::CAPABLE_FLOOR {
             weighted + Self::CAPABLE_BONUS
         } else {
             weighted
-        }
+        };
+        weighted.saturating_sub(Self::penalty(signal))
+    }
+
+    /// Points lost to failures and to a nearly empty quota. Unknown signals cost nothing.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to 0..=130 above
+    fn penalty(signal: ModelSignal) -> u32 {
+        let errors = signal
+            .error_rate
+            .map_or(0.0, |rate| rate.clamp(0.0, 1.0) * Self::ERROR_PENALTY_MAX);
+        let quota = signal.quota_remaining_pct.map_or(0.0, |left| {
+            (Self::QUOTA_COMFORT_PCT - left.clamp(0.0, Self::FULL_PCT)).max(0.0)
+        });
+        (errors + quota).round() as u32
     }
 
     fn seed(model_id: &str) -> &'static FamilySeed {
@@ -183,6 +221,7 @@ impl SmartAutoSuitability {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schemas::live_signals::ModelSignal;
 
     fn quality(model_id: &str, role: WorkRole, plan_backed: bool) -> u8 {
         SmartAutoSuitability::seed(model_id).quality
@@ -240,11 +279,92 @@ mod tests {
             WorkRole::Planning,
             false,
             SmartAutoTier::Balance,
+            ModelSignal::default(),
         );
         assert_eq!(
             score,
             SmartAutoSuitability::CAPABLE_BONUS + 5 * 5 + 2 * 3 + 3
         );
+    }
+
+    fn balance_score(model_id: &str, signal: ModelSignal) -> u32 {
+        SmartAutoSuitability::score(
+            model_id,
+            WorkRole::Planning,
+            false,
+            SmartAutoTier::Balance,
+            signal,
+        )
+    }
+
+    #[test]
+    fn a_measured_price_replaces_the_seed_cheapness() {
+        let id = "acme/brand-new-model";
+        let free = ModelSignal {
+            cost: Some(10),
+            ..ModelSignal::default()
+        };
+        let dear = ModelSignal {
+            cost: Some(0),
+            ..ModelSignal::default()
+        };
+        // Balance weighs cost 2: ten points of cost are twenty points of score.
+        assert_eq!(balance_score(id, free) - balance_score(id, dear), 2 * 10);
+    }
+
+    #[test]
+    fn a_measured_speed_is_blended_two_to_one_with_the_seed() {
+        let id = "acme/brand-new-model";
+        let base = balance_score(id, ModelSignal::default());
+        let fast = ModelSignal {
+            speed: Some(9),
+            ..ModelSignal::default()
+        };
+        // Seed 3, measured 9: (3 + 2 * 9 + 1) / 3 = 7, four points above the seed at weight 1.
+        assert_eq!(balance_score(id, fast), base + 4);
+    }
+
+    #[test]
+    fn an_error_rate_takes_points_off() {
+        let id = "acme/brand-new-model";
+        let base = balance_score(id, ModelSignal::default());
+        let flaky = ModelSignal {
+            error_rate: Some(0.25),
+            ..ModelSignal::default()
+        };
+        assert_eq!(balance_score(id, flaky), base - 25);
+    }
+
+    #[test]
+    fn a_nearly_empty_quota_takes_points_off_and_a_full_one_none() {
+        let id = "acme/brand-new-model";
+        let base = balance_score(id, ModelSignal::default());
+        let quota = |left| ModelSignal {
+            quota_remaining_pct: Some(left),
+            ..ModelSignal::default()
+        };
+        assert_eq!(balance_score(id, quota(80.0)), base);
+        assert_eq!(balance_score(id, quota(30.0)), base);
+        assert_eq!(balance_score(id, quota(10.0)), base - 20);
+        assert_eq!(balance_score(id, quota(0.0)), base - 30);
+    }
+
+    #[test]
+    fn a_penalty_never_drops_a_capable_model_below_a_weak_one() {
+        let broken = ModelSignal {
+            error_rate: Some(1.0),
+            quota_remaining_pct: Some(0.0),
+            ..ModelSignal::default()
+        };
+        let capable = balance_score("copilot/claude-sonnet-4.6", broken);
+        let weak = SmartAutoSuitability::score(
+            "copilot/claude-haiku-4.5",
+            WorkRole::Planning,
+            false,
+            SmartAutoTier::Balance,
+            ModelSignal::default(),
+        );
+        assert!(capable > weak);
     }
 
     #[test]
@@ -254,12 +374,14 @@ mod tests {
             WorkRole::Planning,
             false,
             SmartAutoTier::Efficiency,
+            ModelSignal::default(),
         );
         let sonnet = SmartAutoSuitability::score(
             "copilot/claude-sonnet-4.6",
             WorkRole::Planning,
             false,
             SmartAutoTier::Efficiency,
+            ModelSignal::default(),
         );
         assert!(haiku < SmartAutoSuitability::CAPABLE_BONUS);
         assert!(sonnet > haiku);

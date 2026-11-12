@@ -133,6 +133,13 @@
   padding-top: 4px;
 }
 
+.profile-form-checks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+
 .profile-form-buttons {
   display: flex;
   gap: 6px;

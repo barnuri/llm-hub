@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::effort_level::EffortLevel;
+use crate::schemas::live_signals::LiveSignals;
 use crate::schemas::model_context::strip_1m_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::pin_miss::PinMiss;
@@ -34,18 +35,20 @@ impl SmartAutoRouter {
     /// Routes one turn over the eligible `pool`. `anchor` holds the affinity store and the
     /// turn's key, `None` without a key. Returns `None` for an empty pool.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // each input is a separate per-request value; a bundle would only rename them
     pub fn route<'a>(
         pool: &[&'a ModelDescriptor],
         policy: &SmartAutoPolicy,
         signals: &TurnSignals,
         anchor: Option<(&SmartAutoAffinity, &AffinityKey)>,
         usage: &HashMap<String, u64>,
+        live: &LiveSignals,
         requested: Option<EffortLevel>,
         now: Instant,
     ) -> Option<RouteDecision<'a>> {
         let tier = policy.tier.unwrap_or_default();
         let (model, turn, reason, pin_miss) =
-            Self::choose(pool, policy, signals, anchor, usage, now)?;
+            Self::choose(pool, policy, signals, anchor, usage, live, now)?;
         let effort = SmartAutoEffort::select(
             tier,
             turn.role,
@@ -69,6 +72,7 @@ impl SmartAutoRouter {
         signals: &TurnSignals,
         anchor: Option<(&SmartAutoAffinity, &AffinityKey)>,
         usage: &HashMap<String, u64>,
+        live: &LiveSignals,
         now: Instant,
     ) -> Option<(
         &'a ModelDescriptor,
@@ -94,7 +98,7 @@ impl SmartAutoRouter {
                 let turn = SmartAutoRoles::classify_user_text(signals, policy.role);
                 let incumbent = Self::incumbent(pool, anchor, turn.role, now);
                 let (model, reason) =
-                    Self::pick(pool, tier, turn, incumbent, usage, RouteReason::Fresh)?;
+                    Self::pick(pool, tier, turn, incumbent, usage, live, RouteReason::Fresh)?;
                 let pin_miss = (reason == RouteReason::Fresh).then_some(miss);
                 return Some((model, turn, reason, pin_miss));
             }
@@ -122,8 +126,15 @@ impl SmartAutoRouter {
             return Some((pinned, turn, RouteReason::Pinned, None));
         }
         let incumbent = Self::incumbent(pool, anchor, turn.role, now);
-        let (model, reason) =
-            Self::pick(pool, tier, turn, incumbent, usage, RouteReason::RoleSwitch)?;
+        let (model, reason) = Self::pick(
+            pool,
+            tier,
+            turn,
+            incumbent,
+            usage,
+            live,
+            RouteReason::RoleSwitch,
+        )?;
         let reason = if std::ptr::eq(model, pinned) {
             RouteReason::Pinned
         } else {
@@ -179,12 +190,64 @@ impl SmartAutoRouter {
         turn: RoleDecision,
         incumbent: Option<&'a ModelDescriptor>,
         usage: &HashMap<String, u64>,
+        live: &LiveSignals,
         otherwise: RouteReason,
     ) -> Option<(&'a ModelDescriptor, RouteReason)> {
         if let Some(incumbent) = incumbent {
             return Some((incumbent, RouteReason::Incumbent));
         }
-        Self::best(pool, tier, turn, usage).map(|model| (model, otherwise))
+        Self::best(pool, tier, turn, usage, live).map(|model| (model, otherwise))
+    }
+
+    /// The models to try after the pick fails, best first, by the same score as the pick.
+    /// `taken` (the pick and any explicit fallbacks) is skipped. The first one comes from another
+    /// profile when the pool has one, because a gateway that hangs usually hangs for all of its
+    /// models. At most `limit` come back.
+    #[must_use]
+    pub fn runners_up(
+        pool: &[&ModelDescriptor],
+        tier: SmartAutoTier,
+        turn: RoleDecision,
+        taken: &[String],
+        usage: &HashMap<String, u64>,
+        live: &LiveSignals,
+        limit: usize,
+    ) -> Vec<String> {
+        let taken: Vec<&str> = taken.iter().map(|id| strip_1m_suffix(id)).collect();
+        let mut ranked: Vec<&ModelDescriptor> = pool
+            .iter()
+            .copied()
+            .filter(|model| !taken.contains(&strip_1m_suffix(&model.qualified_id)))
+            .collect();
+        ranked.sort_by_key(|model| {
+            Reverse((
+                SmartAutoSuitability::score(
+                    &model.qualified_id,
+                    turn.role,
+                    turn.plan_backed,
+                    tier,
+                    live.get(&model.qualified_id),
+                ),
+                Self::usage_points(model, usage),
+                Reverse(model.qualified_id.as_str()),
+            ))
+        });
+        let picked_profile = pool
+            .iter()
+            .find(|model| taken.first() == Some(&strip_1m_suffix(&model.qualified_id)))
+            .map(|model| model.profile.as_str());
+        if let Some(other) = ranked
+            .iter()
+            .position(|model| Some(model.profile.as_str()) != picked_profile)
+        {
+            let first = ranked.remove(other);
+            ranked.insert(0, first);
+        }
+        ranked
+            .into_iter()
+            .take(limit)
+            .map(|model| model.qualified_id.clone())
+            .collect()
     }
 
     /// The highest seed score, then the most usage points, then the lowest qualified id.
@@ -193,10 +256,17 @@ impl SmartAutoRouter {
         tier: SmartAutoTier,
         turn: RoleDecision,
         usage: &HashMap<String, u64>,
+        live: &LiveSignals,
     ) -> Option<&'a ModelDescriptor> {
         pool.iter().copied().max_by_key(|model| {
             (
-                SmartAutoSuitability::score(&model.qualified_id, turn.role, turn.plan_backed, tier),
+                SmartAutoSuitability::score(
+                    &model.qualified_id,
+                    turn.role,
+                    turn.plan_backed,
+                    tier,
+                    live.get(&model.qualified_id),
+                ),
                 Self::usage_points(model, usage),
                 Reverse(model.qualified_id.as_str()),
             )
@@ -227,6 +297,7 @@ mod tests {
     use super::*;
     use crate::schemas::evidence_source::EvidenceSource;
     use crate::schemas::limit_evidence::LimitEvidence;
+    use crate::schemas::live_signals::ModelSignal;
     use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
     use crate::schemas::smart_auto_headers::SmartAutoHeaders;
     use crate::services::smart_auto_pool::SmartAutoPool;
@@ -286,6 +357,7 @@ mod tests {
             &signals(text, 1, false),
             None,
             &HashMap::new(),
+            &LiveSignals::default(),
             None,
             Instant::now(),
         )
@@ -306,6 +378,7 @@ mod tests {
             turn,
             Some((affinity, &key)),
             &HashMap::new(),
+            &LiveSignals::default(),
             None,
             now,
         )
@@ -526,6 +599,7 @@ mod tests {
             &signals(PLANNING_TEXT, 1, false),
             None,
             &HashMap::new(),
+            &LiveSignals::default(),
             Some(EffortLevel::Low),
             Instant::now(),
         )
@@ -549,11 +623,177 @@ mod tests {
             &signals(PLANNING_TEXT, 1, false),
             None,
             &usage,
+            &LiveSignals::default(),
             None,
             Instant::now(),
         )
         .unwrap();
         assert_eq!(used.model.qualified_id, "acme/model-b");
+    }
+
+    fn route_live(pool: &[&ModelDescriptor], tier: SmartAutoTier, live: &LiveSignals) -> String {
+        SmartAutoRouter::route(
+            pool,
+            &policy(tier),
+            &signals(PLANNING_TEXT, 1, false),
+            None,
+            &HashMap::new(),
+            live,
+            None,
+            Instant::now(),
+        )
+        .unwrap()
+        .model
+        .qualified_id
+        .clone()
+    }
+
+    fn live(rows: &[(&str, ModelSignal)]) -> LiveSignals {
+        LiveSignals::new(
+            rows.iter()
+                .map(|(id, signal)| ((*id).to_owned(), *signal))
+                .collect(),
+        )
+    }
+
+    fn planning_turn() -> RoleDecision {
+        RoleDecision {
+            role: WorkRole::Planning,
+            plan_backed: false,
+            reason: RoleReason::NoCue,
+        }
+    }
+
+    fn runners(
+        pool: &[&ModelDescriptor],
+        taken: &[&str],
+        live: &LiveSignals,
+        limit: usize,
+    ) -> Vec<String> {
+        let taken: Vec<String> = taken.iter().map(|id| (*id).to_owned()).collect();
+        SmartAutoRouter::runners_up(
+            pool,
+            SmartAutoTier::Balance,
+            planning_turn(),
+            &taken,
+            &HashMap::new(),
+            live,
+            limit,
+        )
+    }
+
+    #[test]
+    fn runners_up_skip_the_pick_and_follow_the_score() {
+        let owned = models(&["acme/model-a", "acme/model-b", "acme/model-c"]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let flaky = ModelSignal {
+            error_rate: Some(0.5),
+            ..ModelSignal::default()
+        };
+        let signals = live(&[("acme/model-b", flaky)]);
+
+        let next = runners(&pool, &["acme/model-a"], &signals, 5);
+
+        assert_eq!(next, ["acme/model-c", "acme/model-b"]);
+    }
+
+    #[test]
+    fn the_first_runner_up_comes_from_another_profile_when_there_is_one() {
+        let owned = models(&["acme/model-a", "acme/model-b", "beta/model-z"]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+
+        let next = runners(&pool, &["acme/model-a"], &LiveSignals::default(), 2);
+
+        assert_eq!(next, ["beta/model-z", "acme/model-b"]);
+    }
+
+    #[test]
+    fn runners_up_are_capped_and_skip_explicit_fallbacks() {
+        let owned = models(&[
+            "acme/model-a",
+            "acme/model-b",
+            "acme/model-c",
+            "acme/model-d",
+        ]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+
+        let next = runners(
+            &pool,
+            &["acme/model-a", "acme/model-b[1m]"],
+            &LiveSignals::default(),
+            1,
+        );
+
+        assert_eq!(next, ["acme/model-c"]);
+        assert!(runners(&pool[..1], &["acme/model-a"], &LiveSignals::default(), 2).is_empty());
+    }
+
+    #[test]
+    fn a_failing_model_loses_to_an_equal_one() {
+        let owned = models(&["acme/model-a", "acme/model-b"]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let flaky = ModelSignal {
+            error_rate: Some(0.3),
+            ..ModelSignal::default()
+        };
+        let signals = live(&[("acme/model-a", flaky)]);
+        assert_eq!(
+            route_live(&pool, SmartAutoTier::Balance, &signals),
+            "acme/model-b"
+        );
+    }
+
+    #[test]
+    fn a_nearly_empty_quota_moves_the_pick_to_another_profile() {
+        let owned = models(&["acme/model-a", "beta/model-a"]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let low = ModelSignal {
+            quota_remaining_pct: Some(5.0),
+            ..ModelSignal::default()
+        };
+        let signals = live(&[("acme/model-a", low)]);
+        assert_eq!(
+            route_live(&pool, SmartAutoTier::Balance, &signals),
+            "beta/model-a"
+        );
+    }
+
+    #[test]
+    fn the_fast_tier_follows_measured_speed() {
+        let owned = models(&["acme/model-a", "acme/model-b"]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let quick = ModelSignal {
+            speed: Some(10),
+            ..ModelSignal::default()
+        };
+        let slow = ModelSignal {
+            speed: Some(0),
+            ..ModelSignal::default()
+        };
+        let signals = live(&[("acme/model-a", slow), ("acme/model-b", quick)]);
+        assert_eq!(
+            route_live(&pool, SmartAutoTier::Fast, &signals),
+            "acme/model-b"
+        );
+    }
+
+    #[test]
+    fn the_efficiency_tier_follows_measured_cost() {
+        let owned = models(&["acme/model-a", "acme/model-b"]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let dear = ModelSignal {
+            cost: Some(1),
+            ..ModelSignal::default()
+        };
+        let cheap = ModelSignal {
+            cost: Some(9),
+            ..ModelSignal::default()
+        };
+        let signals = live(&[("acme/model-a", dear), ("acme/model-b", cheap)]);
+        assert_eq!(
+            route_live(&pool, SmartAutoTier::Efficiency, &signals),
+            "acme/model-b"
+        );
     }
 
     #[test]
@@ -564,6 +804,7 @@ mod tests {
             &signals(PLANNING_TEXT, 1, false),
             None,
             &HashMap::new(),
+            &LiveSignals::default(),
             None,
             Instant::now(),
         );
@@ -580,6 +821,7 @@ mod tests {
             &signals(SCOPED_TEXT, 1, true),
             None,
             &HashMap::new(),
+            &LiveSignals::default(),
             None,
             Instant::now(),
         )
@@ -726,6 +968,7 @@ mod tests {
                 &turn,
                 Some((&affinity, &key)),
                 &usage,
+                &LiveSignals::default(),
                 None,
                 started,
             );

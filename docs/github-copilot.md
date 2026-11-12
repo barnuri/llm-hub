@@ -137,18 +137,27 @@ A seeded limit never replaces a learned one. The hub never sends probe requests.
 
 ## Cache keep-warm
 
-Copilot's prompt cache for Claude models lasts about five minutes after its last use. When a Claude
-Code stream pauses longer than that, the next turn writes the whole prompt to the cache again, at the
-write price. At the listed prices the write price is 12.5 times the read price on Haiku and on the
+Prompt caches expire when they are not used. Copilot's cache for Claude models lasts about five
+minutes after its last use. When a Claude Code stream pauses longer than that, the next turn writes
+the whole prompt to the cache again, at the write price. At the listed prices the write price is 12.5 times the read price on Haiku and on the
 older Sonnet and Opus models, and 25 times on Sonnet 5.5 and Opus 5.5.
 
-Keep-warm avoids that rewrite for native Copilot Claude streams:
+Keep-warm avoids that rewrite. It is not limited to Copilot: it covers every remote profile whose
+upstream reports cached prompt tokens, on chat completions, messages and responses calls. A local
+server is left out, because its cache does not expire. The Copilot details below hold for the other
+profiles too, except where marked.
 
 - The hub keeps the last request body of each stream in memory. It keeps at most 16 streams and
   64 MB of bodies, and drops the least recently used first.
-- While a stream is idle, the hub replays that body every four minutes with `stream` set to false and
-  `max_tokens` set to 1. The rest of the body is unchanged.
-- The ping sends `x-initiator: agent`, so Copilot records it as agent-initiated, not as a user turn. Whether that avoids premium-request charges is not verified.
+- While a stream is idle, the hub replays that body every four minutes. The ping replays the request on the same API and path it used, not streamed, with the answer capped:
+  `max_tokens` 1 on messages and chat completions (`max_completion_tokens` when the request used it),
+  and `max_output_tokens` 16 on responses, which is that API's floor.
+- A stream is kept only when the answer reported at least 2,048 cached prompt tokens, and only when
+  the pings cost less than the rewrite. For the idle cap, the hub compares the cache-read price times
+  the number of pings with the rewrite price (cache write, or input when the card has no write
+  price). A model with a small discount, such as 75% with no write premium, is not kept warm. A model
+  with no known price is kept.
+- On Copilot the ping sends `x-initiator: agent`, so Copilot records it as agent-initiated, not as a user turn. Whether that avoids premium-request charges is not verified.
 - Pings stop when the stream resumes, when a request for it is in flight, or when the idle cap is reached.
   The default cap is 30 minutes after the last user request.
 - All pings share one budget of 10 per minute. A ping that gets a non-2xx reply drops its stream until
@@ -157,14 +166,16 @@ Keep-warm avoids that rewrite for native Copilot Claude streams:
 
 The cost break-even depends on the model. An idle stream costs less to keep warm than to rewrite
 only up to the break-even idle time. On Haiku that is about 46 minutes at the listed prices, so the
-30-minute default pays on every model in the price table.
+30-minute default pays there. The hub checks this per model and skips the ones where it does not.
 
 Turn it off, or change the cap, with `LLM_HUB_KEEP_WARM` and `LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES`.
-See [Keep-warm](configuration.md#keep-warm).
+Turn it off for one profile with `LLM_HUB_<NAME>_KEEP_WARM=false`, or with the "Keep prompt cache
+warm" checkbox on the Profiles page. A stream needs a session id from the client, as Claude Code
+sends, so that pings never cross sessions. See [Keep-warm](configuration.md#keep-warm).
 
 Warning: each ping is a request to Copilot from a client other than its own. Heavy automated use of
 Copilot outside its own clients can trigger GitHub's abuse detection and suspend your Copilot access.
-Keep-warm adds pings to every idle Claude stream, so leave it off if that risk is not acceptable.
+Keep-warm adds pings to every idle stream that qualifies, so leave it off, or turn it off for that profile, if that risk is not acceptable.
 
 ## Rejected-field stripping
 

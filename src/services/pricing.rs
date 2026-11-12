@@ -627,6 +627,8 @@ mod tests {
             model_prices,
             managed: None,
             copilot: None,
+            keep_warm: true,
+            first_byte_timeout_ms: None,
         };
         let shared = TokenRates {
             input_per_1m: 5.0,

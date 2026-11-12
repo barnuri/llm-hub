@@ -48,6 +48,7 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
                 "headers": p.extra_headers.iter().cloned().collect::<HashMap<_, _>>(),
                 "timeout_ms": p.timeout_ms,
                 "enabled": p.enabled,
+                "keep_warm": p.keep_warm,
                 "models": p.static_models,
                 "healthy": health.get(&p.name).copied(),
                 "managed": p.managed.is_some(),
@@ -116,6 +117,11 @@ pub async fn upsert_profile(
         model_prices: existing.map(|p| p.model_prices.clone()).unwrap_or_default(),
         managed: existing.and_then(|p| p.managed.clone()),
         copilot: existing.and_then(|p| p.copilot.clone()),
+        keep_warm: input
+            .keep_warm
+            .or_else(|| existing.map(|p| p.keep_warm))
+            .unwrap_or(true),
+        first_byte_timeout_ms: existing.and_then(|p| p.first_byte_timeout_ms),
     };
     if !profile.base_url.starts_with("http://") && !profile.base_url.starts_with("https://") {
         return Err(AppError::BadRequest(

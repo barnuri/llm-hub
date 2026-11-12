@@ -48,6 +48,9 @@ pub const DEFAULT_INSIGHTS_RANGE: &str = "7d";
 /// ~30k-token prompt), which idle-timeout logic downstream cannot tell apart
 /// from a dead connection. 15s sits well inside the usual 30s/60s idle limits.
 pub const DEFAULT_SSE_KEEPALIVE_MS: u64 = 15_000;
+/// How long a Smart Auto streamed attempt on a remote profile may wait for its first byte
+/// before the hub marks the model and tries the next one.
+pub const DEFAULT_FIRST_BYTE_TIMEOUT_MS: u64 = 20_000;
 /// The keepalive itself. A line starting with `:` is a comment in the SSE
 /// grammar, so every conformant parser drops it before it reaches the message
 /// stream — it is inert in both the `OpenAI` and Anthropic dialects.

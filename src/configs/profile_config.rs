@@ -18,6 +18,13 @@ pub struct ProfileConfig {
     pub managed: Option<crate::configs::ManagedCommand>,
     /// Native GitHub Copilot auth; env-only, never set through the admin API.
     pub copilot: Option<crate::configs::CopilotAuth>,
+    /// Keep this profile's idle prompt caches warm with pings. `LLM_HUB_<NAME>_KEEP_WARM`, on by
+    /// default. The global `LLM_HUB_KEEP_WARM` switch still has the last word.
+    pub keep_warm: bool,
+    /// Longest wait for the first byte of a streamed Smart Auto attempt on this profile.
+    /// `LLM_HUB_<NAME>_FIRST_BYTE_TIMEOUT_MS`, env-only. It beats the global limit and applies to
+    /// a local server too; `0` turns the limit off for this profile. `None` uses the global rule.
+    pub first_byte_timeout_ms: Option<u64>,
 }
 
 impl ProfileConfig {
@@ -67,6 +74,8 @@ mod tests {
             model_prices: std::collections::HashMap::new(),
             managed: None,
             copilot: None,
+            keep_warm: true,
+            first_byte_timeout_ms: None,
         }
     }
 

@@ -24,18 +24,21 @@ Boolean flags accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off`.
 | `LLM_HUB_MAX_REPLAY_BYTES` | `268435456` (256 MB) | Largest request body the hub buffers for fallback replay and Anthropic translation. |
 | `LLM_HUB_STREAM_ROLE` | `true` | Add `role: "assistant"` to the first streamed delta when the upstream leaves it out. |
 | `LLM_HUB_SSE_KEEPALIVE_MS` | `15000` | Idle time before an SSE keepalive comment. `0` turns it off. |
+| `LLM_HUB_FIRST_BYTE_TIMEOUT_MS` | `20000` | Longest wait for the first byte of a streamed Smart Auto attempt on a remote profile. A model that misses it is cooled and the next fallback is tried. `0` turns it off. See [Live signals](smart-auto.md#live-signals). |
 | `LLM_HUB_COPILOT_PRICES_REFRESH_SECS` | `86400` (24 hours) | How often the hub fetches Copilot model prices from GitHub Docs while a Copilot profile is enabled. The same interval governs Copilot model descriptions fetched from the GitHub Docs model comparison page. Fetches stay at least 1 hour apart. `0` turns the fetch off and the built-in prices apply. Editable on the Models page. |
 | `LLM_HUB_COPILOT_GUARD_MODELS` | `*` | Models (`<model>`, `<profile>/<model>` or `*`) whose Copilot CLI requests get the tool-loop guard. The guard adds a system-prompt note. It also withholds a tool that the history shows called the same way 3 times in a row. Empty turns it off. |
 | `LLM_HUB_COPILOT_STRIP_SAMPLING_MODELS` | 10 local model ids (`DEFAULT_COPILOT_STRIP_SAMPLING_MODELS` in `src/services/transforms.rs`) | Models whose Copilot CLI requests lose Copilot's fixed `temperature`, `top_p` and penalties, so the model's own sampling applies. Empty turns it off. |
 
 ## Keep-warm
 
-Keep-warm sends a one-token ping on an idle Copilot Claude stream so its prompt cache stays warm.
-See [Cache keep-warm](github-copilot.md#cache-keep-warm) for what it sends and what it costs.
+Keep-warm sends a one-token ping on an idle stream so its prompt cache stays warm. It works for
+every remote profile, on chat completions, messages and responses calls. See
+[Cache keep-warm](github-copilot.md#cache-keep-warm) for what it sends and what it costs.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LLM_HUB_KEEP_WARM` | `true` | Turns the pings on or off. |
+| `LLM_HUB_KEEP_WARM` | `true` | Turns the pings on or off for every profile. |
+| `LLM_HUB_<NAME>_KEEP_WARM` | `true` | `false` stops the pings for this one profile. The Profiles page has a "Keep prompt cache warm" checkbox that writes it. |
 | `LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES` | `30` | Minutes after a stream's last user request at which the pings stop. The range is `5` to `10080` (one week). A value outside it fails the config load. |
 
 The Models page writes both variables to `.env`. A value set in the process environment wins over
@@ -70,6 +73,8 @@ The Models page writes both variables to `.env`. A value set in the process envi
 | `LLM_HUB_<NAME>_HEADERS` | none | Extra headers, as a JSON object of strings. |
 | `LLM_HUB_<NAME>_TIMEOUT_MS` | none | Deadline per attempt for this profile. |
 | `LLM_HUB_<NAME>_ENABLED` | `true` | `false` turns the profile off without deleting it. |
+| `LLM_HUB_<NAME>_KEEP_WARM` | `true` | `false` stops [keep-warm](#keep-warm) pings for this profile. |
+| `LLM_HUB_<NAME>_FIRST_BYTE_TIMEOUT_MS` | none | First-byte limit for a streamed Smart Auto attempt on this profile. It beats `LLM_HUB_FIRST_BYTE_TIMEOUT_MS`, applies to a local server too, and `0` turns the limit off for the profile. Env-only. |
 | `LLM_HUB_<NAME>_MODELS` | none | Comma-separated static models, for upstreams without `/v1/models` or while a managed process is stopped. |
 | `LLM_HUB_<NAME>_INPUT_USD_PER_1M` | global | Input price. |
 | `LLM_HUB_<NAME>_OUTPUT_USD_PER_1M` | global | Output price. |

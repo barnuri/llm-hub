@@ -6,8 +6,9 @@ use crate::configs::{ProfileConfig, env_name};
 const PREFIX: &str = "LLM_HUB_";
 /// Profile keys only an operator may set (they run a program or pick the
 /// upstream credential); upsert keeps them as written and never writes them itself.
-const OPERATOR_ONLY_KEYS: [&str; 9] = [
+const OPERATOR_ONLY_KEYS: [&str; 10] = [
     "COMMAND",
+    "FIRST_BYTE_TIMEOUT_MS",
     "IDLE_SECS",
     "START_TIMEOUT_SECS",
     "AUTH",
@@ -62,6 +63,9 @@ pub fn upsert_profile(
     }
     if !profile.enabled {
         new_vars.push((format!("{upper}_ENABLED"), "false".to_string()));
+    }
+    if !profile.keep_warm {
+        new_vars.push((format!("{upper}_KEEP_WARM"), "false".to_string()));
     }
     if !profile.static_models.is_empty() {
         new_vars.push((format!("{upper}_MODELS"), profile.static_models.join(",")));
@@ -187,6 +191,8 @@ mod tests {
             model_prices: HashMap::default(),
             managed: None,
             copilot: None,
+            keep_warm: true,
+            first_byte_timeout_ms: None,
         }
     }
 
@@ -313,6 +319,23 @@ mod tests {
             1
         );
         assert!(!content.contains("https://old"));
+    }
+
+    #[test]
+    fn upsert_writes_keep_warm_only_when_it_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let mut profile = sample_profile();
+
+        profile.keep_warm = false;
+        upsert_profile(&path, &profile, &["groq".to_string()]).unwrap();
+        let off = std::fs::read_to_string(&path).unwrap();
+        assert!(off.contains("LLM_HUB_GROQ_KEEP_WARM=false"), "{off}");
+
+        profile.keep_warm = true;
+        upsert_profile(&path, &profile, &["groq".to_string()]).unwrap();
+        let on = std::fs::read_to_string(&path).unwrap();
+        assert!(!on.contains("KEEP_WARM"), "{on}");
     }
 
     #[test]

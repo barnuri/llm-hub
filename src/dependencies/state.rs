@@ -22,6 +22,7 @@ use crate::services::keyring_credential_store::KeyringCredentialStore;
 use crate::services::listed_prices::ListedPrices;
 use crate::services::live_feed::LiveFeed;
 use crate::services::managed_process::ProcessManager;
+use crate::services::model_health::ModelHealth;
 use crate::services::model_limits::{ModelLimit, ModelLimits};
 use crate::services::pricing::PricingBook;
 use crate::services::process_gh_cli::ProcessGhCli;
@@ -29,6 +30,7 @@ use crate::services::profile_usage::ProfileUsageCache;
 use crate::services::selection_log::SelectionLog;
 use crate::services::smart_auto_affinity::SmartAutoAffinity;
 use crate::services::smart_auto_decisions::SmartAutoDecisionLog;
+use crate::services::smart_auto_live::SmartAutoLive;
 use crate::services::smart_auto_rules::SmartAutoRulesStore;
 use crate::services::stats::{RequestOutcome, StatsRegistry};
 use crate::services::store::{Store, now_ms, store_dir};
@@ -50,6 +52,10 @@ struct Inner {
     /// Rebuilt with the model list on every refresh, never per request.
     model_descriptors: ArcSwap<ModelDescriptorSnapshot>,
     model_usage: ArcSwap<HashMap<String, u64>>,
+    /// Failures, error rates and speed of each model, written by the request path.
+    model_health: ModelHealth,
+    /// Cost score (0 to 10) of each model from the price book, rebuilt with the model list.
+    model_costs: ArcSwap<HashMap<String, u8>>,
     /// profile name -> reachable, updated on every models fan-out.
     upstream_health: DashMap<String, bool>,
     /// Copilot profile name -> advertised bare model id -> upstream entry.
@@ -148,6 +154,8 @@ impl AppState {
             model_cache: ArcSwap::from_pointee(None),
             model_descriptors: ArcSwap::from_pointee(ModelDescriptorSnapshot::default()),
             model_usage: ArcSwap::from_pointee(HashMap::new()),
+            model_health: ModelHealth::default(),
+            model_costs: ArcSwap::from_pointee(HashMap::new()),
             upstream_health: DashMap::new(),
             upstream_models: DashMap::new(),
             copilot_catalogs: DashMap::new(),
@@ -266,11 +274,29 @@ impl AppState {
         self.0.model_descriptors.load_full()
     }
 
-    /// Swaps in the descriptors a model refresh built. Readers keep the snapshot they loaded.
+    /// Swaps in the descriptors a model refresh built, and the cost scores they price to.
+    /// Readers keep the snapshot they loaded.
     pub fn set_model_descriptors(&self, descriptors: Vec<ModelDescriptor>) {
+        let costs = SmartAutoLive::cost_scores(
+            &self.pricing_book(),
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor.qualified_id.as_str()),
+        );
+        self.0.model_costs.store(Arc::new(costs));
         self.0
             .model_descriptors
             .store(Arc::new(ModelDescriptorSnapshot::new(descriptors)));
+    }
+
+    /// Cost score (0 dearest, 10 free) of each priced model.
+    pub fn model_costs(&self) -> Arc<HashMap<String, u8>> {
+        self.0.model_costs.load_full()
+    }
+
+    /// Failures, error rates and speed measured on the request path.
+    pub fn model_health(&self) -> &ModelHealth {
+        &self.0.model_health
     }
 
     pub fn set_upstream_models(&self, profile: &str, models: HashMap<String, UpstreamModel>) {

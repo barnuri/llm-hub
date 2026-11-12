@@ -24,12 +24,15 @@ use crate::schemas::attempt_outcome::{AttemptOutcome, OutcomeCode, OutcomeSource
 use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::profile_filter::ProfileFilter;
+use crate::schemas::model_context::strip_1m_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_id::ModelId;
 use crate::schemas::prompt_shape::PromptShape;
 use crate::schemas::reply_protocol::ReplyProtocol;
 use crate::schemas::review_evidence::ReviewEvidence;
 use crate::schemas::review_request::ReviewRequest;
+use crate::schemas::role_decision::RoleDecision;
+use crate::schemas::role_reason::RoleReason;
 use crate::schemas::route_reason::RouteReason;
 use crate::schemas::scope_kind::ScopeKind;
 use crate::schemas::selection_event::SelectionEvent;
@@ -61,7 +64,8 @@ use crate::services::fallback::{
     RetryPolicy, fallback_chain, per_attempt_timeout_ms, retain_eligible,
 };
 use crate::services::harness::client_signature;
-use crate::services::keep_warm::{KeepWarmLease, PingPlan};
+use crate::services::keep_warm::{ApiShape, KeepWarm, KeepWarmLease, PingPlan, PingTarget};
+use crate::services::model_health::FailureKind;
 use crate::services::multipart_model;
 use crate::services::request_images::request_has_image;
 use crate::services::responses_chat::{self, ChatStream};
@@ -69,6 +73,7 @@ use crate::services::responses_item_ids::ResponsesItemIds;
 use crate::services::review_graph::ReviewGraph;
 use crate::services::review_orchestrator::ReviewOrchestrator;
 use crate::services::smart_auto_effort::SmartAutoEffort;
+use crate::services::smart_auto_live::SmartAutoLive;
 use crate::services::smart_auto_pool::SmartAutoPool;
 use crate::services::smart_auto_router::SmartAutoRouter;
 use crate::services::stage_client::StageClient;
@@ -306,12 +311,19 @@ pub(crate) async fn attempt_loop(
         }
         let started = Instant::now();
         let session_token = auto.as_ref().and_then(|pick| pick.session_token.as_deref());
+        // A caller's own timeout header wins. Otherwise only a streamed Smart Auto attempt on a
+        // remote profile gets the short first-byte limit: a buffered answer or a local model
+        // that is still loading is slow for good reasons.
+        let first_byte = (attempt_timeout.is_none() && smart.is_some() && client_streams)
+            .then_some(())
+            .filter(|()| reviewing.is_none())
+            .and_then(|()| first_byte_limit(&state.config(), &model_id.profile));
         let sender = AttemptSender::for_attempt(
             state,
             &method,
             &attempt,
             model_id,
-            attempt_timeout,
+            attempt_timeout.or(first_byte),
             session_token,
         );
         let mut keep_warm = keep_warm_lease(state, &attempt, model_id, worker.as_deref());
@@ -325,6 +337,15 @@ pub(crate) async fn attempt_loop(
             Ok(response) => (Ok(attempt.reply_rewrite.apply(response).await), None),
             other => (other, None),
         };
+        let result = match (result, first_byte) {
+            (Ok(response), Some(limit))
+                if SUCCESS_STATUS_RANGE.contains(&response.status().as_u16()) =>
+            {
+                await_first_chunk(response, limit.saturating_sub(started.elapsed())).await
+            }
+            (other, _) => other,
+        };
+        note_attempt_health(state, model_id, client_path, &result);
 
         match result {
             Ok(response) => {
@@ -347,8 +368,9 @@ pub(crate) async fn attempt_loop(
                         .and_then(|plan| plan.commit(status, model_id));
                     let stream_lease = keep_warm.take().filter(|_| succeeded).map(|mut lease| {
                         let accepted = retried_body.unwrap_or_else(|| attempt.body.clone());
-                        let beta = attempt.headers.get(HEADER_ANTHROPIC_BETA).cloned();
-                        lease.record_stream(accepted, model_id.clone(), started, beta);
+                        if let Some(target) = keep_warm_target(&attempt) {
+                            lease.record_stream(accepted, model_id.clone(), started, target);
+                        }
                         lease
                     });
                     let mut out = match reviewing.filter(|_| succeeded) {
@@ -469,6 +491,59 @@ pub(crate) async fn attempt_loop(
     }
     unreachable!("attempt loop always returns on the last attempt");
 }
+
+/// Waits up to `limit` for the first body chunk of a streamed 2xx reply, then hands back a reply
+/// that still carries that chunk. A silent upstream becomes the `timeout` error, so the loop
+/// marks the model and tries the next one. Nothing is buffered beyond the one chunk.
+async fn await_first_chunk(
+    response: reqwest::Response,
+    limit: Duration,
+) -> Result<reqwest::Response, String> {
+    let (status, version, headers) = (
+        response.status(),
+        response.version(),
+        response.headers().clone(),
+    );
+    let mut chunks = response.bytes_stream();
+    let first = match tokio::time::timeout(limit, chunks.next()).await {
+        Err(_elapsed) => return Err("timeout: no first byte".to_owned()),
+        Ok(None) => None,
+        Ok(Some(Err(error))) => return Err(format!("read error: {error}")),
+        Ok(Some(Ok(chunk))) => Some(chunk),
+    };
+    let head = futures_util::stream::iter(first.map(Ok::<Bytes, reqwest::Error>));
+    let body = reqwest::Body::wrap_stream(head.chain(chunks));
+    Ok(rebuilt_response(status, version, headers, body))
+}
+
+/// Feeds one attempt's result into the model health record: an answer clears the model, a
+/// timeout, a transport error or a model-side status cools it. Request-side statuses change nothing.
+fn note_attempt_health(
+    state: &AppState,
+    model_id: &ModelId,
+    endpoint: &str,
+    result: &Result<reqwest::Response, String>,
+) {
+    let (model, now) = (model_id.qualified(), Instant::now());
+    let health = state.model_health();
+    match result {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            if SUCCESS_STATUS_RANGE.contains(&status) {
+                health.record_success(&model, endpoint, now);
+            } else if let Some(kind) = FailureKind::from_status(status) {
+                health.record_failure(&model, endpoint, kind, now);
+            }
+        }
+        Err(reason) => {
+            health.record_failure(&model, endpoint, FailureKind::from_reason(reason), now);
+        }
+    }
+}
+
+/// How many next-best pool models a Smart Auto request may try after its explicit fallbacks.
+/// Each hung attempt costs up to the first-byte limit, so this also bounds the worst wait.
+const IMPLICIT_FALLBACKS: usize = 2;
 
 /// `routed_by` of a request the client pinned to one concrete model.
 const ROUTED_BY_PINNED: &str = "pinned";
@@ -637,6 +712,16 @@ fn resolve_hub(
     if let Some(profiles) = &profiles {
         pool.retain(|descriptor| profiles.allows(&descriptor.qualified_id));
     }
+    // Models that just failed, or whose quota is used up, sit out. When that would leave nothing,
+    // the pool stays whole: a model that may fail beats a certain 400.
+    let live = SmartAutoLive::collect(state, endpoint, &pool, Instant::now());
+    let sits_out = |descriptor: &&ModelDescriptor| {
+        live.unavailable
+            .contains(strip_1m_suffix(&descriptor.qualified_id))
+    };
+    if pool.iter().any(|descriptor| !sits_out(descriptor)) {
+        pool.retain(|descriptor| !sits_out(descriptor));
+    }
     let affinity_key = AffinityKey::new(&signals, &caller, &policy, endpoint);
     let affinity_scope = AffinityKey::scope(&signals, &caller);
     let selector_name = requested.qualified();
@@ -652,6 +737,7 @@ fn resolve_hub(
         &signals,
         anchor,
         &usage,
+        &live.signals,
         requested,
         Instant::now(),
     )
@@ -728,7 +814,10 @@ fn resolve_hub(
             snapshot: snapshot.as_ref(),
             endpoint,
             evidence_tokens: signals.estimated_prompt_tokens,
-            admits: &|id: &str| profiles.as_ref().is_none_or(|filter| filter.allows(id)),
+            admits: &|id: &str| {
+                profiles.as_ref().is_none_or(|filter| filter.allows(id))
+                    && !live.unavailable.contains(strip_1m_suffix(id))
+            },
         },
         &|profile: &str| {
             config
@@ -760,9 +849,27 @@ fn resolve_hub(
         review,
         task: signals.last_user_text.clone(),
     };
+    // The explicit chain first, then the next best models of the same pool: a pick that hangs
+    // or fails is answered by another model inside this request, not by an error.
+    let mut fallbacks = retain_eligible(fallbacks, Some(&pool));
+    let mut taken = vec![decision.model.qualified_id.clone()];
+    taken.extend(fallbacks.iter().cloned());
+    fallbacks.extend(SmartAutoRouter::runners_up(
+        &pool,
+        tier,
+        RoleDecision {
+            role: decision.role,
+            plan_backed: decision.plan_backed,
+            reason: RoleReason::CallerHint,
+        },
+        &taken,
+        &usage,
+        &live.signals,
+        IMPLICIT_FALLBACKS,
+    ));
     Ok(HubResolution::Concrete {
         primary,
-        fallbacks: retain_eligible(fallbacks, Some(&pool)),
+        fallbacks,
         plan: Box::new(plan),
     })
 }
@@ -1999,7 +2106,37 @@ async fn retry_without_rejected_fields(
     Ok((response, Some(retried)))
 }
 
-/// The keep-warm lease for a native Copilot Claude attempt on a session, when keep-warm is on.
+/// The first-byte limit for a streamed Smart Auto attempt on `profile`: the configured limit, or
+/// the profile's own shorter timeout. `None` for a local server (managed or on this machine),
+/// which may be loading a model, and for an unknown profile. A Copilot profile is remote.
+fn first_byte_limit(config: &HubConfig, profile: &str) -> Option<Duration> {
+    let found = config.profile(profile)?;
+    let limit = match found.first_byte_timeout_ms {
+        Some(0) => return None,
+        Some(own) => Duration::from_millis(own),
+        None if found.copilot.is_none() && found.is_local() => return None,
+        None => config.first_byte_timeout?,
+    };
+    Some(
+        found
+            .timeout_ms
+            .map_or(limit, |own| limit.min(Duration::from_millis(own))),
+    )
+}
+
+/// Whether an idle stream sent to `upstream_path` on `profile` may be kept warm: keep-warm is on
+/// globally and for the profile, and the call is a chat, messages or responses call whatever the
+/// provider. A local server is left out: its cache does not expire, and a ping would only keep
+/// it busy. A Copilot profile is remote by definition.
+fn keep_warm_allowed(config: &HubConfig, profile: &str, upstream_path: &str) -> bool {
+    config.keep_warm.enabled
+        && config
+            .profile(profile)
+            .is_some_and(|found| found.keep_warm && (found.copilot.is_some() || !found.is_local()))
+        && ApiShape::from_upstream_path(upstream_path).is_some()
+}
+
+/// The keep-warm lease for an attempt on a session, when `keep_warm_allowed` says so.
 fn keep_warm_lease(
     state: &AppState,
     attempt: &Attempt<'_>,
@@ -2007,14 +2144,21 @@ fn keep_warm_lease(
     worker: Option<&str>,
 ) -> Option<KeepWarmLease> {
     let worker = worker?;
-    let eligible = attempt.native_messages
-        && model_id.model.starts_with(CLAUDE_MODEL_PREFIX)
-        && state.config().keep_warm.enabled
-        && is_copilot_profile(state, model_id);
-    eligible.then(|| state.keep_warm().begin(worker))
+    keep_warm_allowed(&state.config(), &model_id.profile, attempt.path.as_str())
+        .then(|| state.keep_warm().begin(worker))
 }
 
-fn keep_warm_headers(beta: Option<HeaderValue>) -> HeaderMap {
+/// Where a ping for `attempt` goes: the upstream path the request used and its API shape.
+fn keep_warm_target(attempt: &Attempt<'_>) -> Option<PingTarget> {
+    let path = attempt.path.as_str();
+    Some(PingTarget {
+        shape: ApiShape::from_upstream_path(path)?,
+        path: path.to_owned(),
+        beta: attempt.headers.get(HEADER_ANTHROPIC_BETA).cloned(),
+    })
+}
+
+fn keep_warm_headers(shape: ApiShape, beta: Option<HeaderValue>, copilot: bool) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if let Some(beta) = beta {
         headers.insert(HEADER_ANTHROPIC_BETA, beta);
@@ -2023,11 +2167,16 @@ fn keep_warm_headers(beta: Option<HeaderValue>) -> HeaderMap {
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    headers.insert(
-        HEADER_X_INITIATOR,
-        HeaderValue::from_static(INITIATOR_AGENT),
-    );
-    with_anthropic_version(&headers)
+    if copilot {
+        headers.insert(
+            HEADER_X_INITIATOR,
+            HeaderValue::from_static(INITIATOR_AGENT),
+        );
+    }
+    match shape {
+        ApiShape::Messages => with_anthropic_version(&headers),
+        ApiShape::ChatCompletions | ApiShape::Responses => headers,
+    }
 }
 
 /// `body` without the fields the profile's upstream is known to reject, as real attempts send it.
@@ -2052,15 +2201,19 @@ pub(crate) async fn send_keep_warm_ping(state: &AppState, ping: PingPlan) {
         stream_key,
         model_id,
         body,
-        beta,
+        target,
     } = ping;
     let body = without_unsupported_fields(state, &model_id, body);
-    let headers = keep_warm_headers(beta);
+    let headers = keep_warm_headers(
+        target.shape,
+        target.beta,
+        is_copilot_profile(state, &model_id),
+    );
     let method = Method::POST;
     let sender = AttemptSender {
         state,
         method: &method,
-        path: UpstreamPath::Verbatim(MESSAGES_ENDPOINT),
+        path: UpstreamPath::Verbatim(&target.path),
         headers: &headers,
         model_id: &model_id,
         attempt_timeout: None,
@@ -2385,8 +2538,9 @@ enum UpstreamPath<'a> {
     /// A client-facing `/v1/...` path; upstream bases already end at the API
     /// root, so the `/v1` is dropped.
     Strip(&'a str),
-    /// An upstream path that keeps its `/v1`, such as Copilot's `/v1/messages`.
-    Verbatim(&'static str),
+    /// An upstream path that keeps its `/v1`, such as Copilot's `/v1/messages`, or one
+    /// already stripped, such as a keep-warm ping's stored path.
+    Verbatim(&'a str),
 }
 
 impl<'a> UpstreamPath<'a> {
@@ -2723,9 +2877,8 @@ fn build_response(
         rejected_limit_model(state, status, upstream.headers(), model_id, upstream_path);
     // Read before `bytes_stream()` consumes the response. A comment frame
     // injected into a JSON body would corrupt it, so this is SSE-only.
-    let keepalive = is_event_stream(&upstream)
-        .then(|| state.config().sse_keepalive)
-        .flatten();
+    let is_stream = is_event_stream(&upstream);
+    let keepalive = is_stream.then(|| state.config().sse_keepalive).flatten();
     let mut response_headers = filter_response_headers(&headermap_from_reqwest(upstream.headers()));
     if transform.is_some() {
         // The rewritten body has no encoding. The attempt asked for `identity`,
@@ -2807,6 +2960,17 @@ fn build_response(
         );
         let usage = summary_usage(&summary);
         let answer = std::mem::take(&mut summary.answer);
+        if let Some(ttft_ms) = summary
+            .ttft_ms
+            .filter(|_| is_stream && outcome_seed.status < ERROR_STATUS_MIN)
+        {
+            state_for_stats.model_health().record_ttft(
+                &learn_model.qualified(),
+                &client_path,
+                ttft_ms,
+                Instant::now(),
+            );
+        }
         let outcome = RequestOutcome {
             latency_ms: crate::utils::time::elapsed_ms(started),
             ttft_ms: summary.ttft_ms,
@@ -2831,7 +2995,14 @@ fn build_response(
         if let Some(lease) = keep_warm
             .filter(|_| summary.upstream_end == UpstreamEnd::Complete && outcome.error.is_none())
         {
-            lease.complete(outcome.cache_read_tokens + outcome.cache_write_tokens);
+            // A model whose cache-read discount cannot pay for the pings gets none: report no
+            // cached tokens, which drops the stream.
+            let pays = KeepWarm::pays_off(
+                state_for_stats.pricing_book().rates_for(&outcome.model_key),
+                state_for_stats.config().keep_warm.idle_cap,
+            );
+            let cached = outcome.cache_read_tokens + outcome.cache_write_tokens;
+            lease.complete(if pays { cached } else { 0 });
         }
         if let Some(attempt) = capture_answer {
             save_answer(&state_for_stats, &attempt, &answer);
@@ -3826,6 +3997,51 @@ mod tests {
         assert_eq!(chunks[first + 1], "data: two\n\n", "{chunks:?}");
     }
 
+    fn streamed_reply(
+        body: impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync + 'static,
+    ) -> reqwest::Response {
+        rebuilt_response(
+            StatusCode::OK,
+            reqwest::Version::HTTP_11,
+            HeaderMap::new(),
+            reqwest::Body::wrap_stream(body),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_silent_stream_hits_the_first_byte_limit() {
+        let reply = streamed_reply(stream::pending());
+
+        let result = await_first_chunk(reply, Duration::from_millis(50)).await;
+
+        assert_eq!(result.unwrap_err(), "timeout: no first byte");
+    }
+
+    #[tokio::test]
+    async fn the_first_chunk_is_kept_in_the_reply() {
+        let chunks = stream::iter([
+            Ok(Bytes::from_static(b"data: one\n\n")),
+            Ok(Bytes::from_static(b"data: two\n\n")),
+        ]);
+
+        let reply = await_first_chunk(streamed_reply(chunks), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(reply.status(), StatusCode::OK);
+        let body = reply.bytes().await.unwrap();
+        assert_eq!(&body[..], b"data: one\n\ndata: two\n\n");
+    }
+
+    #[tokio::test]
+    async fn an_empty_stream_is_not_a_timeout() {
+        let reply = await_first_chunk(streamed_reply(stream::empty()), Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert!(reply.bytes().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn client_closing_before_upstream_eof_still_reports_usage_and_ttft() {
         let usage_frame = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":34}}\n\ndata: [DONE]\n\n";
@@ -4338,7 +4554,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn requests_that_are_not_native_claude_keep_no_stream() {
+        async fn a_chat_completions_stream_is_kept_and_pinged_on_its_own_path() {
             let copilot = copilot().await;
             Mock::given(method("POST"))
                 .and(path(UPSTREAM_CHAT_PATH))
@@ -4348,19 +4564,16 @@ mod tests {
                 )
                 .mount(&copilot.upstream)
                 .await;
-            let translated = anthropic_body(TRANSLATED_ID, false);
-            let (status, _) = send(
-                &copilot,
-                &with_caller_version(with_session(CLAUDE_SESSION)),
-                &translated,
-                RouteKind::Anthropic,
-            )
-            .await;
-            assert_eq!(status, 200);
             let plain = json!({
                 "model": format!("{PROFILE}/{PLAIN_ID}"),
-                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+                "max_tokens": 256,
+                "messages": [
+                    {"role": "system", "content": "You are terse."},
+                    {"role": "user", "content": "hi"},
+                ],
             });
+
             let (status, _) = send(
                 &copilot,
                 &with_session(CLAUDE_SESSION),
@@ -4368,17 +4581,126 @@ mod tests {
                 RouteKind::OpenAi,
             )
             .await;
-            assert_eq!(status, 200);
 
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let now = std::time::Instant::now() + crate::consts::KEEP_WARM_PING_INTERVAL;
-            assert!(
-                copilot
-                    .state
-                    .keep_warm()
-                    .take_due(now, keep_warm_cap())
-                    .is_empty()
+            assert_eq!(status, 200);
+            let plans = due_pings(&copilot).await;
+            assert_eq!(plans.len(), 1);
+            assert_eq!(plans[0].target.shape, ApiShape::ChatCompletions);
+            assert!(plans[0].target.path.ends_with("/chat/completions"));
+            let ping: Value = serde_json::from_slice(&plans[0].body).unwrap();
+            assert_eq!(ping["stream"], json!(false));
+            assert_eq!(ping["max_tokens"], json!(1));
+            assert_eq!(ping["messages"], plain["messages"]);
+        }
+
+        #[tokio::test]
+        async fn a_chat_ping_goes_to_the_chat_path_with_the_capped_body() {
+            let copilot = copilot().await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(CACHED_CHAT_REPLY.as_bytes(), "application/json"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+            let plain = json!({
+                "model": format!("{PROFILE}/{PLAIN_ID}"),
+                "stream": true,
+                "messages": [
+                    {"role": "system", "content": "You are terse."},
+                    {"role": "user", "content": "hi"},
+                ],
+            });
+            send(
+                &copilot,
+                &with_session(CLAUDE_SESSION),
+                &plain,
+                RouteKind::OpenAi,
+            )
+            .await;
+            let plan = due_pings(&copilot).await.into_iter().next().unwrap();
+
+            send_keep_warm_ping(&copilot.state, plan).await;
+
+            let sent = requests_to(&copilot, UPSTREAM_CHAT_PATH).await;
+            assert_eq!(sent.len(), 2);
+            let ping = sent_json(&sent[1]);
+            assert_eq!(ping["stream"], json!(false));
+            assert_eq!(ping["max_tokens"], json!(1));
+            assert_eq!(copilot.state.keep_warm().ping_totals().0, 1);
+        }
+
+        fn config_with(extra: &[(&str, &str)]) -> HubConfig {
+            let mut vars: HashMap<String, String> = [
+                ("LLM_HUB_PROFILES", "remote,optout,home"),
+                ("LLM_HUB_REMOTE_BASE_URL", "https://api.example.com/v1"),
+                ("LLM_HUB_OPTOUT_BASE_URL", "https://other.example.com/v1"),
+                ("LLM_HUB_OPTOUT_KEEP_WARM", "false"),
+                ("LLM_HUB_HOME_BASE_URL", "http://127.0.0.1:11436/v1"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+            vars.extend(
+                extra
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
             );
+            HubConfig::from_map(&vars).unwrap()
+        }
+
+        #[test]
+        fn the_first_byte_limit_skips_local_servers_and_yields_to_a_shorter_profile_timeout() {
+            let config = config_with(&[("LLM_HUB_OPTOUT_TIMEOUT_MS", "5000")]);
+            let default = config.first_byte_timeout.unwrap();
+            assert_eq!(first_byte_limit(&config, "remote"), Some(default));
+            assert_eq!(
+                first_byte_limit(&config, "optout"),
+                Some(Duration::from_millis(5000))
+            );
+            assert_eq!(first_byte_limit(&config, "home"), None);
+            let explicit = config_with(&[
+                ("LLM_HUB_HOME_FIRST_BYTE_TIMEOUT_MS", "3000"),
+                ("LLM_HUB_REMOTE_FIRST_BYTE_TIMEOUT_MS", "0"),
+            ]);
+            assert_eq!(
+                first_byte_limit(&explicit, "home"),
+                Some(Duration::from_millis(3000))
+            );
+            assert_eq!(first_byte_limit(&explicit, "remote"), None);
+            assert_eq!(first_byte_limit(&config, "missing"), None);
+            let off = config_with(&[("LLM_HUB_FIRST_BYTE_TIMEOUT_MS", "0")]);
+            assert_eq!(first_byte_limit(&off, "remote"), None);
+        }
+
+        #[test]
+        fn keep_warm_applies_to_every_remote_profile_by_default() {
+            let config = config_with(&[]);
+            assert!(keep_warm_allowed(&config, "remote", "/chat/completions"));
+            assert!(keep_warm_allowed(&config, "remote", "/responses"));
+            assert!(keep_warm_allowed(&config, "remote", "/v1/messages"));
+        }
+
+        #[test]
+        fn a_profile_can_opt_out_and_the_global_switch_still_wins() {
+            let config = config_with(&[]);
+            assert!(!keep_warm_allowed(&config, "optout", "/chat/completions"));
+            let off = config_with(&[("LLM_HUB_KEEP_WARM", "false")]);
+            assert!(!keep_warm_allowed(&off, "remote", "/chat/completions"));
+        }
+
+        #[test]
+        fn local_servers_unknown_profiles_and_other_calls_are_left_out() {
+            let config = config_with(&[]);
+            assert!(!keep_warm_allowed(&config, "home", "/chat/completions"));
+            assert!(!keep_warm_allowed(&config, "missing", "/chat/completions"));
+            assert!(!keep_warm_allowed(&config, "remote", "/embeddings"));
+            assert!(!keep_warm_allowed(
+                &config,
+                "remote",
+                "/v1/messages/count_tokens"
+            ));
         }
 
         #[tokio::test]

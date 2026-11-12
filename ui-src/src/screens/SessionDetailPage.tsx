@@ -233,7 +233,7 @@ function CacheCausesPanel({ causes }: { readonly causes: readonly SessionCacheCa
 
 function KeepWarmCard({ summary }: { readonly summary: SessionSummary }) {
   return (
-    <Panel title="Keep-warm" sub="cache pings for idle Claude streams">
+    <Panel title="Keep-warm" sub="cache pings for idle streams">
       <dl className="sessions-keepwarm">
         <dt>Pings</dt>
         <dd>{formatNumber(summary.keepwarm_pings)}</dd>

@@ -21,6 +21,7 @@ use crate::schemas::selection_stage::SelectionStage;
 use crate::schemas::selection_state::SelectionState;
 use crate::schemas::smart_auto_decision::SmartAutoDecision;
 use crate::schemas::smart_auto_rules::SmartAutoRules;
+use crate::services::model_health::HealthRow;
 use crate::services::selection_log::SelectionLog;
 use crate::services::smart_auto_rules::{LoadedRules, RuleEffect, RulesSource, rule_effects};
 use crate::services::store::now_ms;
@@ -92,6 +93,14 @@ pub struct OutcomeBody {
 #[derive(Serialize)]
 struct DecisionsBody {
     decisions: Vec<SmartAutoDecision>,
+}
+
+#[derive(Serialize)]
+struct HealthBody {
+    /// Each `(model, endpoint)` the hub attempted: failures, cooldown, error rate and speed.
+    models: Vec<HealthRow>,
+    /// Cost score (0 dearest, 10 free) of each priced model, from the price book.
+    costs: std::collections::BTreeMap<String, u8>,
 }
 
 #[derive(Serialize)]
@@ -269,6 +278,20 @@ pub async fn decisions(
         .clamp(1, AUTO_DECISIONS_MAX_LIMIT);
     Json(DecisionsBody {
         decisions: state.smart_auto_decisions().recent(limit),
+    })
+    .into_response()
+}
+
+/// `GET /api/smart-auto/health`: what Smart Auto measured about each model. A model with
+/// `cooled_for_ms` above 0 is skipped until it elapses.
+pub async fn health(State(state): State<AppState>) -> Response {
+    Json(HealthBody {
+        models: state.model_health().report(std::time::Instant::now()),
+        costs: state
+            .model_costs()
+            .iter()
+            .map(|(id, score)| (id.clone(), *score))
+            .collect(),
     })
     .into_response()
 }

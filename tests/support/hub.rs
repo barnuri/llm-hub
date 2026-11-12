@@ -85,12 +85,22 @@ pub fn completion(text: &str) -> ResponseTemplate {
 
 /// A hub with profiles `alpha` and `beta`, after its first model refresh, so the Smart Auto pool holds both.
 pub async fn start_alpha_beta_hub(alpha: &MockServer, beta: &MockServer) -> (HubProcess, String) {
-    let (hub, base) = start_hub(HashMap::from([
+    start_alpha_beta_hub_with(alpha, beta, HashMap::new()).await
+}
+
+/// [`start_alpha_beta_hub`] with extra environment variables.
+pub async fn start_alpha_beta_hub_with(
+    alpha: &MockServer,
+    beta: &MockServer,
+    extra: HashMap<String, String>,
+) -> (HubProcess, String) {
+    let mut vars = HashMap::from([
         ("LLM_HUB_PROFILES".into(), "alpha,beta".into()),
         ("LLM_HUB_ALPHA_BASE_URL".into(), alpha.uri()),
         ("LLM_HUB_BETA_BASE_URL".into(), beta.uri()),
-    ]))
-    .await;
+    ]);
+    vars.extend(extra);
+    let (hub, base) = start_hub(vars).await;
     let models: serde_json::Value = reqwest::Client::new()
         .get(format!("{base}/v1/models"))
         .send()

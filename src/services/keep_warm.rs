@@ -1,12 +1,12 @@
+#[cfg(test)]
 use axum::http::HeaderValue;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use serde_json::{Value, json};
 
-use crate::configs::KeepWarmConfig;
+use crate::configs::{KeepWarmConfig, TokenRates};
 use crate::consts::{
     KEEP_WARM_MAX_BODY_BYTES, KEEP_WARM_MAX_STREAMS, KEEP_WARM_MAX_TOTAL_BYTES,
     KEEP_WARM_MIN_CACHED_TOKENS, KEEP_WARM_PING_INTERVAL, KEEP_WARM_PINGS_PER_MINUTE,
@@ -16,9 +16,12 @@ use crate::dependencies::state::AppState;
 use crate::schemas::keep_warm_summary::KeepWarmSummary;
 use crate::schemas::model_id::ModelId;
 
+mod api_shape;
 mod lease;
 mod ping_plan;
 mod warm_request;
+
+pub(crate) use api_shape::{ApiShape, PingTarget};
 
 pub(crate) use lease::KeepWarmLease;
 pub(crate) use ping_plan::PingPlan;
@@ -26,8 +29,8 @@ pub(crate) use warm_request::WarmRequest;
 
 type StreamKey = (String, String);
 
-/// Keeps the last request body of each idle Copilot Claude stream, so a ping can
-/// replay it and refresh the prompt cache. Everything here is in memory and bounded.
+/// Keeps the last request body of each idle stream on a profile that caches prompts, so a ping
+/// can replay it and refresh the cache. Everything here is in memory and bounded.
 #[derive(Default)]
 pub struct KeepWarm {
     state: Mutex<State>,
@@ -45,10 +48,11 @@ struct State {
 }
 
 struct Stream {
-    /// The ping body: the accepted request with `stream` false and `max_tokens` 1.
+    /// The ping body: the accepted request with `stream` false and the output capped.
     body: Bytes,
     model_id: ModelId,
-    beta: Option<HeaderValue>,
+    /// Where and how the ping goes.
+    target: PingTarget,
     last_user: Instant,
     last_ping: Option<Instant>,
     ping_in_flight: bool,
@@ -158,8 +162,8 @@ impl KeepWarm {
         }
     }
 
-    /// Keeps the stream for the next ping. A response that cached too few prompt tokens, or a body
-    /// over the size cap, drops the stream instead.
+    /// Keeps a native Messages stream for the next ping. See [`Self::touch_with`].
+    #[cfg(test)]
     pub(crate) fn touch(
         &self,
         key: StreamKey,
@@ -169,9 +173,30 @@ impl KeepWarm {
         cached_tokens: u64,
         beta: Option<HeaderValue>,
     ) {
+        self.touch_with(
+            key,
+            body,
+            model_id,
+            started,
+            cached_tokens,
+            PingTarget::messages(beta),
+        );
+    }
+
+    /// Keeps the stream for the next ping. A response that cached too few prompt tokens, or a body
+    /// over the size cap, drops the stream instead.
+    pub(crate) fn touch_with(
+        &self,
+        key: StreamKey,
+        body: &[u8],
+        model_id: &ModelId,
+        started: Instant,
+        cached_tokens: u64,
+        target: PingTarget,
+    ) {
         let ping_body = (cached_tokens >= KEEP_WARM_MIN_CACHED_TOKENS
             && body.len() <= KEEP_WARM_MAX_BODY_BYTES)
-            .then(|| Self::ping_body(body))
+            .then(|| target.shape.ping_body(body))
             .flatten();
         let mut state = self.lock();
         let Some(ping_body) = ping_body else {
@@ -194,7 +219,7 @@ impl KeepWarm {
             Stream {
                 body: ping_body,
                 model_id: model_id.clone(),
-                beta,
+                target,
                 last_user,
                 last_ping,
                 ping_in_flight,
@@ -204,13 +229,39 @@ impl KeepWarm {
         state.evict_to_bounds();
     }
 
-    /// The ping body for an accepted request: the same body with `stream` false and `max_tokens` 1.
+    /// The ping body for an accepted Messages request: the same body with `stream` false and `max_tokens` 1.
+    #[cfg(test)]
     pub(crate) fn ping_body(body: &[u8]) -> Option<Bytes> {
-        let mut request: Value = serde_json::from_slice(body).ok()?;
-        let fields = request.as_object_mut()?;
-        fields.insert("stream".to_string(), Value::Bool(false));
-        fields.insert("max_tokens".to_string(), json!(1));
-        serde_json::to_vec(&request).ok().map(Bytes::from)
+        ApiShape::Messages.ping_body(body)
+    }
+
+    /// Whether keeping a cache warm for `idle_cap` costs less than rewriting it. A ping reads the
+    /// cached prompt at the cache-read rate, and one comes every ping interval. Resuming without
+    /// a ping rewrites the prompt at the cache-write rate, or at the input rate when the card has
+    /// no write price. A model with no known price gets the benefit of the doubt.
+    #[must_use]
+    pub(crate) fn pays_off(rates: TokenRates, idle_cap: Duration) -> bool {
+        let rates = rates.with_cache_defaults();
+        let (read, rewrite) = (rates.cache_read_per_1m, rates.cache_write_per_1m);
+        if rewrite <= 0.0 {
+            return true;
+        }
+        let pings = idle_cap.as_secs_f64() / KEEP_WARM_PING_INTERVAL.as_secs_f64();
+        pings * read < rewrite - read
+    }
+
+    /// Drops the streams of every profile `keep` refuses: turned off, disabled or removed.
+    pub fn retain_profiles(&self, keep: impl Fn(&str) -> bool) {
+        let mut state = self.lock();
+        let dropped: Vec<StreamKey> = state
+            .streams
+            .iter()
+            .filter(|(_, stream)| !keep(&stream.model_id.profile))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &dropped {
+            state.take(key);
+        }
     }
 
     /// Takes the streams due at `now`, most overdue first, within the global ping budget. A stream
@@ -251,7 +302,7 @@ impl KeepWarm {
                 stream_key: key.1.clone(),
                 model_id: stream.model_id.clone(),
                 body: stream.body.clone(),
-                beta: stream.beta.clone(),
+                target: stream.target.clone(),
             });
         }
         plans
@@ -340,6 +391,12 @@ impl KeepWarm {
                     state.keep_warm().clear();
                     continue;
                 }
+                let config = state.config();
+                state.keep_warm().retain_profiles(|name| {
+                    config
+                        .profile(name)
+                        .is_some_and(|profile| profile.enabled && profile.keep_warm)
+                });
                 for ping in state
                     .keep_warm()
                     .take_due(Instant::now(), settings.idle_cap)
@@ -360,7 +417,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::consts::KEEP_WARM_MAX_BODY_BYTES;
@@ -392,6 +449,57 @@ mod tests {
 
     fn key(worker: &str, stream: &str) -> StreamKey {
         (worker.to_string(), stream.to_string())
+    }
+
+    fn rates(input: f64, cache_read: f64, cache_write: f64) -> TokenRates {
+        TokenRates {
+            input_per_1m: input,
+            output_per_1m: 0.0,
+            cache_read_per_1m: cache_read,
+            cache_write_per_1m: cache_write,
+        }
+    }
+
+    #[test]
+    fn pings_pay_off_when_a_rewrite_costs_far_more_than_a_read() {
+        // Claude-style prices: reads at a tenth of input, writes at 1.25 times.
+        let claude = rates(1.0, 0.1, 1.25);
+        assert!(KeepWarm::pays_off(claude, IDLE_CAP));
+        // Over a week of pings the reads cost more than one rewrite.
+        assert!(!KeepWarm::pays_off(claude, Duration::from_hours(168)));
+    }
+
+    #[test]
+    fn pings_do_not_pay_off_when_the_cache_discount_is_small() {
+        // A 75% discount with no write premium: seven and a half reads cost more than one rewrite.
+        assert!(!KeepWarm::pays_off(rates(2.0, 0.5, 0.0), IDLE_CAP));
+        // A 90% discount with no write premium still pays for 30 minutes.
+        assert!(KeepWarm::pays_off(rates(2.0, 0.2, 0.0), IDLE_CAP));
+    }
+
+    #[test]
+    fn a_model_with_no_known_price_is_kept() {
+        assert!(KeepWarm::pays_off(TokenRates::default(), IDLE_CAP));
+    }
+
+    #[test]
+    fn streams_of_a_profile_that_turned_keep_warm_off_are_dropped() {
+        let registry = Arc::new(KeepWarm::default());
+        let t0 = Instant::now();
+        let other = ModelId::parse("groq/llama-3").unwrap();
+        registry.touch(
+            key("w", "kept"),
+            &request_body(10),
+            &model(),
+            t0,
+            4096,
+            None,
+        );
+        registry.touch(key("w", "gone"), &request_body(10), &other, t0, 4096, None);
+
+        registry.retain_profiles(|profile| profile != "groq");
+
+        assert_eq!(keys(&registry), vec![key("w", "kept")]);
     }
 
     #[test]
@@ -608,7 +716,12 @@ mod tests {
     async fn completed_lease_keeps_its_stream_after_the_blocking_read() {
         let registry = Arc::new(KeepWarm::default());
         let mut lease = registry.begin("w");
-        lease.record_stream(request_body(10), model(), Instant::now(), None);
+        lease.record_stream(
+            request_body(10),
+            model(),
+            Instant::now(),
+            PingTarget::messages(None),
+        );
         lease.complete(4096);
 
         let deadline = Instant::now() + Duration::from_secs(5);

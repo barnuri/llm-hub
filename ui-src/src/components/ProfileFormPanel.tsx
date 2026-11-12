@@ -46,6 +46,7 @@ export function ProfileFormPanel({ existing, onSaved, onCancel, onToast }: Profi
   const [apiKey, setApiKey] = useState("");
   const [staticModels, setStaticModels] = useState(existing?.models.join(",") ?? "");
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
+  const [keepWarm, setKeepWarm] = useState(existing?.keep_warm ?? true);
   const [errors, setErrors] = useState<FormErrors>({});
   const [saving, setSaving] = useState(false);
   const firstField = useRef<HTMLInputElement>(null);
@@ -79,6 +80,7 @@ export function ProfileFormPanel({ existing, onSaved, onCancel, onToast }: Profi
           api_key: apiKey || undefined,
           models: staticModels.split(",").map((s) => s.trim()).filter(Boolean),
           enabled,
+          keep_warm: keepWarm,
         }),
       });
       onToast(existing ? "Profile saved" : "Profile added");
@@ -163,7 +165,10 @@ export function ProfileFormPanel({ existing, onSaved, onCancel, onToast }: Profi
           />
         </div>
         <div className="profile-form-foot">
-          <Checkbox checked={enabled} onChange={setEnabled} label="Enabled" />
+          <div className="profile-form-checks">
+            <Checkbox checked={enabled} onChange={setEnabled} label="Enabled" />
+            <Checkbox checked={keepWarm} onChange={setKeepWarm} label="Keep prompt cache warm" />
+          </div>
           <div className="profile-form-buttons">
             <button type="button" className="btn small" onClick={onCancel}>
               Cancel

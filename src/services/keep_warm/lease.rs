@@ -1,12 +1,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::http::HeaderValue;
 use bytes::Bytes;
 
-use super::KeepWarm;
+use super::{KeepWarm, PingTarget};
 use crate::schemas::model_id::ModelId;
-use crate::schemas::prompt_shape::PromptShape;
 
 /// One user request in flight for a worker. Dropping it ends the request.
 pub(crate) struct KeepWarmLease {
@@ -20,7 +18,7 @@ struct Recorded {
     body: Bytes,
     model_id: ModelId,
     started: Instant,
-    beta: Option<HeaderValue>,
+    target: PingTarget,
 }
 
 impl KeepWarmLease {
@@ -38,13 +36,13 @@ impl KeepWarmLease {
         body: Bytes,
         model_id: ModelId,
         started: Instant,
-        beta: Option<HeaderValue>,
+        target: PingTarget,
     ) {
         self.recorded = Some(Recorded {
             body,
             model_id,
             started,
-            beta,
+            target,
         });
     }
 
@@ -57,18 +55,16 @@ impl KeepWarmLease {
         let registry = Arc::clone(&self.registry);
         let worker = self.worker.clone();
         tokio::task::spawn_blocking(move || {
-            let Some(stream_key) =
-                PromptShape::from_body(&recorded.body).and_then(|shape| shape.stream_key)
-            else {
+            let Some(stream_key) = recorded.target.shape.stream_key(&recorded.body) else {
                 return;
             };
-            registry.touch(
+            registry.touch_with(
                 (worker, stream_key),
                 &recorded.body,
                 &recorded.model_id,
                 recorded.started,
                 cached_tokens,
-                recorded.beta,
+                recorded.target,
             );
         });
     }

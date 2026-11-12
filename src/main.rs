@@ -414,6 +414,7 @@ fn build_router(state: AppState) -> Router {
             "/api/smart-auto/decisions",
             get(routes::smart_auto::decisions),
         )
+        .route("/api/smart-auto/health", get(routes::smart_auto::health))
         .route("/api/copilot/usage", get(routes::copilot::usage))
         .route("/api/usage/sources", get(routes::profile_usage::sources))
         .route(
@@ -813,7 +814,11 @@ mod tests {
         assert_eq!(body["selection"]["stale"], false);
         assert_eq!(without_key.status().as_u16(), 401);
 
-        for route in ["/api/smart-auto/history", "/api/smart-auto/decisions"] {
+        for route in [
+            "/api/smart-auto/history",
+            "/api/smart-auto/decisions",
+            "/api/smart-auto/health",
+        ] {
             let url = format!("{base}{route}");
             let with_key = client
                 .get(&url)

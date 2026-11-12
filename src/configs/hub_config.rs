@@ -7,9 +7,9 @@ use super::managed_command::ManagedCommand;
 use super::profile_config::ProfileConfig;
 use super::usage_source::{BIFROST_KEY_PREFIX, UsageSource};
 use crate::consts::{
-    DEFAULT_BIND, DEFAULT_COPILOT_PRICES_REFRESH_SECS, DEFAULT_KEEP_WARM_ENABLED,
-    DEFAULT_KEEP_WARM_IDLE_CAP_MINUTES, DEFAULT_MAX_REPLAY_BYTES, DEFAULT_MAX_REQUEST_BODY_BYTES,
-    DEFAULT_PORT, DEFAULT_SSE_KEEPALIVE_MS,
+    DEFAULT_BIND, DEFAULT_COPILOT_PRICES_REFRESH_SECS, DEFAULT_FIRST_BYTE_TIMEOUT_MS,
+    DEFAULT_KEEP_WARM_ENABLED, DEFAULT_KEEP_WARM_IDLE_CAP_MINUTES, DEFAULT_MAX_REPLAY_BYTES,
+    DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_PORT, DEFAULT_SSE_KEEPALIVE_MS,
 };
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
@@ -62,6 +62,9 @@ pub struct HubConfig {
     /// Idle gap after which an SSE response gets a keepalive comment frame.
     /// `None` when `LLM_HUB_SSE_KEEPALIVE_MS=0` — the knob's off switch.
     pub sse_keepalive: Option<Duration>,
+    /// Longest wait for the first byte of a streamed Smart Auto attempt on a remote profile.
+    /// `None` when `LLM_HUB_FIRST_BYTE_TIMEOUT_MS=0`. A model that misses it is cooled.
+    pub first_byte_timeout: Option<Duration>,
     /// How often the Copilot price table is fetched. `None` when
     /// `LLM_HUB_COPILOT_PRICES_REFRESH_SECS=0`: the hub never fetches it.
     pub copilot_prices_refresh: Option<Duration>,
@@ -145,6 +148,13 @@ impl HubConfig {
             _ => DEFAULT_SSE_KEEPALIVE_MS,
         };
 
+        let first_byte_timeout_ms: u64 = match get("FIRST_BYTE_TIMEOUT_MS") {
+            Some(v) if !v.is_empty() => v
+                .parse()
+                .map_err(|_| format!("LLM_HUB_FIRST_BYTE_TIMEOUT_MS is not a number: {v}"))?,
+            _ => DEFAULT_FIRST_BYTE_TIMEOUT_MS,
+        };
+
         let copilot_prices_refresh_secs: u64 = match get("COPILOT_PRICES_REFRESH_SECS") {
             Some(v) if !v.is_empty() => v
                 .parse()
@@ -203,6 +213,8 @@ impl HubConfig {
                 |list| split_list(&list),
             ),
             sse_keepalive: (sse_keepalive_ms > 0).then(|| Duration::from_millis(sse_keepalive_ms)),
+            first_byte_timeout: (first_byte_timeout_ms > 0)
+                .then(|| Duration::from_millis(first_byte_timeout_ms)),
             copilot_prices_refresh: (copilot_prices_refresh_secs > 0)
                 .then(|| Duration::from_secs(copilot_prices_refresh_secs)),
             keep_warm,
@@ -286,6 +298,13 @@ impl HubConfig {
             model_prices,
             managed,
             copilot,
+            keep_warm: get("KEEP_WARM").is_none_or(|v| !is_falsy(&v)),
+            first_byte_timeout_ms: match get("FIRST_BYTE_TIMEOUT_MS").filter(|v| !v.is_empty()) {
+                None => None,
+                Some(v) => Some(v.parse().map_err(|_| {
+                    format!("LLM_HUB_{upper}_FIRST_BYTE_TIMEOUT_MS is not a number: {v}")
+                })?),
+            },
         })
     }
 }
@@ -780,6 +799,68 @@ mod tests {
                 "LLM_HUB_SSE_KEEPALIVE_MS={value}"
             );
         }
+    }
+
+    #[test]
+    fn first_byte_timeout_defaults_and_zero_disables() {
+        for (value, expected) in [
+            (
+                None,
+                Some(Duration::from_millis(DEFAULT_FIRST_BYTE_TIMEOUT_MS)),
+            ),
+            (Some("0"), None),
+            (Some("5000"), Some(Duration::from_millis(5000))),
+            (
+                Some(""),
+                Some(Duration::from_millis(DEFAULT_FIRST_BYTE_TIMEOUT_MS)),
+            ),
+        ] {
+            let mut vars = base_vars();
+            if let Some(value) = value {
+                vars.insert("LLM_HUB_FIRST_BYTE_TIMEOUT_MS".into(), value.into());
+            }
+            let cfg = HubConfig::from_map(&vars).unwrap();
+            assert_eq!(cfg.first_byte_timeout, expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn first_byte_timeout_rejects_a_non_numeric_value() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_FIRST_BYTE_TIMEOUT_MS".into(), "soon".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_FIRST_BYTE_TIMEOUT_MS"), "{err}");
+    }
+
+    #[test]
+    fn a_profile_first_byte_timeout_parses_and_rejects_text() {
+        let mut vars = base_vars();
+        let limit = |vars: &HashMap<String, String>| {
+            HubConfig::from_map(vars)
+                .unwrap()
+                .profile("groq")
+                .unwrap()
+                .first_byte_timeout_ms
+        };
+        assert_eq!(limit(&vars), None);
+        vars.insert("LLM_HUB_GROQ_FIRST_BYTE_TIMEOUT_MS".into(), "1500".into());
+        assert_eq!(limit(&vars), Some(1500));
+        vars.insert("LLM_HUB_GROQ_FIRST_BYTE_TIMEOUT_MS".into(), "soon".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("GROQ_FIRST_BYTE_TIMEOUT_MS"), "{err}");
+    }
+
+    #[test]
+    fn a_profile_keeps_its_cache_warm_unless_it_opts_out() {
+        let mut vars = base_vars();
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert!(cfg.profiles.iter().all(|profile| profile.keep_warm));
+
+        vars.insert("LLM_HUB_GROQ_KEEP_WARM".into(), "false".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        let warm = |name: &str| cfg.profile(name).unwrap().keep_warm;
+        assert!(warm("openai"));
+        assert!(!warm("groq"));
     }
 
     #[test]

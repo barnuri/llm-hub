@@ -44,7 +44,7 @@ export function KeepWarmPanel({ settings, readonly, onSaved, onToast }: KeepWarm
   };
 
   return (
-    <Panel title="Cache keep-warm" sub="Copilot Claude prompt cache">
+    <Panel title="Cache keep-warm" sub="Prompt cache of every profile">
       <form className="keep-warm-form" onSubmit={(event) => void save(event)}>
         <Checkbox checked={enabled} disabled={locked || saving} onChange={setEnabled} label="Keep idle streams warm" />
         <label className="keep-warm-field">
@@ -66,7 +66,7 @@ export function KeepWarmPanel({ settings, readonly, onSaved, onToast }: KeepWarm
       </form>
       <p className="dim models-side-note">
         Saved as <code>LLM_HUB_KEEP_WARM</code> and <code>LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES</code>. Pings go out at
-        most 10 per minute in total.
+        most 10 per minute in total. Each profile can opt out in its own settings; local servers are never pinged.
         {readonly ? " Config is read-only." : ""}
       </p>
       {settings.overridden_by_env ? (

@@ -13,5 +13,7 @@ pub struct ProfileInput {
     pub headers: Option<HashMap<String, String>>,
     pub timeout_ms: Option<u64>,
     pub enabled: Option<bool>,
+    /// Omitted on update => keep the profile's current setting; a new profile starts on.
+    pub keep_warm: Option<bool>,
     pub models: Option<Vec<String>>,
 }

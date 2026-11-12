@@ -208,6 +208,8 @@ mod tests {
             model_prices: HashMap::new(),
             managed: None,
             copilot,
+            keep_warm: true,
+            first_byte_timeout_ms: None,
         }
     }
 

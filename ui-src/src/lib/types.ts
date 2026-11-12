@@ -35,6 +35,8 @@ export interface ProfileRow {
   readonly headers: Record<string, string>;
   readonly timeout_ms: number | null;
   readonly enabled: boolean;
+  /** Keep this profile's idle prompt caches warm with pings (`LLM_HUB_<NAME>_KEEP_WARM`, on by default). */
+  readonly keep_warm: boolean;
   readonly models: readonly string[];
   readonly healthy: boolean | null;
   /** True for a native GitHub Copilot profile. */
@@ -464,4 +466,28 @@ export interface SmartAutoEffectRow {
 
 export interface SmartAutoEffectResponse {
   readonly rows: readonly SmartAutoEffectRow[];
+}
+
+/** What Smart Auto measured about one model on one route (`GET /api/smart-auto/health`). */
+export interface ModelHealthRow {
+  readonly model: string;
+  readonly endpoint: string;
+  /** Failures in a row; 0 after an answer. */
+  readonly failures: number;
+  readonly last_failure: "timeout" | "transport" | { readonly status: number } | null;
+  /** Milliseconds left before Smart Auto picks the model again; 0 when it is not cooled. */
+  readonly cooled_for_ms: number;
+  /** Share of recent attempts that failed on the model's side, 0 to 1. */
+  readonly error_rate: number;
+  readonly outcomes: number;
+  readonly ttft_ms: number | null;
+  readonly samples: number;
+  /** 0 (slow) to 10 (fast); null until enough samples. */
+  readonly speed: number | null;
+}
+
+export interface ModelHealthSnapshot {
+  readonly models: readonly ModelHealthRow[];
+  /** Cost score per priced model: 0 dearest, 10 free. */
+  readonly costs: Record<string, number>;
 }

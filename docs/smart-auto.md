@@ -82,7 +82,7 @@ The steps:
 8. **Effort.** See [Effort](#effort).
 9. **Review decision.** See [Review](#review).
 10. **Stream or buffer.** A checked answer is held until the check ends. Every other answer streams. A reply with a tool call goes out at once, unchecked.
-11. **Fallbacks.** The `x-llm-hub-fallbacks` chain and the default chain use the same pool. A fallback the policy forbids is never called.
+11. **Fallbacks.** The `x-llm-hub-fallbacks` chain and the default chain use the same pool. A fallback the policy forbids is never called. After them the hub adds up to two more models from the pool, best score first, so a pick that hangs or fails is answered inside the same request. See [Live signals](#live-signals).
 12. **History.** Each dispatch writes a `selected` event before the request is sent. Then it writes `started` on a 2xx, then `completed`, `rejected` or `cancelled`. Checks add `judge`, `critic` and `repair` events.
 13. **Status line.** Shows the worker's current model. See [Where to see things](#where-to-see-things).
 
@@ -161,7 +161,32 @@ Among eligible models, the router picks the highest score. Ties go to the most u
 - **Capable bonus.** A model whose role quality is at least 5 gets +1000. So every capable model beats every other one.
 - **Usage.** The 30-day request count gives 0 points below 128 requests, 1 point below 32,768, and 2 points above. Usage only separates near ties.
 
-Ranking uses these built-in seeds and the usage counts. It does not use measured latency or quality.
+The seeds are the starting point. [Live signals](#live-signals) replace the cost and speed seeds with what the hub measured, and take points off for failures and a low quota.
+
+### Live signals
+
+The seed table cannot know that a model is down, slow today, dear on this account, or on a profile that is running out of quota. The hub measures these four things in memory and feeds them into the same score. None of them adds a network call, a process or a disk read to the request path.
+
+| Signal | Measured from | Effect on the score |
+|---|---|---|
+| Cost | The price book: configured rates, published Copilot rates and rates an upstream lists. Blended as three parts input to one part output, in USD per million tokens. | Replaces the seed cheapness: 10 for a local or sub-$0.10 model, 0 above $100. A model with no known price keeps its seed. |
+| Speed | Time to the first byte of each streamed answer, averaged with recent answers weighted most. Needs 3 samples, and a sample goes stale after 30 minutes. | Replaces the seed speed with two parts measured to one part seed. Scores run from 10 (under 1 s) to 0 (over 20 s). Buffered answers are not counted, because their first byte is the whole answer. |
+| Error rate | The share of recent attempts that failed on the model's side: a timeout, a transport error, 404, 408, 429 or 5xx. Needs 5 attempts. | Takes off 100 points at a 100% rate, so 5% costs 5 points. A 400, 401, 403 or 422 describes the request or the account and is not counted. |
+| Quota | The cached quota of the model's profile (Copilot, Bifrost). A snapshot older than an hour is ignored. | Nothing above 30% left. Below that, 1 point per percent, up to 30. |
+
+One further rule keeps a broken model out of the pool, not just lower in the ranking:
+
+- **Cooldown.** A failed attempt cools the model on that route for 30 seconds. Each failure in a row doubles the wait, up to 10 minutes. An answer clears it. The model rejoins the pool when the wait ends, so the next request tests it.
+
+A quota only costs points. It applies to every model of the profile, because the hub cannot tell which models a quota meters. A metered model that the upstream refuses is cooled by its own error.
+
+A cooled model is also dropped from the fallback chain and from the checker candidates. If every model would be dropped, the pool is left whole: a model that may fail beats a certain 400. A kept model that cools leaves the pool, so its conversation moves to a fresh pick.
+
+The marks are per route (`/v1/messages`, `/v1/chat/completions`, ...), because a model can lack one route and serve the others. Nothing is stored: a restart clears every mark and sample.
+
+**First-byte limit.** A streamed Smart Auto attempt on a remote profile must send its first byte within `LLM_HUB_FIRST_BYTE_TIMEOUT_MS` (20 seconds by default, `0` turns it off). A silent model gets a `timeout`, is cooled, and the next fallback runs. When the chain has no fallback left, the hub tries the next best models of the same pool, at most two: the first from another profile when the pool has one (a gateway that hangs usually hangs for all its models), then the best of the rest by the same score. The limit does not apply to buffered turns (a checked answer, or a client that did not ask to stream), to local servers (managed, or on this machine) that may be loading, or to a request that sets `x-llm-hub-timeout-ms`, which wins. A profile with a shorter `LLM_HUB_<NAME>_TIMEOUT_MS` keeps it. Only the first chunk is held back, so a healthy stream is not delayed.
+
+See what the hub measured with `GET /api/smart-auto/health`.
 
 ### Effort
 
@@ -218,6 +243,7 @@ If a check runs out of budget, times out or returns a bad verdict, the draft is 
   - `GET /api/smart-auto/current?worker=<id>` or `?session=<id>`: the worker's main model, its active stages, `age_ms`, and `stale` (true after 10 minutes). `selection` is `null` before the first event. Returns 400 without either parameter.
   - `GET /api/smart-auto/history?workflow=&worker=&since_seq=&limit=`: events after `since_seq`, oldest first. `limit` defaults to 200 and is capped at 1,000.
   - `GET /api/smart-auto/decisions?limit=N`: the newest routes first, from memory. `limit` defaults to 50 and is capped at 200.
+  - `GET /api/smart-auto/health`: each `(model, route)` the hub attempted, with `failures` in a row, `last_failure`, `cooled_for_ms` (above 0 means skipped), `error_rate`, `outcomes`, `ttft_ms`, `samples` and `speed`. `costs` holds the cost score of each priced model.
   - `GET /api/smart-auto/rules`: the active rules, their source (`file`, `env` or `none`), and whether they are read-only.
   - `PUT /api/smart-auto/rules`: checks the JSON, saves it atomically and makes it active. Refused when env rules own the rules.
   - `GET /api/smart-auto/rules/effect`: each known model's outcome under the current rules, with the reason and the glob that decided it.

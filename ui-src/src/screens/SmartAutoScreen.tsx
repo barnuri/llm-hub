@@ -4,6 +4,7 @@ import { CostOverTimePanel } from "../components/CostOverTimePanel";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
 import { SmartAutoFeaturesPanel } from "../components/SmartAutoFeaturesPanel";
 import { KpiCard } from "../components/KpiCard";
+import { ModelHealthPanel } from "../components/ModelHealthPanel";
 import { ModelName } from "../components/ModelName";
 import { Panel } from "../components/Panel";
 import { Pill, type PillTone } from "../components/Pill";
@@ -1456,6 +1457,7 @@ export function SmartAutoScreen({ profiles, prices }: SmartAutoScreenProps) {
         <SmartAutoFeaturesPanel events={filtered} kinds={kinds} prices={prices} />
         <CostOverTimePanel />
         <CostByTierRolePanel range={range} />
+        <ModelHealthPanel />
       </>
     );
   }

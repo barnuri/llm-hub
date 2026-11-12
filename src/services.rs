@@ -34,6 +34,7 @@ pub mod managed_process;
 #[cfg(test)]
 pub mod memory_credential_store;
 pub mod model_descriptors;
+pub mod model_health;
 pub mod model_limits;
 pub(crate) mod model_picker;
 pub mod multipart_model;
@@ -55,6 +56,7 @@ pub mod session_insights;
 pub mod smart_auto_affinity;
 pub mod smart_auto_decisions;
 pub mod smart_auto_effort;
+pub mod smart_auto_live;
 pub mod smart_auto_pool;
 pub mod smart_auto_roles;
 pub mod smart_auto_router;
