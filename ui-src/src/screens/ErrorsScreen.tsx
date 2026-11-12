@@ -31,8 +31,11 @@ interface ReasonGroup {
   readonly lastTsMs: number;
 }
 
+// A gateway stamps every failure with a unique `request_id=<uuid>`; strip it so repeats group.
+const REQUEST_ID = / · request_id=[0-9a-f-]+/i;
+
 function reasonOf(row: UsageRow): string {
-  return row.error ?? UNRECORDED_REASON;
+  return row.error?.replace(REQUEST_ID, "") ?? UNRECORDED_REASON;
 }
 
 function groupReasons(rows: readonly UsageRow[]): readonly ReasonGroup[] {

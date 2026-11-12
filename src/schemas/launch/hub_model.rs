@@ -1,11 +1,17 @@
 use serde_json::Value;
 
-/// One `/v1/models` entry, with the window and output limit the hub reports for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+use super::hub_model_price::HubModelPrice;
+
+/// One `/v1/models` entry: the window, output limit, picker label and price the hub reports for it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct HubModel {
     id: String,
     context_window: Option<u64>,
     advertised_max_output_tokens: Option<u64>,
+    display_name: Option<String>,
+    recommended: bool,
+    vision: bool,
+    price: Option<HubModelPrice>,
 }
 
 impl HubModel {
@@ -20,7 +26,36 @@ impl HubModel {
             id: id.to_string(),
             context_window,
             advertised_max_output_tokens: None,
+            display_name: None,
+            recommended: false,
+            vision: false,
+            price: None,
         }
+    }
+
+    /// A catalog entry with a picker label, marked recommended or not.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_display_name(mut self, name: &str, recommended: bool) -> Self {
+        self.display_name = Some(name.to_string());
+        self.recommended = recommended;
+        self
+    }
+
+    /// A catalog entry that takes images.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_vision(mut self) -> Self {
+        self.vision = true;
+        self
+    }
+
+    /// A catalog entry with a listed price.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_price(mut self, price: HubModelPrice) -> Self {
+        self.price = Some(price);
+        self
     }
 
     /// A catalog entry whose hub entry advertises `max_output_tokens`.
@@ -54,7 +89,40 @@ impl HubModel {
             id: entry.get("id")?.as_str()?.to_string(),
             context_window: entry.get("context_window").and_then(Value::as_u64),
             advertised_max_output_tokens: entry.get("max_output_tokens").and_then(Value::as_u64),
+            display_name: entry
+                .get("display_name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            recommended: entry.get("recommended").and_then(Value::as_bool) == Some(true),
+            vision: entry
+                .pointer("/capabilities/supports/vision")
+                .and_then(Value::as_bool)
+                == Some(true),
+            price: HubModelPrice::from_entry(entry),
         })
+    }
+
+    /// The picker label the hub lists, with " (recommended)" on the hub's recommended entry.
+    #[must_use]
+    pub fn picker_label(&self) -> Option<String> {
+        let name = self.display_name.as_deref()?;
+        Some(if self.recommended {
+            format!("{name} (recommended)")
+        } else {
+            name.to_string()
+        })
+    }
+
+    /// Whether the model takes image and PDF attachments.
+    #[must_use]
+    pub fn takes_attachments(&self) -> bool {
+        self.vision
+    }
+
+    /// The price the hub lists, in USD per one million tokens.
+    #[must_use]
+    pub fn price(&self) -> Option<&HubModelPrice> {
+        self.price.as_ref()
     }
 
     /// The hub model id.
@@ -114,6 +182,31 @@ mod tests {
                 HubModel::new("llama_swap/glm-4.7-flash", None),
             ]
         );
+    }
+
+    #[test]
+    fn list_reads_the_picker_label_vision_and_price() {
+        let payload = json!({"data": [
+            {"id": "hub/smart-auto-balance", "display_name": "Smart Auto (Balance)",
+             "recommended": true},
+            {"id": "copilot/claude-opus-5-5", "display_name": "claude-opus-5-5 · copilot · $4/$20",
+             "capabilities": {"supports": {"vision": true}},
+             "llm_hub_price": {"input_usd_per_1m": 4.0, "output_usd_per_1m": 20.0}},
+        ]});
+
+        let models = HubModel::list_from(&payload);
+
+        assert_eq!(
+            models[0].picker_label().as_deref(),
+            Some("Smart Auto (Balance) (recommended)")
+        );
+        assert!(!models[0].takes_attachments());
+        assert_eq!(
+            models[1].picker_label().as_deref(),
+            Some("claude-opus-5-5 · copilot · $4/$20")
+        );
+        assert!(models[1].takes_attachments());
+        assert_eq!(models[1].price(), Some(&HubModelPrice::new(4.0, 20.0)));
     }
 
     #[test]

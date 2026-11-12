@@ -76,9 +76,29 @@ such as `exec`. The command never changes `~/.codex/config.toml`.
 
 `llm-hub opencode` sets `LLM_HUB_API_KEY` and `OPENCODE_CONFIG_CONTENT`. The config adds an
 `llm-hub` provider (`@ai-sdk/openai-compatible`, base `<hub>/v1`,
-`apiKey: "{env:LLM_HUB_API_KEY}"`). The provider lists every hub model with its context and
-output limits, where the hub knows them. With a model, the config also sets
-`"model": "llm-hub/<model>"`. The command passes only your arguments to `opencode`.
+`apiKey: "{env:LLM_HUB_API_KEY}"`). The provider lists every hub model with the fields the
+hub knows:
+
+- `name`: the hub's picker label, the same one Claude Code's `/model` shows (for example
+  `claude-opus-5-5 · copilot · $4/$20` or `Smart Auto (Balance) (recommended)`).
+- `limit`: context and output limits.
+- `cost`: input, output and cache rates in USD per 1M tokens, so opencode reports the session cost.
+- `attachment: true`: when the model takes images.
+
+`--profiles` and the `--smart-auto-*` flags become provider `headers`, as with
+`llm-hub claude`. The config sets `enabled_providers: ["llm-hub"]`, so the model picker lists hub
+models only. With no model named, the command uses `hub/<tier>` (default
+`hub/smart-auto-balance`). The config sets `model` and `small_model` to
+`llm-hub/<model>`. The command passes only your arguments to `opencode`, after `--standalone`:
+opencode 2 runs every TUI on one background service, which never reads the launcher's
+`OPENCODE_CONFIG_CONTENT`, so the command starts a private server instead. Pass `--server <url>`
+or `--standalone` yourself to replace it.
+
+Opencode sends no session id of its own. The server plugin
+`~/.config/opencode/plugins/llm-hub-session.ts` adds `x-llm-hub-session-id: <opencode session
+id>` to every `llm-hub` request. The hub reads it as it reads `x-claude-code-session-id`, so
+Smart Auto keeps per-session state, and the status line reads
+`/api/smart-auto/current?session=<id>`. The hub never forwards the header upstream.
 
 ## llm-hub copilot-cli
 

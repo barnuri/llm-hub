@@ -63,6 +63,8 @@ pub const HEADER_SYSTEM_PROMPT_MODE: &str = "x-llm-hub-system-prompt-mode";
 pub const HEADER_REASONING_STRIP: &str = "x-llm-hub-reasoning-strip";
 /// Response-side diagnostic: which request transforms actually fired.
 pub const HEADER_TRANSFORMS: &str = "x-llm-hub-transforms";
+/// Harnesses without a native session header (opencode) name their conversation in this one.
+pub const HEADER_SESSION_ID: &str = "x-llm-hub-session-id";
 /// Response-side diagnostic on `<profile>/auto`: Auto's own pick, as a qualified id.
 pub const HEADER_AUTO_PICK: &str = "x-llm-hub-auto-pick";
 /// Response-side diagnostic on `<profile>/auto`: why the served model was chosen.

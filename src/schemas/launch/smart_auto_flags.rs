@@ -23,8 +23,8 @@ impl SmartAutoFlags {
     const EXCLUDE_FLAG: &str = "--smart-auto-exclude";
     const ROLE_FLAG: &str = "--smart-auto-role";
     const END_OF_OPTIONS: &str = "--";
-    /// Smart Auto flags that a preset id cannot carry; the Claude launcher sends these as headers.
-    const PRESET_ONLY: &str = "Smart Auto flags other than a tier or a 1M minimum need the claude launcher, which sends them as headers";
+    /// Smart Auto flags that a preset id cannot carry; the Claude and opencode launchers send these as headers.
+    const PRESET_ONLY: &str = "Smart Auto flags other than a tier or a 1M minimum need the claude or opencode launcher, which sends them as headers";
     const LIST_SEPARATOR: &str = ",";
     const ROLE_NAMES: &str = "planning, investigation, implementation, validation or conversation";
 
@@ -69,39 +69,36 @@ impl SmartAutoFlags {
     /// The `Name: value` lines that send these flags as Smart Auto request headers.
     #[must_use]
     pub fn header_lines(&self) -> Vec<String> {
+        self.headers()
+            .into_iter()
+            .map(|(name, value)| format!("{name}: {value}"))
+            .collect()
+    }
+
+    /// The Smart Auto request headers that send these flags, as name and value pairs.
+    #[must_use]
+    pub fn headers(&self) -> Vec<(&'static str, String)> {
         let policy = &self.policy;
-        let mut lines = Vec::new();
+        let mut headers = Vec::new();
         if let Some(tier) = policy.tier {
-            lines.push(Self::header_line(SmartAutoHeaders::TIER, tier.as_str()));
+            headers.push((SmartAutoHeaders::TIER, tier.as_str().to_string()));
         }
         for allow_list in &policy.include {
-            lines.push(Self::header_line(
-                SmartAutoHeaders::INCLUDE,
-                &Self::join_globs(allow_list),
-            ));
+            headers.push((SmartAutoHeaders::INCLUDE, Self::join_globs(allow_list)));
         }
         if !policy.exclude.is_empty() {
-            lines.push(Self::header_line(
-                SmartAutoHeaders::EXCLUDE,
-                &Self::join_globs(&policy.exclude),
-            ));
+            headers.push((SmartAutoHeaders::EXCLUDE, Self::join_globs(&policy.exclude)));
         }
         if let Some(tokens) = policy.min_context_tokens {
-            lines.push(Self::header_line(
-                SmartAutoHeaders::MIN_CONTEXT,
-                &tokens.to_string(),
-            ));
+            headers.push((SmartAutoHeaders::MIN_CONTEXT, tokens.to_string()));
         }
         if let Some(tokens) = policy.min_input_tokens {
-            lines.push(Self::header_line(
-                SmartAutoHeaders::MIN_INPUT,
-                &tokens.to_string(),
-            ));
+            headers.push((SmartAutoHeaders::MIN_INPUT, tokens.to_string()));
         }
         if let Some(role) = policy.role {
-            lines.push(Self::header_line(SmartAutoHeaders::ROLE, role.as_str()));
+            headers.push((SmartAutoHeaders::ROLE, role.as_str().to_string()));
         }
-        lines
+        headers
     }
 
     /// The built-in Smart Auto model id that carries exactly these flags, for a launcher without headers.
@@ -198,10 +195,6 @@ impl SmartAutoFlags {
 
     fn qualified(name: &str) -> String {
         format!("{}/{name}", HubSelector::NAMESPACE)
-    }
-
-    fn header_line(name: &str, value: &str) -> String {
-        format!("{name}: {value}")
     }
 
     fn join_globs(globs: &BTreeSet<String>) -> String {

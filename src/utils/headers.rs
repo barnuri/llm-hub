@@ -2,7 +2,7 @@ use axum::http::header::HeaderMap;
 
 use crate::consts::{
     HEADER_FALLBACKS, HEADER_FALLBACKS_ALIAS, HEADER_REASONING_STRIP, HEADER_RETRY_ON,
-    HEADER_SYSTEM_PROMPT_MODE, HEADER_TIMEOUT_MS,
+    HEADER_SESSION_ID, HEADER_SYSTEM_PROMPT_MODE, HEADER_TIMEOUT_MS,
 };
 use crate::schemas::smart_auto_headers::SmartAutoHeaders;
 
@@ -20,7 +20,7 @@ const HOP_BY_HOP: [&str; 8] = [
 /// Headers that must never be forwarded upstream on top of hop-by-hop ones:
 /// the caller's auth (replaced by the profile key), host/length (set by the
 /// client lib), and llm-hub control headers.
-const REQUEST_ONLY_STRIP: [&str; 11] = [
+const REQUEST_ONLY_STRIP: [&str; 12] = [
     "authorization",
     "x-api-key",
     "host",
@@ -31,6 +31,7 @@ const REQUEST_ONLY_STRIP: [&str; 11] = [
     HEADER_RETRY_ON,
     HEADER_SYSTEM_PROMPT_MODE,
     HEADER_REASONING_STRIP,
+    HEADER_SESSION_ID,
     crate::schemas::launch::profile_filter::ProfileFilter::HEADER,
 ];
 
@@ -98,6 +99,7 @@ mod tests {
             ("transfer-encoding", "chunked"),
             ("x-llm-hub-fallbacks", "a/b"),
             ("x-llm-hub-profiles", "copilot"),
+            ("x-llm-hub-session-id", "ses_1"),
             ("content-type", "application/json"),
         ]));
         assert_eq!(out.len(), 1);

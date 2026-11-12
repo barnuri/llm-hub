@@ -17,8 +17,8 @@ latency rules and the rebuild steps. Read `local.md` in this folder if it exists
 machine-specific paths and overrides the defaults below.
 
 Read-only collection never needs approval. Editing source, tests, and the rebuild do not need
-approval either. Ask (AskUserQuestion) only before a profile `DELETE`, a `.env` change, a
-publish, or marking rows solved.
+approval either. Marking rows solved for a fixed `code` group (step 9) needs no approval. Ask
+(AskUserQuestion) only before a profile `DELETE`, a `.env` change, or a publish.
 
 ## Steps
 
@@ -48,8 +48,9 @@ publish, or marking rows solved.
    `./target/release/llm-hub service install`, then `curl -s http://127.0.0.1:8888/healthz` must print `ok`.
 8. Verify. Re-run steps 1 and 2. Every profile that was failing must show `healthy: true`, or a
    stated reason in step 5. Count the open rows from the last 24 hours in the feed. Expect zero from fixed causes.
-9. Mark solved. After verify passes, ask with AskUserQuestion which fixed groups to mark. Then for
-   the open rows of those groups with a non-null `id`, run
+9. Mark solved. Always do this once verify passes. Do not ask. Mark every group you fixed in
+   this run, and only those. Leave `config` and `upstream` groups open. For the open rows of the
+   fixed groups with a non-null `id`, run
    `curl -s -X POST http://127.0.0.1:8888/api/errors/resolve -H 'Content-Type: application/json' -d '{"ids":[...],"solved":true}'`
    (max 500 ids per call). Marking a reason also covers its older occurrences. A newer occurrence
    of a solved reason shows as open again. Use `"solved":false` only to reopen rows the user names.

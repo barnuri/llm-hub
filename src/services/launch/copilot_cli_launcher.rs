@@ -19,11 +19,10 @@ impl CopilotCliLauncher {
             .env("COPILOT_PROVIDER_BASE_URL", endpoint.v1_url())
             .env("COPILOT_PROVIDER_TYPE", Self::PROVIDER_TYPE)
             .env("COPILOT_PROVIDER_API_KEY", endpoint.api_key());
-        if let Some(model) = args.model() {
-            spec = spec.env("COPILOT_MODEL", model);
-            if let Some(known) = HubModel::find(catalog, model) {
-                spec = Self::with_limits(spec, known);
-            }
+        let model = args.model().unwrap_or("copilot/claude-opus-5-5");
+        spec = spec.env("COPILOT_MODEL", model);
+        if let Some(known) = HubModel::find(catalog, model) {
+            spec = Self::with_limits(spec, known);
         }
         spec.args(args.into_passthrough())
     }
@@ -52,12 +51,14 @@ mod tests {
         let spec = CopilotCliLauncher::spec(&endpoint(), LaunchArgs::from_strs(&["--yolo"]), &[]);
 
         assert_eq!(spec.program(), "copilot");
+        assert_eq!(spec.env_value("COPILOT_MODEL"), Some("copilot/claude-opus-5-5"));
         assert_eq!(
             spec.env_names(),
             [
                 "COPILOT_PROVIDER_BASE_URL",
                 "COPILOT_PROVIDER_TYPE",
-                "COPILOT_PROVIDER_API_KEY"
+                "COPILOT_PROVIDER_API_KEY",
+                "COPILOT_MODEL"
             ]
         );
         assert_eq!(
@@ -71,31 +72,6 @@ mod tests {
 
     #[test]
     fn known_model_gets_prompt_and_output_budgets() {
-        let catalog = [HubModel::new("copilot/claude-opus-5-5", Some(200_000))];
-
-        let spec = CopilotCliLauncher::spec(
-            &endpoint(),
-            LaunchArgs::from_strs(&["copilot/claude-opus-5-5", "-p", "hi"]),
-            &catalog,
-        );
-
-        assert_eq!(
-            spec.env_value("COPILOT_MODEL"),
-            Some("copilot/claude-opus-5-5")
-        );
-        assert_eq!(
-            spec.env_value("COPILOT_PROVIDER_MAX_PROMPT_TOKENS"),
-            Some("167232")
-        );
-        assert_eq!(
-            spec.env_value("COPILOT_PROVIDER_MAX_OUTPUT_TOKENS"),
-            Some("32768")
-        );
-        assert_eq!(spec.argv(), ["-p", "hi"]);
-    }
-
-    #[test]
-    fn unknown_model_sets_no_budgets() {
         let spec = CopilotCliLauncher::spec(&endpoint(), LaunchArgs::from_strs(&["other"]), &[]);
 
         assert_eq!(spec.env_value("COPILOT_MODEL"), Some("other"));

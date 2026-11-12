@@ -240,6 +240,9 @@ pub(crate) async fn attempt_loop(
     }
 
     let client_path = bare_path(path_and_query);
+    if client_path == NATIVE_COUNT_TOKENS_PATH && !serves_native_count_tokens(state, &chain[0]) {
+        return Ok(local_count_tokens(bodies.original.len()));
+    }
     let client = client_signature(headers);
     // The Smart Auto template already holds the worker key of the caller's worker id, else its session.
     let worker = smart
@@ -1365,10 +1368,13 @@ async fn resolve_auto(
     })
 }
 
-/// The caller's Claude Code session id, kept only when it is `[A-Za-z0-9._-]{1,128}`,
-/// so the log and the decisions API never echo arbitrary header bytes.
+/// The caller's session id, from Claude Code's header or else the hub's own, kept only when it
+/// is `[A-Za-z0-9._-]{1,128}`, so the log and the decisions API never echo arbitrary header bytes.
 fn claude_code_session_id(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(HEADER_CLAUDE_CODE_SESSION_ID)?.as_bytes();
+    let value = headers
+        .get(HEADER_CLAUDE_CODE_SESSION_ID)
+        .or_else(|| headers.get(crate::consts::HEADER_SESSION_ID))?
+        .as_bytes();
     let valid = (1..=CLAUDE_CODE_SESSION_ID_MAX_LEN).contains(&value.len())
         && value
             .iter()
@@ -2341,6 +2347,25 @@ fn parts_for_rewrite(response: &reqwest::Response) -> (StatusCode, reqwest::Vers
     let mut headers = response.headers().clone();
     headers.remove(reqwest::header::CONTENT_LENGTH);
     (response.status(), response.version(), headers)
+}
+
+/// True when the upstream serves Anthropic token counting for this model.
+fn serves_native_count_tokens(state: &AppState, model_id: &ModelId) -> bool {
+    state
+        .upstream_model(&model_id.profile, &model_id.model)
+        .is_some_and(|model| model.native_messages)
+}
+
+/// Answers `count_tokens` locally, with the byte-based estimate, for an
+/// upstream without the route. It saves the round trip and the 405 it returns.
+fn local_count_tokens(body_bytes: usize) -> Response {
+    let body = serde_json::json!({"input_tokens": estimated_prompt_tokens(body_bytes)});
+    let mut response = Response::new(Body::from(body.to_string()));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 /// Copilot serves Anthropic token counting at `/v1/messages/count_tokens`, so a
@@ -5061,6 +5086,34 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn count_tokens_on_a_model_without_the_route_is_answered_locally() {
+            let copilot = copilot().await;
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                NATIVE_COUNT_TOKENS_PATH,
+                &client_headers(),
+                Bytes::from(anthropic_body(TRANSLATED_ID, false).to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), 200);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(reply["input_tokens"].is_u64());
+            assert!(
+                requests_to(&copilot, NATIVE_COUNT_TOKENS_PATH)
+                    .await
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
         async fn claude_model_without_native_messages_is_translated_to_chat_completions() {
             let copilot = copilot().await;
             Mock::given(method("POST"))
@@ -6333,6 +6386,23 @@ mod tests {
             assert_eq!(session("has space"), None);
             assert_eq!(session("semi;colon"), None);
             assert_eq!(claude_code_session_id(&client_headers()), None);
+        }
+
+        #[test]
+        fn hub_session_header_names_the_session_when_claude_code_header_is_absent() {
+            let mut headers = client_headers();
+            headers.insert(
+                crate::consts::HEADER_SESSION_ID,
+                HeaderValue::from_static("ses_oc1"),
+            );
+
+            assert_eq!(claude_code_session_id(&headers).as_deref(), Some("ses_oc1"));
+
+            headers.insert(
+                HEADER_CLAUDE_CODE_SESSION_ID,
+                HeaderValue::from_static("cc-1"),
+            );
+            assert_eq!(claude_code_session_id(&headers).as_deref(), Some("cc-1"));
         }
 
         #[tokio::test]

@@ -114,7 +114,7 @@ async fn build_spec(
         Harness::Claude => {
             let inherited = std::env::var(ClaudeLauncher::custom_headers_var()).ok();
             let model = ClaudeLauncher::inherited_model(|name| std::env::var(name).ok());
-            let args = claude_model(args, smart_auto, model.as_deref())?;
+            let args = header_transport_model(args, smart_auto, model.as_deref())?;
             ClaudeLauncher::spec(
                 endpoint,
                 args,
@@ -130,8 +130,14 @@ async fn build_spec(
             CodexLauncher::spec(endpoint, args, &catalog)
         }
         Harness::Opencode => {
-            let args = preset_args(args, smart_auto)?;
-            OpencodeLauncher::spec(endpoint, args, &client.models().await)
+            let args = header_transport_model(args, smart_auto, None)?;
+            OpencodeLauncher::spec(
+                endpoint,
+                args,
+                &client.models().await,
+                client.profiles(),
+                smart_auto,
+            )
         }
         Harness::CopilotCli => {
             let args = preset_args(args, smart_auto)?;
@@ -147,9 +153,10 @@ async fn build_spec(
     Ok(spec)
 }
 
-/// Claude Code with no model named or inherited uses the tier the flags name, or Balance.
-/// Smart Auto flags reach the hub only on a `hub/*` model, so a concrete model with them is an error.
-fn claude_model(
+/// A harness that sends Smart Auto flags as headers (Claude Code, opencode) with no model named or
+/// inherited uses the tier the flags name, or Balance. Smart Auto flags reach the hub only on a
+/// `hub/*` model, so a concrete model with them is an error.
+fn header_transport_model(
     args: LaunchArgs,
     smart_auto: &SmartAutoFlags,
     inherited: Option<&str>,
@@ -324,7 +331,7 @@ mod tests {
 
     #[test]
     fn claude_without_a_model_defaults_to_smart_auto_balance() {
-        let args = claude_model(
+        let args = header_transport_model(
             LaunchArgs::from_strs(&["-p", "hi"]),
             &SmartAutoFlags::default(),
             None,
@@ -340,13 +347,13 @@ mod tests {
         let efficiency = flags_of(&["--smart-auto-tier=efficiency"]);
 
         assert_eq!(
-            claude_model(LaunchArgs::from_strs(&[]), &efficiency, None)
+            header_transport_model(LaunchArgs::from_strs(&[]), &efficiency, None)
                 .unwrap()
                 .model(),
             Some("hub/smart-auto-efficiency")
         );
         assert_eq!(
-            claude_model(
+            header_transport_model(
                 LaunchArgs::from_strs(&[]),
                 &SmartAutoFlags::default(),
                 Some("hub/smart-auto-fast")
@@ -356,7 +363,7 @@ mod tests {
             None
         );
         assert_eq!(
-            claude_model(
+            header_transport_model(
                 LaunchArgs::from_strs(&["copilot/m"]),
                 &SmartAutoFlags::default(),
                 None
@@ -371,10 +378,14 @@ mod tests {
     fn smart_auto_flags_next_to_a_concrete_model_are_an_error() {
         let fast = flags_of(&["--smart-auto-tier=fast"]);
 
-        assert!(claude_model(LaunchArgs::from_strs(&["copilot/m"]), &fast, None).is_err());
-        assert!(claude_model(LaunchArgs::from_strs(&[]), &fast, Some("copilot/m")).is_err());
+        assert!(
+            header_transport_model(LaunchArgs::from_strs(&["copilot/m"]), &fast, None).is_err()
+        );
+        assert!(
+            header_transport_model(LaunchArgs::from_strs(&[]), &fast, Some("copilot/m")).is_err()
+        );
         assert_eq!(
-            claude_model(LaunchArgs::from_strs(&["hub/smart-auto-fast"]), &fast, None)
+            header_transport_model(LaunchArgs::from_strs(&["hub/smart-auto-fast"]), &fast, None)
                 .unwrap()
                 .model(),
             Some("hub/smart-auto-fast")
@@ -385,7 +396,7 @@ mod tests {
     fn a_tier_flag_naming_another_tier_than_the_model_is_an_error() {
         let fast = flags_of(&["--smart-auto-tier=fast"]);
 
-        let error = claude_model(
+        let error = header_transport_model(
             LaunchArgs::from_strs(&["hub/smart-auto-balance"]),
             &fast,
             None,
@@ -396,7 +407,7 @@ mod tests {
             "tier header `fast` conflicts with model `hub/smart-auto-balance`: use the matching model id or remove the header"
         );
         assert!(
-            claude_model(
+            header_transport_model(
                 LaunchArgs::from_strs(&[]),
                 &fast,
                 Some("hub/smart-auto-balance")
@@ -404,7 +415,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            claude_model(
+            header_transport_model(
                 LaunchArgs::from_strs(&["hub/smart-auto-long-balance"]),
                 &flags_of(&["--smart-auto-tier=balance"]),
                 None
