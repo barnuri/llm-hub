@@ -16,7 +16,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::configs::{HubConfig, LongContextTier, PriceCard, ProfileConfig, TokenRates};
+use crate::configs::{HubConfig, PriceCard, ProfileConfig, TokenRates};
 use crate::consts::{LONG_CONTEXT_SUFFIX, STATS_OVERFLOW_KEY};
 use crate::schemas::cost_parts::CostParts;
 use crate::schemas::usage_report::UsageReport;
@@ -588,6 +588,10 @@ impl PricingBook {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    reason = "fixture prices are exact decimal constants"
+)]
 mod tests {
     use super::*;
 
@@ -654,7 +658,7 @@ mod tests {
         };
         let card = PriceCard {
             base: rate(1.0),
-            long_context: Some(LongContextTier {
+            long_context: Some(crate::configs::LongContextTier {
                 threshold_tokens: 271_999,
                 rates: rate(2.0),
             }),

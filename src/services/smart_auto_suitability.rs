@@ -121,16 +121,19 @@ impl SmartAutoSuitability {
         tier: SmartAutoTier,
         signal: ModelSignal,
     ) -> u32 {
-        let seed = Self::seed(model_id);
-        let quality = seed.quality[Self::column(role, plan_backed)];
+        let model_seed = Self::seed(model_id);
+        let quality = model_seed.quality[Self::column(role, plan_backed)];
         let weights = Self::weights(tier);
-        let cost = signal.cost.unwrap_or(seed.cheapness);
-        let speed = signal.speed.map_or(u32::from(seed.speed), |measured| {
-            (u32::from(seed.speed) * (Self::SPEED_BLEND_PARTS - Self::MEASURED_SPEED_PARTS)
-                + u32::from(measured) * Self::MEASURED_SPEED_PARTS
-                + Self::SPEED_BLEND_PARTS / 2)
-                / Self::SPEED_BLEND_PARTS
-        });
+        let cost = signal.cost.unwrap_or(model_seed.cheapness);
+        let speed = signal
+            .speed
+            .map_or(u32::from(model_seed.speed), |measured| {
+                (u32::from(model_seed.speed)
+                    * (Self::SPEED_BLEND_PARTS - Self::MEASURED_SPEED_PARTS)
+                    + u32::from(measured) * Self::MEASURED_SPEED_PARTS
+                    + Self::SPEED_BLEND_PARTS / 2)
+                    / Self::SPEED_BLEND_PARTS
+            });
         let weighted = weights.quality * u32::from(quality)
             + weights.cheapness * u32::from(cost)
             + weights.speed * speed;

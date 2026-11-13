@@ -8,7 +8,6 @@ use axum::http::HeaderMap;
 use crate::consts::{HEADER_FALLBACKS, HEADER_FALLBACKS_ALIAS, HEADER_RETRY_ON, HEADER_TIMEOUT_MS};
 use crate::schemas::model_context::strip_1m_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
-use crate::services::transforms::RouteKind;
 
 /// Statuses that describe the request itself — identical on every upstream,
 /// so retrying only multiplies latency and cost. Never retried even via 5xx rule.
@@ -119,11 +118,19 @@ pub fn per_attempt_timeout_ms(headers: &HeaderMap) -> Option<u64> {
     header_str(headers, HEADER_TIMEOUT_MS)?.trim().parse().ok()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retry-After cooldown is not wired into the proxy yet"
+)]
 pub fn retry_after_cooldown_deadline(headers: &HeaderMap) -> Option<Instant> {
     let raw = header_str(headers, "retry-after")?;
     retry_after_deadline_from_raw(raw.trim())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retry-After cooldown is not wired into the proxy yet"
+)]
 pub fn profile_retry_cooldown_deadline(profile: &str) -> Option<Instant> {
     cooldowns()
         .lock()
@@ -131,6 +138,10 @@ pub fn profile_retry_cooldown_deadline(profile: &str) -> Option<Instant> {
         .and_then(|map| map.get(profile).copied())
 }
 
+#[allow(
+    dead_code,
+    reason = "Retry-After cooldown is not wired into the proxy yet"
+)]
 pub fn note_profile_retry_cooldown(profile: &str, deadline: Option<Instant>) {
     let Some(deadline) = deadline else {
         return;
@@ -140,6 +151,10 @@ pub fn note_profile_retry_cooldown(profile: &str, deadline: Option<Instant>) {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Retry-After cooldown is not wired into the proxy yet"
+)]
 pub fn skip_cooldown_profiles(chain: Vec<String>) -> Vec<String> {
     let now = Instant::now();
     let mut eligible = Vec::with_capacity(chain.len());
@@ -157,6 +172,10 @@ pub fn skip_cooldown_profiles(chain: Vec<String>) -> Vec<String> {
     cooled
 }
 
+#[allow(
+    dead_code,
+    reason = "Retry-After cooldown is not wired into the proxy yet"
+)]
 pub fn cooldown_wait_until(chain: &[String]) -> Option<Instant> {
     let now = Instant::now();
     chain
@@ -168,23 +187,31 @@ pub fn cooldown_wait_until(chain: &[String]) -> Option<Instant> {
         .min()
 }
 
+#[allow(
+    dead_code,
+    reason = "Retry-After cooldown is not wired into the proxy yet"
+)]
 fn retry_after_deadline_from_raw(raw: &str) -> Option<Instant> {
     if raw.is_empty() {
         return None;
     }
     if let Ok(seconds) = raw.parse::<u64>() {
-        return Some(Instant::now() + Duration::from_secs(seconds.min(60)));
+        return Some(Instant::now() + Duration::from_mins(1).min(Duration::from_secs(seconds)));
     }
     parse_http_date(raw).map(|when| {
         let now = SystemTime::now();
         let wait = when
             .duration_since(now)
             .unwrap_or(Duration::ZERO)
-            .min(Duration::from_secs(60));
+            .min(Duration::from_mins(1));
         Instant::now() + wait
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Retry-After cooldown is not wired into the proxy yet"
+)]
 fn parse_http_date(raw: &str) -> Option<SystemTime> {
     if raw.len() < 29 {
         return None;
@@ -209,29 +236,41 @@ fn parse_http_date(raw: &str) -> Option<SystemTime> {
     let hour = raw.get(17..19)?.parse::<u32>().ok()?;
     let minute = raw.get(20..22)?.parse::<u32>().ok()?;
     let second = raw.get(23..25)?.parse::<u32>().ok()?;
-    let days = days_from_civil(year as i64, month as i64, day as i64)?;
+    let days = days_from_civil(i64::from(year), i64::from(month), i64::from(day))?;
     let secs = days
         .checked_mul(86_400)?
-        .checked_add(hour as i64 * 3_600 + minute as i64 * 60 + second as i64)?;
-    Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
+        .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))?;
+    Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).ok()?))
 }
 
+#[allow(
+    dead_code,
+    reason = "Retry-After cooldown is not wired into the proxy yet"
+)]
 fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    let y = year - (month <= 2) as i64;
+    let y = year - i64::from(month <= 2);
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = y - era * 400;
     let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146097 + doe - 719468)
+    Some(era * 146_097 + doe - 719_468)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retry-After cooldown is not wired into the proxy yet"
+)]
 fn is_profile_cooled_down(profile: &str, now: Instant) -> bool {
     profile_retry_cooldown_deadline(profile).is_some_and(|deadline| deadline > now)
 }
 
+#[allow(
+    dead_code,
+    reason = "Retry-After cooldown is not wired into the proxy yet"
+)]
 fn cooldowns() -> &'static Mutex<HashMap<String, Instant>> {
     static COOLDOWNS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
     COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -254,7 +293,6 @@ mod tests {
     use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
     use crate::schemas::smart_auto_policy::SmartAutoPolicy;
     use crate::services::smart_auto_pool::SmartAutoPool;
-    use crate::services::transforms::RouteKind;
     use axum::http::HeaderValue;
     use std::time::{Duration, Instant};
 
@@ -379,7 +417,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", HeaderValue::from_static("120"));
         let deadline = retry_after_cooldown_deadline(&headers).expect("deadline");
-        assert!(deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(60));
+        assert!(deadline.saturating_duration_since(Instant::now()) <= Duration::from_mins(1));
     }
 
     #[test]
@@ -402,9 +440,9 @@ mod tests {
 
     #[test]
     fn cooldown_wait_is_capped_at_sixty_seconds() {
-        note_profile_retry_cooldown("profile/c", Some(Instant::now() + Duration::from_secs(120)));
+        note_profile_retry_cooldown("profile/c", Some(Instant::now() + Duration::from_mins(2)));
         let wait = cooldown_wait_until(&["profile/c".to_string()]).expect("wait");
-        assert!(wait <= Instant::now() + Duration::from_secs(120));
+        assert!(wait <= Instant::now() + Duration::from_mins(2));
     }
 
     #[test]

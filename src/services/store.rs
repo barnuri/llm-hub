@@ -168,6 +168,8 @@ pub(crate) fn group_tier_role(
                 }
             }
             let cost_usd = group.cost.total();
+            #[allow(clippy::cast_precision_loss)] // attempt counts stay far below 2^52
+            let completed_count = completed_attempts as f64;
             TierRoleRow {
                 tier: tier.into(),
                 role: role.into(),
@@ -175,7 +177,7 @@ pub(crate) fn group_tier_role(
                 cost_usd,
                 completed_attempts,
                 cost_per_completed_usd: (completed_attempts > 0)
-                    .then(|| cost_usd / completed_attempts as f64),
+                    .then(|| cost_usd / completed_count),
                 outcomes,
             }
         })
@@ -219,6 +221,7 @@ impl Store {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // linear schema setup and migrations
     fn open_sqlite(path: &str) -> Result<Store, String> {
         let conn =
             Connection::open(path).map_err(|e| format!("cannot open sqlite at {path}: {e}"))?;
@@ -630,7 +633,7 @@ impl Store {
     }
 
     /// Sets or clears `resolved_ms` on failed rows by id. Returns rows updated.
-    /// Only the SQLite store keeps row ids, so the JSON store refuses.
+    /// Only the `SQLite` store keeps row ids, so the JSON store refuses.
     pub fn set_errors_resolved(
         &self,
         ids: &[i64],
@@ -2773,6 +2776,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp, reason = "fixture costs are exact small integers")]
 mod tier_role_tests {
     use super::*;
     use crate::configs::TokenRates;

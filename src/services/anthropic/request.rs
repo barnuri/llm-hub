@@ -260,10 +260,10 @@ pub(crate) fn adaptive_thinking(body: &mut Value) {
     }
     let effort = super::responses_request::reasoning_effort(body);
     body["thinking"] = json!({"type": "adaptive"});
-    if let Some(effort) = effort {
-        if body.pointer("/output_config/effort").is_none() {
-            body["output_config"]["effort"] = json!(effort);
-        }
+    if let Some(effort) = effort
+        && body.pointer("/output_config/effort").is_none()
+    {
+        body["output_config"]["effort"] = json!(effort);
     }
 }
 

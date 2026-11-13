@@ -1,6 +1,6 @@
 //! Per-model prices an upstream lists in its own `/v1/models` as `pricing.prompt` and
-//! `pricing.completion`, in USD per token (Bifrost and OpenRouter list them this way).
-//! OpenRouter's `pricing.overrides[].min_prompt_tokens` entries become the long-context tier.
+//! `pricing.completion`, in USD per token (Bifrost and `OpenRouter` list them this way).
+//! `OpenRouter`'s `pricing.overrides[].min_prompt_tokens` entries become the long-context tier.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -120,6 +120,10 @@ fn round(value: f64) -> f64 {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    reason = "fixture prices are exact decimal constants"
+)]
 mod tests {
     use serde_json::json;
 
@@ -130,7 +134,7 @@ mod tests {
             json!({"id": "azure/gpt-4.1-nano", "pricing": {
                 "prompt": "0.0000001000", "completion": "0.0000004000",
                 "input_cache_read": "0.0000000250", "web_search": "0.0140000000"}}),
-            json!({"id": "azure/gpt-4.1", "pricing": {"prompt": 0.000002, "completion": 0.000008}}),
+            json!({"id": "azure/gpt-4.1", "pricing": {"prompt": 0.000_002, "completion": 0.000_008}}),
             json!({"id": "free-model", "pricing": {"prompt": "0", "completion": "0"}}),
             json!({"id": "no-pricing"}),
         ]
@@ -167,7 +171,7 @@ mod tests {
         let item = json!({"id": "openai/gpt-x", "pricing": {
             "prompt": "0.000001", "completion": "0.000005",
             "input_cache_read": "0.00000005", "input_cache_write": "0.00000125",
-            "overrides": [{"min_prompt_tokens": 272000, "prompt": "0.000002",
+            "overrides": [{"min_prompt_tokens": 272_000, "prompt": "0.000002",
                 "completion": "0.0000075", "input_cache_read": "0.0000001",
                 "input_cache_write": "0.0000025"}]}});
 

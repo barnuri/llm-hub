@@ -380,6 +380,10 @@ fn usage(response: &Value) -> Value {
 }
 
 /// Translates one Responses SSE body into chat-completion chunks, as the bytes arrive.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent stream-state flags"
+)]
 pub struct ChatStream {
     frames: SseFrames,
     served_model: String,
@@ -620,6 +624,7 @@ fn string_field_or<'v>(value: &'v Value, key: &str, default: &'v str) -> &'v str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn chunks(out: &[u8]) -> Vec<Value> {
         String::from_utf8(out.to_vec())
@@ -792,10 +797,10 @@ mod tests {
                    "status": "completed", "usage": {"input_tokens": 9, "output_tokens": 4}}}),
         ];
         let mut stream = ChatStream::new("copilot/gpt-5.5".into(), NameMap::default(), true);
-        let wire: String = events
-            .iter()
-            .map(|event| format!("event: x\ndata: {event}\n\n"))
-            .collect();
+        let wire = events.iter().fold(String::new(), |mut wire, event| {
+            let _ = write!(wire, "event: x\ndata: {event}\n\n");
+            wire
+        });
         let mut out = stream.push(wire.as_bytes());
         out.extend(stream.finish());
 

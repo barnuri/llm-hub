@@ -77,7 +77,7 @@ fn count_before(line: &str, word: &str) -> Option<u64> {
 }
 
 /// The tool-result text of the request's last message or trailing tool messages, joined.
-/// Handles OpenAI chat (`role: tool`), Anthropic messages (`tool_result` blocks) and
+/// Handles `OpenAI` chat (`role: tool`), Anthropic messages (`tool_result` blocks) and
 /// Responses input (`function_call_output`). `None` when the request ends with no tool result.
 pub fn last_tool_result_text(body: &Value) -> Option<String> {
     let items = body

@@ -93,6 +93,10 @@ mod tests {
     use super::*;
     use crate::configs::{KeepWarmConfig, ProfileConfig, TokenRates};
 
+    #[allow(
+        clippy::zero_sized_map_values,
+        reason = "UsageSource is an enum meant to gain variants"
+    )]
     fn sample(bind: &str, port: u16) -> HubConfig {
         HubConfig {
             bind: bind.into(),

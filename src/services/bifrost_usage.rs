@@ -46,7 +46,7 @@ pub(crate) async fn fetch(
         .json()
         .await
         .inspect_err(|e| {
-            tracing::warn!("profile {profile}: the Bifrost quota body is not JSON: {e}")
+            tracing::warn!("profile {profile}: the Bifrost quota body is not JSON: {e}");
         })
         .ok()?;
     let usage = normalise(&body, now_ms);
@@ -201,7 +201,7 @@ mod tests {
         let usage = normalise(&quota_body(), NOW_MS).unwrap();
 
         let provider = &usage.quotas[1];
-        assert_eq!(provider.entitlement, 15.0);
+        assert!((provider.entitlement - 15.0).abs() < f64::EPSILON);
         assert!((provider.remaining_percentage - 100.0 / 3.0).abs() < 1e-9);
     }
 

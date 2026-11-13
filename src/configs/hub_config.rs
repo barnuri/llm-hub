@@ -28,6 +28,10 @@ const PREFIX: &str = "LLM_HUB_";
 pub struct HubConfig {
     pub profiles: Vec<ProfileConfig>,
     /// Quota source per non-Copilot profile name, from `LLM_HUB_<NAME>_USAGE` or the key prefix.
+    #[allow(
+        clippy::zero_sized_map_values,
+        reason = "UsageSource is an enum meant to gain variants"
+    )]
     pub usage_sources: HashMap<String, UsageSource>,
     /// Operator Smart Auto presets from `LLM_HUB_SMART_AUTO_PRESETS`, served as `hub/<name>`.
     pub smart_auto_presets: BTreeMap<String, SmartAutoPolicy>,
@@ -92,6 +96,10 @@ impl HubConfig {
         self.usage_sources.get(profile).copied()
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "flat list of env keys; splitting adds no clarity"
+    )]
     pub fn from_map(vars: &HashMap<String, String>) -> Result<HubConfig, String> {
         let get = |key: &str| {
             vars.get(&format!("{PREFIX}{key}"))
@@ -311,6 +319,10 @@ impl HubConfig {
 
 /// Quota source per profile: `LLM_HUB_<NAME>_USAGE` (`bifrost` or `none`) wins, and an unset var
 /// falls back to the key prefix. Copilot profiles are skipped, their auth is the source.
+#[allow(
+    clippy::zero_sized_map_values,
+    reason = "UsageSource is an enum meant to gain variants"
+)]
 fn usage_sources_from_map(
     profiles: &[ProfileConfig],
     vars: &HashMap<String, String>,
@@ -809,7 +821,7 @@ mod tests {
                 Some(Duration::from_millis(DEFAULT_FIRST_BYTE_TIMEOUT_MS)),
             ),
             (Some("0"), None),
-            (Some("5000"), Some(Duration::from_millis(5000))),
+            (Some("5000"), Some(Duration::from_secs(5))),
             (
                 Some(""),
                 Some(Duration::from_millis(DEFAULT_FIRST_BYTE_TIMEOUT_MS)),

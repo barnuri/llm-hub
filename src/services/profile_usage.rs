@@ -144,7 +144,7 @@ impl ProfileUsageQuota {
         }
         let remaining_percentage =
             ((entitlement - used) / entitlement * FULL_PERCENT).clamp(0.0, FULL_PERCENT);
-        let usd = (unit == QuotaUnit::Usd).then_some((used, entitlement));
+        let usd_amounts = (unit == QuotaUnit::Usd).then_some((used, entitlement));
         Some(ProfileUsageQuota {
             id,
             unit,
@@ -154,8 +154,8 @@ impl ProfileUsageQuota {
             remaining_percentage,
             overage_permitted: None,
             reset_date,
-            used_usd: usd.map(|(used, _)| used),
-            limit_usd: usd.map(|(_, limit)| limit),
+            used_usd: usd_amounts.map(|(used, _)| used),
+            limit_usd: usd_amounts.map(|(_, limit)| limit),
         })
     }
 }

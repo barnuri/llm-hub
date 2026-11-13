@@ -391,7 +391,7 @@ fn local_midnight_ms(now_ms: u64) -> u64 {
     let secs = libc::time_t::try_from(now_ms / 1000).unwrap_or(libc::time_t::MAX);
     // SAFETY: `localtime_r` writes only into `tm`, which lives on this stack frame.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+    if unsafe { libc::localtime_r(&raw const secs, &raw mut tm) }.is_null() {
         return now_ms.saturating_sub(86_400_000);
     }
     let into_day = u64::try_from(tm.tm_hour).unwrap_or(0) * 3600

@@ -4627,9 +4627,9 @@ mod tests {
                 RouteKind::OpenAi,
             )
             .await;
-            let plan = due_pings(&copilot).await.into_iter().next().unwrap();
+            let ping_plan = due_pings(&copilot).await.into_iter().next().unwrap();
 
-            send_keep_warm_ping(&copilot.state, plan).await;
+            send_keep_warm_ping(&copilot.state, ping_plan).await;
 
             let sent = requests_to(&copilot, UPSTREAM_CHAT_PATH).await;
             assert_eq!(sent.len(), 2);
@@ -4665,7 +4665,7 @@ mod tests {
             assert_eq!(first_byte_limit(&config, "remote"), Some(default));
             assert_eq!(
                 first_byte_limit(&config, "optout"),
-                Some(Duration::from_millis(5000))
+                Some(Duration::from_secs(5))
             );
             assert_eq!(first_byte_limit(&config, "home"), None);
             let explicit = config_with(&[
@@ -4674,7 +4674,7 @@ mod tests {
             ]);
             assert_eq!(
                 first_byte_limit(&explicit, "home"),
-                Some(Duration::from_millis(3000))
+                Some(Duration::from_secs(3))
             );
             assert_eq!(first_byte_limit(&explicit, "remote"), None);
             assert_eq!(first_byte_limit(&config, "missing"), None);
