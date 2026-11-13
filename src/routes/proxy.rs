@@ -884,7 +884,11 @@ pub(crate) fn hub_policy(
 /// The caller's `x-llm-hub-profiles` filter when it names a concrete profile. The `hub` name
 /// only lists the virtual models, so a filter of `hub` alone leaves the pool unrestricted.
 fn concrete_profile_filter(headers: &HeaderMap) -> Option<ProfileFilter> {
-    let profiles = ProfileFilter::from_request(None, headers);
+    concrete_profiles(ProfileFilter::from_request(None, headers))
+}
+
+/// `profiles` when it names a concrete profile, as `concrete_profile_filter` reads the header.
+pub(crate) fn concrete_profiles(profiles: ProfileFilter) -> Option<ProfileFilter> {
     profiles
         .to_list()
         .split(',')

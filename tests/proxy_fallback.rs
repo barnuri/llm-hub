@@ -812,3 +812,107 @@ async fn tiers_lists_each_tier_pool_and_the_role_defaults() {
     assert_eq!(reply["role_tier_defaults"]["planning"], "intelligence");
     assert_eq!(reply["role_tier_defaults"]["conversation"], "fast");
 }
+
+const SESSION_ID: &str = "x-llm-hub-session-id";
+
+/// Sends one `hub/smart-auto-fast` turn on `route`, then polls resolve until it reports the pin.
+async fn resolve_after_a_turn(route: &str, body: serde_json::Value) {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    for upstream in [&alpha, &beta] {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ok_completion())
+            .mount(upstream)
+            .await;
+    }
+    let (_hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+    let client = reqwest::Client::new();
+    let worker = format!("run-pin{route}");
+    let session = "pin-session-1";
+
+    let response = client
+        .post(format!("{base}{route}"))
+        .header(SMART_AUTO_WORKER, &worker)
+        .header(SESSION_ID, session)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let served = response.headers()["x-llm-hub-model"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    response.bytes().await.unwrap();
+
+    let url = format!("{base}/api/smart-auto/resolve");
+    let query = serde_json::json!({"tier": "fast", "worker": worker, "session": session});
+    let mut reply = serde_json::Value::Null;
+    for _ in 0..100 {
+        reply = client
+            .post(&url)
+            .json(&query)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if reply["pinned"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(reply["pinned"], true, "{reply}");
+    assert_eq!(reply["model"], served.as_str(), "{reply}");
+
+    // The profiles filter leaves the pin out of the pool, and the dry run does not drop it.
+    let other = if served.starts_with("alpha/") {
+        "beta"
+    } else {
+        "alpha"
+    };
+    let mut filtered = query.clone();
+    filtered["profiles"] = serde_json::json!(other);
+    let reply: serde_json::Value = client
+        .post(&url)
+        .json(&filtered)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reply["pinned"], false, "{reply}");
+    assert!(
+        reply["model"].as_str().unwrap().starts_with(other),
+        "{reply}"
+    );
+    let again: serde_json::Value = client
+        .post(&url)
+        .json(&query)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again["pinned"], true, "{again}");
+}
+
+#[tokio::test]
+async fn resolve_reports_a_pin_set_through_messages() {
+    resolve_after_a_turn(
+        "/v1/messages",
+        serde_json::json!({"model": "hub/smart-auto-fast", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn resolve_reports_a_pin_set_through_chat_completions() {
+    resolve_after_a_turn("/v1/chat/completions", chat_body("hub/smart-auto-fast")).await;
+}

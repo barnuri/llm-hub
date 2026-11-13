@@ -11,7 +11,7 @@ use crate::consts::{
     SELECTION_HISTORY_MAX_LIMIT,
 };
 use crate::dependencies::state::AppState;
-use crate::routes::proxy::hub_policy;
+use crate::routes::proxy::{concrete_profiles, hub_policy};
 use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::app_error::AppError;
 use crate::schemas::attempt_outcome::{AttemptOutcome, OutcomeCode, OutcomeSource};
@@ -19,6 +19,7 @@ use crate::schemas::current_selection::CurrentSelection;
 use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::history_query::HistoryQuery;
 use crate::schemas::hub_selector::HubSelector;
+use crate::schemas::launch::profile_filter::ProfileFilter;
 use crate::schemas::model_context::strip_1m_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::role_decision::RoleDecision;
@@ -390,6 +391,8 @@ pub struct ResolveBody {
     pub exclude: Vec<String>,
     pub min_context: Option<u64>,
     pub text: Option<String>,
+    /// Comma-separated profiles, the same filter as the `x-llm-hub-profiles` header.
+    pub profiles: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -419,13 +422,21 @@ struct TiersReply {
     role_tier_defaults: BTreeMap<&'static str, &'static str>,
 }
 
-/// The client route a dry run resolves for; affinity keys include it.
+/// The client route a dry run resolves for when no pin exists; affinity keys include it.
 const RESOLVE_ENDPOINT: &str = "/v1/messages";
+/// Every client route a pin can be kept under. A dry run looks up each and uses the latest.
+const PIN_ENDPOINTS: [&str; 5] = [
+    "/v1/messages",
+    "/v1/chat/completions",
+    "/chat/completions",
+    "/v1/responses",
+    "/responses",
+];
 /// How many other eligible models a dry run lists.
 const RESOLVE_ALTERNATIVES: usize = 4;
 
 /// `POST /api/smart-auto/resolve`: the model a `hub/smart-auto-<tier>` turn would get, without
-/// calling an upstream or recording anything. With `worker` or `session`, a kept pin is reported.
+/// calling an upstream or recording anything. With `worker` or `session`, a kept pin from any route is reported.
 pub async fn resolve(State(state): State<AppState>, Json(body): Json<ResolveBody>) -> Response {
     match resolve_dry_run(&state, body) {
         Ok(reply) => Json(reply).into_response(),
@@ -475,17 +486,6 @@ fn resolve_dry_run(state: &AppState, mut body: ResolveBody) -> Result<ResolveRep
     let selector = tier_selector(&config.smart_auto_presets, tier)?;
     let rules = state.smart_auto_rules().current();
     let policy = hub_policy(&rules, &selector, &caller);
-    let snapshot = state.model_descriptors();
-    let mut pool = SmartAutoPool::eligible(&snapshot, &policy, RESOLVE_ENDPOINT, 0);
-    let now = Instant::now();
-    let live = SmartAutoLive::collect(state, RESOLVE_ENDPOINT, &pool, now);
-    let sits_out = |descriptor: &&ModelDescriptor| {
-        live.unavailable
-            .contains(strip_1m_suffix(&descriptor.qualified_id))
-    };
-    if pool.iter().any(|descriptor| !sits_out(descriptor)) {
-        pool.retain(|descriptor| !sits_out(descriptor));
-    }
     let text = non_empty(body.text);
     let signals = TurnSignals {
         estimated_prompt_tokens: 0,
@@ -498,8 +498,41 @@ fn resolve_dry_run(state: &AppState, mut body: ResolveBody) -> Result<ResolveRep
         prompt_cache_key: None,
         content_key: None,
     };
-    let key = AffinityKey::new(&signals, &caller, &policy, RESOLVE_ENDPOINT);
-    let anchor = key.as_ref().map(|key| (state.smart_auto_affinity(), key));
+    let now = Instant::now();
+    let affinity = state.smart_auto_affinity();
+    let pinned = PIN_ENDPOINTS
+        .into_iter()
+        .filter_map(|endpoint| {
+            let key = AffinityKey::new(&signals, &caller, &policy, endpoint)?;
+            Some((affinity.pin_last_used(&key, now)?, endpoint, key))
+        })
+        .max_by_key(|(last_used, _, _)| *last_used);
+    let (endpoint, key) = match pinned {
+        Some((_, endpoint, key)) => (endpoint, Some(key)),
+        None => (
+            RESOLVE_ENDPOINT,
+            AffinityKey::new(&signals, &caller, &policy, RESOLVE_ENDPOINT),
+        ),
+    };
+    let snapshot = state.model_descriptors();
+    let mut pool = SmartAutoPool::eligible(&snapshot, &policy, endpoint, 0);
+    if let Some(profiles) = body
+        .profiles
+        .as_deref()
+        .and_then(|list| concrete_profiles(ProfileFilter::from_list(list)))
+    {
+        pool.retain(|descriptor| profiles.allows(&descriptor.qualified_id));
+    }
+    let live = SmartAutoLive::collect(state, endpoint, &pool, now);
+    let sits_out = |descriptor: &&ModelDescriptor| {
+        live.unavailable
+            .contains(strip_1m_suffix(&descriptor.qualified_id))
+    };
+    if pool.iter().any(|descriptor| !sits_out(descriptor)) {
+        pool.retain(|descriptor| !sits_out(descriptor));
+    }
+    let detached = key.as_ref().map(|key| affinity.detached(key));
+    let anchor = detached.as_ref().zip(key.as_ref());
     let usage = state.model_usage();
     let decision = SmartAutoRouter::route(
         &pool,

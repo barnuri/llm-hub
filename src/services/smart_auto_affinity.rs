@@ -26,7 +26,7 @@ struct PinTable {
     next_sequence: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PinEntry {
     active: Option<ActivePin>,
     incumbents: Vec<(WorkRole, String)>,
@@ -35,7 +35,7 @@ struct PinEntry {
     sequence: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ActivePin {
     model: String,
     role: WorkRole,
@@ -90,6 +90,29 @@ impl SmartAutoAffinity {
             return Err(PinMiss::LeftPool);
         }
         Ok((pin.model.clone(), pin.role, pin.plan_backed))
+    }
+
+    /// When the pin under `key` was last used, `None` without a live pin. Changes nothing.
+    #[must_use]
+    pub fn pin_last_used(&self, key: &AffinityKey, now: Instant) -> Option<Instant> {
+        let table = self.lock();
+        let entry = table.entries.get(key)?;
+        let live = now.saturating_duration_since(entry.last_used) <= Self::IDLE;
+        (live && entry.active.is_some()).then_some(entry.last_used)
+    }
+
+    /// A private copy holding only the entry under `key`, so a dry run can route against it
+    /// without touching this store.
+    #[must_use]
+    pub fn detached(&self, key: &AffinityKey) -> SmartAutoAffinity {
+        let copy = SmartAutoAffinity::new();
+        if let Some(entry) = self.lock().entries.get(key).cloned() {
+            let mut table = copy.lock();
+            table.order.push_back((*key, entry.sequence));
+            table.next_sequence = entry.sequence + 1;
+            table.entries.insert(*key, entry);
+        }
+        copy
     }
 
     /// The model this conversation last used for `role`, only while it is in `eligible`.

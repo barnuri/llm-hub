@@ -835,6 +835,26 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn smart_auto_resolve_requires_the_master_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = serve_hub_with_rules(dir.path(), None).await;
+        let url = format!("{base}/api/smart-auto/resolve");
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({"tier": "fast"});
+
+        let without_key = client.post(&url).json(&body).send().await.unwrap();
+        let with_key = client
+            .post(&url)
+            .bearer_auth(MASTER_KEY)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(without_key.status().as_u16(), 401);
+        assert_ne!(with_key.status().as_u16(), 401);
+    }
+
     async fn serve_hub_with_rules(store_dir: &std::path::Path, env_rules: Option<&str>) -> String {
         let mut vars: HashMap<String, String> = [
             ("LLM_HUB_PROFILES", "copilot"),
