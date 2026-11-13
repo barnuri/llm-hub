@@ -415,6 +415,8 @@ fn build_router(state: AppState) -> Router {
             get(routes::smart_auto::decisions),
         )
         .route("/api/smart-auto/health", get(routes::smart_auto::health))
+        .route("/api/smart-auto/resolve", post(routes::smart_auto::resolve))
+        .route("/api/smart-auto/tiers", get(routes::smart_auto::tiers))
         .route("/api/copilot/usage", get(routes::copilot::usage))
         .route("/api/usage/sources", get(routes::profile_usage::sources))
         .route(
@@ -818,6 +820,7 @@ mod tests {
             "/api/smart-auto/history",
             "/api/smart-auto/decisions",
             "/api/smart-auto/health",
+            "/api/smart-auto/tiers",
         ] {
             let url = format!("{base}{route}");
             let with_key = client

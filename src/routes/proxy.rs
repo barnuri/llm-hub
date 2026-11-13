@@ -76,6 +76,7 @@ use crate::services::smart_auto_effort::SmartAutoEffort;
 use crate::services::smart_auto_live::SmartAutoLive;
 use crate::services::smart_auto_pool::SmartAutoPool;
 use crate::services::smart_auto_router::SmartAutoRouter;
+use crate::services::smart_auto_rules::LoadedRules;
 use crate::services::stage_client::StageClient;
 use crate::services::stats::{RequestOutcome, ScrapedUsage, scrape_stream_usage, scrape_usage};
 use crate::services::store::now_ms;
@@ -675,20 +676,8 @@ fn resolve_hub(
         return Ok(HubResolution::NotHub(fallbacks));
     };
     let caller = SmartAutoHeaders::from_headers(headers)?;
-    // The tier is chosen by the model id; a header that names another tier is refused, never ignored.
-    if let Some(header_tier) = caller.policy.tier.filter(|tier| *tier != selector.tier) {
-        return Err(AppError::BadRequest(format!(
-            "tier header `{}` conflicts with model `{}`: use the matching model id or remove the header",
-            header_tier.as_str(),
-            selector.name,
-        )));
-    }
     let rules = state.smart_auto_rules().current();
-    let policy = rules.layer(
-        caller.rules_mode.unwrap_or_default(),
-        &selector.policy,
-        &caller.policy,
-    );
+    let policy = hub_policy(&rules, &selector, &caller);
     let endpoint = match bodies.route {
         RouteKind::OpenAi => bare_path(bodies.upstream_path),
         RouteKind::Anthropic => MESSAGES_ENDPOINT,
@@ -874,6 +863,24 @@ fn resolve_hub(
     })
 }
 
+/// The policy of a `hub/*` turn: rules, then the selector, then the caller's headers. A tier
+/// header overrides the tier the selector names; every other header only tightens.
+pub(crate) fn hub_policy(
+    rules: &LoadedRules,
+    selector: &HubSelector,
+    caller: &SmartAutoHeaders,
+) -> SmartAutoPolicy {
+    let mut policy = rules.layer(
+        caller.rules_mode.unwrap_or_default(),
+        &selector.policy,
+        &caller.policy,
+    );
+    if let Some(tier) = caller.policy.tier {
+        policy.tier = Some(tier);
+    }
+    policy
+}
+
 /// The caller's `x-llm-hub-profiles` filter when it names a concrete profile. The `hub` name
 /// only lists the virtual models, so a filter of `hub` alone leaves the pool unrestricted.
 fn concrete_profile_filter(headers: &HeaderMap) -> Option<ProfileFilter> {
@@ -893,7 +900,8 @@ fn no_eligible_model(
     endpoint: &str,
     has_image: bool,
 ) -> AppError {
-    let mut restrictions = vec![format!("tier {}", selector.tier.as_str())];
+    let tier = policy.tier.unwrap_or(selector.tier);
+    let mut restrictions = vec![format!("tier {}", tier.as_str())];
     if let Some(profiles) = profiles {
         restrictions.push(format!("profiles {}", profiles.to_list().replace(',', "|")));
     }

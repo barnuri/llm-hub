@@ -596,24 +596,38 @@ async fn a_tool_continuation_stays_on_the_routed_solver() {
 }
 
 #[tokio::test]
-async fn a_tier_header_that_conflicts_with_the_model_is_refused() {
+async fn a_tier_header_overrides_the_tier_of_the_model() {
     let alpha = listing_upstream("m1").await;
     let beta = listing_upstream("m2").await;
+    for upstream in [&alpha, &beta] {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ok_completion())
+            .mount(upstream)
+            .await;
+    }
     let (_hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+    let client = reqwest::Client::new();
 
-    let response = reqwest::Client::new()
+    let response = client
         .post(format!("{base}/v1/chat/completions"))
         .header("x-llm-hub-smart-auto-tier", "fast")
         .json(&chat_body("hub/smart-auto-balance"))
         .send()
         .await
         .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
 
-    assert_eq!(response.status(), 400);
-    let body = response.text().await.unwrap();
-    assert!(body.contains("conflicts with model"), "{body}");
-    assert!(chat_requests(&alpha).await.is_empty());
-    assert!(chat_requests(&beta).await.is_empty());
+    let decisions: serde_json::Value = client
+        .get(format!("{base}/api/smart-auto/decisions?limit=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(decisions["decisions"][0]["tier"], "fast", "{decisions}");
 }
 
 #[tokio::test]
@@ -720,4 +734,81 @@ async fn smart_auto_dispatch_is_visible_in_the_selection_history() {
     assert_eq!(selected["pin_miss"], "no_pin");
     assert_eq!(selected["affinity_scope"], "content_hash");
     drop(hub);
+}
+
+#[tokio::test]
+async fn resolve_names_the_model_without_calling_an_upstream() {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    let (_hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/smart-auto/resolve");
+
+    let reply: serde_json::Value = client
+        .post(&url)
+        .json(&serde_json::json!({"tier": "intelligence", "role": "planning"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let model = reply["model"].as_str().unwrap();
+    assert!(["alpha/m1", "beta/m2"].contains(&model), "{reply}");
+    assert_eq!(reply["tier"], "intelligence");
+    assert_eq!(reply["role"], "planning");
+    assert_eq!(reply["pinned"], false);
+    assert_eq!(reply["reason"], "fresh");
+    let alternatives = reply["alternatives"].as_array().unwrap();
+    assert_eq!(alternatives.len(), 1, "{reply}");
+    assert_ne!(alternatives[0], reply["model"]);
+    assert!(chat_requests(&alpha).await.is_empty());
+    assert!(chat_requests(&beta).await.is_empty());
+
+    let only_beta: serde_json::Value = client
+        .post(&url)
+        .json(&serde_json::json!({"include": ["beta/*"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(only_beta["model"], "beta/m2");
+    assert_eq!(only_beta["tier"], "balance");
+
+    for (body, status) in [
+        (serde_json::json!({"tier": "max"}), 400),
+        (serde_json::json!({"role": "coding"}), 400),
+        (serde_json::json!({"include": ["nobody/*"]}), 409),
+    ] {
+        let response = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(response.status().as_u16(), status, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn tiers_lists_each_tier_pool_and_the_role_defaults() {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    let (_hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let reply: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/smart-auto/tiers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(reply["default_tier"], "balance");
+    let tiers = reply["tiers"].as_array().unwrap();
+    assert_eq!(tiers.len(), 4);
+    assert_eq!(tiers[2]["name"], "intelligence");
+    assert_eq!(tiers[2]["selector"], "hub/smart-auto-intelligence");
+    assert_eq!(tiers[2]["pool"], serde_json::json!(["alpha/m1", "beta/m2"]));
+    assert_eq!(reply["roles"].as_array().unwrap().len(), 5);
+    assert_eq!(reply["role_tier_defaults"]["planning"], "intelligence");
+    assert_eq!(reply["role_tier_defaults"]["conversation"], "fast");
 }

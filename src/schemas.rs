@@ -65,6 +65,7 @@ pub mod session_tool_result;
 pub mod smart_auto_decision;
 pub mod smart_auto_headers;
 pub mod smart_auto_policy;
+pub mod smart_auto_role_tiers;
 pub mod smart_auto_rules;
 pub mod smart_auto_tier;
 pub mod stage_budget;

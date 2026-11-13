@@ -67,7 +67,7 @@ The steps:
 
 1. **Headers.** Every `x-llm-hub-smart-auto-*` header is read, then removed. No upstream sees it. The table is in [Headers](#headers).
 2. **Rules layer.** If `LLM_HUB_SMART_AUTO_RULES` is set, its JSON is the only rules layer. The saved file is ignored. Otherwise the layer is `smart-auto-rules.json`, in the store's directory. No file means no rules. Rules have `include`, `exclude`, and per-profile `profiles.<name>.include` and `exclude`. All are globs over `<profile>/<model>` or the bare model id.
-3. **Merge.** Rules, then the selector's policy, then the headers. `merge` only tightens. Excludes add up. Include lists stack, so a model must match one glob in each list. Minimums take the larger value. `role` takes the request's value. The tier comes from the selector.
+3. **Merge.** Rules, then the selector's policy, then the headers. `merge` only tightens. Excludes add up. Include lists stack, so a model must match one glob in each list. Minimums take the larger value. `role` takes the request's value. The tier comes from the selector, unless the `x-llm-hub-smart-auto-tier` header names one: the header wins.
    - `x-llm-hub-smart-auto-rules: override` swaps the saved include, exclude and profile rules for the request's include and exclude. It works only when no env rules are set.
 4. **Eligible pool.** The pool is the set of models allowed for this request. A model must pass each check, in order:
    1. It is a concrete chat model. Speech models, `hub/*` ids and Copilot Auto aliases (`auto`, `auto-fast`, ...) never count.
@@ -90,7 +90,7 @@ The steps:
 
 | Header | Value | Effect |
 |---|---|---|
-| `x-llm-hub-smart-auto-tier` | `efficiency`, `balance`, `intelligence` or `fast` | Read into the tier. See Open questions: it does not change a `hub/*` selector's tier. |
+| `x-llm-hub-smart-auto-tier` | `efficiency`, `balance`, `intelligence` or `fast` | Overrides the tier the `hub/*` selector or preset names. Other headers only tighten. |
 | `x-llm-hub-smart-auto-include` | Comma-separated globs | Adds an allow-list. Repeated headers join the same list. |
 | `x-llm-hub-smart-auto-exclude` | Comma-separated globs | Removes matching models. Adds to other excludes. |
 | `x-llm-hub-smart-auto-min-context` | Tokens, such as `1m` or `200k` | Minimum total context. `1m` is 1,000,000. |
@@ -247,6 +247,8 @@ If a check runs out of budget, times out or returns a bad verdict, the draft is 
   - `GET /api/smart-auto/rules`: the active rules, their source (`file`, `env` or `none`), and whether they are read-only.
   - `PUT /api/smart-auto/rules`: checks the JSON, saves it atomically and makes it active. Refused when env rules own the rules.
   - `GET /api/smart-auto/rules/effect`: each known model's outcome under the current rules, with the reason and the glob that decided it.
+  - `POST /api/smart-auto/resolve`: a dry run. It builds the same pool and policy as a `hub/smart-auto-<tier>` turn on `/v1/messages` and returns the pick, without an upstream call and without writing affinity, history or decisions. Body fields, all optional: `tier` (default `balance`), `role`, `worker`, `session`, `include` and `exclude` (glob lists), `min_context` (tokens) and `text` (user text for role classification). With `worker` or `session`, a kept pin is reported. Reply: `{"model", "tier", "role", "plan_backed", "effort", "reason", "pinned", "alternatives"}`, where `alternatives` holds up to 4 other eligible models, best first. An unknown tier or role returns 400. An empty pool returns 409.
+  - `GET /api/smart-auto/tiers`: `{"default_tier", "tiers": [{"name", "selector", "pool"}], "roles", "role_tier_defaults"}`. `pool` lists the models eligible for the tier under the current rules. `role_tier_defaults` maps each role to a suggested tier for clients. The hub does not apply it.
 
 ### Privacy and storage
 
@@ -271,7 +273,6 @@ Set `LLM_HUB_STORE_PATH` to choose the store file. See [Configuration](configura
 
 ## Open questions
 
-- **Tier header on a `hub/*` selector.** `SmartAutoPolicy::merge` keeps the earlier tier, and every `hub/*` selector sets one. So a request's `x-llm-hub-smart-auto-tier` seems unable to change the tier of `hub/smart-auto-balance`. The Claude launcher sends `--smart-auto-tier=fast` as this header on a named `hub/smart-auto-balance` (`src/services/launch/claude_launcher.rs`, test `smart_auto_flags_follow_the_profiles_header`). I read this from the code and did not run it. Is the tier flag meant to work with a named model?
 - **Fast tier comment.** The comment in `src/schemas/smart_auto_tier.rs` says "lowest measured latency". The router uses the built-in speed seed and no measurement. This doc describes the seed.
 - **Status line consumer.** I found no code in this repository that reads `/api/smart-auto/current` for the status line.
 - **Rejected check status.** A rejected draft becomes `AppError::UpstreamUnavailable`. I did not check which HTTP status that maps to.

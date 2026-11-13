@@ -11,20 +11,39 @@ use crate::consts::{
     SELECTION_HISTORY_MAX_LIMIT,
 };
 use crate::dependencies::state::AppState;
+use crate::routes::proxy::hub_policy;
+use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::app_error::AppError;
 use crate::schemas::attempt_outcome::{AttemptOutcome, OutcomeCode, OutcomeSource};
 use crate::schemas::current_selection::CurrentSelection;
+use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::history_query::HistoryQuery;
+use crate::schemas::hub_selector::HubSelector;
+use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_descriptor::ModelDescriptor;
+use crate::schemas::role_decision::RoleDecision;
+use crate::schemas::role_reason::RoleReason;
+use crate::schemas::route_reason::RouteReason;
 use crate::schemas::scope_kind::ScopeKind;
 use crate::schemas::selection_event::SelectionEvent;
 use crate::schemas::selection_stage::SelectionStage;
 use crate::schemas::selection_state::SelectionState;
 use crate::schemas::smart_auto_decision::SmartAutoDecision;
+use crate::schemas::smart_auto_headers::SmartAutoHeaders;
+use crate::schemas::smart_auto_policy::SmartAutoPolicy;
+use crate::schemas::smart_auto_role_tiers::{ROLE_TIER_DEFAULTS, role_from_name};
 use crate::schemas::smart_auto_rules::SmartAutoRules;
+use crate::schemas::smart_auto_tier::SmartAutoTier;
+use crate::schemas::turn_signals::TurnSignals;
 use crate::services::model_health::HealthRow;
 use crate::services::selection_log::SelectionLog;
+use crate::services::smart_auto_live::SmartAutoLive;
+use crate::services::smart_auto_pool::SmartAutoPool;
+use crate::services::smart_auto_router::SmartAutoRouter;
 use crate::services::smart_auto_rules::{LoadedRules, RuleEffect, RulesSource, rule_effects};
 use crate::services::store::now_ms;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct CurrentQuery {
@@ -357,6 +376,220 @@ pub async fn attempt_text(
         }
         Err(e) => AppError::Internal(format!("selection text cannot be read: {e}")).into_response(),
     }
+}
+
+/// The body of `POST /api/smart-auto/resolve`. Every field is optional.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResolveBody {
+    pub tier: Option<String>,
+    pub role: Option<String>,
+    pub worker: Option<String>,
+    pub session: Option<String>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub min_context: Option<u64>,
+    pub text: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ResolveReply {
+    model: String,
+    tier: &'static str,
+    role: &'static str,
+    plan_backed: bool,
+    effort: Option<&'static str>,
+    reason: &'static str,
+    pinned: bool,
+    alternatives: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct TierRow {
+    name: &'static str,
+    selector: String,
+    pool: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct TiersReply {
+    default_tier: &'static str,
+    tiers: Vec<TierRow>,
+    roles: Vec<&'static str>,
+    role_tier_defaults: BTreeMap<&'static str, &'static str>,
+}
+
+/// The client route a dry run resolves for; affinity keys include it.
+const RESOLVE_ENDPOINT: &str = "/v1/messages";
+/// How many other eligible models a dry run lists.
+const RESOLVE_ALTERNATIVES: usize = 4;
+
+/// `POST /api/smart-auto/resolve`: the model a `hub/smart-auto-<tier>` turn would get, without
+/// calling an upstream or recording anything. With `worker` or `session`, a kept pin is reported.
+pub async fn resolve(State(state): State<AppState>, Json(body): Json<ResolveBody>) -> Response {
+    match resolve_dry_run(&state, body) {
+        Ok(reply) => Json(reply).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// The caller layer a dry run stands for: the tier, role and filters the body names.
+fn resolve_caller(body: &mut ResolveBody) -> Result<SmartAutoHeaders, AppError> {
+    let tier = match non_empty(body.tier.take()) {
+        None => SmartAutoTier::default(),
+        Some(name) => SmartAutoTier::from_name(&name)
+            .ok_or_else(|| AppError::BadRequest(format!("unknown tier {name:?}")))?,
+    };
+    let role = non_empty(body.role.take())
+        .map(|name| {
+            role_from_name(&name)
+                .ok_or_else(|| AppError::BadRequest(format!("unknown role {name:?}")))
+        })
+        .transpose()?;
+    let globs = |list: Vec<String>| -> BTreeSet<String> {
+        list.into_iter().filter(|glob| !glob.is_empty()).collect()
+    };
+    let include = globs(std::mem::take(&mut body.include));
+    Ok(SmartAutoHeaders {
+        policy: SmartAutoPolicy {
+            tier: Some(tier),
+            include: if include.is_empty() {
+                Vec::new()
+            } else {
+                vec![include]
+            },
+            exclude: globs(std::mem::take(&mut body.exclude)),
+            min_context_tokens: body.min_context,
+            role,
+            ..SmartAutoPolicy::default()
+        },
+        worker: non_empty(body.worker.take()),
+        ..SmartAutoHeaders::default()
+    })
+}
+
+fn resolve_dry_run(state: &AppState, mut body: ResolveBody) -> Result<ResolveReply, AppError> {
+    let caller = resolve_caller(&mut body)?;
+    let tier = caller.policy.tier.unwrap_or_default();
+    let config = state.config();
+    let selector = tier_selector(&config.smart_auto_presets, tier)?;
+    let rules = state.smart_auto_rules().current();
+    let policy = hub_policy(&rules, &selector, &caller);
+    let snapshot = state.model_descriptors();
+    let mut pool = SmartAutoPool::eligible(&snapshot, &policy, RESOLVE_ENDPOINT, 0);
+    let now = Instant::now();
+    let live = SmartAutoLive::collect(state, RESOLVE_ENDPOINT, &pool, now);
+    let sits_out = |descriptor: &&ModelDescriptor| {
+        live.unavailable
+            .contains(strip_1m_suffix(&descriptor.qualified_id))
+    };
+    if pool.iter().any(|descriptor| !sits_out(descriptor)) {
+        pool.retain(|descriptor| !sits_out(descriptor));
+    }
+    let text = non_empty(body.text);
+    let signals = TurnSignals {
+        estimated_prompt_tokens: 0,
+        tool_continuation: false,
+        user_turns: usize::from(text.is_some()),
+        last_user_text: text,
+        has_tools: false,
+        has_image: false,
+        session_id: non_empty(body.session),
+        prompt_cache_key: None,
+        content_key: None,
+    };
+    let key = AffinityKey::new(&signals, &caller, &policy, RESOLVE_ENDPOINT);
+    let anchor = key.as_ref().map(|key| (state.smart_auto_affinity(), key));
+    let usage = state.model_usage();
+    let decision = SmartAutoRouter::route(
+        &pool,
+        &policy,
+        &signals,
+        anchor,
+        &usage,
+        &live.signals,
+        None,
+        now,
+    )
+    .ok_or_else(|| {
+        AppError::Conflict(format!(
+            "smart_auto_no_eligible_model: no model serves {} under the current rules and filters",
+            tier.selector()
+        ))
+    })?;
+    let alternatives = SmartAutoRouter::runners_up(
+        &pool,
+        tier,
+        RoleDecision {
+            role: decision.role,
+            plan_backed: decision.plan_backed,
+            reason: RoleReason::CallerHint,
+        },
+        std::slice::from_ref(&decision.model.qualified_id),
+        &usage,
+        &live.signals,
+        RESOLVE_ALTERNATIVES,
+    );
+    Ok(ResolveReply {
+        model: decision.model.qualified_id.clone(),
+        tier: tier.as_str(),
+        role: decision.role.as_str(),
+        plan_backed: decision.plan_backed,
+        effort: decision.effort.map(EffortLevel::as_str),
+        reason: decision.reason.as_str(),
+        pinned: matches!(
+            decision.reason,
+            RouteReason::Pinned | RouteReason::ToolContinuationReplay
+        ),
+        alternatives,
+    })
+}
+
+/// `GET /api/smart-auto/tiers`: each tier's selector and eligible pool under the current rules,
+/// the role names and the advisory tier per role.
+pub async fn tiers(State(state): State<AppState>) -> Response {
+    let config = state.config();
+    let rules = state.smart_auto_rules().current();
+    let snapshot = state.model_descriptors();
+    let mut rows = Vec::with_capacity(SmartAutoTier::ALL.len());
+    for tier in SmartAutoTier::ALL {
+        let selector = match tier_selector(&config.smart_auto_presets, tier) {
+            Ok(selector) => selector,
+            Err(error) => return error.into_response(),
+        };
+        let policy = hub_policy(&rules, &selector, &SmartAutoHeaders::default());
+        let pool = SmartAutoPool::eligible(&snapshot, &policy, RESOLVE_ENDPOINT, 0)
+            .into_iter()
+            .map(|descriptor| descriptor.qualified_id.clone())
+            .collect();
+        rows.push(TierRow {
+            name: tier.as_str(),
+            selector: format!("{}/{}", HubSelector::NAMESPACE, tier.selector()),
+            pool,
+        });
+    }
+    Json(TiersReply {
+        default_tier: SmartAutoTier::default().as_str(),
+        tiers: rows,
+        roles: ROLE_TIER_DEFAULTS
+            .iter()
+            .map(|(role, _)| role.as_str())
+            .collect(),
+        role_tier_defaults: ROLE_TIER_DEFAULTS
+            .iter()
+            .map(|(role, tier)| (role.as_str(), tier.as_str()))
+            .collect(),
+    })
+    .into_response()
+}
+
+fn tier_selector(
+    presets: &BTreeMap<String, SmartAutoPolicy>,
+    tier: SmartAutoTier,
+) -> Result<HubSelector, AppError> {
+    let id = format!("{}/{}", HubSelector::NAMESPACE, tier.selector());
+    HubSelector::parse(&id, presets)?
+        .ok_or_else(|| AppError::Internal(format!("{id} is not a hub selector")))
 }
 
 /// Drops an empty query value, so `?worker=` behaves as if the parameter were absent.
