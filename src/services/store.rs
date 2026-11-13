@@ -168,7 +168,10 @@ pub(crate) fn group_tier_role(
                 }
             }
             let cost_usd = group.cost.total();
-            #[allow(clippy::cast_precision_loss)] // attempt counts stay far below 2^52
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "attempt counts stay far below 2^52"
+            )]
             let completed_count = completed_attempts as f64;
             TierRoleRow {
                 tier: tier.into(),
@@ -221,7 +224,7 @@ impl Store {
         }
     }
 
-    #[allow(clippy::too_many_lines)] // linear schema setup and migrations
+    #[allow(clippy::too_many_lines, reason = "linear schema setup and migrations")]
     fn open_sqlite(path: &str) -> Result<Store, String> {
         let conn =
             Connection::open(path).map_err(|e| format!("cannot open sqlite at {path}: {e}"))?;

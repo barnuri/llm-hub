@@ -393,6 +393,10 @@ pub struct ResolveBody {
     pub text: Option<String>,
     /// Comma-separated profiles, the same filter as the `x-llm-hub-profiles` header.
     pub profiles: Option<String>,
+    /// The parent workflow, the same as the `x-llm-hub-smart-auto-parent` header.
+    pub parent: Option<String>,
+    /// The parent policy handle, the same as the `x-llm-hub-smart-auto-policy` header.
+    pub policy_handle: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -436,7 +440,7 @@ const PIN_ENDPOINTS: [&str; 5] = [
 const RESOLVE_ALTERNATIVES: usize = 4;
 
 /// `POST /api/smart-auto/resolve`: the model a `hub/smart-auto-<tier>` turn would get, without
-/// calling an upstream or recording anything. With `worker` or `session`, a kept pin from any route is reported.
+/// calling an upstream or recording anything. With `worker` or `session`, the dry run reports a kept pin, whichever client route set it.
 pub async fn resolve(State(state): State<AppState>, Json(body): Json<ResolveBody>) -> Response {
     match resolve_dry_run(&state, body) {
         Ok(reply) => Json(reply).into_response(),
@@ -475,6 +479,8 @@ fn resolve_caller(body: &mut ResolveBody) -> Result<SmartAutoHeaders, AppError> 
             ..SmartAutoPolicy::default()
         },
         worker: non_empty(body.worker.take()),
+        parent: non_empty(body.parent.take()),
+        policy_handle: non_empty(body.policy_handle.take()),
         ..SmartAutoHeaders::default()
     })
 }
@@ -597,7 +603,7 @@ pub async fn tiers(State(state): State<AppState>) -> Response {
             .collect();
         rows.push(TierRow {
             name: tier.as_str(),
-            selector: format!("{}/{}", HubSelector::NAMESPACE, tier.selector()),
+            selector: tier_selector_id(tier),
             pool,
         });
     }
@@ -620,9 +626,14 @@ fn tier_selector(
     presets: &BTreeMap<String, SmartAutoPolicy>,
     tier: SmartAutoTier,
 ) -> Result<HubSelector, AppError> {
-    let id = format!("{}/{}", HubSelector::NAMESPACE, tier.selector());
+    let id = tier_selector_id(tier);
     HubSelector::parse(&id, presets)?
         .ok_or_else(|| AppError::Internal(format!("{id} is not a hub selector")))
+}
+
+/// The `hub/smart-auto-<tier>` id of a tier.
+fn tier_selector_id(tier: SmartAutoTier) -> String {
+    format!("{}/{}", HubSelector::NAMESPACE, tier.selector())
 }
 
 /// Drops an empty query value, so `?worker=` behaves as if the parameter were absent.

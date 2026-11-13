@@ -916,3 +916,54 @@ async fn resolve_reports_a_pin_set_through_messages() {
 async fn resolve_reports_a_pin_set_through_chat_completions() {
     resolve_after_a_turn("/v1/chat/completions", chat_body("hub/smart-auto-fast")).await;
 }
+
+#[tokio::test]
+async fn resolve_finds_a_pin_set_with_a_parent() {
+    let alpha = listing_upstream("m1").await;
+    let beta = listing_upstream("m2").await;
+    for upstream in [&alpha, &beta] {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ok_completion())
+            .mount(upstream)
+            .await;
+    }
+    let (_hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header(SMART_AUTO_WORKER, "run-parent")
+        .header("x-llm-hub-smart-auto-parent", "flow-1")
+        .header(SESSION_ID, "parent-session")
+        .json(&chat_body("hub/smart-auto-fast"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let served = response.headers()["x-llm-hub-model"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    response.bytes().await.unwrap();
+
+    let query = serde_json::json!({"tier": "fast", "worker": "run-parent",
+        "session": "parent-session", "parent": "flow-1"});
+    let mut reply = serde_json::Value::Null;
+    for _ in 0..100 {
+        reply = client
+            .post(format!("{base}/api/smart-auto/resolve"))
+            .json(&query)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if reply["pinned"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(reply["pinned"], true, "{reply}");
+    assert_eq!(reply["model"], served.as_str(), "{reply}");
+}
