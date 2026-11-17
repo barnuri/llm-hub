@@ -13,7 +13,7 @@ Source code: [github.com/barnuri/llm-hub](https://github.com/barnuri/llm-hub).
 4. Updates arrive on their own.
 5. It is open source under the MIT license.
 
-We recommend installing it. Four steps below.
+We recommend installing it. One command below.
 
 You set it up once. After that, you start Claude Code with one command.
 
@@ -25,31 +25,40 @@ You set it up once. After that, you start Claude Code with one command.
 2. Claude Code installed. Check it with `claude --version`.
 3. A Mac or Linux computer. For Windows, see the [install guide](../service-and-updates.md#install).
 
-## Install in 4 steps
+## Install in one command
 
-**Step 1. Install llm-hub.** Paste this in a terminal:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/barnuri/llm-hub/master/scripts/install.sh | sh
-```
-
-**Step 2. Make a settings file.** Make a folder, for example `~/llm-hub`. Put a file named `.env`
-in it with these two lines:
+Paste this in a terminal. It installs everything, signs you in to GitHub, and writes the settings.
+Run it again any time: it does only the steps that are not done yet.
 
 ```sh
-LLM_HUB_COPILOT_BASE_URL=https://api.githubcopilot.com
-LLM_HUB_COPILOT_AUTH=github-copilot
+curl -fsSL https://raw.githubusercontent.com/barnuri/llm-hub/master/scripts/install.sh | sh -s -- --copilot
 ```
 
-**Step 3. Log in to GitHub.** Run this from the same folder:
+The script:
 
-```sh
-llm-hub copilot login --profile copilot
-```
+1. Installs the GitHub CLI (`gh`) with Homebrew, apt, or dnf when it is missing.
+2. Installs `llm-hub` when it is missing.
+3. Creates `~/llm-hub/.env` with the Copilot settings. Existing values stay.
+4. Runs `gh auth login` in the browser when you are not logged in. llm-hub reads the token from `gh`.
+5. Checks the token against GitHub.
 
-The terminal shows a code and a web address. Open the address, enter the code, and approve.
+Flags (all optional):
 
-**Step 4. Start Claude Code on Copilot.** Keep llm-hub running in one terminal (run `llm-hub`
+| Flag | Effect |
+|------|--------|
+| `--dir PATH` | Settings folder (default `~/llm-hub`) |
+| `--profile NAME` | Profile name (default `copilot`) |
+| `--auth-flow github-copilot-vscode` | Use the VS Code flow instead |
+| `--device-login` | Sign in with llm-hub's device code instead of `gh` |
+| `--service` | Also run llm-hub in the background (`llm-hub service install`) |
+| `--force-env` | Replace the managed `.env` values with the defaults |
+| `--skip-install` | Do not install `gh` or `llm-hub` |
+| `--skip-gh-login` | Do not start `gh auth login` |
+
+To pass flags through the pipe: `... | sh -s -- --service --dir ~/llm-hub`.
+Or save the file and run it: `sh scripts/install.sh --help`.
+
+**Then start Claude Code on Copilot.** Keep llm-hub running in one terminal (run `llm-hub`
 from the folder). In a second terminal, run:
 
 ```sh

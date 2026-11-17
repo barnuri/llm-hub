@@ -12,6 +12,7 @@ use crate::services::copilot_headers::ACCEPT_JSON;
 use crate::services::copilot_sessions::CopilotSessionCache;
 use crate::services::credential_store::CredentialStore;
 use crate::services::gh_cli::GhCli;
+use crate::utils::error_chain::error_chain;
 
 const DEVICE_CODE_PATH: &str = "login/device/code";
 const ACCESS_TOKEN_PATH: &str = "login/oauth/access_token";
@@ -240,7 +241,12 @@ async fn request_device_code(
         .json(&json!({ "client_id": client_id, "scope": GITHUB_OAUTH_SCOPE }))
         .send()
         .await
-        .map_err(|e| format!("the device code request failed: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "the device code request failed: {}",
+                error_chain(&e)
+            )
+        })?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("the device code request returned status {status}"));
@@ -268,7 +274,7 @@ async fn poll_access_token(
         }))
         .send()
         .await
-        .map_err(|e| format!("the device login poll failed: {e}"))?;
+        .map_err(|e| format!("the device login poll failed: {}", error_chain(&e)))?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("the device login poll returned status {status}"));
