@@ -31,6 +31,12 @@ impl SmartAutoRouter {
     const MAX_USAGE_POINTS: u32 = 2;
     /// A conversation turn this short is an approval that continues the kept model's work.
     const APPROVAL_MAX_WORDS: usize = 3;
+    /// The role a step-down is scored as: the cheap worker of plan-backed implementation.
+    const CHEAP_WORK: RoleDecision = RoleDecision {
+        role: WorkRole::Implementation,
+        plan_backed: true,
+        reason: RoleReason::NoCue,
+    };
 
     /// Routes one turn over the eligible `pool`. `anchor` holds the affinity store and the
     /// turn's key, `None` without a key. Returns `None` for an empty pool.
@@ -112,16 +118,31 @@ impl SmartAutoRouter {
             return Some((pinned, turn, RouteReason::ToolContinuationReplay, None));
         }
         let turn = SmartAutoRoles::classify_user_text(signals, policy.role);
+        let step_down_allowed = affinity.step_down_allowed(key, signals.user_turns, now);
+        if Self::steps_down(
+            pinned_role,
+            pinned_plan_backed,
+            turn,
+            signals,
+            step_down_allowed,
+        ) {
+            let model = Self::best(pool, tier, Self::CHEAP_WORK, usage, live)?;
+            let reason = if std::ptr::eq(model, pinned) {
+                RouteReason::Pinned
+            } else {
+                RouteReason::RoleSwitch
+            };
+            return Some((model, turn, reason, None));
+        }
         let settled = affinity.soft_switch_allowed(key, signals.user_turns, now);
-        let switches =
-            SmartAutoAffinity::should_switch(
-                pinned_role,
-                pinned_plan_backed,
-                turn.role,
-                turn.plan_backed,
-                signals,
-                settled,
-            ) || Self::steps_down(pinned_role, pinned_plan_backed, turn, signals, settled);
+        let switches = SmartAutoAffinity::should_switch(
+            pinned_role,
+            pinned_plan_backed,
+            turn.role,
+            turn.plan_backed,
+            signals,
+            settled,
+        );
         if !switches {
             return Some((pinned, turn, RouteReason::Pinned, None));
         }
@@ -143,25 +164,32 @@ impl SmartAutoRouter {
         Some((model, turn, reason, None))
     }
 
-    /// Whether a settled heavy pin steps down to the conversation pick at the start of a turn.
-    /// Only a plain conversation turn (no role cue) qualifies, and not a short approval such as
-    /// "yes, go", which continues the heavy work. A tool continuation never steps down, so a
-    /// tool loop keeps its model, its prompt cache and its signed thinking blocks.
+    /// Whether a heavy pin steps down to the cheap pick at the start of a user turn. Only
+    /// planning and implementation without a plan keep a premium model; any other turn moves,
+    /// even on a warm cache, because the turn's tool loop then replays the cheap model. A short
+    /// approval such as "yes, go" continues the heavy work. The decision is made once per user
+    /// turn: a tool continuation never steps down, so a turn never churns between models.
+    /// `allowed` is the switch budget, which bounds ping-pong across turns.
     fn steps_down(
         pinned_role: WorkRole,
         pinned_plan_backed: bool,
         turn: RoleDecision,
         signals: &TurnSignals,
-        settled: bool,
+        allowed: bool,
     ) -> bool {
         let pinned_is_heavy = pinned_role != WorkRole::Conversation
             && !(pinned_role == WorkRole::Implementation && pinned_plan_backed);
-        settled
+        allowed
             && !signals.tool_continuation
             && pinned_is_heavy
-            && turn.role == WorkRole::Conversation
-            && turn.reason == RoleReason::NoCue
+            && !Self::needs_premium(turn)
             && !Self::is_short_approval(signals)
+    }
+
+    /// Planning and implementation without a plan are the turns that keep a premium model.
+    fn needs_premium(turn: RoleDecision) -> bool {
+        turn.role == WorkRole::Planning
+            || (turn.role == WorkRole::Implementation && !turn.plan_backed)
     }
 
     /// A user turn of at most `APPROVAL_MAX_WORDS` visible words.
@@ -469,50 +497,76 @@ mod tests {
     }
 
     #[test]
-    fn a_minor_role_change_keeps_the_pin() {
+    fn a_premium_pin_stays_between_premium_roles() {
         let now = Instant::now();
-        let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
+        let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
+        let affinity = pinned_store(OPUS, WorkRole::Implementation, false, now);
         let owned = models(&[HAIKU, OPUS, SONNET]);
         let pool: Vec<&ModelDescriptor> = owned.iter().collect();
-        let decision = route_pinned(&pool, &affinity, &signals(REVIEW_TEXT, 6, false), now);
+        let decision = route_pinned(&pool, &affinity, &signals(PLANNING_TEXT, 6, false), cold);
         assert_eq!(decision.model.qualified_id, OPUS);
-        assert_eq!(decision.role, WorkRole::Validation);
+        assert_eq!(decision.role, WorkRole::Planning);
         assert_eq!(decision.reason, RouteReason::Pinned);
     }
 
     #[test]
-    fn planning_to_plan_backed_implementation_switches_once_settled() {
+    fn a_warm_heavy_pin_steps_down_for_plan_backed_work_and_its_tool_loop_stays() {
         let now = Instant::now();
-        let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
         let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
+        let key = key(&policy(SmartAutoTier::Balance));
         let owned = models(&[HAIKU, OPUS, SONNET]);
         let pool: Vec<&ModelDescriptor> = owned.iter().collect();
 
-        let unsettled = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 2, false), cold);
-        assert_eq!(unsettled.model.qualified_id, OPUS);
-        assert_eq!(unsettled.reason, RouteReason::Pinned);
+        let turn = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 2, false), now);
+        assert_eq!(turn.model.qualified_id, HAIKU);
+        assert_eq!(turn.role, WorkRole::Implementation);
+        assert_eq!(turn.reason, RouteReason::RoleSwitch);
 
-        let settled = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 3, false), cold);
-        assert_eq!(settled.model.qualified_id, HAIKU);
-        assert_eq!(settled.reason, RouteReason::RoleSwitch);
+        assert!(affinity.commit(&key, HAIKU, turn.role, turn.plan_backed, 2, now));
+        let replay = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 2, true), now);
+        assert_eq!(replay.model.qualified_id, HAIKU);
+        assert_eq!(replay.reason, RouteReason::ToolContinuationReplay);
     }
 
     #[test]
-    fn a_warm_heavy_pin_keeps_its_model_for_a_role_cue() {
+    fn a_warm_heavy_pin_keeps_its_model_for_planning_and_hard_implementation() {
         let now = Instant::now();
-        let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
         let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
         let owned = models(&[HAIKU, OPUS, SONNET]);
         let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let planning = route_pinned(&pool, &affinity, &signals(PLANNING_TEXT, 2, false), now);
+        assert_eq!(planning.model.qualified_id, OPUS);
+        assert_eq!(planning.reason, RouteReason::Pinned);
+        let hard = "implement the retry logic for the storage client";
+        let hard = route_pinned(&pool, &affinity, &signals(hard, 2, false), now);
+        assert_eq!(hard.model.qualified_id, OPUS);
+        assert_eq!(hard.role, WorkRole::Implementation);
+        assert!(!hard.plan_backed);
+    }
 
-        let warm = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 3, false), now);
-        assert_eq!(warm.model.qualified_id, OPUS);
-        assert_eq!(warm.role, WorkRole::Implementation);
-        assert_eq!(warm.reason, RouteReason::Pinned);
+    #[test]
+    fn a_warm_heavy_pin_steps_down_for_review_work() {
+        let now = Instant::now();
+        let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let decision = route_pinned(&pool, &affinity, &signals(REVIEW_TEXT, 2, false), now);
+        assert_eq!(decision.model.qualified_id, HAIKU);
+        assert_eq!(decision.reason, RouteReason::RoleSwitch);
+    }
 
-        let cold_turn = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 3, false), cold);
-        assert_eq!(cold_turn.model.qualified_id, HAIKU);
-        assert_eq!(cold_turn.reason, RouteReason::RoleSwitch);
+    #[test]
+    fn step_downs_stop_when_the_switch_budget_is_spent() {
+        let now = Instant::now();
+        let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
+        let key = key(&policy(SmartAutoTier::Balance));
+        assert!(affinity.commit(&key, HAIKU, WorkRole::Implementation, true, 2, now));
+        assert!(affinity.commit(&key, OPUS, WorkRole::Planning, false, 3, now));
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let decision = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 4, false), now);
+        assert_eq!(decision.model.qualified_id, OPUS);
+        assert_eq!(decision.reason, RouteReason::Pinned);
     }
 
     #[test]
@@ -531,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn a_settled_heavy_pin_steps_down_on_a_plain_conversation_turn() {
+    fn a_heavy_pin_steps_down_on_a_plain_conversation_turn() {
         let now = Instant::now();
         let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
         let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
@@ -539,9 +593,9 @@ mod tests {
         let pool: Vec<&ModelDescriptor> = owned.iter().collect();
         let chat = "thanks, what does the new storage layer do for us";
 
-        let unsettled = route_pinned(&pool, &affinity, &signals(chat, 2, false), cold);
-        assert_eq!(unsettled.model.qualified_id, OPUS);
-        assert_eq!(unsettled.reason, RouteReason::Pinned);
+        let warm = route_pinned(&pool, &affinity, &signals(chat, 2, false), now);
+        assert_eq!(warm.model.qualified_id, HAIKU);
+        assert_eq!(warm.reason, RouteReason::RoleSwitch);
 
         let settled = route_pinned(&pool, &affinity, &signals(chat, 3, false), cold);
         assert_eq!(settled.model.qualified_id, HAIKU);

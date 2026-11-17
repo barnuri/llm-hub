@@ -242,7 +242,7 @@ async fn wait_for_stored_prompt(store: &Path, needle: &str) {
 /// A settled pin whose prompt cache is still warm keeps its model on a role change: a switch would
 /// rebuild the whole prompt cache on the new model. Cold-cache switching is covered by the router
 /// and affinity unit tests, which control the clock.
-async fn a_warm_settled_pin_keeps_its_model_on_a_role_change() {
+async fn a_warm_premium_pin_steps_down_for_plan_backed_implementation() {
     let (alpha, beta) = reviewed_pair(
         vec![
             json!({"id": "claude-opus-4.6"}),
@@ -285,7 +285,9 @@ async fn a_warm_settled_pin_keeps_its_model_on_a_role_change() {
     )
     .await;
     assert_eq!(implementation.status(), 200);
-    assert_eq!(
+    // The mock upstreams price every model the same, so the step-down lands on the best
+    // plan-backed worker by quality; in production the cheap model wins on cost.
+    assert_ne!(
         implementation.headers()["x-llm-hub-model"],
         "alpha/claude-opus-4.6"
     );
@@ -295,7 +297,7 @@ async fn a_warm_settled_pin_keeps_its_model_on_a_role_change() {
     );
     assert_eq!(
         implementation.headers()["x-llm-hub-smart-auto-reason"],
-        "pinned"
+        "role_switch"
     );
 }
 

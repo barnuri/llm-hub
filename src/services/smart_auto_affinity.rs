@@ -159,6 +159,23 @@ impl SmartAutoAffinity {
         dwelled && recent_switches < Self::SOFT_SWITCH_BUDGET
     }
 
+    /// Whether a step-down to the cheap model is allowed at user turn `turn`. A warm cache and
+    /// the dwell do not block it, because a premium tool loop costs more than one cache rewrite.
+    /// Only the switch budget does.
+    #[must_use]
+    pub fn step_down_allowed(&self, key: &AffinityKey, turn: usize, now: Instant) -> bool {
+        let mut table = self.lock();
+        let Some(entry) = table.live_entry(key, now) else {
+            return true;
+        };
+        let recent_switches = entry
+            .switch_turns
+            .iter()
+            .filter(|switched| turn.saturating_sub(**switched) < Self::SOFT_SWITCH_WINDOW_TURNS)
+            .count();
+        recent_switches < Self::SOFT_SWITCH_BUDGET
+    }
+
     /// Pins `model` for `role` and its plan backing after a successful response at turn `turn`.
     /// Returns `false` and pins nothing for an Auto alias, a `hub/*` id or an unqualified id.
     pub fn commit(
