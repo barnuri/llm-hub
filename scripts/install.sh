@@ -90,11 +90,11 @@ install_binary() {
 }
 
 step "llm-hub binary"
-if command -v llm-hub >/dev/null 2>&1; then
-  ok "llm-hub at $(command -v llm-hub)"
-elif [ "$SKIP_INSTALL" -eq 1 ]; then
-  die "llm-hub is missing and --skip-install is set"
+if [ "$SKIP_INSTALL" -eq 1 ]; then
+  command -v llm-hub >/dev/null 2>&1 || die "llm-hub is missing and --skip-install is set"
+  ok "llm-hub at $(command -v llm-hub) (skipped update)"
 else
+  # Always the newest published release: an existing install is replaced.
   install_binary
   command -v llm-hub >/dev/null 2>&1 || die "llm-hub not on PATH. Add $INSTALL_DIR to PATH and rerun"
 fi
