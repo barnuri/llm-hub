@@ -39,6 +39,12 @@
 | master | | |
 | this PR | | |
 
+## Binary size
+
+<!-- Required when the binary-size check reports growth over 2% against the latest release.
+     Say what added the size, and why it is worth it for users. The check fails without it.
+     Run locally: cargo build --release && scripts/binary-size.sh -->
+
 ## Tests
 
 <!-- The tests that cover this change. A bug fix needs a test that fails before the fix.
@@ -54,5 +60,6 @@
 - [ ] A new opt-in feature has a test for the on state and a test for the default state
 - [ ] Follows [CONTRIBUTING.md](../CONTRIBUTING.md): SOLID, one responsibility per module, no new per-request network call or disk read
 - [ ] Request-path changes: the Performance table above comes from the `llm-hub-perf` skill (at most 50 ms added)
+- [ ] Binary growth over 2% is explained under Binary size
 - [ ] Docs in `docs/` updated for a new option or behavior
 - [ ] No secrets, internal hosts, quotas or personal paths in code, tests or the description

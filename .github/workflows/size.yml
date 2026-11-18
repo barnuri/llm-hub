@@ -1,0 +1,82 @@
+name: size
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: size-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  MAX_GROWTH_PCT: 2
+
+jobs:
+  binary-size:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: changes
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if git diff --name-only "origin/$BASE_REF...HEAD" | grep -qE '^(src/|ui/|build.rs|Cargo\.(toml|lock)|rust-toolchain.toml|scripts/binary-size.sh|\.github/workflows/size.yml)'; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+            echo "No change to the binary's inputs." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - id: binary
+        if: steps.changes.outputs.rust == 'true'
+        uses: actions/cache@v6
+        with:
+          path: size-binary/llm-hub
+          key: size-binary-${{ github.event.pull_request.head.sha }}
+      - if: steps.changes.outputs.rust == 'true' && steps.binary.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-size-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-size-${{ runner.os }}-
+      - if: steps.changes.outputs.rust == 'true' && steps.binary.outputs.cache-hit != 'true'
+        run: |
+          rustup toolchain install
+          cargo build --release
+          mkdir -p size-binary
+          cp target/release/llm-hub size-binary/llm-hub
+      - name: Compare with the latest release
+        if: steps.changes.outputs.rust == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set +e
+          scripts/binary-size.sh size-binary/llm-hub > size.md
+          grew=$?
+          set -e
+          cat size.md >> "$GITHUB_STEP_SUMMARY"
+          cat size.md
+          if [ "$grew" -eq 0 ]; then
+            exit 0
+          fi
+          reason=$(printf '%s\n' "$PR_BODY" \
+            | awk '/^## Binary size/ {on=1; next} /^## / {on=0} on' \
+            | sed -e 's/<!--.*-->//g' -e '/<!--/,/-->/d' -e '/^|/d' -e '/^[[:space:]]*$/d')
+          if [ "$(printf '%s' "$reason" | wc -c)" -lt 40 ]; then
+            echo "::error::The binary grew more than $MAX_GROWTH_PCT%. Explain why under '## Binary size' in the PR body: what added the size and why it is worth it."
+            exit 1
+          fi
+          echo "The PR body explains the growth:" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$reason" >> "$GITHUB_STEP_SUMMARY"
