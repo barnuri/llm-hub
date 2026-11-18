@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::dependencies::state::AppState;
 use crate::schemas::app_error::AppError;
+use crate::schemas::error_body::ErrorBody;
 use crate::services::profile_usage::{self, ProfileUsage, UsageKey};
 
 #[derive(Serialize)]
@@ -30,6 +31,7 @@ struct UsageSourcesBody {
 }
 
 /// `GET /api/usage/sources`: the enabled profiles that have a quota source, in config order.
+#[utoipa::path(get, path = "/api/usage/sources", tag = "profiles", summary = "Profiles that have a quota source", responses((status = 200, description = "Enabled profiles with a quota source, in config order", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn sources(State(state): State<AppState>) -> Response {
     let config = state.config();
     let sources = config
@@ -48,6 +50,7 @@ pub async fn sources(State(state): State<AppState>) -> Response {
 }
 
 /// `GET /api/profiles/{name}/usage`: the profile's quota, whatever its source.
+#[utoipa::path(get, operation_id = "profile_usage", path = "/api/profiles/{name}/usage", tag = "profiles", summary = "A profile quota", params(("name" = String, Path, description = "Profile name")), responses((status = 200, description = "The profile quota, whatever its source", body = Object), (status = 404, description = "Not found.", body = ErrorBody), (status = 502, description = "Upstream unavailable.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn usage(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let config = state.config();
     let Some(key) = UsageKey::for_profile(&config, &name) else {

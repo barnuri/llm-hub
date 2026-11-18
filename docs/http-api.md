@@ -47,6 +47,8 @@ Routes marked "key" need a key only when [hub auth](#hub-authentication) is on.
 | POST | `/api/keys` | Create a hub API key. Returns it once. | key |
 | DELETE | `/api/keys/{name}` | Delete a hub API key. | key |
 | POST | `/api/restart` | Restart the hub. A service manager restarts a service. A foreground run starts itself again. | key |
+| GET | `/openapi.json` | Generated OpenAPI 3.1 document. See [API docs](../README.md#api-docs). | key |
+| GET | `/api-docs/` | Interactive Swagger UI, assets embedded. | key |
 | GET | any other path | The web UI. | none |
 
 `POST /api/profiles`, `DELETE /api/profiles/{name}` and `POST /api/fallbacks` fail while
@@ -75,6 +77,6 @@ its hash.
 
 - While hub auth is off, the hub ignores the client key and sends each profile's own key
   upstream.
-- When auth is on, every `/v1/*` and `/api/*` route needs the master key or an enabled hub key,
+- When auth is on, every `/v1/*` and `/api/*` route, plus `/openapi.json` and `/api-docs/`, needs the master key or an enabled hub key,
   as `Authorization: Bearer <key>` or `x-api-key: <key>`.
 - `/healthz` and the UI files never need a key.

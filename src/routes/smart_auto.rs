@@ -3,6 +3,8 @@ use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
+use utoipa::IntoParams;
+use utoipa::ToSchema;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +19,7 @@ use crate::schemas::app_error::AppError;
 use crate::schemas::attempt_outcome::{AttemptOutcome, OutcomeCode, OutcomeSource};
 use crate::schemas::current_selection::CurrentSelection;
 use crate::schemas::effort_level::EffortLevel;
+use crate::schemas::error_body::ErrorBody;
 use crate::schemas::history_query::HistoryQuery;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::profile_filter::ProfileFilter;
@@ -46,13 +49,15 @@ use crate::services::store::now_ms;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct CurrentQuery {
     pub worker: Option<String>,
     pub session: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HistoryParams {
     pub workflow: Option<String>,
     pub worker: Option<String>,
@@ -62,12 +67,14 @@ pub struct HistoryParams {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct DecisionsQuery {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct AttemptParams {
     pub attempt: Option<String>,
 }
@@ -99,7 +106,7 @@ struct HistoryEvent {
     outcome: Option<AttemptOutcome>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct OutcomeBody {
     /// The salted attempt key, as history shows it.
     pub attempt: Option<String>,
@@ -136,6 +143,7 @@ struct EffectBody {
 }
 
 /// `GET /api/smart-auto/current?worker=<id>` or `?session=<id>`: the worker's main model, its active stages and freshness.
+#[utoipa::path(get, path = "/api/smart-auto/current", tag = "smart-auto", summary = "Current selection of a worker", params(CurrentQuery), responses((status = 200, description = "The worker selection, or null", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn current(State(state): State<AppState>, Query(query): Query<CurrentQuery>) -> Response {
     let Some(raw) = non_empty(query.worker).or_else(|| non_empty(query.session)) else {
         return AppError::BadRequest("worker or session is required".into()).into_response();
@@ -161,6 +169,7 @@ fn is_scope_key_prefix(raw: &str) -> bool {
 }
 
 /// `GET /api/smart-auto/history?workflow=&worker=&since_seq=&limit=`: selection events after `since_seq`, oldest first.
+#[utoipa::path(get, path = "/api/smart-auto/history", tag = "smart-auto", summary = "Selection events", params(HistoryParams), responses((status = 200, description = "Events after since_seq, oldest first", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn history(
     State(state): State<AppState>,
     Query(params): Query<HistoryParams>,
@@ -242,6 +251,7 @@ async fn with_outcomes(
 
 /// `POST /api/smart-auto/outcome`: records a client-reported outcome for an attempt, or for the
 /// worker's last completed attempt. A client outcome overrides review and heuristic ones.
+#[utoipa::path(post, path = "/api/smart-auto/outcome", tag = "smart-auto", summary = "Report an attempt outcome", request_body(content = OutcomeBody, description = "The attempt, session or worker, and the outcome code", content_type = "application/json"), responses((status = 200, description = "Recorded", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 404, description = "Not found.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn report_outcome(
     State(state): State<AppState>,
     Json(body): Json<OutcomeBody>,
@@ -288,6 +298,7 @@ pub async fn report_outcome(
 }
 
 /// `GET /api/smart-auto/decisions?limit=N`: the newest Smart Auto routes, newest first.
+#[utoipa::path(get, path = "/api/smart-auto/decisions", tag = "smart-auto", summary = "Recent Smart Auto routes", params(DecisionsQuery), responses((status = 200, description = "Routes, newest first", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn decisions(
     State(state): State<AppState>,
     Query(query): Query<DecisionsQuery>,
@@ -304,6 +315,7 @@ pub async fn decisions(
 
 /// `GET /api/smart-auto/health`: what Smart Auto measured about each model. A model with
 /// `cooled_for_ms` above 0 is skipped until it elapses.
+#[utoipa::path(get, path = "/api/smart-auto/health", tag = "smart-auto", summary = "Per-model measurements", responses((status = 200, description = "Failures, cooldown, error rate, speed and cost scores", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn health(State(state): State<AppState>) -> Response {
     Json(HealthBody {
         models: state.model_health().report(std::time::Instant::now()),
@@ -317,11 +329,13 @@ pub async fn health(State(state): State<AppState>) -> Response {
 }
 
 /// `GET /api/smart-auto/rules`: the active allow, exclude and include rules, their source and whether they are read-only.
+#[utoipa::path(get, path = "/api/smart-auto/rules", tag = "smart-auto", summary = "Active rules", responses((status = 200, description = "Rules, their source and the read-only flag", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn get_rules(State(state): State<AppState>) -> Response {
     rules_response(&state.smart_auto_rules().current())
 }
 
 /// `PUT /api/smart-auto/rules`: validates the body, saves it atomically and returns the saved rules.
+#[utoipa::path(put, path = "/api/smart-auto/rules", tag = "smart-auto", summary = "Replace the rules", request_body(content = Object, description = "Smart Auto rules document", content_type = "application/json"), responses((status = 200, description = "The saved rules", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 403, description = "Config is read-only (LLM_HUB_CONFIG_READONLY=true).", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn put_rules(State(state): State<AppState>, body: Bytes) -> Response {
     match state.smart_auto_rules().replace(&body) {
         Ok(loaded) => rules_response(&loaded),
@@ -331,6 +345,7 @@ pub async fn put_rules(State(state): State<AppState>, body: Bytes) -> Response {
 
 /// `GET /api/smart-auto/rules/effect`: each model's `eligible`, `reason` and `matched` glob under the current rules.
 /// Reasons are checked in this order: `not_chat`, `auto_alias`, `hub_namespace`, `allowed_override`, `excluded_by_global`, `excluded_by_profile`, `not_in_profile_include`, `not_in_global_include`, `eligible`.
+#[utoipa::path(get, path = "/api/smart-auto/rules/effect", tag = "smart-auto", summary = "Effect of the rules per model", responses((status = 200, description = "Each model with eligible, reason and matched glob", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn rules_effect(State(state): State<AppState>) -> Response {
     let rules = state.smart_auto_rules().current();
     let rows = rule_effects(&state.model_descriptors(), rules.policy());
@@ -348,6 +363,7 @@ fn rules_response(loaded: &LoadedRules) -> Response {
 
 /// `GET /api/smart-auto/attempt?attempt=<key>`: the stored prompt and answer text of one dispatch attempt.
 /// Both are `null` when none was kept, for example when persistence is off or the attempt predates capture.
+#[utoipa::path(get, path = "/api/smart-auto/attempt", tag = "smart-auto", summary = "Stored text of one attempt", params(AttemptParams), responses((status = 200, description = "Prompt and answer text, each null when none was kept", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn attempt_text(
     State(state): State<AppState>,
     Query(params): Query<AttemptParams>,
@@ -380,7 +396,7 @@ pub async fn attempt_text(
 }
 
 /// The body of `POST /api/smart-auto/resolve`. Every field is optional.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ResolveBody {
     pub tier: Option<String>,
@@ -441,6 +457,7 @@ const RESOLVE_ALTERNATIVES: usize = 4;
 
 /// `POST /api/smart-auto/resolve`: the model a `hub/smart-auto-<tier>` turn would get, without
 /// calling an upstream or recording anything. With `worker` or `session`, the dry run reports a kept pin, whichever client route set it.
+#[utoipa::path(post, path = "/api/smart-auto/resolve", tag = "smart-auto", summary = "Dry-run a Smart Auto route", request_body(content = ResolveBody, description = "Tier, role and optional worker or session", content_type = "application/json"), responses((status = 200, description = "The model the turn would get, without calling an upstream or recording anything", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn resolve(State(state): State<AppState>, Json(body): Json<ResolveBody>) -> Response {
     match resolve_dry_run(&state, body) {
         Ok(reply) => Json(reply).into_response(),
@@ -586,6 +603,7 @@ fn resolve_dry_run(state: &AppState, mut body: ResolveBody) -> Result<ResolveRep
 
 /// `GET /api/smart-auto/tiers`: each tier's selector and eligible pool under the current rules,
 /// the role names and the advisory tier per role.
+#[utoipa::path(get, path = "/api/smart-auto/tiers", tag = "smart-auto", summary = "Tiers, roles and pools", responses((status = 200, description = "Each tier selector and eligible pool, the roles and the advisory tier per role", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn tiers(State(state): State<AppState>) -> Response {
     let config = state.config();
     let rules = state.smart_auto_rules().current();

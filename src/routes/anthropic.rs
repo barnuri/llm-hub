@@ -30,6 +30,13 @@ const ANTHROPIC_REQUEST_HEADERS: [&str; 2] = [
 /// # Errors
 /// 400 on a malformed body, an unprefixed model, an unsupported image source,
 /// or a body over `LLM_HUB_MAX_REPLAY_BYTES`; 502 when every attempt fails.
+#[utoipa::path(post, path = "/v1/messages", tag = "proxy", summary = "Anthropic Messages",
+    description = "Anthropic Messages API. The model must be `<profile>/<model>`. The hub forwards natively to Anthropic-capable upstreams and translates for the rest. Fallback and transform headers (`X-LLM-Hub-*`) apply. The hub reports errors in the Anthropic error envelope.",
+    request_body(content = Object, description = "Anthropic Messages request body", content_type = "application/json"),
+    responses((status = 200, description = "Message, or an SSE stream when `stream` is true", content((Object = "application/json"), (String = "text/event-stream"))),
+        (status = 400, description = "Malformed body, unprefixed model, unsupported image source or oversized body.", body = Object),
+        (status = 401, description = "Missing or invalid hub key.", body = Object),
+        (status = 502, description = "Every attempt failed.", body = Object)))]
 pub async fn messages(
     State(state): State<AppState>,
     req: Request,

@@ -1,0 +1,3068 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "llm-hub",
+    "description": "Single-binary LLM proxy. One port speaks OpenAI chat completions, OpenAI Responses and Anthropic Messages, and routes by `<profile>/<model>`. The `/api/*` routes feed the dashboard. The dashboard itself (any other GET path) is a web UI and is not part of this document.\n\nAuth: when `LLM_HUB_MASTER_KEY` is set or a hub API key exists, every `/v1/*`, `/api/*`, `/openapi.json` and `/api-docs` request needs a key. With neither, auth is off and any or no key is accepted. `/healthz` never needs a key.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/claude-code/settings": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "summary": "claude --settings input",
+        "operationId": "settings",
+        "parameters": [
+          {
+            "name": "profiles",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON with a picker entry for every hub model",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/copilot/auto/decisions": {
+      "get": {
+        "tags": [
+          "copilot"
+        ],
+        "summary": "Recent Copilot Auto decisions",
+        "operationId": "auto_decisions",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Decisions, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/copilot/prices": {
+      "post": {
+        "tags": [
+          "copilot"
+        ],
+        "summary": "Set the Copilot price refresh interval",
+        "operationId": "set_copilot_prices",
+        "requestBody": {
+          "description": "Refresh interval in seconds; 0 turns the fetch off",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CopilotPricesInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Config is read-only (LLM_HUB_CONFIG_READONLY=true).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/copilot/usage": {
+      "get": {
+        "tags": [
+          "copilot"
+        ],
+        "summary": "Copilot quota",
+        "operationId": "copilot_usage",
+        "parameters": [
+          {
+            "name": "profile",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Quota of the named or first enabled Copilot profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/copilot/usage/history": {
+      "get": {
+        "tags": [
+          "copilot"
+        ],
+        "summary": "Stored Copilot quota readings",
+        "operationId": "usage_history",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "`7d` (default) or `30d`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Readings and the daily burn. Needs the sqlite store.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/errors": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Failed requests",
+        "operationId": "errors",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "`1d`, `7d` (default), `30d`, or `all`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recent failed requests. Needs persistence.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/errors/resolve": {
+      "post": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Mark errors solved or reopen them",
+        "operationId": "resolve_errors",
+        "requestBody": {
+          "description": "Request ids and the solved flag",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveErrorsInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated count",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/fallbacks": {
+      "post": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Set the default fallback chain",
+        "operationId": "set_default_fallbacks",
+        "requestBody": {
+          "description": "Ordered model ids",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FallbacksInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Config is read-only (LLM_HUB_CONFIG_READONLY=true).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/insights": {
+      "get": {
+        "tags": [
+          "insights"
+        ],
+        "summary": "Per-model speed, stability and health",
+        "operationId": "insights",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "`1d`, `7d` (default), `30d`, or `all`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "min_requests",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "by",
+            "in": "query",
+            "description": "Criterion for `/api/insights/pick`; `overall` when omitted.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PickBy"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Insights report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/insights/pick": {
+      "get": {
+        "tags": [
+          "insights"
+        ],
+        "summary": "Best model by a criterion",
+        "operationId": "insights_pick",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "`1d`, `7d` (default), `30d`, or `all`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "min_requests",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "by",
+            "in": "query",
+            "description": "Criterion for `/api/insights/pick`; `overall` when omitted.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PickBy"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The picked model",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/insights/report": {
+      "get": {
+        "tags": [
+          "insights"
+        ],
+        "summary": "Insights as one document for agents",
+        "operationId": "insights_agent_report",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "`1d`, `7d` (default), `30d`, or `all`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "min_requests",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "by",
+            "in": "query",
+            "description": "Criterion for `/api/insights/pick`; `overall` when omitted.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PickBy"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Insights document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/keep-warm": {
+      "post": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Configure keep-warm pings",
+        "operationId": "set_keep_warm",
+        "requestBody": {
+          "description": "Keep-warm switch and idle cap",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeepWarmInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Config is read-only (LLM_HUB_CONFIG_READONLY=true).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/keys": {
+      "get": {
+        "tags": [
+          "keys"
+        ],
+        "summary": "List hub API keys",
+        "operationId": "list_api_keys",
+        "responses": {
+          "200": {
+            "description": "Keys without secrets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "keys"
+        ],
+        "summary": "Create a hub API key",
+        "operationId": "create_api_key",
+        "requestBody": {
+          "description": "Key name",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiKeyInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The new key, shown once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Config is read-only (LLM_HUB_CONFIG_READONLY=true).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/keys/{name}": {
+      "delete": {
+        "tags": [
+          "keys"
+        ],
+        "summary": "Delete a hub API key",
+        "operationId": "delete_api_key",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Key name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Config is read-only (LLM_HUB_CONFIG_READONLY=true).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/live": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Live feed of finished requests",
+        "operationId": "stream",
+        "responses": {
+          "200": {
+            "description": "Server-sent events: one data line per finished request (a usage row), plus a keep-alive comment",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/profiles": {
+      "get": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "List profiles",
+        "operationId": "list_profiles",
+        "responses": {
+          "200": {
+            "description": "Profiles with managed and running flags, API keys masked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Create or update a profile",
+        "operationId": "upsert_profile",
+        "requestBody": {
+          "description": "Profile fields. An omitted or empty api_key keeps the stored key.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The saved profile",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Config is read-only (LLM_HUB_CONFIG_READONLY=true).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/profiles/{name}": {
+      "delete": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Delete a profile",
+        "operationId": "delete_profile",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Profile name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Config is read-only (LLM_HUB_CONFIG_READONLY=true).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/profiles/{name}/test": {
+      "post": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Test a profile upstream",
+        "operationId": "test_profile",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Profile name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Test result with status and latency",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/profiles/{name}/usage": {
+      "get": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "A profile quota",
+        "operationId": "profile_usage",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Profile name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The profile quota, whatever its source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/restart": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Restart the hub",
+        "operationId": "restart_server",
+        "responses": {
+          "200": {
+            "description": "Restart requested",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "List sessions",
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "`today`, `1d`, `7d` (default), `30d`, or `all`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sessions in the range",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{worker}": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "summary": "Session detail",
+        "operationId": "detail",
+        "parameters": [
+          {
+            "name": "worker",
+            "in": "path",
+            "description": "Worker key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/smart-auto/attempt": {
+      "get": {
+        "tags": [
+          "smart-auto"
+        ],
+        "summary": "Stored text of one attempt",
+        "operationId": "attempt_text",
+        "parameters": [
+          {
+            "name": "attempt",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Prompt and answer text, each null when none was kept",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/smart-auto/current": {
+      "get": {
+        "tags": [
+          "smart-auto"
+        ],
+        "summary": "Current selection of a worker",
+        "operationId": "current",
+        "parameters": [
+          {
+            "name": "worker",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The worker selection, or null",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/smart-auto/decisions": {
+      "get": {
+        "tags": [
+          "smart-auto"
+        ],
+        "summary": "Recent Smart Auto routes",
+        "operationId": "decisions",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Routes, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/smart-auto/health": {
+      "get": {
+        "tags": [
+          "smart-auto"
+        ],
+        "summary": "Per-model measurements",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Failures, cooldown, error rate, speed and cost scores",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/smart-auto/history": {
+      "get": {
+        "tags": [
+          "smart-auto"
+        ],
+        "summary": "Selection events",
+        "operationId": "history",
+        "parameters": [
+          {
+            "name": "workflow",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "worker",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since_seq",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "since_ts_ms",
+            "in": "query",
+            "description": "Read the saved history from this time on, instead of the in-memory ring.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Events after since_seq, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/smart-auto/outcome": {
+      "post": {
+        "tags": [
+          "smart-auto"
+        ],
+        "summary": "Report an attempt outcome",
+        "operationId": "report_outcome",
+        "requestBody": {
+          "description": "The attempt, session or worker, and the outcome code",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OutcomeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/smart-auto/resolve": {
+      "post": {
+        "tags": [
+          "smart-auto"
+        ],
+        "summary": "Dry-run a Smart Auto route",
+        "operationId": "resolve",
+        "requestBody": {
+          "description": "Tier, role and optional worker or session",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The model the turn would get, without calling an upstream or recording anything",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/smart-auto/rules": {
+      "get": {
+        "tags": [
+          "smart-auto"
+        ],
+        "summary": "Active rules",
+        "operationId": "get_rules",
+        "responses": {
+          "200": {
+            "description": "Rules, their source and the read-only flag",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "smart-auto"
+        ],
+        "summary": "Replace the rules",
+        "operationId": "put_rules",
+        "requestBody": {
+          "description": "Smart Auto rules document",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The saved rules",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Config is read-only (LLM_HUB_CONFIG_READONLY=true).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/smart-auto/rules/effect": {
+      "get": {
+        "tags": [
+          "smart-auto"
+        ],
+        "summary": "Effect of the rules per model",
+        "operationId": "rules_effect",
+        "responses": {
+          "200": {
+            "description": "Each model with eligible, reason and matched glob",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/smart-auto/tiers": {
+      "get": {
+        "tags": [
+          "smart-auto"
+        ],
+        "summary": "Tiers, roles and pools",
+        "operationId": "tiers",
+        "responses": {
+          "200": {
+            "description": "Each tier selector and eligible pool, the roles and the advisory tier per role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/stats": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Request statistics",
+        "operationId": "stats",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "`live` (default), `1d`, `7d`, `30d`, or `all`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "model",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "routed_by",
+            "in": "query",
+            "description": "Keeps requests whose route starts with this text, for example `smart-auto`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aggregated request stats",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/usage": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Usage history with costs",
+        "operationId": "usage_history_all",
+        "responses": {
+          "200": {
+            "description": "Usage and cost history. Needs persistence.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/usage/sources": {
+      "get": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Profiles that have a quota source",
+        "operationId": "sources",
+        "responses": {
+          "200": {
+            "description": "Enabled profiles with a quota source, in config order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Liveness",
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "The text `ok`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/v1/messages": {
+      "post": {
+        "tags": [
+          "proxy"
+        ],
+        "summary": "Anthropic Messages",
+        "description": "Anthropic Messages API. The model must be `<profile>/<model>`. The hub forwards natively to Anthropic-capable upstreams and translates for the rest. Fallback and transform headers (`X-LLM-Hub-*`) apply. The hub reports errors in the Anthropic error envelope.",
+        "operationId": "messages",
+        "requestBody": {
+          "description": "Anthropic Messages request body",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Message, or an SSE stream when `stream` is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed body, unprefixed model, unsupported image source or oversized body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Every attempt failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "summary": "List models",
+        "operationId": "list_models",
+        "parameters": [
+          {
+            "name": "profiles",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Merged model list with <profile>/<model> ids",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models/{id}": {
+      "get": {
+        "tags": [
+          "models"
+        ],
+        "summary": "Get one model",
+        "operationId": "get_model_by_id",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Model id, <profile>/<model>",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The model descriptor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/{path}": {
+      "get": {
+        "tags": [
+          "proxy"
+        ],
+        "summary": "Pass-through GET to the upstream",
+        "description": "Pass-through, not a typed API. The hub forwards any `/v1/*` path that has no dedicated route to the upstream profile its target model names, and returns the upstream response unchanged (status, headers, body, SSE stream). The target comes from the `model` field of a JSON body (or a multipart `model` part), written `<profile>/<model>`. The hub strips the profile prefix before it forwards. Known examples: `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `POST /v1/messages/count_tokens`. Request and response shapes are those of the upstream provider, so this document does not describe them. Optional `X-LLM-Hub-*` request headers set fallbacks, timeout, retry statuses and body transforms. `X-LLM-Hub-Model` and `X-LLM-Hub-Attempts` response headers report what served the request. The hub answers 400 when the model has no known profile prefix, 401 on a bad hub key, and 502 when every attempt fails.",
+        "operationId": "proxy_get",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "description": "Rest of the upstream path, for example `chat/completions`. May contain slashes.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The upstream response, passed through unchanged. Streams as SSE when the upstream streams.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model missing or without a known profile prefix, or body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Every attempt failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "proxy"
+        ],
+        "summary": "Pass-through PUT to the upstream",
+        "description": "Pass-through, not a typed API. The hub forwards any `/v1/*` path that has no dedicated route to the upstream profile its target model names, and returns the upstream response unchanged (status, headers, body, SSE stream). The target comes from the `model` field of a JSON body (or a multipart `model` part), written `<profile>/<model>`. The hub strips the profile prefix before it forwards. Known examples: `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `POST /v1/messages/count_tokens`. Request and response shapes are those of the upstream provider, so this document does not describe them. Optional `X-LLM-Hub-*` request headers set fallbacks, timeout, retry statuses and body transforms. `X-LLM-Hub-Model` and `X-LLM-Hub-Attempts` response headers report what served the request. The hub answers 400 when the model has no known profile prefix, 401 on a bad hub key, and 502 when every attempt fails.",
+        "operationId": "proxy_put",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "description": "Rest of the upstream path, for example `chat/completions`. May contain slashes.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The upstream response, passed through unchanged. Streams as SSE when the upstream streams.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model missing or without a known profile prefix, or body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Every attempt failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "proxy"
+        ],
+        "summary": "Pass-through POST to the upstream",
+        "description": "Pass-through, not a typed API. The hub forwards any `/v1/*` path that has no dedicated route to the upstream profile its target model names, and returns the upstream response unchanged (status, headers, body, SSE stream). The target comes from the `model` field of a JSON body (or a multipart `model` part), written `<profile>/<model>`. The hub strips the profile prefix before it forwards. Known examples: `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `POST /v1/messages/count_tokens`. Request and response shapes are those of the upstream provider, so this document does not describe them. Optional `X-LLM-Hub-*` request headers set fallbacks, timeout, retry statuses and body transforms. `X-LLM-Hub-Model` and `X-LLM-Hub-Attempts` response headers report what served the request. The hub answers 400 when the model has no known profile prefix, 401 on a bad hub key, and 502 when every attempt fails.",
+        "operationId": "proxy_post",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "description": "Rest of the upstream path, for example `chat/completions`. May contain slashes.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The upstream response, passed through unchanged. Streams as SSE when the upstream streams.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model missing or without a known profile prefix, or body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Every attempt failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "proxy"
+        ],
+        "summary": "Pass-through DELETE to the upstream",
+        "description": "Pass-through, not a typed API. The hub forwards any `/v1/*` path that has no dedicated route to the upstream profile its target model names, and returns the upstream response unchanged (status, headers, body, SSE stream). The target comes from the `model` field of a JSON body (or a multipart `model` part), written `<profile>/<model>`. The hub strips the profile prefix before it forwards. Known examples: `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `POST /v1/messages/count_tokens`. Request and response shapes are those of the upstream provider, so this document does not describe them. Optional `X-LLM-Hub-*` request headers set fallbacks, timeout, retry statuses and body transforms. `X-LLM-Hub-Model` and `X-LLM-Hub-Attempts` response headers report what served the request. The hub answers 400 when the model has no known profile prefix, 401 on a bad hub key, and 502 when every attempt fails.",
+        "operationId": "proxy_delete",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "description": "Rest of the upstream path, for example `chat/completions`. May contain slashes.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The upstream response, passed through unchanged. Streams as SSE when the upstream streams.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model missing or without a known profile prefix, or body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Every attempt failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "proxy"
+        ],
+        "summary": "Pass-through PATCH to the upstream",
+        "description": "Pass-through, not a typed API. The hub forwards any `/v1/*` path that has no dedicated route to the upstream profile its target model names, and returns the upstream response unchanged (status, headers, body, SSE stream). The target comes from the `model` field of a JSON body (or a multipart `model` part), written `<profile>/<model>`. The hub strips the profile prefix before it forwards. Known examples: `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `POST /v1/messages/count_tokens`. Request and response shapes are those of the upstream provider, so this document does not describe them. Optional `X-LLM-Hub-*` request headers set fallbacks, timeout, retry statuses and body transforms. `X-LLM-Hub-Model` and `X-LLM-Hub-Attempts` response headers report what served the request. The hub answers 400 when the model has no known profile prefix, 401 on a bad hub key, and 502 when every attempt fails.",
+        "operationId": "proxy_patch",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "description": "Rest of the upstream path, for example `chat/completions`. May contain slashes.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The upstream response, passed through unchanged. Streams as SSE when the upstream streams.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model missing or without a known profile prefix, or body too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Every attempt failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiKeyInput": {
+        "type": "object",
+        "description": "Admin API request body for creating a hub api key.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "CopilotPricesInput": {
+        "type": "object",
+        "description": "Admin API request body for the Copilot price refresh interval.",
+        "required": [
+          "refresh_secs"
+        ],
+        "properties": {
+          "refresh_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds between fetches; `0` turns the fetch off.",
+            "minimum": 0
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "Error envelope the hub returns on a failed `/api/*` or `/v1/*` call.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        }
+      },
+      "ErrorDetail": {
+        "type": "object",
+        "required": [
+          "message",
+          "type"
+        ],
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Human-readable message."
+          },
+          "type": {
+            "type": "string",
+            "description": "Error kind, for example `invalid_request_error` or `authentication_error`."
+          }
+        }
+      },
+      "FallbacksInput": {
+        "type": "object",
+        "description": "Admin API request body for setting the default fallback chain.",
+        "required": [
+          "fallbacks"
+        ],
+        "properties": {
+          "fallbacks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "KeepWarmInput": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "idle_cap_minutes"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "idle_cap_minutes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "OutcomeBody": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "attempt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The salted attempt key, as history shows it."
+          },
+          "code": {
+            "$ref": "#/components/schemas/OutcomeCode"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The caller's raw Claude Code session id; the hub salts it into a worker key."
+          },
+          "worker": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An already-salted worker key, as history shows it."
+          }
+        }
+      },
+      "OutcomeCode": {
+        "type": "string",
+        "description": "What is known about whether a completed Smart Auto attempt did its job.",
+        "enum": [
+          "tests_passed",
+          "tests_failed",
+          "review_passed",
+          "review_rejected",
+          "user_accepted",
+          "user_corrected"
+        ]
+      },
+      "PickBy": {
+        "type": "string",
+        "description": "Ranking criterion for `/api/insights/pick`.",
+        "enum": [
+          "overall",
+          "stability",
+          "speed",
+          "ttft",
+          "decode",
+          "prefill"
+        ]
+      },
+      "ProfileInput": {
+        "type": "object",
+        "description": "Admin API request body for creating or updating a profile.",
+        "required": [
+          "name",
+          "base_url"
+        ],
+        "properties": {
+          "api_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Omitted or empty on update => keep the existing key (write-only field)."
+          },
+          "base_url": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "headers": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "keep_warm": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Omitted on update => keep the profile's current setting; a new profile starts on."
+          },
+          "models": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ResolveBody": {
+        "type": "object",
+        "description": "The body of `POST /api/smart-auto/resolve`. Every field is optional.",
+        "properties": {
+          "exclude": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "include": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "min_context": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "default": null,
+            "minimum": 0
+          },
+          "parent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The parent workflow, the same as the `x-llm-hub-smart-auto-parent` header.",
+            "default": null
+          },
+          "policy_handle": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The parent policy handle, the same as the `x-llm-hub-smart-auto-policy` header.",
+            "default": null
+          },
+          "profiles": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Comma-separated profiles, the same filter as the `x-llm-hub-profiles` header.",
+            "default": null
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "session": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "worker": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResolveErrorsInput": {
+        "type": "object",
+        "required": [
+          "ids",
+          "solved"
+        ],
+        "properties": {
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "description": "Request ids from `/api/errors` `recent[].id`."
+          },
+          "solved": {
+            "type": "boolean",
+            "description": "`true` marks the errors solved, `false` reopens them."
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "api_key": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key",
+        "description": "Same key as `bearer`, sent as the `x-api-key` header. Needed only when hub auth is on."
+      },
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Hub master key or an enabled hub API key, sent as `Authorization: Bearer <key>`. Needed only when hub auth is on."
+      }
+    }
+  },
+  "security": [
+    {
+      "bearer": []
+    },
+    {
+      "api_key": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "proxy",
+      "description": "Model traffic: Anthropic Messages and the pass-through catch-all."
+    },
+    {
+      "name": "models",
+      "description": "Model catalog."
+    },
+    {
+      "name": "profiles",
+      "description": "Upstream profiles, fallbacks, keep-warm and quotas."
+    },
+    {
+      "name": "keys",
+      "description": "Hub API keys."
+    },
+    {
+      "name": "stats",
+      "description": "Request stats, usage, errors and the live feed."
+    },
+    {
+      "name": "insights",
+      "description": "Model rankings."
+    },
+    {
+      "name": "sessions",
+      "description": "Coding-agent sessions."
+    },
+    {
+      "name": "smart-auto",
+      "description": "Smart Auto routing: selections, rules, outcomes, dry runs."
+    },
+    {
+      "name": "copilot",
+      "description": "GitHub Copilot quota, prices and Auto decisions."
+    },
+    {
+      "name": "system",
+      "description": "Liveness and restart."
+    }
+  ]
+}

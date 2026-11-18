@@ -27,6 +27,9 @@ tower-http = { version = "0.7.0", features = ["trace"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+utoipa = "6.0.0"
+utoipa-axum = "0.3.0"
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum", "vendored"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

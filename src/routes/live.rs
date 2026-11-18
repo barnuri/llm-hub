@@ -9,8 +9,10 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::consts::{LIVE_KEEP_ALIVE_INTERVAL, LIVE_KEEP_ALIVE_TEXT};
 use crate::dependencies::state::AppState;
+use crate::schemas::error_body::ErrorBody;
 use crate::schemas::usage_row::UsageRow;
 
+#[utoipa::path(get, path = "/api/live", tag = "stats", summary = "Live feed of finished requests", responses((status = 200, description = "Server-sent events: one data line per finished request (a usage row), plus a keep-alive comment", content((String = "text/event-stream"))), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn stream(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {

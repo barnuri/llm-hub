@@ -5,11 +5,13 @@ use serde_json::{Value, json};
 
 use crate::dependencies::state::AppState;
 use crate::routes::models::{ProfilesQuery, enabled_models};
+use crate::schemas::error_body::ErrorBody;
 use crate::schemas::launch::profile_filter::ProfileFilter;
 use crate::services::model_picker::sort_models;
 
 /// `claude --settings` input listing every hub model, since gateway discovery keeps only ids
 /// with `claude` or `anthropic`. Auto models first, then by request count; `?profiles=a,b` limits it.
+#[utoipa::path(get, path = "/api/claude-code/settings", tag = "models", summary = "claude --settings input", params(ProfilesQuery), responses((status = 200, description = "JSON with a picker entry for every hub model", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn settings(
     State(state): State<AppState>,
     Query(query): Query<ProfilesQuery>,

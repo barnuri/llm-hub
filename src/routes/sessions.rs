@@ -1,10 +1,12 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use serde::Deserialize;
+use utoipa::IntoParams;
 
 use crate::dependencies::state::AppState;
 use crate::routes::admin::since_for_range;
 use crate::schemas::app_error::AppError;
+use crate::schemas::error_body::ErrorBody;
 use crate::schemas::session_detail::SessionDetail;
 use crate::schemas::session_list::SessionList;
 use crate::services::pricing::PricingBook;
@@ -13,13 +15,15 @@ use crate::services::store::{Store, now_ms};
 
 const DEFAULT_SESSIONS_RANGE: &str = "7d";
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SessionsQuery {
     /// `today`, `1d`, `7d` (default), `30d`, or `all`.
     #[serde(default)]
     pub range: Option<String>,
 }
 
+#[utoipa::path(get, path = "/api/sessions", tag = "sessions", summary = "List sessions", params(SessionsQuery), responses((status = 200, description = "Sessions in the range", body = Object), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn list(
     State(state): State<AppState>,
     Query(query): Query<SessionsQuery>,
@@ -35,6 +39,7 @@ pub async fn list(
     Ok(Json(list))
 }
 
+#[utoipa::path(get, path = "/api/sessions/{worker}", tag = "sessions", summary = "Session detail", params(("worker" = String, Path, description = "Worker key")), responses((status = 200, description = "One session", body = Object), (status = 404, description = "Not found.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn detail(
     State(state): State<AppState>,
     Path(worker): Path<String>,

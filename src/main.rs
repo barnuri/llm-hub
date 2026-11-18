@@ -14,7 +14,11 @@ use std::collections::HashMap;
 
 use axum::Router;
 use axum::middleware;
-use axum::routing::{any, delete, get, post};
+use axum::routing::{any, get};
+use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::configs::HubConfig;
 use crate::consts::{ENV_FILE, LOGS_DIR, VERSION};
@@ -360,105 +364,75 @@ fn run_service_command() {
     }
 }
 
-fn build_router(state: AppState) -> Router {
-    let proxied = Router::new()
-        .route("/v1/messages", post(routes::anthropic::messages))
+/// Every documented route, collected with its `#[utoipa::path]`. A route added here without
+/// that attribute does not compile. Raw `.route(...)` calls (wildcards) are checked by a test.
+fn api_router(state: &AppState) -> OpenApiRouter<AppState> {
+    use routes::smart_auto;
+    use routes::{admin, anthropic, claude_code, copilot, live, models, profile_usage, sessions};
+
+    let proxied = OpenApiRouter::new()
+        .routes(routes!(anthropic::messages))
         .route("/v1/{*path}", any(routes::proxy::proxy))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             routes::models::await_first_catalog,
         ));
-    let protected = Router::new()
+    OpenApiRouter::with_openapi(routes::api_docs::ApiDoc::openapi())
         .merge(proxied)
-        .route("/v1/models", get(routes::models::list_models))
+        .routes(routes!(models::list_models))
         .route("/v1/models/{*id}", get(routes::proxy::get_model_by_id))
-        .route(
-            "/api/profiles",
-            get(routes::admin::list_profiles).post(routes::admin::upsert_profile),
-        )
-        .route(
-            "/api/profiles/{name}",
-            delete(routes::admin::delete_profile),
-        )
-        .route(
-            "/api/profiles/{name}/test",
-            post(routes::admin::test_profile),
-        )
-        .route(
-            "/api/claude-code/settings",
-            get(routes::claude_code::settings),
-        )
-        .route(
-            "/api/copilot/auto/decisions",
-            get(routes::copilot::auto_decisions),
-        )
-        .route("/api/smart-auto/current", get(routes::smart_auto::current))
-        .route(
-            "/api/smart-auto/rules",
-            get(routes::smart_auto::get_rules).put(routes::smart_auto::put_rules),
-        )
-        .route(
-            "/api/smart-auto/rules/effect",
-            get(routes::smart_auto::rules_effect),
-        )
-        .route("/api/smart-auto/history", get(routes::smart_auto::history))
-        .route(
-            "/api/smart-auto/outcome",
-            post(routes::smart_auto::report_outcome),
-        )
-        .route(
-            "/api/smart-auto/attempt",
-            get(routes::smart_auto::attempt_text),
-        )
-        .route(
-            "/api/smart-auto/decisions",
-            get(routes::smart_auto::decisions),
-        )
-        .route("/api/smart-auto/health", get(routes::smart_auto::health))
-        .route("/api/smart-auto/resolve", post(routes::smart_auto::resolve))
-        .route("/api/smart-auto/tiers", get(routes::smart_auto::tiers))
-        .route("/api/copilot/usage", get(routes::copilot::usage))
-        .route("/api/usage/sources", get(routes::profile_usage::sources))
-        .route(
-            "/api/profiles/{name}/usage",
-            get(routes::profile_usage::usage),
-        )
-        .route(
-            "/api/copilot/usage/history",
-            get(routes::copilot::usage_history),
-        )
-        .route("/api/fallbacks", post(routes::admin::set_default_fallbacks))
-        .route(
-            "/api/copilot/prices",
-            post(routes::admin::set_copilot_prices),
-        )
-        .route("/api/keep-warm", post(routes::admin::set_keep_warm))
-        .route("/api/restart", post(routes::admin::restart_server))
-        .route("/api/stats", get(routes::admin::stats))
-        .route("/api/usage", get(routes::admin::usage))
-        .route("/api/live", get(routes::live::stream))
-        .route("/api/errors", get(routes::admin::errors))
-        .route("/api/errors/resolve", post(routes::admin::resolve_errors))
-        .route("/api/sessions", get(routes::sessions::list))
-        .route("/api/sessions/{worker}", get(routes::sessions::detail))
-        .route("/api/insights", get(routes::admin::insights))
-        .route("/api/insights/pick", get(routes::admin::insights_pick))
-        .route(
-            "/api/insights/report",
-            get(routes::admin::insights_agent_report),
-        )
-        .route(
-            "/api/keys",
-            get(routes::admin::list_api_keys).post(routes::admin::create_api_key),
-        )
-        .route("/api/keys/{name}", delete(routes::admin::delete_api_key))
+        .routes(routes!(admin::list_profiles, admin::upsert_profile))
+        .routes(routes!(admin::delete_profile))
+        .routes(routes!(admin::test_profile))
+        .routes(routes!(claude_code::settings))
+        .routes(routes!(copilot::auto_decisions))
+        .routes(routes!(smart_auto::current))
+        .routes(routes!(smart_auto::get_rules, smart_auto::put_rules))
+        .routes(routes!(smart_auto::rules_effect))
+        .routes(routes!(smart_auto::history))
+        .routes(routes!(smart_auto::report_outcome))
+        .routes(routes!(smart_auto::attempt_text))
+        .routes(routes!(smart_auto::decisions))
+        .routes(routes!(smart_auto::health))
+        .routes(routes!(smart_auto::resolve))
+        .routes(routes!(smart_auto::tiers))
+        .routes(routes!(copilot::usage))
+        .routes(routes!(profile_usage::sources))
+        .routes(routes!(profile_usage::usage))
+        .routes(routes!(copilot::usage_history))
+        .routes(routes!(admin::set_default_fallbacks))
+        .routes(routes!(admin::set_copilot_prices))
+        .routes(routes!(admin::set_keep_warm))
+        .routes(routes!(admin::restart_server))
+        .routes(routes!(admin::stats))
+        .routes(routes!(admin::usage))
+        .routes(routes!(live::stream))
+        .routes(routes!(admin::errors))
+        .routes(routes!(admin::resolve_errors))
+        .routes(routes!(sessions::list))
+        .routes(routes!(sessions::detail))
+        .routes(routes!(admin::insights))
+        .routes(routes!(admin::insights_pick))
+        .routes(routes!(admin::insights_agent_report))
+        .routes(routes!(admin::list_api_keys, admin::create_api_key))
+        .routes(routes!(admin::delete_api_key))
+}
+
+fn build_router(state: AppState) -> Router {
+    let (protected, openapi) = api_router(&state).split_for_parts();
+    // The spec and the docs UI sit under the same key check as /api/*.
+    let protected = protected
+        .merge(SwaggerUi::new("/api-docs").url("/openapi.json", openapi))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             services::auth::require_master_key,
         ));
 
+    let (health, _) = OpenApiRouter::<AppState>::new()
+        .routes(routes!(routes::admin::healthz))
+        .split_for_parts();
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .merge(health)
         .merge(protected)
         .fallback(routes::ui::serve)
         .with_state(state)
@@ -543,6 +517,35 @@ mod tests {
         assert_eq!(body["data"][0]["id"], "copilot/claude-opus-4-5");
         assert_eq!(with_bearer.status().as_u16(), 200);
         assert_eq!(without_key.status().as_u16(), 401);
+    }
+
+    #[tokio::test]
+    async fn openapi_and_docs_ui_follow_the_master_key_rule() {
+        let base = serve_hub_with_auth().await;
+        let client = reqwest::Client::new();
+        for path in ["/openapi.json", "/api-docs/"] {
+            let denied = client.get(format!("{base}{path}")).send().await.unwrap();
+            assert_eq!(denied.status(), 401, "{path} without a key");
+            let ok = client
+                .get(format!("{base}{path}"))
+                .bearer_auth(MASTER_KEY)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), 200, "{path} with the key");
+        }
+        let spec: serde_json::Value = client
+            .get(format!("{base}/openapi.json"))
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(spec["openapi"].as_str().unwrap().starts_with("3.1"));
+        let health = client.get(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(health.status(), 200);
     }
 
     #[tokio::test]

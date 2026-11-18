@@ -22,6 +22,7 @@ use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::app_error::AppError;
 use crate::schemas::attempt_outcome::{AttemptOutcome, OutcomeCode, OutcomeSource};
 use crate::schemas::effort_level::EffortLevel;
+use crate::schemas::error_body::ErrorBody;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::profile_filter::ProfileFilter;
 use crate::schemas::model_context::strip_1m_suffix;
@@ -164,6 +165,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Respon
 }
 
 /// GET /v1/models/{id...} — routes by the id's first segment.
+#[utoipa::path(get, path = "/v1/models/{id}", tag = "models", summary = "Get one model", params(("id" = String, Path, description = "Model id, <profile>/<model>")), responses((status = 200, description = "The model descriptor", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 404, description = "Not found.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn get_model_by_id(
     State(state): State<AppState>,
     req: Request,
@@ -445,6 +447,12 @@ pub(crate) async fn attempt_loop(
                         state.learn_rejected_prompt_limit(&model_id.profile, upstream, &body);
                     }
                 }
+                tracing::warn!(
+                    model = %model_id.qualified(),
+                    status,
+                    request_bytes = attempt.body.len(),
+                    "attempt rejected, retried on the next fallback"
+                );
                 record_failure(
                     state,
                     model_id,

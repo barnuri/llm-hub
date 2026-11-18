@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
+use utoipa::IntoParams;
+use utoipa::ToSchema;
 
 use axum::Json;
 use axum::extract::{Path as UrlPath, Query, State};
@@ -14,6 +16,7 @@ use crate::schemas::api_key_input::ApiKeyInput;
 use crate::schemas::api_key_record::ApiKeyRecord;
 use crate::schemas::app_error::AppError;
 use crate::schemas::copilot_prices_input::CopilotPricesInput;
+use crate::schemas::error_body::ErrorBody;
 use crate::schemas::errors_report::ErrorsReport;
 use crate::schemas::fallbacks_input::FallbacksInput;
 use crate::schemas::insights::insights_report::InsightsReport;
@@ -32,6 +35,14 @@ use crate::services::store::{StatsFilter, TierRoleRow, hash_key, now_ms};
 use crate::utils::hex::to_hex;
 use crate::utils::time::elapsed_ms;
 
+/// Liveness probe. Needs no key.
+#[utoipa::path(get, path = "/healthz", tag = "system", summary = "Liveness", security(()),
+    responses((status = 200, description = "The text `ok`", body = String)))]
+pub async fn healthz() -> &'static str {
+    "ok"
+}
+
+#[utoipa::path(get, path = "/api/profiles", tag = "profiles", summary = "List profiles", responses((status = 200, description = "Profiles with managed and running flags, API keys masked", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
     let config = state.config();
     let health = state.upstream_health();
@@ -73,6 +84,7 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+#[utoipa::path(post, path = "/api/profiles", tag = "profiles", summary = "Create or update a profile", request_body(content = ProfileInput, description = "Profile fields. An omitted or empty api_key keeps the stored key.", content_type = "application/json"), responses((status = 200, description = "The saved profile", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 403, description = "Config is read-only (LLM_HUB_CONFIG_READONLY=true).", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn upsert_profile(
     State(state): State<AppState>,
     Json(input): Json<ProfileInput>,
@@ -139,6 +151,7 @@ pub async fn upsert_profile(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[utoipa::path(post, path = "/api/fallbacks", tag = "profiles", summary = "Set the default fallback chain", request_body(content = FallbacksInput, description = "Ordered model ids", content_type = "application/json"), responses((status = 200, description = "Saved", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 403, description = "Config is read-only (LLM_HUB_CONFIG_READONLY=true).", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn set_default_fallbacks(
     State(state): State<AppState>,
     Json(input): Json<FallbacksInput>,
@@ -153,6 +166,7 @@ pub async fn set_default_fallbacks(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[utoipa::path(post, path = "/api/copilot/prices", tag = "copilot", summary = "Set the Copilot price refresh interval", request_body(content = CopilotPricesInput, description = "Refresh interval in seconds; 0 turns the fetch off", content_type = "application/json"), responses((status = 200, description = "Saved", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 403, description = "Config is read-only (LLM_HUB_CONFIG_READONLY=true).", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn set_copilot_prices(
     State(state): State<AppState>,
     Json(input): Json<CopilotPricesInput>,
@@ -167,6 +181,7 @@ pub async fn set_copilot_prices(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[utoipa::path(post, path = "/api/keep-warm", tag = "profiles", summary = "Configure keep-warm pings", request_body(content = KeepWarmInput, description = "Keep-warm switch and idle cap", content_type = "application/json"), responses((status = 200, description = "Saved summary", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 403, description = "Config is read-only (LLM_HUB_CONFIG_READONLY=true).", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn set_keep_warm(
     State(state): State<AppState>,
     Json(input): Json<KeepWarmInput>,
@@ -186,6 +201,7 @@ fn keep_warm_pinned_by(is_set: impl Fn(&str) -> bool) -> bool {
     is_set("LLM_HUB_KEEP_WARM") || is_set("LLM_HUB_KEEP_WARM_IDLE_CAP_MINUTES")
 }
 
+#[utoipa::path(delete, path = "/api/profiles/{name}", tag = "profiles", summary = "Delete a profile", params(("name" = String, Path, description = "Profile name")), responses((status = 200, description = "Deleted", body = Object), (status = 404, description = "Not found.", body = ErrorBody), (status = 403, description = "Config is read-only (LLM_HUB_CONFIG_READONLY=true).", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn delete_profile(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
@@ -209,6 +225,7 @@ pub async fn delete_profile(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[utoipa::path(post, path = "/api/profiles/{name}/test", tag = "profiles", summary = "Test a profile upstream", params(("name" = String, Path, description = "Profile name")), responses((status = 200, description = "Test result with status and latency", body = Object), (status = 404, description = "Not found.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn test_profile(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
@@ -254,12 +271,14 @@ pub async fn test_profile(
 
 /// Triggers a graceful restart: supervised installs are restarted by their
 /// supervisor; standalone runs respawn themselves after the server drains.
+#[utoipa::path(post, path = "/api/restart", tag = "system", summary = "Restart the hub", responses((status = 200, description = "Restart requested", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn restart_server(State(state): State<AppState>) -> Json<Value> {
     crate::services::restart::request_restart(state.restart_notify());
     Json(json!({ "ok": true, "restarting": true }))
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct StatsQuery {
     /// `live` (default), `1d`, `7d`, `30d`, or `all`.
     #[serde(default)]
@@ -270,6 +289,7 @@ pub struct StatsQuery {
     pub routed_by: Option<String>,
 }
 
+#[utoipa::path(get, path = "/api/stats", tag = "stats", summary = "Request statistics", params(StatsQuery), responses((status = 200, description = "Aggregated request stats", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn stats(
     State(state): State<AppState>,
     Query(query): Query<StatsQuery>,
@@ -426,6 +446,7 @@ mod local_midnight_tests {
     }
 }
 
+#[utoipa::path(get, operation_id = "usage_history_all", path = "/api/usage", tag = "stats", summary = "Usage history with costs", responses((status = 200, description = "Usage and cost history. Needs persistence.", body = Object), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn usage(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let Some(store) = state.store() else {
         return Err(AppError::BadRequest(
@@ -440,13 +461,15 @@ pub async fn usage(State(state): State<AppState>) -> Result<Json<Value>, AppErro
     Ok(Json(body))
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ErrorsQuery {
     /// `1d`, `7d` (default), `30d`, or `all`.
     #[serde(default)]
     pub range: Option<String>,
 }
 
+#[utoipa::path(get, path = "/api/errors", tag = "stats", summary = "Failed requests", params(ErrorsQuery), responses((status = 200, description = "Recent failed requests. Needs persistence.", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn errors(
     State(state): State<AppState>,
     Query(query): Query<ErrorsQuery>,
@@ -494,7 +517,7 @@ pub async fn errors(
     Ok(Json(body))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ResolveErrorsInput {
     /// Request ids from `/api/errors` `recent[].id`.
     pub ids: Vec<i64>,
@@ -503,6 +526,7 @@ pub struct ResolveErrorsInput {
 }
 
 /// Marks failed requests solved (or reopens them). Solved errors stay in the DB for history.
+#[utoipa::path(post, path = "/api/errors/resolve", tag = "stats", summary = "Mark errors solved or reopen them", request_body(content = ResolveErrorsInput, description = "Request ids and the solved flag", content_type = "application/json"), responses((status = 200, description = "Updated count", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn resolve_errors(
     State(state): State<AppState>,
     Json(input): Json<ResolveErrorsInput>,
@@ -531,6 +555,7 @@ const MAX_RESOLVE_IDS: usize = 500;
 
 // --- hub api keys ---
 
+#[utoipa::path(get, path = "/api/keys", tag = "keys", summary = "List hub API keys", responses((status = 200, description = "Keys without secrets", body = Object), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn list_api_keys(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let Some(store) = state.store() else {
         return Ok(Json(json!({ "persistent": false, "keys": [] })));
@@ -544,6 +569,7 @@ pub async fn list_api_keys(State(state): State<AppState>) -> Result<Json<Value>,
 }
 
 /// Creates a key and returns it ONCE — only the hash is stored.
+#[utoipa::path(post, path = "/api/keys", tag = "keys", summary = "Create a hub API key", request_body(content = ApiKeyInput, description = "Key name", content_type = "application/json"), responses((status = 200, description = "The new key, shown once", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 403, description = "Config is read-only (LLM_HUB_CONFIG_READONLY=true).", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn create_api_key(
     State(state): State<AppState>,
     Json(input): Json<ApiKeyInput>,
@@ -571,6 +597,7 @@ pub async fn create_api_key(
     Ok(Json(json!({ "name": record.name, "key": key })))
 }
 
+#[utoipa::path(delete, path = "/api/keys/{name}", tag = "keys", summary = "Delete a hub API key", params(("name" = String, Path, description = "Key name")), responses((status = 200, description = "Deleted", body = Object), (status = 404, description = "Not found.", body = ErrorBody), (status = 403, description = "Config is read-only (LLM_HUB_CONFIG_READONLY=true).", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn delete_api_key(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
@@ -594,7 +621,8 @@ fn reload_config(state: &AppState) -> Result<(), AppError> {
         .map_err(AppError::Internal)
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct InsightsQuery {
     /// `1d`, `7d` (default), `30d`, or `all`.
     #[serde(default)]
@@ -606,6 +634,7 @@ pub struct InsightsQuery {
 }
 
 /// Per-model speed, stability, health and category leaders.
+#[utoipa::path(get, path = "/api/insights", tag = "insights", summary = "Per-model speed, stability and health", params(InsightsQuery), responses((status = 200, description = "Insights report", body = Object), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn insights(
     State(state): State<AppState>,
     Query(query): Query<InsightsQuery>,
@@ -617,6 +646,7 @@ pub async fn insights(
 }
 
 /// The best ranked model for `by`, so scripts can choose a model from stats.
+#[utoipa::path(get, path = "/api/insights/pick", tag = "insights", summary = "Best model by a criterion", params(InsightsQuery), responses((status = 200, description = "The picked model", body = Object), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn insights_pick(
     State(state): State<AppState>,
     Query(query): Query<InsightsQuery>,
@@ -636,6 +666,7 @@ pub async fn insights_pick(
 
 /// Full insights for agents: plain-language summary, every pick, per-model
 /// metrics and failure reasons in one JSON document.
+#[utoipa::path(get, path = "/api/insights/report", tag = "insights", summary = "Insights as one document for agents", params(InsightsQuery), responses((status = 200, description = "Insights document", body = Object), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn insights_agent_report(
     State(state): State<AppState>,
     Query(query): Query<InsightsQuery>,

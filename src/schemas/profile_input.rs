@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use utoipa::ToSchema;
 
 use serde::Deserialize;
 
 /// Admin API request body for creating or updating a profile.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ProfileInput {
     pub name: String,
     pub display_name: Option<String>,

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// What is known about whether a completed Smart Auto attempt did its job.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeCode {
     TestsPassed,

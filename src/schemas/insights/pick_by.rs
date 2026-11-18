@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Ranking criterion for `/api/insights/pick`.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PickBy {
     #[default]

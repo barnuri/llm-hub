@@ -15,6 +15,7 @@ pub mod copilot_user_response;
 pub mod cost_parts;
 pub mod current_selection;
 pub mod effort_level;
+pub mod error_body;
 pub mod errors_report;
 pub mod evidence_source;
 pub mod fallbacks_input;

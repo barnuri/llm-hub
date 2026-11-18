@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use utoipa::IntoParams;
 
 use axum::Json;
 use axum::extract::{Query, Request, State};
@@ -12,6 +13,7 @@ use serde_json::{Value, json};
 use crate::configs::ProfileConfig;
 use crate::consts::{CONTEXT_TOKENS_1M, MODELS_CACHE_TTL, MODELS_FANOUT_TIMEOUT};
 use crate::dependencies::state::AppState;
+use crate::schemas::error_body::ErrorBody;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::profile_filter::ProfileFilter;
 use crate::schemas::limit_evidence::LimitEvidence;
@@ -48,11 +50,13 @@ const CONFIDENCE_SCALE: f64 = 100.0;
 
 /// `?profiles=a,b` limits a model list to those profiles, like the
 /// `x-llm-hub-profiles` header.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ProfilesQuery {
     pub profiles: Option<String>,
 }
 
+#[utoipa::path(get, path = "/v1/models", tag = "models", summary = "List models", params(ProfilesQuery), responses((status = 200, description = "Merged model list with <profile>/<model> ids", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn list_models(
     State(state): State<AppState>,
     Query(query): Query<ProfilesQuery>,

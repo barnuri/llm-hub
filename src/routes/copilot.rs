@@ -2,10 +2,12 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use utoipa::IntoParams;
 
 use crate::consts::{AUTO_DECISIONS_DEFAULT_LIMIT, AUTO_DECISIONS_MAX_LIMIT};
 use crate::dependencies::state::AppState;
 use crate::schemas::app_error::AppError;
+use crate::schemas::error_body::ErrorBody;
 use crate::schemas::quota_history::QuotaHistory;
 use crate::schemas::quota_snapshot_row::QuotaSnapshotRow;
 use crate::services::copilot_auto_decisions::TieredDecision;
@@ -16,19 +18,22 @@ use crate::services::store::{Store, now_ms};
 
 const DEFAULT_QUOTA_RANGE: &str = "7d";
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct UsageQuery {
     pub profile: Option<String>,
 }
 
 /// Query of `GET /api/copilot/usage/history`.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct QuotaHistoryQuery {
     /// `7d` (default) or `30d`.
     pub range: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct DecisionsQuery {
     pub session: Option<String>,
     pub limit: Option<usize>,
@@ -41,6 +46,7 @@ struct DecisionsBody {
 
 /// `GET /api/copilot/auto/decisions?session=<id>&limit=N`: recent Copilot Auto
 /// decisions, newest first, for one Claude Code session or for all of them.
+#[utoipa::path(get, path = "/api/copilot/auto/decisions", tag = "copilot", summary = "Recent Copilot Auto decisions", params(DecisionsQuery), responses((status = 200, description = "Decisions, newest first", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn auto_decisions(
     State(state): State<AppState>,
     Query(query): Query<DecisionsQuery>,
@@ -56,6 +62,7 @@ pub async fn auto_decisions(
 
 /// `GET /api/copilot/usage?profile=<name>`: the profile's Copilot quota, or
 /// the first enabled Copilot profile's when `profile` is omitted.
+#[utoipa::path(get, operation_id = "copilot_usage", path = "/api/copilot/usage", tag = "copilot", summary = "Copilot quota", params(UsageQuery), responses((status = 200, description = "Quota of the named or first enabled Copilot profile", body = Object), (status = 404, description = "Not found.", body = ErrorBody), (status = 502, description = "Upstream unavailable.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn usage(State(state): State<AppState>, Query(query): Query<UsageQuery>) -> Response {
     let config = state.config();
     let selected = match query.profile.as_deref() {
@@ -81,6 +88,7 @@ pub async fn usage(State(state): State<AppState>, Query(query): Query<UsageQuery
 
 /// `GET /api/copilot/usage/history?range=7d|30d`: every stored quota reading in the range, and the daily
 /// burn computed from them. Needs the sqlite store.
+#[utoipa::path(get, path = "/api/copilot/usage/history", tag = "copilot", summary = "Stored Copilot quota readings", params(QuotaHistoryQuery), responses((status = 200, description = "Readings and the daily burn. Needs the sqlite store.", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn usage_history(
     State(state): State<AppState>,
     Query(query): Query<QuotaHistoryQuery>,

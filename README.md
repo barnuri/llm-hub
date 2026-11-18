@@ -58,6 +58,34 @@ of OpenAI-compatible APIs into one `/v1/models` and routes each request by its p
 
 See [Coding agents](docs/coding-agents.md) for what each command sets.
 
+## API docs
+
+The hub generates an OpenAPI 3.1 document from its handler code and serves it with an interactive
+Swagger UI. The UI assets are embedded in the binary and need no network.
+
+- OpenAPI JSON: <http://127.0.0.1:8888/openapi.json>
+- Interactive docs: <http://127.0.0.1:8888/api-docs/>
+
+Both follow the `/api/*` auth rule: when hub auth is on, send the key as
+`Authorization: Bearer <key>` or `x-api-key: <key>`, for example
+`curl -H "x-api-key: $KEY" http://127.0.0.1:8888/openapi.json`. A browser page load cannot send
+that header, so with hub auth on, read the JSON with `curl` or use the docs UI with auth off.
+`/docs` stays the dashboard.
+
+`docs/openapi.json` is the committed copy. The `/v1/{path}` catch-all is documented as a
+pass-through: its shapes belong to the upstream provider.
+
+Regenerate it after you change a route, a handler's `#[utoipa::path]` or a request type:
+
+```sh
+UPDATE_OPENAPI=1 cargo test openapi_file
+```
+
+`cargo test` fails when `docs/openapi.json` differs from the code, and when a raw `.route(...)`
+has no documented path. Validate the file offline with
+`bunx @readme/openapi-parser validate docs/openapi.json` (OpenAPI 3.1 aware). A test runs the same
+command when `bunx` is on PATH, and another asserts every `operationId` is unique.
+
 ## Documentation
 
 - [Commands](docs/commands.md): every `llm-hub` command, including `help` and `serve`.
@@ -65,7 +93,7 @@ See [Coding agents](docs/coding-agents.md) for what each command sets.
 - [GitHub Copilot](docs/github-copilot.md): native Copilot auth, model limits and the usage API.
 - [Copilot Auto](docs/copilot-auto.md): how `copilot/auto` picks a model, and what hydra is.
 - [Coding agents](docs/coding-agents.md): the five harness commands, their environment and a shell wrapper.
-- [HTTP API](docs/http-api.md): routes, control headers and hub authentication.
+- [HTTP API](docs/http-api.md): routes, control headers and hub authentication. The generated spec is in [API docs](#api-docs).
 - [Anthropic Messages](docs/anthropic-messages.md): the translated `/v1/messages` route and its limits.
 - [Fallbacks and transforms](docs/fallbacks-and-transforms.md): fallback chains and request changes.
 - [Usage and insights](docs/usage-and-insights.md): UI tabs, stats and model rankings.
