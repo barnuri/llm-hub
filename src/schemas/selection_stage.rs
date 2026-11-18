@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-// Only the solver is dispatched today, so the review variants are never built yet.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "Only the solver is dispatched today, so the review variants are never built yet"
+)]
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionStage {

@@ -117,6 +117,7 @@ pub struct StatsRegistry {
 pub const SERIES_HOUR_MS: u64 = 3_600_000;
 pub const SERIES_DAY_MS: u64 = 86_400_000;
 
+#[derive(Debug, Default)]
 pub struct RequestOutcome {
     pub profile: String,
     pub model_key: String,
@@ -315,7 +316,11 @@ fn record_entry(entry: &EntryStats, outcome: &RequestOutcome) {
     if let Some(tps) = tokens_per_sec(outcome)
         && let Ok(mut guard) = entry.tokens_per_sec_x100.lock()
     {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "Clamped to 1..=1e9 on the same line"
+        )]
         let centi = (tps * 100.0).round().clamp(1.0, 1_000_000_000.0) as u64;
         let histogram = guard.get_or_insert_with(new_tps_histogram);
         let _ = histogram.record(centi);
@@ -330,7 +335,10 @@ fn record_entry(entry: &EntryStats, outcome: &RequestOutcome) {
 ///
 /// Streaming: wall time after the first token. Non-stream: full request latency.
 #[must_use]
-#[allow(clippy::cast_precision_loss)] // throughput estimate; exact integer math not needed
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Throughput estimate; exact integer math not needed"
+)]
 pub fn tokens_per_sec(outcome: &RequestOutcome) -> Option<f64> {
     if outcome.tokens_out == 0 || outcome.latency_ms == 0 {
         return None;
@@ -345,11 +353,19 @@ pub fn tokens_per_sec(outcome: &RequestOutcome) -> Option<f64> {
     Some(outcome.tokens_out as f64 * 1000.0 / gen_ms as f64)
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "The bounds are constants that Histogram accepts"
+)]
 fn new_histogram() -> Histogram<u64> {
     // 1ms..1h, 3 significant digits — a few KB per entry.
     Histogram::new_with_bounds(1, 3_600_000, 3).expect("static histogram bounds are valid")
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "The bounds are constants that Histogram accepts"
+)]
 fn new_tps_histogram() -> Histogram<u64> {
     // 0.01 tok/s .. 100_000 tok/s stored as centi-tps.
     Histogram::new_with_bounds(1, 10_000_000, 3).expect("static tps histogram bounds are valid")
@@ -386,7 +402,10 @@ fn entry_snapshot(key: &str, stats: &EntryStats) -> EntrySnapshot {
     }
 }
 
-#[allow(clippy::cast_precision_loss)] // cache-hit % display; mantissa loss is fine
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Cache-hit % display; mantissa loss is fine"
+)]
 fn overview_from_entry(stats: &EntryStats) -> OverviewSnapshot {
     let snap = entry_snapshot("overview", stats);
     let (uncached_in, cached_in) = split_cached_input(
@@ -428,7 +447,10 @@ fn latency_percentiles(lock: &Mutex<Option<Histogram<u64>>>) -> (u64, u64) {
     }
 }
 
-#[allow(clippy::cast_precision_loss)] // display averages from histogram centi-units
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Display averages from histogram centi-units"
+)]
 fn tps_summary(stats: &EntryStats) -> (f64, f64) {
     let p50 = match stats.tokens_per_sec_x100.lock() {
         Ok(guard) => guard

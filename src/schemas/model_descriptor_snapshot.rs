@@ -21,14 +21,14 @@ impl ModelDescriptorSnapshot {
     }
 
     /// `qualified_id` is `<profile>/<model>`; a `[1m]` alias is ignored.
-    #[allow(dead_code)] // consumed by Smart Auto eligibility and admission
+    #[allow(dead_code, reason = "Consumed by Smart Auto eligibility and admission")]
     #[must_use]
     pub fn get(&self, qualified_id: &str) -> Option<&ModelDescriptor> {
         self.by_qualified_id.get(strip_1m_suffix(qualified_id))
     }
 
     /// `model` is the bare id the hub advertises, e.g. `claude-opus-5-5`; a `[1m]` alias is ignored.
-    #[allow(dead_code)] // consumed by Smart Auto eligibility and admission
+    #[allow(dead_code, reason = "Consumed by Smart Auto eligibility and admission")]
     #[must_use]
     pub fn for_model(&self, profile: &str, model: &str) -> Option<&ModelDescriptor> {
         self.get(&format!("{profile}/{}", strip_1m_suffix(model)))
@@ -39,7 +39,7 @@ impl ModelDescriptorSnapshot {
         self.by_qualified_id.values()
     }
 
-    #[allow(dead_code)] // consumed by Smart Auto eligibility and admission
+    #[allow(dead_code, reason = "Consumed by Smart Auto eligibility and admission")]
     #[must_use]
     pub fn len(&self) -> usize {
         self.by_qualified_id.len()

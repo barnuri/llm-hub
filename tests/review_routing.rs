@@ -1,4 +1,10 @@
 //! Review routing: Efficiency streams one call unreviewed, Balance reviews the final answer, and a Responses caller is never reviewed.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "Integration tests fail by panicking"
+)]
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};

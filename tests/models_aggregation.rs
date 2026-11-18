@@ -1,5 +1,11 @@
 //! Partial aggregation: live upstreams merge, a dead upstream degrades to
 //! its static list — never a 502.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "Integration tests fail by panicking"
+)]
 
 use std::collections::HashMap;
 

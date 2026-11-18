@@ -562,7 +562,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
         let key = {
             let store = Arc::new(Store::open("sqlite", Some(path_str)).unwrap());
-            let log = SelectionLog::open(Some(store.clone()));
+            let log = SelectionLog::open(Some(Arc::clone(&store)));
             let key = log.scope_key(ScopeKind::Worker, WORKER);
             log.record(event(
                 Some(&key),

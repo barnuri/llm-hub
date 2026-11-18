@@ -1,0 +1,3 @@
+#!/bin/sh
+# The full CI check, coverage included, before every push.
+exec "$(git rev-parse --show-toplevel)/scripts/check.sh"

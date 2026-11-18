@@ -1,4 +1,10 @@
 //! Fallback loop: 429 fails over, 400 never retries, attempts trail reported.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "Integration tests fail by panicking"
+)]
 
 use std::collections::HashMap;
 use std::time::Duration;

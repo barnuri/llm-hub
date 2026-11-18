@@ -53,7 +53,10 @@ impl ReviewOrchestrator {
 
     /// Runs the solver under the graph's budget, then reviews its text; tool calls return unreviewed at once.
     /// Dropping the future, or resolving `abort`, cancels every stage still in flight.
-    #[allow(clippy::too_many_lines)] // one sequential state machine; splitting it would scatter the budget and abort handling
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One sequential state machine; splitting it would scatter the budget and abort handling"
+    )]
     pub async fn run<S, T, A>(
         solver: S,
         solver_model: &ModelId,
@@ -208,8 +211,10 @@ impl ReviewOrchestrator {
 
 impl ReviewOrchestrator {
     /// Admits and runs every reviewer other than the answering solver in parallel, and reports the first failed stage.
-    // Each input feeds a different stage call, so bundling them would only rename the arguments.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Each input feeds a different stage call; a bundle would only rename them"
+    )]
     async fn judge_all<T, A>(
         graph: &ReviewGraph,
         solver: &ModelId,
@@ -353,8 +358,10 @@ impl ReviewOrchestrator {
     }
 
     /// Asks the solver for one repair that fixes `issues`, and returns its reply in place of the draft.
-    // Each input feeds a different stage call, so bundling them would only rename the arguments.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Each input feeds a different stage call; a bundle would only rename them"
+    )]
     async fn repair_once<T, A>(
         solver_model: &ModelId,
         transport: &T,
@@ -620,7 +627,10 @@ mod tests {
         })
     }
 
-    #[allow(clippy::unnecessary_wraps)] // the stage transport returns this Result shape
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "The stage transport returns this Result shape"
+    )]
     fn reply(text: &str) -> Result<StageReply, StageError> {
         Ok(StageReply {
             completion: completion(text),

@@ -20,10 +20,10 @@ use crate::services::transforms::{
 
 const PREFIX: &str = "LLM_HUB_";
 
-// Env-driven feature flags: each one is an independent opt-in/opt-out switch
-// read straight from a `LLM_HUB_*` var, so collapsing them into enums would
-// only move the same booleans one indirection away.
-#[allow(clippy::struct_excessive_bools)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Each flag is an independent LLM_HUB_* switch; enums would only add an indirection"
+)]
 #[derive(Debug, Clone)]
 pub struct HubConfig {
     pub profiles: Vec<ProfileConfig>,

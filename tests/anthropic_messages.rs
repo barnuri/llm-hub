@@ -1,5 +1,11 @@
-//! `/v1/messages`: Anthropic in, OpenAI upstream, Anthropic out — plus the
+//! `/v1/messages`: Anthropic in, `OpenAI` upstream, Anthropic out — plus the
 //! control-header interop the route inherits from the shared fallback loop.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "Integration tests fail by panicking"
+)]
 
 use std::collections::HashMap;
 use std::process::{Child, Command};
@@ -311,7 +317,7 @@ async fn messages_oversized_body_is_400_not_passthrough() {
     drop(hub);
 }
 
-/// A representative OpenAI stream: role chunk, two text deltas, a
+/// A representative `OpenAI` stream: role chunk, two text deltas, a
 /// `finish_reason` chunk, the terminal usage chunk, then `[DONE]`.
 fn sse_completion() -> ResponseTemplate {
     let body = concat!(

@@ -6,6 +6,7 @@ use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
 use crate::schemas::pool_limits::PoolLimits;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
 use crate::services::copilot_auto::AutoTier;
+use crate::utils::glob::glob_matches;
 
 /// The one verdict the pool and the rule effects share. `AllowedOverride`, `Admitted` and the
 /// excludes carry the glob that decided it. `Admitted` carries the first include glob that matched.
@@ -28,7 +29,6 @@ pub(crate) enum RuleDecision<'a> {
 pub struct SmartAutoPool;
 
 impl SmartAutoPool {
-    const WILDCARD: u8 = b'*';
     const PROFILE_SEPARATOR: char = '/';
 
     /// Eligible descriptors sorted by qualified id. `endpoint` is the client route, e.g.
@@ -167,7 +167,7 @@ impl SmartAutoPool {
         let bare_id = Self::bare_id(qualified_id);
         globs.into_iter().find(|glob| {
             let glob = strip_1m_suffix(glob);
-            Self::glob_matches(glob, qualified_id) || Self::glob_matches(glob, bare_id)
+            glob_matches(glob, qualified_id) || glob_matches(glob, bare_id)
         })
     }
 
@@ -236,34 +236,6 @@ impl SmartAutoPool {
 
     fn meets(capacity: Option<u64>, minimum: Option<u64>) -> bool {
         minimum.is_none_or(|minimum| capacity.is_some_and(|capacity| capacity >= minimum))
-    }
-
-    /// `*` matches any run of characters, including `/`. Every other byte matches itself.
-    fn glob_matches(glob: &str, text: &str) -> bool {
-        let (glob, text) = (glob.as_bytes(), text.as_bytes());
-        let (mut glob_at, mut text_at) = (0, 0);
-        let mut last_star: Option<(usize, usize)> = None;
-        while text_at < text.len() {
-            match glob.get(glob_at) {
-                Some(&Self::WILDCARD) => {
-                    last_star = Some((glob_at, text_at));
-                    glob_at += 1;
-                }
-                Some(&byte) if byte == text[text_at] => {
-                    glob_at += 1;
-                    text_at += 1;
-                }
-                _ => {
-                    let Some((star_at, star_text_at)) = last_star else {
-                        return false;
-                    };
-                    glob_at = star_at + 1;
-                    text_at = star_text_at + 1;
-                    last_star = Some((star_at, text_at));
-                }
-            }
-        }
-        glob[glob_at..].iter().all(|&byte| byte == Self::WILDCARD)
     }
 }
 
@@ -605,17 +577,14 @@ mod tests {
 
     #[test]
     fn glob_star_matches_any_run_including_slashes() {
-        assert!(SmartAutoPool::glob_matches("*", ""));
-        assert!(SmartAutoPool::glob_matches("*", "copilot/gpt-6-sol"));
-        assert!(SmartAutoPool::glob_matches(
-            "copilot*sol",
-            "copilot/gpt-6-sol"
-        ));
-        assert!(SmartAutoPool::glob_matches("*a*a*b", "aaab"));
-        assert!(SmartAutoPool::glob_matches("gpt-6-sol", "gpt-6-sol"));
-        assert!(!SmartAutoPool::glob_matches("gpt-6", "gpt-6-sol"));
-        assert!(!SmartAutoPool::glob_matches("*luna", "gpt-6-sol"));
-        assert!(!SmartAutoPool::glob_matches("", "gpt"));
+        assert!(glob_matches("*", ""));
+        assert!(glob_matches("*", "copilot/gpt-6-sol"));
+        assert!(glob_matches("copilot*sol", "copilot/gpt-6-sol"));
+        assert!(glob_matches("*a*a*b", "aaab"));
+        assert!(glob_matches("gpt-6-sol", "gpt-6-sol"));
+        assert!(!glob_matches("gpt-6", "gpt-6-sol"));
+        assert!(!glob_matches("*luna", "gpt-6-sol"));
+        assert!(!glob_matches("", "gpt"));
     }
 
     #[test]

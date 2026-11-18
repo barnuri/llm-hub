@@ -13,7 +13,7 @@ pub struct RoleDecision {
     pub reason: RoleReason,
 }
 
-#[allow(dead_code)] // Only the tests read role decisions.
+#[allow(dead_code, reason = "Only the tests read role decisions")]
 impl RoleDecision {
     /// The kind of input that chose the role, derived from the reason.
     #[must_use]

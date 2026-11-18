@@ -41,7 +41,10 @@ impl SmartAutoRouter {
     /// Routes one turn over the eligible `pool`. `anchor` holds the affinity store and the
     /// turn's key, `None` without a key. Returns `None` for an empty pool.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // each input is a separate per-request value; a bundle would only rename them
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Each input is a separate per-request value; a bundle would only rename them"
+    )]
     pub fn route<'a>(
         pool: &[&'a ModelDescriptor],
         policy: &SmartAutoPolicy,

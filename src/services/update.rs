@@ -472,7 +472,10 @@ fn set_aside_if_running_build(current: &Path, built: &Path) -> Result<Option<Pat
 }
 
 #[cfg(not(windows))]
-#[allow(clippy::unnecessary_wraps)] // Matches the Windows variant, which can fail.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Matches the Windows variant, which can fail"
+)]
 fn set_aside_if_running_build(_current: &Path, _built: &Path) -> Result<Option<PathBuf>, String> {
     Ok(None)
 }

@@ -1,5 +1,11 @@
 //! Header-driven request transforms, end to end: what actually reaches the
 //! upstream, and what the client gets back.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "Integration tests fail by panicking"
+)]
 
 use std::collections::HashMap;
 use std::process::{Child, Command};
@@ -83,7 +89,7 @@ async fn mount_ok(upstream: &MockServer, template: ResponseTemplate) {
         .await;
 }
 
-/// 77 bytes — the MCP double-prefix shape that OpenAI rejects outright.
+/// 77 bytes — the MCP double-prefix shape that `OpenAI` rejects outright.
 const LONG_TOOL: &str =
     "mcp__github_enterprise__very_long_tool_name_for_listing_pull_request_reviews";
 

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{Extensions, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -17,6 +17,7 @@ use crate::consts::{
     PROMPT_REFUSAL_MARGIN_PERCENT, SSE_KEEPALIVE_FRAME, USAGE_SCRAPE_TAIL_BYTES,
 };
 use crate::dependencies::state::AppState;
+use crate::ext::{Api, AttemptTarget, ResponseFlow, ResponseTarget};
 use crate::routes::models::{COPILOT_AUTO_MODEL, advertised_bare_id};
 use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::app_error::AppError;
@@ -61,6 +62,7 @@ use crate::services::copilot_auto::{
 use crate::services::copilot_auto_decisions::{AutoDecision, TieredDecision};
 use crate::services::copilot_body_fields::BodyField;
 use crate::services::copilot_headers::{HEADER_X_INITIATOR, INITIATOR_AGENT};
+use crate::services::extension_phases;
 use crate::services::fallback::{
     RetryPolicy, fallback_chain, per_attempt_timeout_ms, retain_eligible,
 };
@@ -70,7 +72,6 @@ use crate::services::model_health::FailureKind;
 use crate::services::multipart_model;
 use crate::services::request_images::request_has_image;
 use crate::services::responses_chat::{self, ChatStream};
-use crate::services::responses_context;
 use crate::services::responses_item_ids::ResponsesItemIds;
 use crate::services::review_graph::ReviewGraph;
 use crate::services::review_orchestrator::ReviewOrchestrator;
@@ -85,6 +86,7 @@ use crate::services::store::now_ms;
 use crate::services::tool_names::NameMap;
 use crate::services::transforms::{self, RouteKind, TransformPlan};
 use crate::services::upstream_auth;
+use crate::services::upstream_reply::rebuilt_response;
 use crate::utils::headers::{filter_request_headers, filter_response_headers};
 
 const NATIVE_COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
@@ -141,11 +143,13 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Respon
         ))),
         // Over the replay cap: stream straight through, fallbacks disabled.
         Some(rest) => {
+            let changed =
+                headers_only_request_phase(&state, &parts.method, &path_and_query, &parts.headers)?;
             passthrough_oversized(
                 &state,
                 parts.method,
                 &path_and_query,
-                &parts.headers,
+                changed.as_ref().unwrap_or(&parts.headers),
                 buffered,
                 rest,
             )
@@ -165,6 +169,26 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Respon
     }
 }
 
+/// The `request` phase for a request whose body the hub does not buffer. Extensions see the
+/// headers and an empty body, so a rule on `model` or `stream` does not match it.
+fn headers_only_request_phase(
+    state: &AppState,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+) -> Result<Option<HeaderMap>, AppError> {
+    let mut ext_state = Extensions::new();
+    let (changed, _) = extension_phases::request_phase(
+        &state.extensions(),
+        method,
+        path,
+        headers,
+        Bytes::new(),
+        &mut ext_state,
+    )?;
+    Ok(changed)
+}
+
 /// GET /v1/models/{id...} — routes by the id's first segment.
 #[utoipa::path(get, path = "/v1/models/{id}", tag = "models", summary = "Get one model", params(("id" = String, Path, description = "Model id, <profile>/<model>")), responses((status = 200, description = "The model descriptor", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 404, description = "Not found.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn get_model_by_id(
@@ -177,11 +201,13 @@ pub async fn get_model_by_id(
         AppError::BadRequest(format!("model id must be <profile>/<model>, got: {path}"))
     })?;
     let target = format!("/v1/models/{}", id.model);
+    let changed =
+        headers_only_request_phase(&state, &Method::GET, parts.uri.path(), &parts.headers)?;
     attempt_single(
         &state,
         Method::GET,
         &target,
-        &parts.headers,
+        changed.as_ref().unwrap_or(&parts.headers),
         Bytes::new(),
         &id,
         None,
@@ -198,7 +224,10 @@ pub async fn get_model_by_id(
 /// `AppError::BadRequest` when the body carries no usable `model` (or, on the
 /// Anthropic route, fails translation); `AppError::UpstreamUnavailable` when
 /// every attempt in the chain fails to produce a response.
-#[allow(clippy::too_many_lines)] // the attempt state machine reads top to bottom; splitting it would thread the same loop state through helpers
+#[allow(
+    clippy::too_many_lines,
+    reason = "The attempt state machine reads top to bottom; splitting it would thread the same loop state through helpers"
+)]
 pub(crate) async fn attempt_loop(
     state: &AppState,
     method: Method,
@@ -207,6 +236,17 @@ pub(crate) async fn attempt_loop(
     body: Bytes,
     route: RouteKind,
 ) -> Result<Response, AppError> {
+    let extensions = state.extensions();
+    let mut ext_state = Extensions::new();
+    let (changed_headers, body) = extension_phases::request_phase(
+        &extensions,
+        &method,
+        path_and_query,
+        headers,
+        body,
+        &mut ext_state,
+    )?;
+    let headers = changed_headers.as_ref().unwrap_or(headers);
     let config = state.config();
     let (bodies, requested_id) =
         AttemptBodies::prepare(&config, path_and_query, headers, &body, route)?;
@@ -271,6 +311,8 @@ pub(crate) async fn attempt_loop(
         }
         let model_id = auto.as_ref().map_or(requested, |pick| &pick.model_id);
         let routed_by = routed_by_label(auto.is_some(), smart.as_ref().map(|plan| plan.tier));
+        let qualified = model_id.qualified();
+        let attempt_headers: Option<HeaderMap>;
         let mut attempt = bodies
             .for_model(state, model_id)
             .map_err(AppError::BadRequest)?;
@@ -300,6 +342,25 @@ pub(crate) async fn attempt_loop(
             let body = std::mem::take(&mut attempt.body);
             attempt.body = non_streaming(body);
         }
+        let target = AttemptTarget {
+            profile: &model_id.profile,
+            model: &qualified,
+            api: Api::from_path(path_and_query),
+            client_path: path_and_query,
+            upstream_path: attempt.path.as_str(),
+        };
+        let (changed, body) = extension_phases::attempt_phase(
+            &extensions,
+            target,
+            attempt.headers,
+            std::mem::take(&mut attempt.body),
+            &mut ext_state,
+        )?;
+        attempt.body = body;
+        attempt_headers = changed;
+        if let Some(changed) = &attempt_headers {
+            attempt.headers = changed;
+        }
         let started = Instant::now();
         let session_token = auto.as_ref().and_then(|pick| pick.session_token.as_deref());
         // A caller's own timeout header wins. Otherwise only a streamed Smart Auto attempt on a
@@ -320,7 +381,20 @@ pub(crate) async fn attempt_loop(
         let mut keep_warm = keep_warm_lease(state, &attempt, model_id, worker.as_deref());
         let (result, retried_body) = match sender.send(attempt.body.clone()).await {
             Ok(response) if attempt.native_messages => {
-                match retry_without_rejected_fields(&bodies, &sender, response).await {
+                let rephase = AttemptRephase {
+                    extensions: &extensions,
+                    target,
+                    headers: attempt.headers,
+                };
+                match retry_without_rejected_fields(
+                    &bodies,
+                    &sender,
+                    response,
+                    rephase,
+                    &mut ext_state,
+                )
+                .await
+                {
                     Ok((response, retried)) => (Ok(response), retried),
                     Err(reason) => (Err(reason), None),
                 }
@@ -340,10 +414,27 @@ pub(crate) async fn attempt_loop(
 
         match result {
             Ok(response) => {
+                let target = ResponseTarget {
+                    profile: &model_id.profile,
+                    model: &qualified,
+                    api: Api::from_path(path_and_query),
+                    client_path,
+                    copilot: is_copilot_profile(state, model_id),
+                    last_attempt: index == last_index,
+                };
+                let (response, flow, client_changes) =
+                    extension_phases::response_phase(&extensions, target, response, &mut ext_state)
+                        .await;
+                let client_changes = if attempt.route == RouteKind::Anthropic {
+                    client_changes.without_body()
+                } else {
+                    client_changes
+                };
                 let status = response.status().as_u16();
                 attempts_trail.push(format!("{}={status}", model_id.qualified()));
-                let final_attempt =
-                    index == last_index || !retry_policy.should_retry_status(status);
+                let retry =
+                    flow == ResponseFlow::RetryNext || retry_policy.should_retry_status(status);
+                let final_attempt = index == last_index || !retry;
                 let succeeded = final_attempt && SUCCESS_STATUS_RANGE.contains(&status);
                 let transition = selection.as_ref().map(|event| {
                     let next = if succeeded {
@@ -403,6 +494,7 @@ pub(crate) async fn attempt_loop(
                             .await
                         }
                     };
+                    out = client_changes.apply(out).await;
                     if let Some(pick) = &auto {
                         insert_header(out.headers_mut(), HEADER_AUTO_PICK, &pick.pick);
                         insert_header(out.headers_mut(), HEADER_AUTO_REASON, &pick.reason);
@@ -655,7 +747,10 @@ impl SmartAutoPlan {
 
 /// Resolves a `hub/*` primary to the pick from the eligible pool, and keeps only pool fallbacks,
 /// so deny wins on every attempt. In memory only; any other model costs one string compare.
-#[allow(clippy::too_many_lines)] // the hub resolution walks each selector form in one place
+#[allow(
+    clippy::too_many_lines,
+    reason = "The hub resolution walks each selector form in one place"
+)]
 fn resolve_hub(
     state: &AppState,
     config: &HubConfig,
@@ -1583,7 +1678,10 @@ fn default_auto_model<'c>(catalog: &'c [Value], path: &str) -> &'c str {
 /// The SSE decision is the upstream's content-type, not the request's `stream`
 /// flag: an upstream that answers a streaming request with a JSON error must be
 /// translated as a message, not fed to the SSE machinery.
-#[allow(clippy::too_many_arguments)] // fourteen inputs, each a separate piece of one delivery
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Fourteen inputs, each a separate piece of one delivery"
+)]
 async fn deliver(
     state: &AppState,
     response: reqwest::Response,
@@ -1646,12 +1744,6 @@ async fn deliver(
     if let Some(applied) = plan.header_value() {
         insert_header(out.headers_mut(), HEADER_TRANSFORMS, &applied);
     }
-    if route == RouteKind::OpenAi
-        && is_responses_endpoint(bare_path(client_path))
-        && is_copilot_profile(state, model_id)
-    {
-        out = responses_context::rename_context_code(out).await;
-    }
     out
 }
 
@@ -1687,7 +1779,11 @@ fn non_streaming(body: Bytes) -> Bytes {
 
 /// Buffers a chat-completions answer, reviews it through `ReviewOrchestrator`, and sends the final
 /// reply once: a JSON body, or SSE re-emitted in the client's protocol when the client streams.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the review path threads one request's state; a split would pass the same set again
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "The review path threads one request's state; a split would pass the same set again"
+)]
 async fn review_deliver(
     state: &AppState,
     response: reqwest::Response,
@@ -1847,7 +1943,7 @@ async fn review_deliver(
         });
     }
     finish_selection(state, selection, &request_stats, None);
-    state.stats().record(&request_stats);
+    state.record_outcome(&request_stats);
     state.publish_live(&request_stats);
     if let Some(store) = state.store()
         && let Err(e) = store.record(&request_stats)
@@ -2128,10 +2224,19 @@ impl<'a> AttemptSender<'a> {
 
 /// Learns the fields a Copilot "Extra inputs are not permitted" 400 names and retries once
 /// without them. Any other response comes back unchanged, with `None`. A retry returns the body it sent.
+/// What the `attempt` phase needs to run again on a rebuilt body.
+struct AttemptRephase<'a> {
+    extensions: &'a crate::ext::ExtensionSet,
+    target: AttemptTarget<'a>,
+    headers: &'a HeaderMap,
+}
+
 async fn retry_without_rejected_fields(
     bodies: &AttemptBodies<'_>,
     sender: &AttemptSender<'_>,
     response: reqwest::Response,
+    rephase: AttemptRephase<'_>,
+    ext_state: &mut Extensions,
 ) -> Result<(reqwest::Response, Option<Bytes>), String> {
     let compressed = is_compressed(response.headers());
     let large = response
@@ -2163,7 +2268,16 @@ async fn retry_without_rejected_fields(
     }
     let (state, model_id) = (sender.state, sender.model_id);
     state.learn_unsupported_body_fields(&model_id.profile, &rejected);
-    let retried = bodies.for_model(state, model_id)?.body;
+    let rebuilt = bodies.for_model(state, model_id)?.body;
+    // The rebuilt body has not seen the attempt phase, so its changes are applied again.
+    let (_, retried) = extension_phases::attempt_phase(
+        rephase.extensions,
+        rephase.target,
+        rephase.headers,
+        rebuilt,
+        ext_state,
+    )
+    .map_err(|e| e.message())?;
     let response = sender.send(retried.clone()).await?;
     Ok((response, Some(retried)))
 }
@@ -2324,26 +2438,12 @@ pub(crate) async fn send_keep_warm_ping(state: &AppState, ping: PingPlan) {
         attempt: None,
         role: None,
     };
-    state.stats().record(&outcome);
+    state.record_outcome(&outcome);
     state.publish_live(&outcome);
     record_request(state, &outcome, None).await;
     state
         .keep_warm()
         .ping_finished(&worker, &stream_key, ok, cost_usd);
-}
-
-/// A response whose body the hub already started reading, handed back whole.
-fn rebuilt_response(
-    status: StatusCode,
-    version: reqwest::Version,
-    headers: HeaderMap,
-    body: impl Into<reqwest::Body>,
-) -> reqwest::Response {
-    let mut rebuilt = Response::new(body.into());
-    *rebuilt.status_mut() = status;
-    *rebuilt.version_mut() = version;
-    *rebuilt.headers_mut() = headers;
-    reqwest::Response::from(rebuilt)
 }
 
 /// True for a Copilot Claude model sent to `/chat/completions`. Newer ones can
@@ -2914,7 +3014,11 @@ fn save_text(
 /// Streams the upstream response through, scraping usage from a rolling tail and recording stats at stream end.
 /// `transform` rewrites frames when `Some`; `None` passes bytes through untouched, and `finish()` output ends the body.
 // Each input is a separate per-response value, so bundling them would only rename them.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the stream-end task records one answer in order; a split would thread the same state through helpers
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "The stream-end task records one answer in order; a split would thread the same state through helpers"
+)]
 fn build_response(
     state: &AppState,
     upstream: reqwest::Response,
@@ -3079,7 +3183,7 @@ fn build_response(
             summary.upstream_end,
         );
         finish_selection(&state_for_stats, selection, &outcome, stop);
-        state_for_stats.stats().record(&outcome);
+        state_for_stats.record_outcome(&outcome);
         state_for_stats.publish_live(&outcome);
         record_request(&state_for_stats, &outcome, prompt_body).await;
     });
@@ -3338,7 +3442,11 @@ fn is_event_stream(response: &reqwest::Response) -> bool {
 /// `MAX_TRANSFORM_BUFFER_BYTES`. Every other route keeps the byte-for-byte
 /// streaming path in `build_response`.
 // Each input is a separate per-response value the translator needs.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the buffered answer is read, learned from and recorded in order; a split would thread the same state through helpers
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "The buffered answer is read, learned from and recorded in order; a split would thread the same state through helpers"
+)]
 async fn build_anthropic_response(
     state: &AppState,
     upstream: reqwest::Response,
@@ -3476,7 +3584,7 @@ async fn build_anthropic_response(
         if let Some(attempt) = answer_attempt {
             save_answer(&state_for_stats, &attempt, &raw);
         }
-        state_for_stats.stats().record(&outcome);
+        state_for_stats.record_outcome(&outcome);
         state_for_stats.publish_live(&outcome);
         if let Some(commit) = commit.filter(|_| outcome.error.is_none()) {
             commit.apply(&state_for_stats);
@@ -3595,7 +3703,10 @@ async fn record_prompt_shape(state: AppState, request_id: i64, body: Bytes) {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // the failure record takes the attempt's values one by one, as the attempt loop holds them
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The failure record takes the attempt's values one by one, as the attempt loop holds them"
+)]
 fn record_failure(
     state: &AppState,
     model_id: &ModelId,
@@ -3634,7 +3745,7 @@ fn record_failure(
         UpstreamEnd::Complete
     };
     log_failure(&outcome, paths, 0, upstream_end);
-    state.stats().record(&outcome);
+    state.record_outcome(&outcome);
     state.publish_live(&outcome);
     if let Some(store) = state.store() {
         let _ = store.record(&outcome);
@@ -7143,6 +7254,189 @@ mod tests {
                     1
                 );
             }
+        }
+
+        fn with_rules(copilot: &Copilot, yaml: &str) {
+            let env = |_: &str| None;
+            let rules = crate::ext::rules::parse(yaml, false, &env).unwrap();
+            let mut all = crate::ext::builtin::builtins();
+            all.push(std::sync::Arc::new(rules));
+            copilot
+                .state
+                .set_extensions(crate::ext::ExtensionSet::new(all));
+        }
+
+        #[tokio::test]
+        async fn an_unbuffered_request_still_passes_the_request_phase() {
+            let copilot = copilot().await;
+            with_rules(
+                &copilot,
+                "rules: [{name: ci, phase: request, match: {header: {x-client: ci}}, actions: [{reject: {status: 403, message: no ci}}, {set_header: {x-unused: '1'}}]}, {name: tag, phase: request, match: {header_absent: x-client}, actions: [{set_header: {x-tag: '1'}}]}]",
+            );
+            let mut ci = client_headers();
+            ci.insert("x-client", HeaderValue::from_static("ci"));
+
+            let error =
+                headers_only_request_phase(&copilot.state, &Method::POST, "/v1/responses", &ci)
+                    .unwrap_err();
+            let tagged = headers_only_request_phase(
+                &copilot.state,
+                &Method::GET,
+                "/v1/models/copilot/gpt-5",
+                &client_headers(),
+            )
+            .unwrap();
+
+            assert_eq!(error.status(), StatusCode::FORBIDDEN);
+            assert_eq!(tagged.unwrap()["x-tag"], "1");
+        }
+
+        #[tokio::test]
+        async fn a_request_rule_rejects_before_any_upstream_call() {
+            let copilot = copilot().await;
+            with_rules(
+                &copilot,
+                "rules: [{name: ci, phase: request, match: {header: {x-client: ci}}, actions: [{reject: {status: 403, message: no ci}}]}]",
+            );
+            let mut headers = client_headers();
+            headers.insert("x-client", HeaderValue::from_static("ci"));
+            let body = json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "hi"});
+
+            let error = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &headers,
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.status(), StatusCode::FORBIDDEN);
+            assert_eq!(error.message(), "no ci");
+            assert!(requests_to(&copilot, RESPONSES_ENDPOINT).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_attempt_rule_changes_the_body_sent_upstream() {
+            let copilot = copilot().await;
+            with_rules(
+                &copilot,
+                "rules: [{name: no-temp, phase: attempt, match: {profile: copilot}, actions: [{remove_field: /temperature}, {set_header: {x-team: blue}}]}]",
+            );
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(200).set_body_json(responses_text_reply("ok")))
+                .mount(&copilot.upstream)
+                .await;
+            let body =
+                json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "hi", "temperature": 1});
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &client_headers(),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
+            assert!(sent_json(&sent[0]).get("temperature").is_none());
+            assert_eq!(sent[0].headers["x-team"], "blue");
+        }
+
+        #[tokio::test]
+        async fn a_response_rule_retries_on_the_next_fallback() {
+            const BIG_ID: &str = "gpt-5-mini";
+            let copilot = copilot().await;
+            copilot.state.set_upstream_models(
+                PROFILE,
+                HashMap::from([
+                    (PLAIN_ID.to_string(), entry(PLAIN_ID, false)),
+                    (BIG_ID.to_string(), entry(BIG_ID, false)),
+                ]),
+            );
+            with_rules(
+                &copilot,
+                "rules: [{name: busy, phase: response, match: {status: 400, error_code: busy}, actions: [{retry_next: true}]}]",
+            );
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .and(body_partial_json(json!({"model": PLAIN_ID})))
+                .respond_with(
+                    ResponseTemplate::new(400)
+                        .set_body_json(json!({"error": {"code": "busy", "message": "try later"}})),
+                )
+                .mount(&copilot.upstream)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .and(body_partial_json(json!({"model": BIG_ID})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(responses_text_reply("ok")))
+                .mount(&copilot.upstream)
+                .await;
+            let body = json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "hi"});
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &fallback_to(BIG_ID),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(requests_to(&copilot, RESPONSES_ENDPOINT).await.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_response_rule_changes_only_what_the_client_gets() {
+            let copilot = copilot().await;
+            with_rules(
+                &copilot,
+                "rules: [{name: shape, phase: response, match: {status: 400}, actions: [{set_field: {/error/message: shortened}}, {set_header: {x-rule: shape}}]}]",
+            );
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .respond_with(prompt_too_long())
+                .mount(&copilot.upstream)
+                .await;
+            let body = json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "hi"});
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &client_headers(),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.headers()["x-rule"], "shape");
+            let raw = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error = serde_json::from_slice::<Value>(&raw).unwrap()["error"].clone();
+            assert_eq!(error["message"], "shortened");
+            assert_eq!(error["code"], "context_length_exceeded");
+            for _ in 0..100 {
+                if learned_limit(&copilot, PLAIN_ID).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(learned_limit(&copilot, PLAIN_ID), Some(900_000));
         }
 
         #[tokio::test]

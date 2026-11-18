@@ -42,7 +42,7 @@ jobs:
           fi
           changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
           has() { echo "$changed" | grep -qE "$1" && echo true || echo false; }
-          echo "rust=$(has '^(src/|tests/|ui/|docs/openapi.json|build.rs|Cargo\.(toml|lock)|rust-toolchain.toml|\.github/workflows/)')" >> "$GITHUB_OUTPUT"
+          echo "rust=$(has '^(src/|tests/|ui/|docs/openapi.json|build.rs|Cargo\.(toml|lock)|rust-toolchain.toml|clippy.toml|scripts/check.sh|\.github/workflows/)')" >> "$GITHUB_OUTPUT"
           echo "ui=$(has '^(ui-src/|\.github/workflows/)')" >> "$GITHUB_OUTPUT"
 
   lint:
@@ -63,8 +63,7 @@ jobs:
             target
           key: cargo-lint-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-lint-${{ runner.os }}-
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: scripts/check.sh fast
       - if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
         run: cargo clean -p llm-hub
       - uses: actions/cache/save@v4
@@ -103,24 +102,12 @@ jobs:
             target
           key: cargo-coverage-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-coverage-${{ runner.os }}-
-      - name: Tests with coverage
-        run: cargo llvm-cov --all-targets --json --summary-only --fail-under-lines "$COVERAGE_MIN" --output-path target/coverage.json
-      - name: Every file meets the minimum
-        run: |
-          jq -r --argjson min "$COVERAGE_MIN" --arg src "$PWD/src/" '
-            .data[0].files[]
-            | select((.filename | startswith($src)) and .summary.lines.percent < $min)
-            | "\(.summary.lines.percent | floor)% \(.filename | ltrimstr($src))"' target/coverage.json > target/below.txt
-          if [ -s target/below.txt ]; then
-            echo "Files under $COVERAGE_MIN% line coverage:"
-            cat target/below.txt
-            exit 1
-          fi
+      - name: Tests with the coverage gate
+        run: scripts/check.sh coverage
       - name: Coverage summary
         if: always()
         run: |
           jq -r '"Total line coverage: \(.data[0].totals.lines.percent | floor)%"' target/coverage.json >> "$GITHUB_STEP_SUMMARY" || true
-          sed 's/^/- under minimum: /' target/below.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
       - if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
         run: cargo clean -p llm-hub
       - uses: actions/cache/save@v4

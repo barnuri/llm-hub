@@ -1,5 +1,11 @@
 //! `/api/insights` and `/api/insights/pick` over a real hub process with a
 //! persistent store and a mocked upstream.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "Integration tests fail by panicking"
+)]
 
 use std::collections::HashMap;
 use std::process::{Child, Command};
@@ -97,10 +103,9 @@ async fn call_model(client: &reqwest::Client, base: &str, model: &str) {
 async fn insights_when_recorded(client: &reqwest::Client, url: &str, calls: u64) -> Value {
     for _ in 0..50 {
         let body: Value = client.get(url).send().await.unwrap().json().await.unwrap();
-        let recorded: u64 = body["models"]
-            .as_array()
-            .map(|models| models.iter().filter_map(|m| m["requests"].as_u64()).sum())
-            .unwrap_or(0);
+        let recorded: u64 = body["models"].as_array().map_or(0, |models| {
+            models.iter().filter_map(|m| m["requests"].as_u64()).sum()
+        });
         if recorded >= calls {
             return body;
         }

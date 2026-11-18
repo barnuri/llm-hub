@@ -1,5 +1,11 @@
 //! Smart Auto end to end on the spawned binary: fallback policy, role switches, effort, the current
 //! and history APIs, the store contents, history across a restart, and reviewer counts per tier.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "Integration tests fail by panicking"
+)]
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -121,7 +127,7 @@ async fn wait_for_concrete_models(base: &str, expected: usize) {
     panic!("the hub did not list {expected} concrete models");
 }
 
-fn chat_request(model: &str, messages: Vec<Value>) -> Value {
+fn chat_request(model: &str, messages: &[Value]) -> Value {
     json!({"model": model, "stream": false, "messages": messages})
 }
 
@@ -243,6 +249,7 @@ async fn wait_for_stored_prompt(store: &Path, needle: &str) {
 /// rebuild the whole prompt cache on the new model. Cold-cache switching is covered by the router
 /// and affinity unit tests, which control the clock.
 async fn a_warm_premium_pin_steps_down_for_plan_backed_implementation() {
+    const WORKER: &str = "run-switch/node-1";
     let (alpha, beta) = reviewed_pair(
         vec![
             json!({"id": "claude-opus-4.6"}),
@@ -252,12 +259,11 @@ async fn a_warm_premium_pin_steps_down_for_plan_backed_implementation() {
     )
     .await;
     let (_hub, base) = start_pair(&alpha, &beta, 3, &[]).await;
-    const WORKER: &str = "run-switch/node-1";
 
     let planning = post_chat(
         &base,
         &[(WORKER_HEADER, WORKER)],
-        &chat_request(BALANCE, vec![user(PLANNING_TEXT)]),
+        &chat_request(BALANCE, &[user(PLANNING_TEXT)]),
     )
     .await;
     assert_eq!(planning.status(), 200);
@@ -274,7 +280,7 @@ async fn a_warm_premium_pin_steps_down_for_plan_backed_implementation() {
         &[(WORKER_HEADER, WORKER)],
         &chat_request(
             BALANCE,
-            vec![
+            &[
                 user(PLANNING_TEXT),
                 assistant("Plan drafted."),
                 user("Plan drafted, carry it out."),
@@ -319,7 +325,7 @@ async fn the_effort_in_the_body_is_one_the_routed_model_publishes() {
     let response = post_chat(
         &base,
         &[(EXCLUDE_HEADER, "beta/*")],
-        &chat_request(EFFICIENCY, vec![user(PLANNING_TEXT)]),
+        &chat_request(EFFICIENCY, &[user(PLANNING_TEXT)]),
     )
     .await;
 
@@ -353,7 +359,7 @@ async fn an_explicit_effort_the_model_publishes_is_sent_unchanged() {
         .mount(&alpha)
         .await;
     let (_hub, base) = start_pair(&alpha, &beta, 2, &[]).await;
-    let mut body = chat_request(EFFICIENCY, vec![user(PLANNING_TEXT)]);
+    let mut body = chat_request(EFFICIENCY, &[user(PLANNING_TEXT)]);
     body["reasoning_effort"] = json!("low");
 
     let response = post_chat(&base, &[(EXCLUDE_HEADER, "beta/*")], &body).await;
@@ -387,7 +393,7 @@ async fn policy_holds_across_the_fallback_chain() {
     let response = post_chat(
         &base,
         &[(MIN_CONTEXT_HEADER, "1m"), (FALLBACKS_HEADER, "alpha/m1")],
-        &chat_request(EFFICIENCY, vec![user(PLANNING_TEXT)]),
+        &chat_request(EFFICIENCY, &[user(PLANNING_TEXT)]),
     )
     .await;
 
@@ -404,7 +410,7 @@ async fn an_empty_pool_makes_no_upstream_call() {
     let response = post_chat(
         &base,
         &[(MIN_CONTEXT_HEADER, "10m")],
-        &chat_request(BALANCE, vec![user(PLANNING_TEXT)]),
+        &chat_request(BALANCE, &[user(PLANNING_TEXT)]),
     )
     .await;
 
@@ -442,7 +448,7 @@ async fn review_sizes_the_reviewers_by_tier() {
         let response = post_chat(
             &base,
             &[(WORKER_HEADER, worker)],
-            &chat_request(selector, vec![user(PLANNING_TEXT)]),
+            &chat_request(selector, &[user(PLANNING_TEXT)]),
         )
         .await;
         assert_eq!(response.status(), 200, "{selector}");
@@ -473,7 +479,7 @@ async fn reviewer_calls_keep_their_tokens_in_the_event_log() {
     let response = post_chat(
         &base,
         &[(WORKER_HEADER, WORKER)],
-        &chat_request(BALANCE, vec![user(PLANNING_TEXT)]),
+        &chat_request(BALANCE, &[user(PLANNING_TEXT)]),
     )
     .await;
 
@@ -492,6 +498,7 @@ async fn reviewer_calls_keep_their_tokens_in_the_event_log() {
 
 #[tokio::test]
 async fn current_and_history_follow_each_dispatch() {
+    const WORKER: &str = "run-current/node-1";
     let alpha = listing_upstream(vec![json!({"id": "m1"})]).await;
     let beta = listing_upstream(vec![json!({"id": "m2"})]).await;
     Mock::given(method("POST"))
@@ -500,14 +507,13 @@ async fn current_and_history_follow_each_dispatch() {
         .mount(&alpha)
         .await;
     let (_hub, base) = start_pair(&alpha, &beta, 2, &[]).await;
-    const WORKER: &str = "run-current/node-1";
     let headers = [(EXCLUDE_HEADER, "beta/*"), (WORKER_HEADER, WORKER)];
 
     for dispatch in 1..=2 {
         let response = post_chat(
             &base,
             &headers,
-            &chat_request(EFFICIENCY, vec![user(PLANNING_TEXT)]),
+            &chat_request(EFFICIENCY, &[user(PLANNING_TEXT)]),
         )
         .await;
         assert_eq!(response.status(), 200);
@@ -591,13 +597,13 @@ async fn the_prompt_text_stays_out_of_the_event_log() {
     let response = post_chat(
         &base,
         &[(EXCLUDE_HEADER, "beta/*"), (WORKER_HEADER, WORKER)],
-        &chat_request(EFFICIENCY, vec![user(&prompt)]),
+        &chat_request(EFFICIENCY, &[user(&prompt)]),
     )
     .await;
 
     assert_eq!(response.status(), 200);
     let events = wait_for_completed(&base, WORKER, 1).await;
-    wait_for_stored_events(&store, DISPATCH_STATES.len() as i64).await;
+    wait_for_stored_events(&store, i64::try_from(DISPATCH_STATES.len()).unwrap()).await;
     wait_for_stored_prompt(&store, PROMPT_MARKER).await;
     assert!(
         !Value::Array(events).to_string().contains(PROMPT_MARKER),
@@ -627,12 +633,12 @@ async fn history_survives_a_restart() {
     let response = post_chat(
         &base,
         &[(EXCLUDE_HEADER, "beta/*"), (WORKER_HEADER, WORKER)],
-        &chat_request(EFFICIENCY, vec![user(PLANNING_TEXT)]),
+        &chat_request(EFFICIENCY, &[user(PLANNING_TEXT)]),
     )
     .await;
     assert_eq!(response.status(), 200);
     wait_for_completed(&base, WORKER, 1).await;
-    wait_for_stored_events(&store, DISPATCH_STATES.len() as i64).await;
+    wait_for_stored_events(&store, i64::try_from(DISPATCH_STATES.len()).unwrap()).await;
     drop(hub);
 
     let (_restarted, base) = start_pair(&alpha, &beta, 2, &extra).await;

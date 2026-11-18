@@ -119,7 +119,13 @@ pub const SERVICE_PORT: u16 = 8888;
 /// Bind address baked into the service definitions as `LLM_HUB_BIND`.
 pub const SERVICE_BIND: &str = "0.0.0.0";
 /// systemd user unit name on Linux / Task Scheduler task name on Windows.
-#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", windows)),
+    allow(
+        dead_code,
+        reason = "Only the Linux and Windows service managers use it"
+    )
+)]
 pub const SERVICE_NAME: &str = "llm-hub";
 pub const GITHUB_REPO: &str = "barnuri/llm-hub";
 pub const VERSION: &str = env!("LLM_HUB_VERSION");

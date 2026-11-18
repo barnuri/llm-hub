@@ -91,11 +91,11 @@ pub struct ModelHealth {
     entries: Mutex<HashMap<(String, String), Entry>>,
 }
 
-// Times are milliseconds and scores run 0 to 10, so the float casts here cannot overflow.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    clippy::cast_precision_loss
+    clippy::cast_precision_loss,
+    reason = "Times are milliseconds and scores run 0 to 10, so the float casts cannot overflow"
 )]
 impl ModelHealth {
     const COOLDOWN_BASE: Duration = Duration::from_secs(30);
