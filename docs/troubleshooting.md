@@ -27,6 +27,11 @@ about 1.46x, so the hub refuses a request locally only when the estimate is over
 150% (`PROMPT_REFUSAL_MARGIN_PERCENT`). A request inside that margin goes to the upstream, which
 returns its own 400 when the prompt is really too long. The hub learns the limit from that 400.
 
+On `/v1/responses` the estimate never refuses alone. Encrypted reasoning items inflate the body
+without adding the same number of tokens. The hub still skips a model whose limit is too small
+when another model in the chain remains. When the estimate would refuse every model, the hub
+sends the request to the model with the largest known limit, and the upstream decides.
+
 ## A Copilot Claude model reports a smaller window than it accepts
 
 Copilot's `/models` understates the prompt limit of Claude models. The hub replaces it with a

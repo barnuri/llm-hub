@@ -142,7 +142,10 @@ mod tests {
             std::fs::write(SPEC_FILE, &generated).unwrap();
             return;
         }
-        let committed = std::fs::read_to_string(SPEC_FILE).unwrap_or_default();
+        // A Windows checkout may turn the committed file's line endings into CRLF.
+        let committed = std::fs::read_to_string(SPEC_FILE)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
         assert!(
             committed == generated,
             "docs/openapi.json is out of date. Regenerate: UPDATE_OPENAPI=1 cargo test openapi_file"
