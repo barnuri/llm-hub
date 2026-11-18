@@ -5,11 +5,15 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::ext::hooks::HookSpec;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuleFile {
     #[serde(default)]
     pub rules: Vec<RuleSpec>,
+    #[serde(default)]
+    pub hooks: Vec<HookSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -17,25 +21,42 @@ pub(crate) struct RuleFile {
 pub(crate) struct RuleSpec {
     pub name: String,
     pub phase: PhaseName,
+    #[serde(default)]
+    pub mode: RuleMode,
     #[serde(default, rename = "match")]
     pub matches: MatchSpec,
     pub actions: Vec<ActionSpec>,
 }
 
+/// Whether a matching rule acts, or only logs that it would have.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RuleMode {
+    #[default]
+    Enforce,
+    Shadow,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PhaseName {
+    HttpRequest,
     Request,
     Attempt,
     Response,
+    HttpResponse,
+    Complete,
 }
 
 impl PhaseName {
     pub fn as_str(self) -> &'static str {
         match self {
+            PhaseName::HttpRequest => "http_request",
             PhaseName::Request => "request",
             PhaseName::Attempt => "attempt",
             PhaseName::Response => "response",
+            PhaseName::HttpResponse => "http_response",
+            PhaseName::Complete => "complete",
         }
     }
 }

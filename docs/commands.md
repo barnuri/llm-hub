@@ -11,7 +11,7 @@
 | `llm-hub service install` | Install and start the background service, or reload it. See [Service](service-and-updates.md#service). |
 | `llm-hub service uninstall` | Remove the background service. |
 | `llm-hub service status` | Show the service status. |
-| `llm-hub extensions check [FILE]` | Validate a rules file the way the server loads it. Exits 1 with the file, rule and reason when it is invalid. See [Extensions](extensions.md#rules). |
+| `llm-hub extensions check [FILE]` | Validate a rules file the way the server loads it, and print how many rules and hooks it has. Exits 1 with the file, rule and reason when it is invalid. See [Extensions](extensions.md#rules). |
 | `llm-hub copilot login [--profile NAME]` | Log in to GitHub for a native Copilot profile. See [Native auth](github-copilot.md#native-auth). |
 | `llm-hub copilot logout [--profile NAME]` | Remove that login from the OS credential store. |
 | `llm-hub claude [model] [args...]` | Start Claude Code against the hub. |

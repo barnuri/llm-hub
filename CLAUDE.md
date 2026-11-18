@@ -18,7 +18,7 @@ Every change must keep the request path at the lowest latency available. Measure
 
 ## Extensions
 
-`src/lib.rs` is the crate. `src/main.rs` only calls `llm_hub::run()`. Request behavior that can run in a phase (`request`, `attempt`, `response`, `complete`) goes in an extension, not in `attempt_loop`. Use a built-in in `src/ext/builtin/`, a rule in a rules file, or a user's own `Extension`. See `docs/extensions.md`. The public API is `llm_hub::Hub` and `llm_hub::ext`. A change there breaks library users.
+`src/lib.rs` is the crate. `src/main.rs` only calls `llm_hub::run()`. Request behavior that can run in a phase (`http_request`, `request`, `attempt`, `response`, `http_response`, `complete`, `config_change`) goes in an extension, not in `attempt_loop`. Use a built-in in `src/ext/builtin/`, a rule in a rules file, or a user's own `Extension`. See `docs/extensions.md`. The public API is `llm_hub::Hub` and `llm_hub::ext`. A change there breaks library users.
 
 ## Tests and coverage
 

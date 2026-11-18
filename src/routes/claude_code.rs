@@ -235,7 +235,7 @@ mod tests {
             attempt: None,
             role: None,
         };
-        state.record_outcome(&outcome);
+        state.record_outcome(&outcome, None);
         let Json(settings) = super::settings(
             State(state),
             Query(ProfilesQuery::default()),

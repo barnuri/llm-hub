@@ -229,9 +229,15 @@ impl AppState {
     }
 
     /// Records a finished request in the stats, then runs the extensions' `complete` phase.
-    pub fn record_outcome(&self, outcome: &RequestOutcome) {
+    /// `request_state` is the typed data the request's extensions stored, when there is any.
+    pub fn record_outcome(
+        &self,
+        outcome: &RequestOutcome,
+        request_state: Option<&Arc<axum::http::Extensions>>,
+    ) {
         self.0.stats.record(outcome);
-        self.extensions().complete(&CompleteCtx::new(outcome));
+        self.extensions()
+            .complete(&CompleteCtx::new(outcome, request_state));
     }
 
     pub fn extensions(&self) -> Arc<ExtensionSet> {

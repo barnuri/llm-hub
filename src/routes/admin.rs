@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::configs::{KeepWarmConfig, ProfileConfig, mask_key};
 use crate::consts::{DEFAULT_INSIGHTS_MIN_REQUESTS, DEFAULT_INSIGHTS_RANGE, ENV_FILE, VERSION};
 use crate::dependencies::state::AppState;
+use crate::ext::ConfigKind;
 use crate::routes::models::send_models_request;
 use crate::schemas::api_key_input::ApiKeyInput;
 use crate::schemas::api_key_record::ApiKeyRecord;
@@ -27,6 +28,7 @@ use crate::schemas::keep_warm_summary::KeepWarmSummary;
 use crate::schemas::profile_input::ProfileInput;
 use crate::schemas::usage_report::UsageReport;
 use crate::services::env_writer;
+use crate::services::extension_phases;
 use crate::services::insights;
 use crate::services::pricing::PricingBook;
 use crate::services::session_insights;
@@ -93,6 +95,18 @@ pub async fn upsert_profile(
 }
 
 fn upsert_profile_in(
+    state: &AppState,
+    input: ProfileInput,
+    env_file: &Path,
+    reload: impl Fn(&AppState) -> Result<(), AppError>,
+) -> Result<Json<Value>, AppError> {
+    let name = input.name.trim().to_owned();
+    extension_phases::changing(state, ConfigKind::ProfileSaved, Some(&name), || {
+        upsert_profile_apply(state, input, env_file, reload)
+    })
+}
+
+fn upsert_profile_apply(
     state: &AppState,
     input: ProfileInput,
     env_file: &Path,
@@ -173,6 +187,17 @@ fn set_default_fallbacks_in(
     env_file: &Path,
     reload: impl Fn(&AppState) -> Result<(), AppError>,
 ) -> Result<Json<Value>, AppError> {
+    extension_phases::changing(state, ConfigKind::DefaultFallbacks, None, || {
+        set_default_fallbacks_apply(state, input, env_file, reload)
+    })
+}
+
+fn set_default_fallbacks_apply(
+    state: &AppState,
+    input: &FallbacksInput,
+    env_file: &Path,
+    reload: impl Fn(&AppState) -> Result<(), AppError>,
+) -> Result<Json<Value>, AppError> {
     if state.config().config_readonly {
         return Err(AppError::ReadOnly);
     }
@@ -192,6 +217,17 @@ pub async fn set_copilot_prices(
 }
 
 fn set_copilot_prices_in(
+    state: &AppState,
+    input: &CopilotPricesInput,
+    env_file: &Path,
+    reload: impl Fn(&AppState) -> Result<(), AppError>,
+) -> Result<Json<Value>, AppError> {
+    extension_phases::changing(state, ConfigKind::CopilotPrices, None, || {
+        set_copilot_prices_apply(state, input, env_file, reload)
+    })
+}
+
+fn set_copilot_prices_apply(
     state: &AppState,
     input: &CopilotPricesInput,
     env_file: &Path,
@@ -221,6 +257,17 @@ fn set_keep_warm_in(
     env_file: &Path,
     reload: impl Fn(&AppState) -> Result<(), AppError>,
 ) -> Result<Json<Value>, AppError> {
+    extension_phases::changing(state, ConfigKind::KeepWarm, None, || {
+        set_keep_warm_apply(state, input, env_file, reload)
+    })
+}
+
+fn set_keep_warm_apply(
+    state: &AppState,
+    input: &KeepWarmInput,
+    env_file: &Path,
+    reload: impl Fn(&AppState) -> Result<(), AppError>,
+) -> Result<Json<Value>, AppError> {
     if state.config().config_readonly {
         return Err(AppError::ReadOnly);
     }
@@ -245,6 +292,17 @@ pub async fn delete_profile(
 }
 
 fn delete_profile_in(
+    state: &AppState,
+    name: &str,
+    env_file: &Path,
+    reload: impl Fn(&AppState) -> Result<(), AppError>,
+) -> Result<Json<Value>, AppError> {
+    extension_phases::changing(state, ConfigKind::ProfileDeleted, Some(name), || {
+        delete_profile_apply(state, name, env_file, reload)
+    })
+}
+
+fn delete_profile_apply(
     state: &AppState,
     name: &str,
     env_file: &Path,
@@ -620,6 +678,15 @@ pub async fn create_api_key(
     State(state): State<AppState>,
     Json(input): Json<ApiKeyInput>,
 ) -> Result<Json<Value>, AppError> {
+    extension_phases::changing(
+        &state,
+        ConfigKind::ApiKeyCreated,
+        Some(input.name.trim()),
+        || create_api_key_apply(&state, &input),
+    )
+}
+
+fn create_api_key_apply(state: &AppState, input: &ApiKeyInput) -> Result<Json<Value>, AppError> {
     let Some(store) = state.store() else {
         return Err(AppError::BadRequest(
             "persistence is off — set LLM_HUB_PERSISTENT=true to manage api keys".into(),
@@ -648,10 +715,16 @@ pub async fn delete_api_key(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
 ) -> Result<Json<Value>, AppError> {
+    extension_phases::changing(&state, ConfigKind::ApiKeyDeleted, Some(&name), || {
+        delete_api_key_apply(&state, &name)
+    })
+}
+
+fn delete_api_key_apply(state: &AppState, name: &str) -> Result<Json<Value>, AppError> {
     let Some(store) = state.store() else {
         return Err(AppError::BadRequest("persistence is off".into()));
     };
-    store.delete_api_key(&name).map_err(AppError::Internal)?;
+    store.delete_api_key(name).map_err(AppError::Internal)?;
     state.refresh_api_key_hashes();
     Ok(Json(json!({ "ok": true })))
 }
@@ -1336,6 +1409,148 @@ mod tests {
         ));
 
         assert_eq!(state.config().default_fallbacks, vec!["a/m1", "b/m2"]);
+    }
+
+    type SavedChanges = std::sync::Arc<std::sync::Mutex<Vec<(ConfigKind, Option<String>)>>>;
+
+    /// Rejects the kinds it is built with, and notes every change it sees saved.
+    struct ConfigGate {
+        rejects: Vec<ConfigKind>,
+        saved: SavedChanges,
+    }
+
+    impl crate::ext::Extension for ConfigGate {
+        fn name(&self) -> &'static str {
+            "config-gate"
+        }
+
+        fn on_config_change(&self, ctx: &crate::ext::ConfigChangeCtx<'_>) -> crate::ext::Flow {
+            if self.rejects.contains(&ctx.kind()) {
+                crate::ext::Flow::reject(403, "settings are frozen")
+            } else {
+                crate::ext::Flow::Continue
+            }
+        }
+
+        fn on_config_changed(&self, ctx: &crate::ext::ConfigChangeCtx<'_>) {
+            self.saved
+                .lock()
+                .unwrap()
+                .push((ctx.kind(), ctx.subject().map(str::to_owned)));
+        }
+    }
+
+    fn gate_state(state: &AppState, rejects: Vec<ConfigKind>) -> SavedChanges {
+        let saved = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut all = crate::ext::builtin::builtins();
+        all.push(std::sync::Arc::new(ConfigGate {
+            rejects,
+            saved: std::sync::Arc::clone(&saved),
+        }));
+        state.set_extensions(crate::ext::ExtensionSet::new(all));
+        saved
+    }
+
+    #[test]
+    fn an_extension_can_stop_a_settings_save_and_sees_the_ones_that_succeed() {
+        let state = state_for(&[]);
+        let saved = gate_state(&state, vec![ConfigKind::DefaultFallbacks]);
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+        let input = FallbacksInput {
+            fallbacks: vec!["a/m1".into()],
+        };
+
+        let stopped = set_default_fallbacks_in(&state, &input, &env, reload_from(&env));
+        let allowed = set_keep_warm_in(
+            &state,
+            &KeepWarmInput {
+                enabled: true,
+                idle_cap_minutes: 30,
+            },
+            &env,
+            reload_from(&env),
+        );
+
+        assert!(matches!(
+            stopped,
+            Err(AppError::Rejected(axum::http::StatusCode::FORBIDDEN, _))
+        ));
+        assert!(state.config().default_fallbacks.is_empty());
+        assert_saved(allowed);
+        assert_eq!(*saved.lock().unwrap(), [(ConfigKind::KeepWarm, None)]);
+    }
+
+    #[test]
+    fn a_failed_save_does_not_reach_the_changed_phase() {
+        let state = state_for(&[("LLM_HUB_CONFIG_READONLY", "true")]);
+        let saved = gate_state(&state, Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+        let input = FallbacksInput {
+            fallbacks: vec!["a/m1".into()],
+        };
+
+        let result = set_default_fallbacks_in(&state, &input, &env, reload_from(&env));
+
+        assert!(matches!(result, Err(AppError::ReadOnly)));
+        assert!(saved.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn profile_prices_and_delete_saves_name_their_subject() {
+        let state = state_for(&[]);
+        let saved = gate_state(&state, Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+
+        assert_saved(upsert_profile_in(
+            &state,
+            profile_input(" groq ", "https://api.groq.com/openai/v1", Some("gsk_x")),
+            &env,
+            reload_from(&env),
+        ));
+        assert_saved(set_copilot_prices_in(
+            &state,
+            &CopilotPricesInput { refresh_secs: 3600 },
+            &env,
+            reload_from(&env),
+        ));
+        assert_saved(delete_profile_in(&state, "groq", &env, reload_from(&env)));
+
+        assert_eq!(
+            *saved.lock().unwrap(),
+            [
+                (ConfigKind::ProfileSaved, Some("groq".to_owned())),
+                (ConfigKind::CopilotPrices, None),
+                (ConfigKind::ProfileDeleted, Some("groq".to_owned())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_changes_pass_the_config_phases() {
+        let (_dir, state) = persistent_state("sqlite", &[]);
+        let saved = gate_state(&state, vec![ConfigKind::ApiKeyDeleted]);
+
+        let Json(created) = create_api_key(
+            State(state.clone()),
+            Json(ApiKeyInput { name: "ci".into() }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created["name"], "ci");
+        let stopped = delete_api_key(State(state.clone()), UrlPath("ci".into())).await;
+
+        assert!(matches!(
+            stopped,
+            Err(AppError::Rejected(axum::http::StatusCode::FORBIDDEN, _))
+        ));
+        assert_eq!(
+            *saved.lock().unwrap(),
+            [(ConfigKind::ApiKeyCreated, Some("ci".to_owned()))]
+        );
+        assert_eq!(state.api_key_hashes().len(), 1);
     }
 
     #[test]

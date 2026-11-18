@@ -1,14 +1,33 @@
+use std::sync::{Arc, LazyLock};
+
+use axum::http::Extensions;
+
 use crate::services::stats::RequestOutcome;
+
+/// Stands in for the request state of an outcome that has none.
+static NO_STATE: LazyLock<Extensions> = LazyLock::new(Extensions::new);
 
 /// The `complete` phase view of one recorded outcome.
 #[derive(Debug)]
 pub struct CompleteCtx<'a> {
     outcome: &'a RequestOutcome,
+    state: Option<&'a Arc<Extensions>>,
 }
 
 impl<'a> CompleteCtx<'a> {
-    pub(crate) fn new(outcome: &'a RequestOutcome) -> CompleteCtx<'a> {
-        CompleteCtx { outcome }
+    pub(crate) fn new(
+        outcome: &'a RequestOutcome,
+        state: Option<&'a Arc<Extensions>>,
+    ) -> CompleteCtx<'a> {
+        CompleteCtx { outcome, state }
+    }
+
+    /// The typed data the request's extensions stored with `state_mut().insert(..)`, as it stood
+    /// after the last `response` phase. Empty when the request stored none, and for outcomes the
+    /// hub records outside a request, such as keep-warm pings.
+    #[must_use]
+    pub fn state(&self) -> &Extensions {
+        self.state.map_or(&*NO_STATE, |state| &**state)
     }
 
     /// The profile that served the request.
@@ -85,7 +104,7 @@ mod tests {
             ..RequestOutcome::default()
         };
 
-        let ctx = CompleteCtx::new(&outcome);
+        let ctx = CompleteCtx::new(&outcome, None);
 
         assert_eq!(ctx.profile(), "groq");
         assert_eq!(ctx.model(), "groq/llama");
@@ -96,5 +115,18 @@ mod tests {
         assert_eq!(ctx.tokens_out(), 7);
         assert_eq!(ctx.error(), Some("rate limited"));
         assert_eq!(ctx.client(), Some("codex"));
+        assert!(ctx.state().is_empty());
+    }
+
+    #[test]
+    fn state_returns_the_request_data_the_extensions_stored() {
+        let outcome = RequestOutcome::default();
+        let mut stored = Extensions::new();
+        stored.insert(7_u8);
+        let stored = Arc::new(stored);
+
+        let ctx = CompleteCtx::new(&outcome, Some(&stored));
+
+        assert_eq!(ctx.state().get::<u8>(), Some(&7));
     }
 }

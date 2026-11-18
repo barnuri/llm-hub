@@ -132,6 +132,9 @@ impl StatusMatch {
 /// Fails when `spec` sets a key that `phase` cannot check.
 fn check_keys(spec: &MatchSpec, phase: PhaseName) -> Result<(), String> {
     let allowed: &[&str] = match phase {
+        PhaseName::HttpRequest => &["path", "method", "api", "header", "header_absent"],
+        PhaseName::HttpResponse => &["path", "method", "api", "header", "header_absent", "status"],
+        PhaseName::Complete => &["profile", "model", "status"],
         PhaseName::Request => &[
             "path",
             "method",

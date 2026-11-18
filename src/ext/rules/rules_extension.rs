@@ -1,30 +1,62 @@
+use std::sync::Arc;
+
+use crate::ext::hooks::{HookSet, HookSpec};
 use crate::ext::rules::action::Action;
 use crate::ext::rules::matcher::{Facts, Matcher};
-use crate::ext::rules::rule_spec::{PhaseName, RuleSpec};
-use crate::ext::{AttemptCtx, Extension, Flow, RequestCtx, ResponseCtx, ResponseFlow};
+use crate::ext::rules::rule_spec::{PhaseName, RuleMode, RuleSpec};
+use crate::ext::{
+    AttemptCtx, Extension, Flow, HttpRequestCtx, HttpResponseCtx, RequestCtx, ResponseCtx,
+    ResponseFlow,
+};
 
 /// One compiled rule.
 #[derive(Debug)]
 struct Rule {
+    name: String,
+    phase: PhaseName,
+    shadow: bool,
     matcher: Matcher,
     actions: Vec<Action>,
+}
+
+impl Rule {
+    /// True when the matching rule should act. A shadow rule only logs what it would do.
+    fn acts(&self) -> bool {
+        if self.shadow {
+            let actions: Vec<String> = self.actions.iter().map(Action::describe).collect();
+            tracing::info!(
+                rule = %self.name,
+                phase = self.phase.as_str(),
+                actions = %actions.join(", "),
+                "A shadow rule matched. The hub took no action."
+            );
+        }
+        !self.shadow
+    }
 }
 
 /// The rules of one rules file, grouped by phase, in file order.
 #[derive(Debug, Default)]
 pub(crate) struct RulesExtension {
+    hooks: Option<Arc<HookSet>>,
+    http_request: Vec<Rule>,
     request: Vec<Rule>,
     attempt: Vec<Rule>,
     response: Vec<Rule>,
+    http_response: Vec<Rule>,
 }
 
 impl RulesExtension {
     /// Compiles `specs`. The error names the rule and what is wrong with it.
     pub fn compile(
         specs: Vec<RuleSpec>,
+        hooks: Vec<HookSpec>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<RulesExtension, String> {
-        let mut rules = RulesExtension::default();
+        let mut rules = RulesExtension {
+            hooks: HookSet::compile(hooks, env)?.map(Arc::new),
+            ..RulesExtension::default()
+        };
         let mut names = std::collections::HashSet::new();
         for spec in specs {
             let name = spec.name.trim().to_owned();
@@ -38,7 +70,15 @@ impl RulesExtension {
                 return Err(format!("rule `{name}`: it has no actions"));
             }
             let phase = spec.phase;
+            if phase == PhaseName::Complete {
+                return Err(format!(
+                    "rule `{name}`: the complete phase runs hooks only, because a rule has nothing to change there"
+                ));
+            }
             let rule = Rule {
+                name: name.clone(),
+                phase,
+                shadow: spec.mode == RuleMode::Shadow,
                 matcher: Matcher::compile(spec.matches, phase)
                     .map_err(|e| format!("rule `{name}`: {e}"))?,
                 actions: spec
@@ -49,9 +89,12 @@ impl RulesExtension {
                     .map_err(|e| format!("rule `{name}`: {e}"))?,
             };
             match phase {
+                PhaseName::HttpRequest => rules.http_request.push(rule),
                 PhaseName::Request => rules.request.push(rule),
                 PhaseName::Attempt => rules.attempt.push(rule),
                 PhaseName::Response => rules.response.push(rule),
+                PhaseName::HttpResponse => rules.http_response.push(rule),
+                PhaseName::Complete => {}
             }
         }
         Ok(rules)
@@ -59,7 +102,33 @@ impl RulesExtension {
 
     /// The number of rules in every phase.
     pub fn len(&self) -> usize {
-        self.request.len() + self.attempt.len() + self.response.len()
+        self.all().count()
+    }
+
+    /// The number of rules that only log what they would do.
+    pub fn shadow_count(&self) -> usize {
+        self.all().filter(|rule| rule.shadow).count()
+    }
+
+    /// The number of HTTP hooks, and how many of them only log what they would do.
+    pub fn hook_counts(&self) -> (usize, usize) {
+        self.hooks
+            .as_ref()
+            .map_or((0, 0), |hooks| (hooks.len(), hooks.shadow_count()))
+    }
+
+    /// Hands the hooks to the extension set, which calls them in the async phases.
+    pub fn take_hooks(&mut self) -> Option<Arc<HookSet>> {
+        self.hooks.take()
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Rule> {
+        self.http_request
+            .iter()
+            .chain(&self.request)
+            .chain(&self.attempt)
+            .chain(&self.response)
+            .chain(&self.http_response)
     }
 
     fn response_facts<'c>(ctx: &'c ResponseCtx<'_>, error_code: Option<&'c str>) -> Facts<'c> {
@@ -81,14 +150,57 @@ impl Extension for RulesExtension {
         "rules"
     }
 
+    fn on_http_request(&self, ctx: &mut HttpRequestCtx<'_>) -> Flow {
+        for rule in &self.http_request {
+            let facts = Facts {
+                path: Some(ctx.path()),
+                method: Some(ctx.method()),
+                api: Some(ctx.api()),
+                headers: Some(ctx.headers()),
+                ..Facts::default()
+            };
+            if !rule.matcher.matches(&facts, false) || !rule.acts() {
+                continue;
+            }
+            for action in &rule.actions {
+                if let Some(rejection) = action.apply_to(ctx) {
+                    return rejection;
+                }
+            }
+        }
+        Flow::Continue
+    }
+
+    fn on_http_response(&self, ctx: &mut HttpResponseCtx<'_>) {
+        for rule in &self.http_response {
+            let facts = Facts {
+                path: Some(ctx.path()),
+                method: Some(ctx.method()),
+                api: Some(ctx.api()),
+                headers: Some(ctx.headers()),
+                status: Some(ctx.status().as_u16()),
+                ..Facts::default()
+            };
+            if !rule.matcher.matches(&facts, false) || !rule.acts() {
+                continue;
+            }
+            for action in &rule.actions {
+                if let Action::SetStatus(status) = action {
+                    ctx.set_status(*status);
+                } else {
+                    action.apply_to(ctx);
+                }
+            }
+        }
+    }
+
     fn on_request(&self, ctx: &mut RequestCtx<'_>) -> Flow {
-        let needs_body = self
-            .request
-            .iter()
-            .any(|rule| rule.matcher.needs_request_body());
-        let model = needs_body.then(|| ctx.model().map(str::to_owned)).flatten();
-        let stream = needs_body.then(|| ctx.stream());
         for rule in &self.request {
+            let (model, stream) = if rule.matcher.needs_request_body() {
+                (ctx.model().map(str::to_owned), Some(ctx.stream()))
+            } else {
+                (None, None)
+            };
             let facts = Facts {
                 path: Some(ctx.path()),
                 method: Some(ctx.method()),
@@ -98,7 +210,7 @@ impl Extension for RulesExtension {
                 stream,
                 ..Facts::default()
             };
-            if !rule.matcher.matches(&facts, false) {
+            if !rule.matcher.matches(&facts, false) || !rule.acts() {
                 continue;
             }
             for action in &rule.actions {
@@ -111,12 +223,8 @@ impl Extension for RulesExtension {
     }
 
     fn on_attempt(&self, ctx: &mut AttemptCtx<'_>) -> Flow {
-        let needs_body = self
-            .attempt
-            .iter()
-            .any(|rule| rule.matcher.needs_request_body());
-        let stream = needs_body.then(|| ctx.stream());
         for rule in &self.attempt {
+            let stream = rule.matcher.needs_request_body().then(|| ctx.stream());
             let facts = Facts {
                 path: Some(ctx.client_path()),
                 api: Some(ctx.api()),
@@ -126,7 +234,7 @@ impl Extension for RulesExtension {
                 stream,
                 ..Facts::default()
             };
-            if !rule.matcher.matches(&facts, false) {
+            if !rule.matcher.matches(&facts, false) || !rule.acts() {
                 continue;
             }
             for action in &rule.actions {
@@ -141,7 +249,8 @@ impl Extension for RulesExtension {
     fn wants_error_body(&self, ctx: &ResponseCtx<'_>) -> bool {
         let facts = Self::response_facts(ctx, None);
         self.response.iter().any(|rule| {
-            (rule.matcher.needs_error_body() || rule.actions.iter().any(Action::changes_body))
+            (rule.matcher.needs_error_body()
+                || (!rule.shadow && rule.actions.iter().any(Action::changes_body)))
                 && rule.matcher.matches(&facts, true)
         })
     }
@@ -150,10 +259,8 @@ impl Extension for RulesExtension {
         let mut flow = ResponseFlow::Continue;
         for rule in &self.response {
             let error_code = ctx.error_code().map(str::to_owned);
-            if !rule
-                .matcher
-                .matches(&Self::response_facts(ctx, error_code.as_deref()), false)
-            {
+            let facts = Self::response_facts(ctx, error_code.as_deref());
+            if !rule.matcher.matches(&facts, false) || !rule.acts() {
                 continue;
             }
             for action in &rule.actions {
@@ -179,6 +286,7 @@ mod tests {
     use super::*;
     use crate::ext::rules::parse;
     use crate::ext::{Api, AttemptTarget, ResponseTarget};
+    use crate::utils::log_capture::LogCapture;
 
     fn rules(yaml: &str) -> RulesExtension {
         let env = |name: &str| (name == "TEAM").then(|| "blue".to_owned());
@@ -308,6 +416,83 @@ mod tests {
     }
 
     #[test]
+    fn a_shadow_rule_logs_what_it_would_do_and_changes_nothing() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+        let rules = rules(
+            "rules:\n  - name: trial-gate\n    phase: request\n    mode: shadow\n    match: {model: 'a/*'}\n    actions:\n      - set_header: {x-seen: '1'}\n      - reject: {status: 403, message: closed}\n  - name: trial-attempt\n    phase: attempt\n    mode: shadow\n    actions:\n      - remove_field: /temperature\n  - name: trial-reply\n    phase: response\n    mode: shadow\n    match: {status: 400}\n    actions:\n      - set_status: 429\n      - retry_next: true\n",
+        );
+        assert_eq!((rules.len(), rules.shadow_count()), (3, 3));
+
+        let (flow, headers, body) = request(
+            &rules,
+            &HeaderMap::new(),
+            r#"{"model":"a/m","temperature":1}"#,
+        );
+        let (attempt_flow, _, attempt_body) = attempt(&rules, "p", r#"{"temperature":1}"#);
+        let reply = response(&rules, 400, json!({"error": {"code": "x"}}));
+
+        assert_eq!(flow, Flow::Continue);
+        assert!(headers.is_none());
+        assert_eq!(&body[..], br#"{"model":"a/m","temperature":1}"#);
+        assert_eq!(attempt_flow, Flow::Continue);
+        assert_eq!(&attempt_body[..], br#"{"temperature":1}"#);
+        assert!(!reply.wants);
+        assert_eq!(reply.flow, ResponseFlow::Continue);
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        let written = logs.text();
+        assert!(written.contains("trial-gate"), "{written}");
+        assert!(written.contains("set_header, reject(403)"), "{written}");
+        assert!(written.contains("phase=\"request\""), "{written}");
+        assert!(
+            written.contains("trial-attempt") && written.contains("remove_field"),
+            "{written}"
+        );
+        assert!(written.contains("set_status(429), retry_next"), "{written}");
+    }
+
+    #[test]
+    fn a_rule_without_a_mode_acts() {
+        let rules = rules(
+            "rules:\n  - name: gate\n    phase: request\n    mode: enforce\n    actions:\n      - reject: {status: 403, message: closed}\n",
+        );
+
+        let (flow, _, _) = request(&rules, &HeaderMap::new(), r#"{"model":"a/m"}"#);
+
+        assert_eq!(flow, Flow::reject(403, "closed"));
+        assert_eq!(rules.shadow_count(), 0);
+    }
+
+    #[test]
+    fn a_later_request_rule_matches_the_model_an_earlier_rule_set() {
+        let rules = rules(
+            "rules:\n  - name: swap\n    phase: request\n    match: {model: 'a/*'}\n    actions:\n      - set_model: b/m\n  - name: gate\n    phase: request\n    match: {model: 'b/*'}\n    actions:\n      - reject: {status: 403, message: b is closed}\n",
+        );
+
+        let (flow, _, _) = request(&rules, &HeaderMap::new(), r#"{"model":"a/m"}"#);
+        assert_eq!(flow, Flow::reject(403, "b is closed"));
+
+        let (flow, _, body) = request(&rules, &HeaderMap::new(), r#"{"model":"c/m"}"#);
+        assert_eq!(flow, Flow::Continue);
+        assert_eq!(&body[..], br#"{"model":"c/m"}"#);
+    }
+
+    #[test]
+    fn a_later_rule_matches_the_stream_flag_an_earlier_rule_set() {
+        let rules = rules(
+            "rules:\n  - name: force\n    phase: request\n    actions:\n      - set_field: {/stream: true}\n  - name: gate\n    phase: request\n    match: {stream: true}\n    actions:\n      - reject: {status: 400, message: no streams}\n",
+        );
+
+        let (flow, _, _) = request(
+            &rules,
+            &HeaderMap::new(),
+            r#"{"model":"a/m","stream":false}"#,
+        );
+
+        assert_eq!(flow, Flow::reject(400, "no streams"));
+    }
+
+    #[test]
     fn attempt_rules_apply_per_profile() {
         let rules = rules(
             "rules:\n  - name: groq-only\n    phase: attempt\n    match: {profile: groq, model: 'groq/*', path: /v1/chat/*, api: chat, stream: false}\n    actions:\n      - set_header: {x-team: '${TEAM}'}\n      - set_model: llama-fast\n  - name: block-local\n    phase: attempt\n    match: {profile: local}\n    actions:\n      - reject: {status: 503, message: local is off}\n",
@@ -393,6 +578,36 @@ mod tests {
             (
                 "rules: [{name: a, phase: request, typo: 1, actions: []}]",
                 "typo",
+            ),
+        ] {
+            let error = parse(yaml, false, &env).unwrap_err();
+            assert!(error.contains(expected), "{yaml}: {error}");
+        }
+    }
+
+    #[test]
+    fn http_phase_rules_accept_only_their_keys_and_actions() {
+        let env = |_: &str| None;
+        for (yaml, expected) in [
+            (
+                "rules: [{name: a, phase: complete, actions: [{set_header: {x: '1'}}]}]",
+                "hooks only",
+            ),
+            (
+                "rules: [{name: a, phase: http_request, match: {model: 'x/*'}, actions: [{reject: {status: 400, message: m}}]}]",
+                "match key `model`",
+            ),
+            (
+                "rules: [{name: a, phase: http_request, actions: [{set_status: 400}]}]",
+                "action `set_status`",
+            ),
+            (
+                "rules: [{name: a, phase: http_response, actions: [{reject: {status: 400, message: m}}]}]",
+                "action `reject`",
+            ),
+            (
+                "rules: [{name: a, phase: http_response, match: {stream: true}, actions: [{set_status: 400}]}]",
+                "match key `stream`",
             ),
         ] {
             let error = parse(yaml, false, &env).unwrap_err();
