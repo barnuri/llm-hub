@@ -17,6 +17,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_TERM_COLOR: always
   COVERAGE_MIN: 80
+  CARGO_LLVM_COV_VERSION: 0.9.1
 
 jobs:
   changes:
@@ -51,13 +52,30 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - run: rustup toolchain install
+      - id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
-          shared-key: lint
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-lint-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-lint-${{ runner.os }}-
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
+        run: cargo clean -p llm-hub
+      - uses: actions/cache/save@v4
+        if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-lint-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
   coverage:
     needs: changes
@@ -66,15 +84,25 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install
       - run: rustup component add llvm-tools-preview
-      - uses: taiki-e/install-action@v2
+      - id: llvm-cov
+        uses: actions/cache@v4
         with:
-          tool: cargo-llvm-cov
-      - uses: Swatinem/rust-cache@v2
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-llvm-cov-${{ runner.os }}-${{ env.CARGO_LLVM_COV_VERSION }}
+      - if: steps.llvm-cov.outputs.cache-hit != 'true'
+        run: cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
+      - id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
-          shared-key: coverage
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-coverage-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-coverage-${{ runner.os }}-
       - name: Tests with coverage
         run: cargo llvm-cov --all-targets --json --summary-only --fail-under-lines "$COVERAGE_MIN" --output-path target/coverage.json
       - name: Every file meets the minimum
@@ -93,6 +121,17 @@ jobs:
         run: |
           jq -r '"Total line coverage: \(.data[0].totals.lines.percent | floor)%"' target/coverage.json >> "$GITHUB_STEP_SUMMARY" || true
           sed 's/^/- under minimum: /' target/below.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+      - if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
+        run: cargo clean -p llm-hub
+      - uses: actions/cache/save@v4
+        if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-coverage-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
   test-windows:
     needs: changes
@@ -101,12 +140,29 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - run: rustup toolchain install
+      - id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
-          shared-key: test-windows
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-test-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-test-${{ runner.os }}-
       - run: cargo test --all-targets
+      - if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
+        run: cargo clean -p llm-hub
+      - uses: actions/cache/save@v4
+        if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-test-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
   ui:
     needs: changes
