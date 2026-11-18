@@ -22,6 +22,7 @@ Boolean flags accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off`.
 |---|---|---|
 | `LLM_HUB_DEFAULT_FALLBACKS` | empty | Fallback chain for requests without the fallback header. |
 | `LLM_HUB_MAX_REPLAY_BYTES` | `268435456` (256 MB) | Largest request body the hub buffers for fallback replay and Anthropic translation. |
+| `LLM_HUB_EXTENSIONS_FILE` | `extensions.yaml`, `extensions.yml` or `extensions.json` in the working directory | Rules file for [extensions](extensions.md#rules). Reloaded on change. `llm-hub extensions check` validates it. |
 | `LLM_HUB_STREAM_ROLE` | `true` | Add `role: "assistant"` to the first streamed delta when the upstream leaves it out. |
 | `LLM_HUB_SSE_KEEPALIVE_MS` | `15000` | Idle time before an SSE keepalive comment. `0` turns it off. |
 | `LLM_HUB_FIRST_BYTE_TIMEOUT_MS` | `20000` | Longest wait for the first byte of a streamed Smart Auto attempt on a remote profile. A model that misses it is cooled and the next fallback is tried. `0` turns it off. See [Live signals](smart-auto.md#live-signals). |

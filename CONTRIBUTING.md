@@ -31,8 +31,10 @@ body or status is a behavior change.
 - **Single responsibility.** One module does one job. Put new logic in its own file under
   `src/services/` and call it from the route. Do not grow `src/routes/proxy.rs` with
   provider-specific branches.
-- **Open/closed.** Extend through the existing seams (`services/transforms.rs`,
-  `services/body_transform.rs`, profile config) instead of editing the core request loop.
+- **Open/closed.** Extend through the extension phases (`src/ext/`, see
+  [docs/extensions.md](docs/extensions.md)) or the existing seams (`services/transforms.rs`,
+  profile config) instead of editing the core request loop. Behavior that only some users want
+  can often be a rule in a rules file, with no code change at all.
 - **Liskov substitution.** A new upstream, credential store or transport must work wherever the
   trait it implements is used, with no special cases at the call site.
 - **Interface segregation.** Keep traits small. A caller depends only on the methods it uses.

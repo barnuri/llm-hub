@@ -13,6 +13,8 @@ pub enum AppError {
     Conflict(String),
     Internal(String),
     UpstreamUnavailable(String),
+    /// An extension refused the request with this status and message.
+    Rejected(StatusCode, String),
 }
 
 impl AppError {
@@ -26,6 +28,7 @@ impl AppError {
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::UpstreamUnavailable(_) => StatusCode::BAD_GATEWAY,
+            AppError::Rejected(status, _) => *status,
         }
     }
 
@@ -39,6 +42,7 @@ impl AppError {
             AppError::Conflict(_) => "conflict_error",
             AppError::Internal(_) => "internal_error",
             AppError::UpstreamUnavailable(_) => "upstream_error",
+            AppError::Rejected(..) => "rejected_error",
         }
     }
 
@@ -49,7 +53,8 @@ impl AppError {
             | AppError::NotImplemented(m)
             | AppError::Internal(m)
             | AppError::UpstreamUnavailable(m)
-            | AppError::Conflict(m) => m.clone(),
+            | AppError::Conflict(m)
+            | AppError::Rejected(_, m) => m.clone(),
             AppError::Unauthorized => "missing or invalid api key".to_string(),
             AppError::ReadOnly => "config is read-only (LLM_HUB_CONFIG_READONLY=true)".to_string(),
         }
@@ -98,6 +103,11 @@ mod tests {
                 AppError::UpstreamUnavailable("down".into()),
                 502,
                 "upstream_error",
+            ),
+            (
+                AppError::Rejected(StatusCode::FORBIDDEN, "no".into()),
+                403,
+                "rejected_error",
             ),
         ];
 

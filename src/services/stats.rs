@@ -117,6 +117,7 @@ pub struct StatsRegistry {
 pub const SERIES_HOUR_MS: u64 = 3_600_000;
 pub const SERIES_DAY_MS: u64 = 86_400_000;
 
+#[derive(Default)]
 pub struct RequestOutcome {
     pub profile: String,
     pub model_key: String,

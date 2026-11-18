@@ -100,7 +100,7 @@ command when `bunx` is on PATH, and another asserts every `operationId` is uniqu
 - [Configuration](docs/configuration.md): every `LLM_HUB_*` variable.
 - [Service and updates](docs/service-and-updates.md): install, the background service, Docker and updates.
 - [Troubleshooting](docs/troubleshooting.md): common failures and their fixes.
-- [Extensions](docs/extensions.md): proposal for extending llm-hub with rules, hooks and Rust code.
+- [Extensions](docs/extensions.md): extend llm-hub with a rules file or Rust code, and use it as a library.
 - [Development](docs/development.md): build, test and reinstall from a checkout.
 - [Subscriptions](docs/subscriptions.md): why llm-hub does not proxy Claude, ChatGPT or Cursor plans.
 

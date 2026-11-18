@@ -5,6 +5,8 @@
 mod configs;
 mod consts;
 mod dependencies;
+pub mod ext;
+mod hub;
 mod routes;
 mod schemas;
 mod services;
@@ -20,16 +22,21 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
 
+pub use crate::hub::Hub;
+/// The `axum` and `serde_json` versions llm-hub's API uses, so extensions match them.
+pub use {axum, serde_json};
+
 use crate::configs::HubConfig;
 use crate::consts::{ENV_FILE, LOGS_DIR, VERSION};
 use crate::dependencies::state::AppState;
+use crate::services::extension_loader::{self, EXTENSIONS_FILE_VAR, ExtensionSources};
 use crate::services::launch;
 use crate::services::store::Store;
 
 /// Env-file pairs merged with process env (process env wins). Reads via
 /// `from_path_iter` so reloads never mutate global process state.
 #[must_use]
-pub fn load_env_vars() -> HashMap<String, String> {
+pub(crate) fn load_env_vars() -> HashMap<String, String> {
     let mut vars: HashMap<String, String> = HashMap::new();
     if let Ok(iter) = dotenvy::from_path_iter(ENV_FILE) {
         for (key, value) in iter.flatten() {
@@ -42,8 +49,12 @@ pub fn load_env_vars() -> HashMap<String, String> {
     vars
 }
 
-#[tokio::main]
-async fn main() {
+/// Runs llm-hub: a CLI command when one is given, else the server until it is told to stop.
+pub async fn run() {
+    Hub::new().run().await;
+}
+
+async fn serve(hub: Hub) {
     if run_smart_auto_command().await {
         return;
     }
@@ -93,8 +104,33 @@ async fn main() {
     let restart_notify = state.restart_notify();
     services::update::spawn_auto_update(auto_update, restart_notify.clone());
     services::config_reload::spawn_env_watcher(state.clone(), restart_notify.clone());
+    let sources = std::sync::Arc::new(ExtensionSources::new(
+        hub.extensions,
+        &vars,
+        std::path::PathBuf::from("."),
+    ));
+    match sources.load_rules(&vars) {
+        Ok(rules) => {
+            if let Some((path, rules)) = &rules {
+                tracing::info!(
+                    "loaded {} extension rules from {}",
+                    rules.len(),
+                    path.display()
+                );
+            }
+            state.set_extensions(sources.compose(rules.map(|(_, rules)| rules)));
+        }
+        Err(e) => {
+            eprintln!("extensions error: {e}");
+            std::process::exit(1);
+        }
+    }
+    extension_loader::spawn_rules_watcher(state.clone(), sources, load_env_vars);
 
-    let app = build_router(state);
+    let mut app = build_router_with(state, hub.routes);
+    for change in hub.router_changes {
+        app = change(app);
+    }
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(listener) => listener,
@@ -214,6 +250,9 @@ Coding agents on the hub ([model] is optional, e.g. copilot/claude-opus-5-5):
                                       after the agent name (also --profiles=a,b), e.g.
                                       llm-hub --profiles copilot,ivrit claude
 
+Extensions:
+  llm-hub extensions check [FILE]  validate a rules file (default: LLM_HUB_EXTENSIONS_FILE or extensions.yaml)
+
 GitHub Copilot upstream:
   llm-hub copilot login [--profile NAME]   sign in with the GitHub device flow
   llm-hub copilot logout [--profile NAME]  remove the saved GitHub token
@@ -249,6 +288,13 @@ async fn run_cli_command() -> bool {
         }
         Some("service") => {
             run_service_command();
+            true
+        }
+        Some("extensions") => {
+            if let Err(e) = run_extensions_command() {
+                eprintln!("extensions: {e}");
+                std::process::exit(1);
+            }
             true
         }
         Some("copilot") => {
@@ -300,6 +346,27 @@ async fn run_launch_command() -> bool {
         std::process::exit(1);
     }
     true
+}
+
+const EXTENSIONS_USAGE: &str = "usage: llm-hub extensions check [FILE]";
+
+/// `llm-hub extensions check [FILE]`: loads a rules file the way the server does and reports it.
+fn run_extensions_command() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let mut vars = load_env_vars();
+    match args.as_slice() {
+        [check] if check == "check" => {}
+        [check, file] if check == "check" => {
+            vars.insert(EXTENSIONS_FILE_VAR.to_owned(), file.clone());
+        }
+        _ => return Err(EXTENSIONS_USAGE.to_owned()),
+    }
+    let sources = ExtensionSources::new(Vec::new(), &vars, std::path::PathBuf::from("."));
+    match sources.load_rules(&vars)? {
+        Some((path, rules)) => println!("{}: {} rules, valid", path.display(), rules.len()),
+        None => println!("no rules file: set {EXTENSIONS_FILE_VAR} or add extensions.yaml"),
+    }
+    Ok(())
 }
 
 const COPILOT_USAGE: &str = "usage: llm-hub copilot <login|logout> [--profile NAME]";
@@ -418,15 +485,23 @@ fn api_router(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(admin::delete_api_key))
 }
 
+#[cfg(test)]
 fn build_router(state: AppState) -> Router {
+    build_router_with(state, None)
+}
+
+/// The hub's routes, plus `ext_routes` under `/ext`. Both sit behind the master key.
+fn build_router_with(state: AppState, ext_routes: Option<Router>) -> Router {
     let (protected, openapi) = api_router(&state).split_for_parts();
     // The spec and the docs UI sit under the same key check as /api/*.
-    let protected = protected
-        .merge(SwaggerUi::new("/api-docs").url("/openapi.json", openapi))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            services::auth::require_master_key,
-        ));
+    let mut protected = protected.merge(SwaggerUi::new("/api-docs").url("/openapi.json", openapi));
+    if let Some(ext_routes) = ext_routes {
+        protected = protected.nest_service("/ext", ext_routes);
+    }
+    let protected = protected.layer(middleware::from_fn_with_state(
+        state.clone(),
+        services::auth::require_master_key,
+    ));
 
     let (health, _) = OpenApiRouter::<AppState>::new()
         .routes(routes!(routes::admin::healthz))

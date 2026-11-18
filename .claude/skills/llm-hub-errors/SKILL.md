@@ -59,7 +59,7 @@ or patch, reproduce it first with `curl -si` against the hub, using the same end
    - `local`: the hub rejected the request itself (see "Two error sources"). Treat it as `code`
      when the rejection is wrong for a valid request.
 6. Fix each `code` group with a test next to the code. Run the targeted test first:
-   `cargo test --bins <test_name>`. Then run `cargo test` in full. Follow "Fix rules" below.
+   `cargo test --lib <test_name>`. Then run `cargo test` in full. Follow "Fix rules" below.
 7. Rebuild and reinstall (required after Rust or UI changes, per the repo `CLAUDE.md`):
    `npm run build:ui` (only when `ui-src/` changed), `cargo build --release`,
    `./target/release/llm-hub service install`, then `curl -s http://127.0.0.1:8888/healthz` must print `ok`.
@@ -85,7 +85,7 @@ or patch, reproduce it first with `curl -si` against the hub, using the same end
 | `599 connect error ... githubcopilot.com` | network or Copilot outage | upstream, report only |
 | `408 Timed out reading request body` | very large request on Copilot | upstream or client, report only |
 | `a prompt of about N tokens is over the known limit of L tokens` (400, local, not in the feed) | the estimate is body bytes / 4, so large `encrypted_content` reasoning items and JSON escaping count as tokens. The hub refuses above 150% of the known limit | fixed: on `/v1/responses` the estimate never refuses alone. A too-small model is still skipped while a fallback remains |
-| Copilot 400 `model_max_prompt_tokens_exceeded` on `/responses`, Codex ends the turn | Codex compacts only on `code: context_length_exceeded` (as an HTTP 400 from Codex 0.169, before that only in a `response.failed` event) | fixed for Codex 0.169 and later: `src/services/responses_context.rs` renames the code and keeps the 400 |
+| Copilot 400 `model_max_prompt_tokens_exceeded` on `/responses`, Codex ends the turn | Codex compacts only on `code: context_length_exceeded` (as an HTTP 400 from Codex 0.169, before that only in a `response.failed` event) | fixed for Codex 0.169 and later: the built-in extension `src/ext/builtin/copilot_context_code.rs` renames the code and keeps the 400 |
 
 ## Fix rules
 
@@ -105,7 +105,7 @@ Learned from a reviewed external patch for the two rows above.
 - Reproduce with a real request shape. A synthetic body (for example trailing whitespace) proves
   the mechanism, not that real clients hit it.
 - Add a test for the default path next to the fix. For context limits, run the fallback tests
-  too: `cargo test --bins known_limit`.
+  too: `cargo test --lib known_limit`.
 
 ## Report format
 

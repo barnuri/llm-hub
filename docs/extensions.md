@@ -1,65 +1,61 @@
 # Extensions
 
-> Status: proposal. Nothing on this page is built yet. The API names and file formats can change
-> before the first release that ships them. Comments are welcome in the pull request or an issue.
-
-llm-hub should let you change its behavior without forking it. This page describes how: one set
-of request phases, and three ways to hook into them. Pick the simplest way that does the job.
+llm-hub lets you change its behavior without forking it. Extensions run in fixed request phases.
+There are two ways to write one:
 
 | Way | You write | Good for | Cost per request |
 |---|---|---|---|
-| [Rules](#rules) | A YAML or JSON file | Headers, body fields, error codes, blocking, fallbacks | Microseconds. A body parse only when a body rule matches |
-| [Hooks](#hooks) | An HTTP service in any language | Policy checks, guardrails, audit | One local HTTP call per matching request, with a timeout |
-| [Rust extensions](#rust-extensions) | Rust code, built with llm-hub as a library | Custom auth, metrics, routes, anything else | A function call |
+| [Rules](#rules) | A YAML or JSON file | Headers, body fields, error codes, blocking, fallbacks, retries | Microseconds. A body parse only when a rule reads or changes the body |
+| [Rust extensions](#rust-extensions) | Rust code, built with llm-hub as a library | Custom auth, metrics, routes, middleware, anything else | A function call |
 
-WebAssembly plugins are a possible fourth way later. See [Not planned yet](#not-planned-yet).
+HTTP hooks for other languages are planned. See [Planned](#planned).
 
 ## Principles
 
-1. **Off by default.** With no rules file, no hooks and no extensions, llm-hub behaves exactly as
-   it does today, and it skips the extension code path entirely.
-2. **One model for every way.** Rules, hooks and Rust extensions run in the same phases, in the
-   same order, with the same context. Built-in features move onto the same phases over time.
-3. **Every route, not only inference.** An extension can see `/v1/*`, `/api/*` and the UI routes.
-   Gateways that hook only the inference path force people to wrap the whole server instead.
-4. **Fail loudly at load, fail safely at run time.** An unknown key, an unknown phase or an
-   invalid rule stops startup with a message that names the file and line. At run time, an
-   extension that errors or panics is logged and skipped, unless it is marked `fail: closed`.
-5. **Streaming stays streaming.** No phase buffers a successful stream unless an extension asks for
-   chunks. Per-chunk phases cost nothing when no extension uses them.
-6. **Measured.** Each extension's time is recorded per request. The hub may add at most 50 ms to
-   the time to first byte, extensions included.
+1. **Off by default.** With no rules file and no Rust extensions, llm-hub behaves as before.
+2. **One model.** Rules and Rust extensions run in the same phases, in the same order, with the
+   same context. llm-hub's own built-in changes use the same phases.
+3. **Fail loudly at load, safely at run time.** An unknown key, an action a phase cannot run, an
+   unset `${NAME}` or a duplicate rule name stops startup with the file and the reason. A panic in
+   an extension at run time is logged, and the request goes on as if the extension did nothing.
+4. **Streaming stays streaming.** A successful stream is never buffered. Only an error body is
+   read, and only when an extension asks for it.
+5. **The hub keeps the truth.** Stats, limit learning and retries read the upstream reply as it
+   came. Response changes apply to what the client gets.
 
 ## Phases
 
-Every request passes these phases in order. Request phases run extensions in their `order`.
-Response phases run them in reverse, so the first extension to see the request is the last to
-see the response.
-
 | Phase | When | An extension can |
 |---|---|---|
-| `http_request` | Every route, before auth | Read or set headers, reject, answer directly |
-| `auth` | Every route that needs a key | Accept or reject the caller, attach an identity |
-| `request` | `/v1/*` after the body is parsed | Change the body and headers, pick the model, set fallbacks, reject, answer directly |
-| `attempt` | Before each upstream attempt, once per fallback | Change this attempt's body and headers, skip this model |
-| `response` | Upstream status and headers arrive | Retry on the next fallback, change the status or headers, rewrite an error body |
-| `chunk` | Each streamed event (opt-in) | Change, drop or add an event |
-| `http_response` | Every route, before the response leaves | Set response headers, read the final status |
-| `complete` | After the last byte, off the request path | Log, count, export metrics |
-| `config_change` | A profile, key or setting is saved | Validate before the save, react after it |
+| `request` | Once per `/v1/*` request, before the model and fallbacks are resolved. Sees the client's headers and body as sent | Change headers and the body, set the model and fallbacks, reject |
+| `attempt` | Before each upstream call: the primary model and each fallback. Sees the exact headers and body sent | Change this attempt's headers and body, reject |
+| `response` | When an upstream reply arrives, before the hub delivers it or tries the next fallback | Retry on the next fallback, change the status, headers or error body the client gets |
+| `complete` | After the hub records the outcome, off the response path | Log, count, export metrics |
 
-Each request carries a typed context that lives until the last byte of a stream is sent. An
-extension stores its own data there in `request` and reads it back in `complete`, with no global
-map keyed by a request id.
+Request and attempt phases run extensions in order: built-ins, then Rust extensions in the order
+you add them, then the rules file. The response phase runs them in reverse, so rules see the
+upstream reply before the built-ins change it. The first rejection stops a phase. In the response
+phase every extension runs, and any `retry_next` wins.
+
+A request carries typed state from `request` to `attempt` and `response`
+(`ctx.state_mut().insert(value)`).
 
 ## Rules
 
-Rules need no code. llm-hub reads them from `extensions.yaml` (or `extensions.json`) next to its
-`.env`, or from the path in `LLM_HUB_EXTENSIONS_FILE`. It reloads the file when it changes. If the
-new file is invalid, the hub keeps the old rules and logs why.
+llm-hub reads rules from the file in `LLM_HUB_EXTENSIONS_FILE`, else from `extensions.yaml`,
+`extensions.yml` or `extensions.json` in its working directory. It reloads the file within a
+second of a change. When the new file is invalid, it keeps the old rules and logs why.
 
-A rule has a `phase`, an optional `match`, and one or more `actions`. Every condition in `match`
-must hold. Rules run in file order. `${NAME}` takes a value from the environment.
+Check a file without starting the server:
+
+```sh
+llm-hub extensions check               # the file the server would load
+llm-hub extensions check my-rules.yaml
+```
+
+A rule has a unique `name`, a `phase`, an optional `match`, and one or more `actions`. Every
+condition in `match` must hold. Rules run in file order. `${NAME}` takes a value from `.env` or the
+process environment.
 
 ```yaml
 rules:
@@ -77,29 +73,28 @@ rules:
     actions:
       - remove_field: /temperature
 
-  # Copilot calls a context overflow model_max_prompt_tokens_exceeded. Codex compacts only on
-  # context_length_exceeded. (llm-hub already does this one built in. It shows the shape.)
-  - name: context-code
-    phase: response
-    match: { profile: copilot, path: /v1/responses, status: 400, error_code: model_max_prompt_tokens_exceeded }
-    actions:
-      - set_field: { /error/code: context_length_exceeded }
-
   # Keep a model away from one client.
-  - name: no-premium-for-ci
+  - name: no-opus-for-ci
     phase: request
     match: { header: { x-client: ci }, model: "*/claude-opus-*" }
     actions:
       - reject: { status: 403, message: "CI may not use Opus models" }
 
-  # A fallback chain for every request that names no chain itself.
+  # A fallback chain for every streamed request that names no chain itself.
   - name: default-chain
     phase: request
-    match: { model: "copilot/gpt-5*", header_absent: x-llm-hub-fallbacks }
+    match: { model: "copilot/gpt-5*", stream: true, header_absent: x-llm-hub-fallbacks }
     actions:
       - set_fallbacks: [ "copilot/gpt-5-mini", "groq/llama-3.3-70b-versatile" ]
 
-  # Never forward the caller's own Authorization header to a local model.
+  # Try the next model when an upstream says it is overloaded.
+  - name: overloaded
+    phase: response
+    match: { status: 5xx, error_code: overloaded }
+    actions:
+      - retry_next: true
+
+  # Never forward the caller's Authorization header to a local model.
   - name: strip-auth-local
     phase: attempt
     match: { profile: local }
@@ -109,144 +104,100 @@ rules:
 
 ### Match conditions
 
-| Key | Matches | Example |
+| Key | Phases | Matches |
 |---|---|---|
-| `path` | The client path, glob | `/v1/responses`, `/api/*` |
-| `method` | The HTTP method | `POST` |
-| `api` | The client API shape | `chat`, `messages`, `responses` |
-| `model` | The requested or attempted model, glob | `copilot/claude-*` |
-| `profile` | The profile of the attempt | `copilot` |
-| `header` | Header values, exact | `{ x-client: ci }` |
-| `header_absent` | A header that is not set | `x-llm-hub-fallbacks` |
-| `stream` | Whether the client asked for a stream | `true` |
-| `status` | The upstream status (`response` phase) | `400`, `5xx` |
-| `error_code` | `error.code` in the upstream error body | `rate_limit_exceeded` |
+| `path` | all | The client path without the query, glob (`/v1/*`) |
+| `method` | request | The HTTP method |
+| `api` | all | `chat`, `messages`, `responses` or `other` |
+| `model` | all | Glob. In `request`, the `model` field of the body. Later, the attempt's `<profile>/<model>` |
+| `profile` | attempt, response | The attempt's profile |
+| `header` | all | Header values, exact. In `response`, the reply headers |
+| `header_absent` | all | Headers that are not set |
+| `stream` | request, attempt | The body's `stream` flag |
+| `status` | response | A status (`400`) or class (`5xx`) |
+| `error_code` | response | `error.code` in the JSON error body |
+
+A key takes one value or a list. A list matches when any value matches. A key that a phase cannot
+check is a load error.
 
 ### Actions
 
 | Action | Phases | Effect |
 |---|---|---|
-| `set_header`, `remove_header` | all but `complete` | Change request headers, or response headers in `response` and `http_response` |
-| `set_field`, `remove_field` | `request`, `attempt`, `response` | Change a JSON body field by JSON Pointer. On `response`, only error bodies |
-| `set_model` | `request`, `attempt` | Send a different model id |
-| `set_fallbacks` | `request` | Replace the fallback chain |
-| `reject` | `http_request`, `auth`, `request` | Answer with this status and message in the client's API format |
-| `retry_next` | `response` | Treat this response as failed and try the next fallback |
-| `set_status` | `response` | Change the status sent to the client |
-| `tag` | all | Add a label to the request in stats and logs |
+| `set_header`, `remove_header` | all | Request headers in `request` and `attempt`; the client's reply headers in `response` |
+| `set_field`, `remove_field` | all | A JSON Pointer in the body (`/metadata/team`). In `response`, the error body only. `set_field` creates missing objects |
+| `set_model` | request, attempt | The body's `model` field |
+| `set_fallbacks` | request | The fallback chain (`x-llm-hub-fallbacks`) |
+| `reject` | request, attempt | Answer with `status` (4xx or 5xx) and `message`, in the client's API format |
+| `retry_next` | response | Try the next model in the chain. On the last model, deliver the reply |
+| `set_status` | response | The status the client gets |
 
-`set_field` and `remove_field` parse the body only when the rule matches. A request that no body
-rule matches is forwarded as raw bytes, as today.
-
-## Hooks
-
-A hook is an HTTP endpoint that llm-hub calls in one phase. Use it for logic that rules cannot
-express and that you want in another language or in another process.
-
-```yaml
-hooks:
-  - name: guardrail
-    phase: request
-    url: http://127.0.0.1:9100/check
-    match: { api: [chat, messages, responses] }
-    send: [headers, body]    # default: headers only. Authorization is never sent.
-    timeout_ms: 200
-    fail: open               # open: skip the hook on error or timeout. closed: reject the request.
-
-  - name: audit
-    phase: complete          # off the request path. Never delays the response.
-    url: http://127.0.0.1:9100/audit
-```
-
-llm-hub sends one JSON object and reads one back:
-
-```json
-{ "phase": "request", "request_id": "…", "path": "/v1/chat/completions", "model": "copilot/gpt-5",
-  "profile": "copilot", "headers": { "x-client": "ci" }, "body": { "messages": [] } }
-```
-
-```json
-{ "action": "continue" }
-{ "action": "reject", "status": 400, "message": "prompt contains a secret" }
-{ "action": "patch", "set_headers": { "x-reviewed": "1" }, "body_patch": [ { "op": "remove", "path": "/temperature" } ] }
-```
-
-`body_patch` is a JSON Patch (RFC 6902). Hooks reuse one pooled connection. llm-hub never starts
-a process per request. A `complete` hook gets the final status, usage, latency and attempts.
+On the Anthropic Messages route, when llm-hub translates the reply, a `response` body change is not
+applied, because the error body is in the upstream's format.
 
 ## Rust extensions
 
-To add code, build your own binary with llm-hub as a library. Your `main.rs` adds extensions and
-calls `run`. The rest of llm-hub is unchanged.
+Build your own binary with llm-hub as a library. Your extensions run inside llm-hub without a
+change to its code.
 
 ```toml
 # Cargo.toml
 [dependencies]
-llm-hub = { git = "https://github.com/barnuri/llm-hub", tag = "v0.2.0" }
+llm-hub = { git = "https://github.com/barnuri/llm-hub" }
 tokio = { version = "1", features = ["full"] }
 ```
 
 ```rust
-use llm_hub::ext::{Extension, Flow, Phase, RequestCtx, CompleteCtx};
 use llm_hub::Hub;
+use llm_hub::axum::{Router, routing::get};
+use llm_hub::ext::{CompleteCtx, Extension, Flow, RequestCtx};
 
-/// Counts requests per model and rejects callers without a team header.
 struct TeamGate;
 
 impl Extension for TeamGate {
-    fn name(&self) -> &'static str { "team-gate" }
+    fn name(&self) -> &str {
+        "team-gate"
+    }
 
-    fn phases(&self) -> &'static [Phase] { &[Phase::Request, Phase::Complete] }
-
-    fn on_request(&self, ctx: &mut RequestCtx) -> Flow {
-        match ctx.header("x-team") {
-            Some(team) => {
-                ctx.state().insert(Team(team.to_owned()));
-                Flow::Continue
-            }
-            None => Flow::reject(401, "x-team header is required"),
+    fn on_request(&self, ctx: &mut RequestCtx<'_>) -> Flow {
+        if ctx.headers().contains_key("x-team") {
+            Flow::Continue
+        } else {
+            Flow::reject(401, "the x-team header is required")
         }
     }
 
-    fn on_complete(&self, ctx: &CompleteCtx) {
-        let team = ctx.state().get::<Team>().map_or("unknown", |team| team.0.as_str());
-        metrics::counter!("requests_by_team", "team" => team.to_owned()).increment(1);
+    fn on_complete(&self, ctx: &CompleteCtx<'_>) {
+        println!("{} answered {} in {} ms", ctx.model(), ctx.status(), ctx.latency_ms());
     }
 }
 
-struct Team(String);
-
 #[tokio::main]
 async fn main() {
-    Hub::from_env()
+    Hub::new()
         .extension(TeamGate)
+        .routes(Router::new().route("/status", get(|| async { "ok" })))
+        .router(|router| router.layer(tower_http::trace::TraceLayer::new_for_http()))
         .run()
-        .await
+        .await;
 }
 ```
 
-Rules for the trait:
+`examples/custom_hub.rs` is a complete example: `cargo run --example custom_hub`.
 
-- **Explicit phases.** `phases()` lists the phases the extension uses. Registration fails when
-  `phases()` names a phase whose method the extension does not override, or the reverse. A hook
-  never stops running unnoticed after an upgrade.
-- **Default methods.** Every phase method has a no-op default, so a new phase in a later llm-hub
-  release does not break existing extensions.
-- **Small context types.** Each phase gets only what it can use: `HttpCtx`, `RequestCtx`,
-  `AttemptCtx`, `ResponseCtx`, `ChunkCtx`, `CompleteCtx`, `ConfigChangeCtx`.
-- **Routes behind auth.** `Hub::route(path, handler)` mounts extra routes under `/ext/`. They sit
-  behind the master key unless the extension says otherwise, so a new route is never open by
-  accident.
-- **Plain middleware.** `Hub::layer(tower_layer)` adds any `tower` layer around every route, for
-  needs the phases do not cover.
-- **Panics are caught.** A panic in a phase method is logged as that extension's error and handled
-  like `fail: open`.
+| API | Use |
+|---|---|
+| `Extension` | A trait. Every method has a no-op default, so you override only what you need, and a new phase in a later release does not break you |
+| `on_request`, `on_attempt` | Return `Flow::Continue` or `Flow::reject(status, message)` |
+| `wants_error_body`, `on_response` | Ask for the error body, then return `ResponseFlow::Continue` or `ResponseFlow::RetryNext` |
+| `on_complete` | Status, model, latency, tokens and error of each finished request |
+| `Hub::routes` | Your routes under `/ext`, behind the master key like `/api` |
+| `Hub::router` | Any change to the finished router, such as a `tower` layer around every route |
 
-Rules and hooks are built on this same trait. A rule file compiles into extensions at load time.
+`llm_hub::axum` and `llm_hub::serde_json` re-export the versions llm-hub uses. The library API is new
+and can change between minor versions. Pin a tag.
 
 ## Use cases
-
-These come from issues people hit when extending other gateways.
 
 | Need | How |
 |---|---|
@@ -255,50 +206,38 @@ These come from issues people hit when extending other gateways.
 | Map a provider's error code to the one a client expects | Rule: `set_field` in `response` |
 | Block a model for some callers | Rule: `reject` in `request` |
 | Default fallback chains per model | Rule: `set_fallbacks` |
-| Retry on a status llm-hub does not retry | Rule: `retry_next` in `response` |
-| Single sign-on or roles for the admin API | Rust: `auth` phase on `/api/*` |
-| Prompt guardrail in Python | Hook in `request`, `fail: closed` |
-| Audit log or billing export | Hook or Rust in `complete` |
-| Per-team metrics with request-scoped labels | Rust: request context plus `complete` |
-| Validate a profile before it is saved | Rust or hook in `config_change` |
-| Access log and panic recovery on every route | Rust: `http_request` and `http_response`, or `Hub::layer` |
-| A custom endpoint | Rust: `Hub::route` |
-| Rewrite each streamed event | Rust: `chunk` |
+| Retry on an error llm-hub does not retry | Rule: `retry_next` in `response` |
+| Per-team metrics or billing export | Rust: request state plus `on_complete` |
+| Custom auth on the inference routes | Rust: `on_request` with `Flow::reject` |
+| An extra endpoint | Rust: `Hub::routes` |
+| Access log, panic recovery or CORS on every route | Rust: `Hub::router` with a `tower` layer |
 
-## Lessons from other gateways
+## Planned
 
-- **Bifrost** has phase hooks, compiled-in plugins, Go shared-object plugins and an embeddable Go
-  core. Its plugins cannot add routes. A pre-request error is only logged and cannot block. Shared
-  objects need the exact Go version and do not work on Windows. Its WebAssembly plugins are
-  deprecated. Plugins are matched by interface, so a plugin that misses a new method stops running
-  without an error. llm-hub takes the phases and the library model, and adds explicit phase
-  registration, routes and blocking.
-- **LiteLLM** declares Python callbacks and guardrails in its config, and has an HTTP guardrail API
-  for other languages. Per-chunk hooks have a fast path when no callback uses them. llm-hub takes
-  the HTTP hook contract and the zero-cost fast path.
-- **Envoy AI Gateway** and **Kong** route and change bodies from declarative config, with small
-  limits (top-level fields, short lists). llm-hub takes model matching from the body and
-  JSON-field actions.
-- **Pingora** and **River** (Rust proxies) define one trait with fixed phases, and turn
-  declarative config into implementations of that trait. llm-hub follows that design.
+1. **HTTP hooks.** A service in any language called in `request`, `attempt` or `complete`, on a
+   pooled connection with a timeout of a few hundred milliseconds and one `fail: open|closed`
+   setting that covers every failure. llm-hub never sends `Authorization` to a hook, and never
+   starts a process per request.
+2. **More phases.** `http_request` and `http_response` on every route, `config_change` before and
+   after a profile or key is saved, and an opt-in `chunk` phase for streamed events that only Rust
+   extensions can use, because a network call per event would stall the stream.
+3. **Rule modes.** `mode: shadow` to log what a rule would do without doing it.
+4. **WebAssembly plugins**, if people need third-party plugins they cannot build into a binary.
+   Bifrost deprecated its WebAssembly plugins, and a call costs tens of microseconds.
 
-## Rollout
+## Lessons from other projects
 
-Each step keeps the current behavior as the default and ships with tests and docs.
-
-1. Split the crate into `lib.rs` and a thin `main.rs`. No behavior change.
-2. Add the phases and the `Extension` trait inside llm-hub. Move one built-in feature onto it
-   (the Copilot context code rename) to prove the design.
-3. Add rules files, with load-time validation and reload.
-4. Make the library API public: `Hub` builder, `Extension`, `route`, `layer`.
-5. Add HTTP hooks.
-
-## Not planned yet
-
-- **WebAssembly plugins.** They give isolation and need no rebuild, but add a runtime to the
-  binary and a cost of tens of microseconds per call. Revisit when people ask for third-party
-  plugins they cannot build into a binary.
-- **Dynamic libraries.** Rust has no stable ABI, so a shared object needs the same compiler and
-  dependency versions as the hub. Building with llm-hub as a library avoids that.
-- **An expression language** (such as CEL) in rule conditions. Start with the fixed match keys
-  above, and add expressions only for needs they cannot express.
+- **Bifrost** has phase hooks, an embeddable Go core and Go shared-object plugins. Its hooks run
+  only on inference routes, plugins cannot add routes, a pre-request error is only logged, shared
+  objects need the exact Go version and do not work on Windows, and a plugin that misses a new
+  interface method stops running without an error. llm-hub's trait methods have defaults and are
+  always called, and Rust extensions can add routes and middleware.
+- **LiteLLM** declares Python callbacks in its config and skips per-chunk work when no callback
+  uses it. **Portkey** runs guardrail plugins before and after a request, but not on the Responses
+  API, and its output checks see nothing on streams. llm-hub's phases cover every `/v1/*` API.
+- **Envoy AI Gateway**, **Kong** and **APISIX** change headers and bodies from declarative config,
+  and **Pingora** and **River** (Rust proxies) compile config into the same trait their code
+  extensions implement. llm-hub's rules file follows that design.
+- **Claude Code**, **Codex** and **opencode** hooks taught: compile matchers once at load, report
+  invalid config with its file and reason, keep hook failures in one setting, and keep hooks with
+  long timeouts off the request path.

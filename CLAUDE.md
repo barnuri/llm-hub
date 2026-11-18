@@ -13,6 +13,10 @@ Every change must keep the request path at the lowest latency available. Measure
 - Review buffering: Balance buffers planning and implementation turns, except plan-backed implementation. Intelligence buffers every turn on chat completions and `/v1/messages` except plan-backed implementation, so a judge or critic can check the draft first. Native Anthropic attempts, `/v1/responses` turns and turns with no eligible reviewer stream. See `docs/smart-auto.md`.
 - When a change touches the request path, compare the hub's time to first byte with a direct `curl` to the upstream. The hub may add at most 50 ms.
 
+## Extensions
+
+`src/lib.rs` is the crate; `src/main.rs` only calls `llm_hub::run()`. Request behavior that can run in a phase (`request`, `attempt`, `response`, `complete`) goes in an extension, not in `attempt_loop`: a built-in in `src/ext/builtin/`, a rule in a rules file, or a user's own `Extension`. See `docs/extensions.md`. The public API is `llm_hub::Hub` and `llm_hub::ext`; a change there is a breaking change for library users.
+
 ## Tests and coverage
 
 Every change to `src/` comes with unit tests in the same change. The `coverage` check fails when the line coverage of any file under `src/` is below 80%.

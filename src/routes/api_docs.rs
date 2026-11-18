@@ -109,7 +109,7 @@ mod tests {
     use crate::services::memory_credential_store::MemoryCredentialStore;
 
     const SPEC_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/openapi.json");
-    const MAIN_SOURCE: &str = include_str!("../main.rs");
+    const ROUTER_SOURCE: &str = include_str!("../lib.rs");
 
     fn generate() -> (String, Value) {
         let vars: HashMap<String, String> = [
@@ -213,7 +213,7 @@ mod tests {
     fn every_raw_route_has_a_documented_path() {
         let (_, spec) = generate();
         let paths = spec["paths"].as_object().unwrap();
-        let production = MAIN_SOURCE.split("#[cfg(test)]").next().unwrap();
+        let production = ROUTER_SOURCE.split("#[cfg(test)]").next().unwrap();
         let mut seen = 0;
         for line in production.lines() {
             let Some(rest) = line.trim().strip_prefix(".route(\"") else {

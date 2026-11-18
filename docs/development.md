@@ -28,4 +28,4 @@ curl -fsS http://127.0.0.1:8888/healthz   # expect: ok
 - [Anthropic Messages endpoint and transforms plan](anthropic-and-transforms-plan.md): the
   original design of `/v1/messages` and the request transforms.
 - [Subscriptions](subscriptions.md): why the hub does not proxy subscription plans.
-- [Extensions](extensions.md): proposal for rules files, HTTP hooks and Rust extensions.
+- [Extensions](extensions.md): rules files and Rust extensions.

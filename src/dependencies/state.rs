@@ -6,6 +6,8 @@ use dashmap::{DashMap, DashSet};
 
 use crate::configs::HubConfig;
 use crate::consts::LOGS_DIR;
+use crate::ext::builtin::builtins;
+use crate::ext::{CompleteCtx, ExtensionSet};
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
 use crate::schemas::upstream_model::UpstreamModel;
@@ -91,6 +93,8 @@ struct Inner {
     smart_auto_rules: SmartAutoRulesStore,
     /// Idle Copilot Claude streams kept warm with pings.
     keep_warm: Arc<KeepWarm>,
+    /// Built-in, library and rule extensions. Swapped whole when a rules file reloads.
+    extensions: ArcSwap<ExtensionSet>,
 }
 
 #[derive(Clone)]
@@ -178,6 +182,7 @@ impl AppState {
             selection_log,
             smart_auto_rules,
             keep_warm: Arc::new(KeepWarm::default()),
+            extensions: ArcSwap::from_pointee(ExtensionSet::new(builtins())),
         }));
         state.refresh_api_key_hashes();
         Ok(state)
@@ -221,6 +226,20 @@ impl AppState {
 
     pub fn stats(&self) -> &StatsRegistry {
         &self.0.stats
+    }
+
+    /// Records a finished request in the stats, then runs the extensions' `complete` phase.
+    pub fn record_outcome(&self, outcome: &RequestOutcome) {
+        self.0.stats.record(outcome);
+        self.extensions().complete(&CompleteCtx::new(outcome));
+    }
+
+    pub fn extensions(&self) -> Arc<ExtensionSet> {
+        self.0.extensions.load_full()
+    }
+
+    pub fn set_extensions(&self, extensions: ExtensionSet) {
+        self.0.extensions.store(Arc::new(extensions));
     }
 
     pub fn live_feed(&self) -> &LiveFeed {
