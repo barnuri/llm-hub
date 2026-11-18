@@ -38,8 +38,9 @@ jobs:
           - target: x86_64-apple-darwin
             runner: macos-15-intel
             asset: llm-hub-macos-x86_64
+          # Cross-compiled on the Intel runner: hosted macOS arm64 runners often have no capacity.
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: macos-15-intel
             asset: llm-hub-macos-aarch64
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
