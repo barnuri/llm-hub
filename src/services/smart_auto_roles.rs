@@ -65,7 +65,7 @@ impl SmartAutoRoles {
     /// The role of the turn, or `None` to keep the previous role on a tool continuation.
     /// A caller hint wins over every rule, a tool continuation included.
     #[must_use]
-    #[allow(dead_code)] // Only the role tests call this.
+    #[allow(dead_code, reason = "Only the role tests call this")]
     pub fn classify(signals: &TurnSignals, hint: Option<WorkRole>) -> Option<RoleDecision> {
         if hint.is_none() && signals.tool_continuation {
             return None;

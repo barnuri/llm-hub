@@ -1,4 +1,4 @@
-use crate::ext::rules::action::{Action, apply_body, apply_headers};
+use crate::ext::rules::action::Action;
 use crate::ext::rules::matcher::{Facts, Matcher};
 use crate::ext::rules::rule_spec::{PhaseName, RuleSpec};
 use crate::ext::{AttemptCtx, Extension, Flow, RequestCtx, ResponseCtx, ResponseFlow};
@@ -57,6 +57,7 @@ impl RulesExtension {
         Ok(rules)
     }
 
+    /// The number of rules in every phase.
     pub fn len(&self) -> usize {
         self.request.len() + self.attempt.len() + self.response.len()
     }
@@ -88,9 +89,8 @@ impl Extension for RulesExtension {
         let model = needs_body.then(|| ctx.model().map(str::to_owned)).flatten();
         let stream = needs_body.then(|| ctx.stream());
         for rule in &self.request {
-            let path = ctx.path().to_owned();
             let facts = Facts {
-                path: Some(&path),
+                path: Some(ctx.path()),
                 method: Some(ctx.method()),
                 api: Some(ctx.api()),
                 model: model.as_deref(),
@@ -102,14 +102,8 @@ impl Extension for RulesExtension {
                 continue;
             }
             for action in &rule.actions {
-                if let Action::Reject(status, message) = action {
-                    return Flow::reject(status.as_u16(), message.clone());
-                }
-                apply_headers(action, ctx.headers_mut());
-                if action.changes_body()
-                    && let Some(body) = ctx.body_mut()
-                {
-                    apply_body(action, body);
+                if let Some(rejection) = action.apply_to(ctx) {
+                    return rejection;
                 }
             }
         }
@@ -117,11 +111,11 @@ impl Extension for RulesExtension {
     }
 
     fn on_attempt(&self, ctx: &mut AttemptCtx<'_>) -> Flow {
-        let needs_stream = self
+        let needs_body = self
             .attempt
             .iter()
             .any(|rule| rule.matcher.needs_request_body());
-        let stream = needs_stream.then(|| ctx.stream());
+        let stream = needs_body.then(|| ctx.stream());
         for rule in &self.attempt {
             let facts = Facts {
                 path: Some(ctx.client_path()),
@@ -136,14 +130,8 @@ impl Extension for RulesExtension {
                 continue;
             }
             for action in &rule.actions {
-                if let Action::Reject(status, message) = action {
-                    return Flow::reject(status.as_u16(), message.clone());
-                }
-                apply_headers(action, ctx.headers_mut());
-                if action.changes_body()
-                    && let Some(body) = ctx.body_mut()
-                {
-                    apply_body(action, body);
+                if let Some(rejection) = action.apply_to(ctx) {
+                    return rejection;
                 }
             }
         }
@@ -173,12 +161,7 @@ impl Extension for RulesExtension {
                     Action::RetryNext => flow = ResponseFlow::RetryNext,
                     Action::SetStatus(status) => ctx.set_status(*status),
                     _ => {
-                        apply_headers(action, ctx.headers_mut());
-                        if action.changes_body()
-                            && let Some(body) = ctx.error_body_mut()
-                        {
-                            apply_body(action, body);
-                        }
+                        action.apply_to(ctx);
                     }
                 }
             }

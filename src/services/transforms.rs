@@ -495,8 +495,11 @@ mod tests {
         map
     }
 
-    // The `Option` is the shape `apply_request` takes, not a fallible result.
-    #[allow(clippy::unnecessary_wraps, clippy::needless_pass_by_value)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        clippy::needless_pass_by_value,
+        reason = "The Option is the shape apply_request takes, not a fallible result"
+    )]
     fn chat(messages: Value) -> Option<Value> {
         Some(json!({"model": "p/m", "messages": messages}))
     }
@@ -798,8 +801,10 @@ mod tests {
         assert!(!guarded("other/qwen3.6-35b", &["llama_swap/qwen3.6-35b"]));
     }
 
-    // The `Option` is the shape `apply_request` takes, not a fallible result.
-    #[allow(clippy::unnecessary_wraps)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "The Option is the shape apply_request takes, not a fallible result"
+    )]
     fn read_agent_loop(model: &str) -> Option<Value> {
         let mut messages = vec![
             json!({"role": "system", "content": "sys"}),
@@ -1001,8 +1006,10 @@ mod tests {
     const LONG_TOOL: &str =
         "mcp__github_enterprise__very_long_tool_name_for_listing_pull_request_reviews";
 
-    // The `Option` is the shape `apply_request` takes, not a fallible result.
-    #[allow(clippy::unnecessary_wraps)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "The Option is the shape apply_request takes, not a fallible result"
+    )]
     fn chat_with_tool(name: &str, stream: bool) -> Option<Value> {
         Some(json!({
             "model": "p/m",

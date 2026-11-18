@@ -60,7 +60,10 @@ impl SmartAutoTier {
 
     /// The canonical bare selector, e.g. `smart-auto-balance`.
     #[must_use]
-    #[allow(dead_code)] // The `/v1/models` listing names each tier through this.
+    #[allow(
+        dead_code,
+        reason = "The `/v1/models` listing names each tier through this"
+    )]
     pub fn selector(self) -> String {
         format!(
             "{}{}{}",

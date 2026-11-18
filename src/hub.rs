@@ -38,7 +38,19 @@ pub struct Hub {
     pub(crate) router_changes: Vec<Box<dyn FnOnce(Router) -> Router + Send>>,
 }
 
+impl std::fmt::Debug for Hub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.extensions.iter().map(|ext| ext.name()).collect();
+        f.debug_struct("Hub")
+            .field("extensions", &names)
+            .field("routes", &self.routes.is_some())
+            .field("router_changes", &self.router_changes.len())
+            .finish()
+    }
+}
+
 impl Hub {
+    /// A hub with only llm-hub's built-in extensions and routes.
     #[must_use]
     pub fn new() -> Hub {
         Hub::default()

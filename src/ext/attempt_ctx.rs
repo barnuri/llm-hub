@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::ext::{Api, JsonBody};
 
 /// The `attempt` phase view of one upstream call: the primary model or one fallback.
+#[derive(Debug)]
 pub struct AttemptCtx<'a> {
     profile: &'a str,
     model: &'a str,
@@ -86,6 +87,7 @@ impl<'a> AttemptCtx<'a> {
         self.upstream_path
     }
 
+    /// The headers for this attempt, before the hub adds upstream auth and removes its control headers.
     #[must_use]
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
@@ -114,11 +116,13 @@ impl<'a> AttemptCtx<'a> {
             .unwrap_or(false)
     }
 
+    /// Typed data for this request, shared with the other phases.
     #[must_use]
     pub fn state(&self) -> &Extensions {
         self.state
     }
 
+    /// Typed data for this request, for a change.
     pub fn state_mut(&mut self) -> &mut Extensions {
         self.state
     }

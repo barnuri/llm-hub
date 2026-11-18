@@ -1,6 +1,5 @@
-#![deny(clippy::all)]
-#![warn(clippy::pedantic)]
-#![deny(rust_2018_idioms)]
+//! The `llm-hub` binary.
+#![forbid(unsafe_code)]
 
 #[tokio::main]
 async fn main() {

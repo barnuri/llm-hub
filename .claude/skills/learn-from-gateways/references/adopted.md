@@ -1,6 +1,6 @@
 # Adopted and Rejected Gateway Findings
 
-Last run: 2026-11-11 (per-model price and quota visibility)
+Last run: 2026-11-18 (extension model)
 
 The `learn-from-gateways` skill appends to this file. Skip each item listed here in a new report.
 
@@ -68,7 +68,7 @@ Design and reference: `docs/extensions.md`. The user approved rollout steps 1-4 
 | Id | Decision | Status | Reason | Evidence |
 |---|---|---|---|---|
 | X1 | One `Extension` trait with fixed phases | adopted, partial: `request`, `attempt`, `response`, `complete` on `/v1/*`. Every-route phases are pending | Bifrost transport hooks see only inference routes; plugins cannot add routes | source-verified |
-| X2 | No silent skip of an extension | adopted, changed: no `phases()` method. Rust calls every trait method; each has a no-op default | Bifrost matches Go plugins by interface; a plugin missing a new method stops running silently. A Rust trait object cannot skip a method | source-verified |
+| X2 | No silent skip of an extension | adopted, changed: no `phases()` method. Rust calls every trait method, and each phase method has a no-op default | Bifrost matches Go plugins by interface; a plugin missing a new method stops running silently. A Rust trait object cannot skip a method | source-verified |
 | X3 | Declarative rules file compiled into the same trait | adopted: YAML or JSON, `deny_unknown_fields`, load-time phase checks, reload on change, `llm-hub extensions check` | River compiles config into Pingora phase modules; Envoy AI Gateway body mutations stay small | source-verified |
 | X4 | HTTP hooks with timeout and one fail open/closed setting, pooled client, no per-request process | pending | LiteLLM generic guardrail API; ext_proc costs 2-5 ms per call; Copilot CLI's split crash/timeout/HTTP failure modes are the mistake to avoid | documented |
 | X5 | `lib.rs` plus thin `main.rs`, `Hub` builder | adopted: `extension`, `routes` (under `/ext`, behind the master key), `router` (any tower layer) | Bifrost core, Vector, Pingora embed this way; avoids Go .so-style ABI limits | source-verified |

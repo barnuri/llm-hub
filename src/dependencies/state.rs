@@ -574,7 +574,7 @@ impl AppState {
     }
 
     pub fn restart_notify(&self) -> Arc<tokio::sync::Notify> {
-        self.0.restart_notify.clone()
+        Arc::clone(&self.0.restart_notify)
     }
 
     pub fn set_upstream_health(&self, profile: &str, healthy: bool) {

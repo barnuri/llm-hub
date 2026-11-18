@@ -1,5 +1,11 @@
 //! Managed local servers: started on first use, shared across concurrent
 //! requests, stopped when idle or on hub shutdown, and never settable via the API.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "Integration tests fail by panicking"
+)]
 
 use std::collections::HashMap;
 use std::net::TcpStream;
@@ -128,9 +134,7 @@ fn test_server_command(dir: &Path, server_port: u16) -> (String, PathBuf) {
 }
 
 fn spawn_count(spawn_log: &Path) -> usize {
-    std::fs::read_to_string(spawn_log)
-        .map(|s| s.lines().count())
-        .unwrap_or(0)
+    std::fs::read_to_string(spawn_log).map_or(0, |s| s.lines().count())
 }
 
 fn is_listening(port: u16) -> bool {

@@ -1,23 +1,22 @@
 use crate::ext::{AttemptCtx, CompleteCtx, Flow, RequestCtx, ResponseCtx, ResponseFlow};
 
-/// Code that runs in llm-hub's request phases. Every method has a no-op default, so an extension
-/// overrides only the phases it needs, and a phase added later does not break it.
+/// Code that runs in llm-hub's request phases. Only `name` is required. Every phase method has a
+/// no-op default.
 ///
-/// Request and attempt phases run extensions in registration order. The response phase runs
-/// them in reverse, so the first extension to see a request is the last to see its response.
-/// A panic in a method is logged and the request continues as if the method returned the default.
+/// Request and attempt phases run extensions in registration order, and the response phase in
+/// reverse. The hub logs a panic in a method and goes on with that method's default result.
 pub trait Extension: Send + Sync + 'static {
     /// A short name for logs.
     fn name(&self) -> &str;
 
-    /// Once per `/v1/*` request, before the model and fallbacks are resolved. Sees the client's
-    /// headers and body as the client sent them.
+    /// Once per `/v1/*` request, before the hub resolves the model and fallbacks. Sees the
+    /// client's headers and body.
     fn on_request(&self, _ctx: &mut RequestCtx<'_>) -> Flow {
         Flow::Continue
     }
 
-    /// Once per upstream attempt, the primary and each fallback. Sees the exact headers and body
-    /// sent to that upstream.
+    /// Once per upstream attempt, the primary and each fallback. Sees the body sent, and the
+    /// headers before the hub adds upstream auth.
     fn on_attempt(&self, _ctx: &mut AttemptCtx<'_>) -> Flow {
         Flow::Continue
     }
@@ -33,7 +32,7 @@ pub trait Extension: Send + Sync + 'static {
         ResponseFlow::Continue
     }
 
-    /// Once the hub records a request's outcome. Runs off the response path. Keep it fast, and
-    /// spawn a task for slow work.
+    /// Each time the hub records an outcome: every failed attempt, the final reply and keep-warm
+    /// pings. It can run before the next fallback. Keep it fast. Spawn a task for slow work.
     fn on_complete(&self, _ctx: &CompleteCtx<'_>) {}
 }

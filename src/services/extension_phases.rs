@@ -84,7 +84,9 @@ impl ClientChanges {
         let (mut parts, body) = delivered.into_parts();
         let body = match self.body {
             Some(changed) => {
-                let _ = to_bytes(body, MAX_TRANSFORM_BUFFER_BYTES).await;
+                if let Err(e) = to_bytes(body, MAX_TRANSFORM_BUFFER_BYTES).await {
+                    tracing::debug!("the replaced reply body did not drain: {e}");
+                }
                 parts.headers.remove(header::CONTENT_LENGTH);
                 Body::from(changed)
             }
@@ -96,8 +98,11 @@ impl ClientChanges {
         for name in &self.removed_headers {
             parts.headers.remove(name);
         }
+        for name in self.set_headers.keys() {
+            parts.headers.remove(name);
+        }
         for (name, value) in &self.set_headers {
-            parts.headers.insert(name.clone(), value.clone());
+            parts.headers.append(name.clone(), value.clone());
         }
         Response::from_parts(parts, body)
     }
@@ -156,10 +161,8 @@ pub(crate) async fn response_phase(
 fn changed_headers(before: &HeaderMap, after: &HeaderMap) -> HeaderMap {
     let mut changed = HeaderMap::new();
     for name in after.keys() {
-        let values: Vec<_> = after.get_all(name).iter().collect();
-        let old: Vec<_> = before.get_all(name).iter().collect();
-        if values != old {
-            for value in values {
+        if !after.get_all(name).iter().eq(before.get_all(name).iter()) {
+            for value in after.get_all(name) {
                 changed.append(name.clone(), value.clone());
             }
         }
@@ -194,4 +197,202 @@ async fn read_capped(response: reqwest::Response, cap: usize) -> Result<Bytes, r
         }
     }
     Ok(read.freeze())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::http::HeaderValue;
+    use serde_json::json;
+
+    use super::*;
+    use crate::ext::{Api, Extension};
+
+    fn upstream(
+        status: u16,
+        headers: &[(&str, &str)],
+        body: impl Into<reqwest::Body>,
+    ) -> reqwest::Response {
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.append(
+                header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        rebuilt_response(
+            StatusCode::from_u16(status).unwrap(),
+            reqwest::Version::HTTP_11,
+            map,
+            body,
+        )
+    }
+
+    fn target() -> ResponseTarget<'static> {
+        ResponseTarget {
+            profile: "p",
+            model: "p/m",
+            api: Api::Chat,
+            client_path: "/v1/chat/completions",
+            copilot: false,
+            last_attempt: true,
+        }
+    }
+
+    /// Reads every error body and renames `error.code` to `renamed`.
+    struct Renamer;
+
+    impl Extension for Renamer {
+        fn name(&self) -> &'static str {
+            "renamer"
+        }
+
+        fn wants_error_body(&self, _ctx: &ResponseCtx<'_>) -> bool {
+            true
+        }
+
+        fn on_response(&self, ctx: &mut ResponseCtx<'_>) -> ResponseFlow {
+            ctx.headers_mut()
+                .append("vary", HeaderValue::from_static("b"));
+            if let Some(body) = ctx.error_body_mut() {
+                body["error"]["code"] = json!("renamed");
+            }
+            ResponseFlow::Continue
+        }
+    }
+
+    fn renamer() -> ExtensionSet {
+        ExtensionSet::new(vec![Arc::new(Renamer)])
+    }
+
+    async fn delivered(response: reqwest::Response) -> Response {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await.unwrap();
+        let mut out = Response::new(Body::from(body));
+        *out.status_mut() = status;
+        *out.headers_mut() = headers;
+        out
+    }
+
+    #[tokio::test]
+    async fn a_changed_error_body_reaches_the_client_and_the_hub_keeps_the_original() {
+        let body = json!({"error": {"code": "x"}}).to_string();
+        let reply = upstream(
+            400,
+            &[("vary", "a"), ("content-length", "22")],
+            body.clone(),
+        );
+        let mut state = Extensions::new();
+
+        let (hub_reply, flow, changes) =
+            response_phase(&renamer(), target(), reply, &mut state).await;
+
+        assert_eq!(flow, ResponseFlow::Continue);
+        let client = changes.apply(delivered(hub_reply).await).await;
+        assert!(client.headers().get(header::CONTENT_LENGTH).is_none());
+        let vary: Vec<_> = client.headers().get_all("vary").iter().collect();
+        assert_eq!(vary, ["a", "b"]);
+        let raw = to_bytes(client.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&raw).unwrap(),
+            json!({"error": {"code": "renamed"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_compressed_error_body_is_not_read() {
+        let body = json!({"error": {"code": "x"}}).to_string();
+        let reply = upstream(400, &[("content-encoding", "gzip")], body.clone());
+        let mut state = Extensions::new();
+
+        let (hub_reply, _, changes) = response_phase(&renamer(), target(), reply, &mut state).await;
+
+        let client = changes.apply(delivered(hub_reply).await).await;
+        let raw = to_bytes(client.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(raw, body.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_success_body_is_not_read_and_unchanged_replies_pass_through() {
+        let reply = upstream(200, &[], "data: {}\n\n");
+        let mut state = Extensions::new();
+
+        let (hub_reply, flow, changes) =
+            response_phase(&ExtensionSet::default(), target(), reply, &mut state).await;
+
+        assert_eq!(flow, ResponseFlow::Continue);
+        assert!(changes.is_empty());
+        let client = changes.apply(delivered(hub_reply).await).await;
+        let raw = to_bytes(client.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&raw[..], b"data: {}\n\n");
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_replayed_whole() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"abcd")),
+            Ok(Bytes::from_static(b"efgh")),
+        ];
+        let reply = upstream(500, &[], reqwest::Body::wrap_stream(stream::iter(chunks)));
+
+        let Err(rest) = read_capped(reply, 5).await else {
+            panic!("the body is over the cap");
+        };
+
+        let raw = upstream(500, &[], rest).bytes().await.unwrap();
+        assert_eq!(&raw[..], b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn a_read_error_replays_the_bytes_read_then_the_error() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"ab")),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let reply = upstream(500, &[], reqwest::Body::wrap_stream(stream::iter(chunks)));
+
+        let Err(rest) = read_capped(reply, 1_024).await else {
+            panic!("the read failed");
+        };
+
+        let mut replayed = upstream(500, &[], rest).bytes_stream();
+        assert_eq!(&replayed.next().await.unwrap().unwrap()[..], b"ab");
+        assert!(replayed.next().await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn removed_headers_and_a_new_status_reach_the_client() {
+        let changes = ClientChanges {
+            status: Some(StatusCode::TOO_MANY_REQUESTS),
+            removed_headers: vec![header::HeaderName::from_static("x-old")],
+            ..ClientChanges::default()
+        };
+        let mut delivered = Response::new(Body::from("{}"));
+        delivered
+            .headers_mut()
+            .insert("x-old", HeaderValue::from_static("1"));
+
+        let client = changes.without_body().apply(delivered).await;
+
+        assert_eq!(client.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!client.headers().contains_key("x-old"));
+    }
+
+    #[test]
+    fn only_new_or_changed_headers_count_as_changed() {
+        let mut before = HeaderMap::new();
+        before.insert("same", HeaderValue::from_static("1"));
+        before.insert("changed", HeaderValue::from_static("1"));
+        let mut after = before.clone();
+        after.insert("changed", HeaderValue::from_static("2"));
+        after.insert("new", HeaderValue::from_static("3"));
+
+        let changed = changed_headers(&before, &after);
+
+        assert_eq!(changed.len(), 2);
+        assert_eq!(changed["changed"], "2");
+        assert_eq!(changed["new"], "3");
+    }
 }

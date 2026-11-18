@@ -752,7 +752,11 @@ fn is_success(call: &RequestOutcome) -> bool {
 }
 
 /// Nearest-rank percentile; `None` for an empty sample.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // rank is within 0..=len
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Rank is within 0..=len"
+)]
 fn percentile(values: &[f64], quantile: f64) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -775,12 +779,19 @@ fn compare_f64(a: f64, b: f64) -> Ordering {
     a.partial_cmp(&b).unwrap_or(Ordering::Equal)
 }
 
-#[allow(clippy::cast_precision_loss)] // token and ms counts stay far below 2^52
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Token and ms counts stay far below 2^52"
+)]
 fn to_f64(value: u64) -> f64 {
     value as f64
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // non-negative ms values
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Non-negative ms values"
+)]
 fn round_ms(value: f64) -> u64 {
     value.round() as u64
 }

@@ -5,6 +5,7 @@ use crate::ext::Api;
 
 /// The `response` phase view of one upstream reply, before the hub delivers it or tries the next
 /// fallback.
+#[derive(Debug)]
 pub struct ResponseCtx<'a> {
     target: ResponseTarget<'a>,
     status: StatusCode,
@@ -15,7 +16,7 @@ pub struct ResponseCtx<'a> {
 }
 
 /// Where a reply came from, for [`ResponseCtx::new`].
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ResponseTarget<'a> {
     pub profile: &'a str,
     pub model: &'a str,
@@ -52,6 +53,7 @@ impl<'a> ResponseCtx<'a> {
         (self.status, body)
     }
 
+    /// The profile that answered, such as `copilot`.
     #[must_use]
     pub fn profile(&self) -> &str {
         self.target.profile
@@ -63,6 +65,7 @@ impl<'a> ResponseCtx<'a> {
         self.target.model
     }
 
+    /// The client API of the request.
     #[must_use]
     pub fn api(&self) -> Api {
         self.target.api
@@ -86,16 +89,18 @@ impl<'a> ResponseCtx<'a> {
         self.target.last_attempt
     }
 
+    /// The status the client gets.
     #[must_use]
     pub fn status(&self) -> StatusCode {
         self.status
     }
 
-    /// The status the client gets.
+    /// Changes the status the client gets.
     pub fn set_status(&mut self, status: StatusCode) {
         self.status = status;
     }
 
+    /// The reply headers the client gets.
     #[must_use]
     pub fn headers(&self) -> &HeaderMap {
         self.headers
@@ -126,11 +131,13 @@ impl<'a> ResponseCtx<'a> {
         self.error_body()?.pointer("/error/code")?.as_str()
     }
 
+    /// Typed data for this request, shared with the other phases.
     #[must_use]
     pub fn state(&self) -> &Extensions {
         self.state
     }
 
+    /// Typed data for this request, for a change.
     pub fn state_mut(&mut self) -> &mut Extensions {
         self.state
     }

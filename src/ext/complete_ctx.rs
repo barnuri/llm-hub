@@ -1,6 +1,7 @@
 use crate::services::stats::RequestOutcome;
 
-/// The `complete` phase view of one recorded request outcome.
+/// The `complete` phase view of one recorded outcome.
+#[derive(Debug)]
 pub struct CompleteCtx<'a> {
     outcome: &'a RequestOutcome,
 }
@@ -22,12 +23,13 @@ impl<'a> CompleteCtx<'a> {
         &self.outcome.model_key
     }
 
-    /// The status the client got.
+    /// The upstream status, before any `response` phase change.
     #[must_use]
     pub fn status(&self) -> u16 {
         self.outcome.status
     }
 
+    /// Time from the request to the last byte, in milliseconds.
     #[must_use]
     pub fn latency_ms(&self) -> u64 {
         self.outcome.latency_ms
@@ -39,11 +41,13 @@ impl<'a> CompleteCtx<'a> {
         self.outcome.ttft_ms
     }
 
+    /// Prompt tokens the upstream reported.
     #[must_use]
     pub fn tokens_in(&self) -> u64 {
         self.outcome.tokens_in
     }
 
+    /// Completion tokens the upstream reported.
     #[must_use]
     pub fn tokens_out(&self) -> u64 {
         self.outcome.tokens_out

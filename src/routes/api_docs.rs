@@ -26,7 +26,7 @@ macro_rules! proxy_doc {
                 (status = 401, description = "Missing or invalid hub key.", body = ErrorBody),
                 (status = 502, description = "Every attempt failed.", body = ErrorBody)
             ))]
-        #[allow(dead_code)]
+        #[allow(dead_code, reason = "Exists only to carry the OpenAPI attribute")]
         pub fn $name() {}
     };
 }

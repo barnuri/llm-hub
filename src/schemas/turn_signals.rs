@@ -7,7 +7,10 @@ use crate::services::request_images::request_has_image;
 /// What one request body says about its latest turn, read once from the parsed body.
 /// Smart Auto routes on these signals and never reads the body again.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Smart Auto routing reads only the prompt estimate so far.
+#[allow(
+    dead_code,
+    reason = "Smart Auto routing reads only the prompt estimate so far"
+)]
 pub struct TurnSignals {
     /// Roughly one token per four request bytes.
     pub estimated_prompt_tokens: u64,

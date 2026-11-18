@@ -3,6 +3,26 @@ name = "llm-hub"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+rust_2018_idioms = { level = "deny", priority = -1 }
+unsafe_op_in_unsafe_fn = "deny"
+
+# CI runs clippy with -D warnings, so every lint below fails the build. clippy.toml allows
+# unwrap, expect, panic and dbg in tests.
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+clone_on_ref_ptr = "warn"
+dbg_macro = "warn"
+expect_used = "warn"
+mod_module_files = "warn"
+panic = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+
 [dependencies]
 arc-swap = "1.9.2"
 axum = "0.8.9"
@@ -48,7 +68,8 @@ windows-sys = { version = "0.61.2", features = [
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "abort"
+# Unwind, so the hub can catch a panicking extension and keep serving.
+panic = "unwind"
 
 [dev-dependencies]
 tempfile = "3.27.0"

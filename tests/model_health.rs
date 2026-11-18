@@ -1,4 +1,10 @@
 //! Smart Auto marks a model that fails or stays silent, and leaves it out of the next pick.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "Integration tests fail by panicking"
+)]
 
 use std::collections::HashMap;
 use std::time::Duration;

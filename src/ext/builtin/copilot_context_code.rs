@@ -1,3 +1,5 @@
+use axum::http::StatusCode;
+
 use crate::ext::{Api, Extension, ResponseCtx, ResponseFlow};
 
 /// The code Copilot sends when a prompt is over the model's input limit.
@@ -10,7 +12,7 @@ pub(crate) struct CopilotContextCode;
 
 impl CopilotContextCode {
     fn applies(ctx: &ResponseCtx<'_>) -> bool {
-        ctx.is_copilot() && ctx.api() == Api::Responses && ctx.status().as_u16() == 400
+        ctx.is_copilot() && ctx.api() == Api::Responses && ctx.status() == StatusCode::BAD_REQUEST
     }
 }
 

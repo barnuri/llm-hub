@@ -11,7 +11,11 @@ git clone https://github.com/barnuri/llm-hub && cd llm-hub
 npm run build:ui        # builds ui-src/ into ui/, which the binary embeds
 cargo test
 cargo run               # foreground on ./.env, port 8410
+git config core.hooksPath .githooks   # lint before each commit, full check before each push
 ```
+
+`scripts/check.sh` runs the same checks as CI: format, clippy, and the tests with the coverage
+gate. Run it before you open a pull request.
 
 See [docs/development.md](docs/development.md) for the full command list.
 
@@ -60,7 +64,9 @@ body or status is a behavior change.
   `cargo-llvm-cov` and `rustup component add llvm-tools-preview`). Every row in its Lines column
   must be 80% or more. CI measures on Linux, so code for another OS counts only there.
 - Upstream calls in tests use `wiremock`. Tests never call a real provider.
-- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` must pass.
+- `scripts/check.sh` must pass. Clippy (`[lints]` in `Cargo.toml`) rejects `unwrap`, `expect`
+  and `panic!` outside tests, an `#[allow]` without a `reason`, an `unsafe` block without a
+  `// SAFETY:` comment, and a public library item without docs or `Debug`.
   The `pr` workflow runs the lint on Linux. It runs the tests on Linux (with coverage) and on
   Windows. It skips these jobs when a pull request changes no Rust input (`src/`, `tests/`, `ui/`,
   Cargo files, `build.rs`, `docs/openapi.json`, workflows).

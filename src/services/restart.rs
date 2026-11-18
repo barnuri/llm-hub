@@ -174,7 +174,7 @@ mod tests {
         let notify = Arc::new(Notify::new());
         let started = tokio::time::Instant::now();
 
-        flag_restart(&requested, notify.clone());
+        flag_restart(&requested, Arc::clone(&notify));
         let notified = tokio::time::timeout(Duration::from_secs(10), notify.notified()).await;
 
         assert!(notified.is_ok());

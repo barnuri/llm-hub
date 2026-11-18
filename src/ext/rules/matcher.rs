@@ -2,6 +2,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 
 use crate::ext::Api;
 use crate::ext::rules::rule_spec::{MatchSpec, OneOrMany, PhaseName, StatusSpec};
+use crate::utils::glob::glob_matches;
 
 /// The compiled `match` of one rule. Every set condition must hold.
 #[derive(Debug, Default)]
@@ -91,11 +92,11 @@ impl Matcher {
     pub fn matches(&self, facts: &Facts<'_>, skip_error_code: bool) -> bool {
         let path = facts.path.map(|p| p.split('?').next().unwrap_or(p));
         any_or_empty(&self.paths, |glob| {
-            path.is_some_and(|p| glob_match(glob, p))
+            path.is_some_and(|p| glob_matches(glob, p))
         }) && any_or_empty(&self.methods, |m| facts.method == Some(m))
             && any_or_empty(&self.apis, |a| facts.api == Some(*a))
             && any_or_empty(&self.models, |glob| {
-                facts.model.is_some_and(|m| glob_match(glob, m))
+                facts.model.is_some_and(|m| glob_matches(glob, m))
             })
             && any_or_empty(&self.profiles, |p| facts.profile == Some(p.as_str()))
             && self.headers.iter().all(|(name, value)| {
@@ -228,51 +229,12 @@ pub(crate) fn header_value(value: &str) -> Result<HeaderValue, String> {
     HeaderValue::from_str(value).map_err(|_| format!("`{value}` is not a valid header value"))
 }
 
-/// Matches `text` against `glob`, where `*` stands for any run of characters.
-pub(crate) fn glob_match(glob: &str, text: &str) -> bool {
-    let mut parts = glob.split('*');
-    let Some(first) = parts.next() else {
-        return true;
-    };
-    let Some(mut rest) = text.strip_prefix(first) else {
-        return false;
-    };
-    let parts: Vec<&str> = parts.collect();
-    let Some((last, middle)) = parts.split_last() else {
-        return rest.is_empty();
-    };
-    for part in middle {
-        match rest.find(part) {
-            Some(at) => rest = &rest[at + part.len()..],
-            None => return false,
-        }
-    }
-    rest.len() >= last.len() && rest.ends_with(last)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn spec(yaml: &str) -> MatchSpec {
         serde_saphyr::from_str(yaml).unwrap()
-    }
-
-    #[test]
-    fn globs_match_prefixes_suffixes_and_middles() {
-        for (glob, text, expected) in [
-            ("*", "anything", true),
-            ("copilot/*", "copilot/gpt-5", true),
-            ("copilot/*", "groq/x", false),
-            ("*/claude-*", "copilot/claude-opus-4-5", true),
-            ("/v1/responses", "/v1/responses", true),
-            ("/v1/responses", "/v1/responses/x", false),
-            ("a*b*c", "aXbYc", true),
-            ("a*b*c", "aXcYb", false),
-            ("ab*ba", "aba", false),
-        ] {
-            assert_eq!(glob_match(glob, text), expected, "{glob} vs {text}");
-        }
     }
 
     #[test]
@@ -400,7 +362,6 @@ mod tests {
         .unwrap();
 
         assert!(!matcher.matches(&Facts::default(), false));
-        let _ = OneOrMany::One(1).into_vec();
     }
 
     #[test]

@@ -325,7 +325,10 @@ impl KeepWarm {
 
     /// Summarises one session's requests. A user request counts as returning cached when it came
     /// back after an idle gap of at least the cache lifetime, read the cache, and had a ping in the gap.
-    #[allow(clippy::cast_precision_loss)] // cache-read token counts stay far below 2^53
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "Cache-read token counts stay far below 2^53"
+    )]
     #[must_use]
     pub(crate) fn summarize(requests: &[WarmRequest]) -> KeepWarmSummary {
         let mut ordered: Vec<&WarmRequest> = requests.iter().collect();

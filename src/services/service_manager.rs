@@ -66,7 +66,10 @@ pub fn render_launchd_plist(exe: &Path, cwd: &Path) -> String {
     )
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "Only the Linux service manager uses it")
+)]
 pub fn render_systemd_unit(exe: &Path, cwd: &Path) -> String {
     let exe = exe.display();
     let cwd = cwd.display();
@@ -93,7 +96,10 @@ WantedBy=default.target
 }
 
 /// Writes the unit to `unit` and (re)starts it through `run`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "Only the Linux service manager uses it")
+)]
 fn install_systemd_unit(
     unit: &Path,
     exe: &Path,
@@ -116,7 +122,10 @@ fn install_systemd_unit(
     Ok(())
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "Only the Linux service manager uses it")
+)]
 fn uninstall_systemd_unit(
     unit_path: impl FnOnce() -> Result<PathBuf, String>,
     mut run: impl FnMut(&str, &[&str]) -> Result<(), String>,
@@ -135,7 +144,10 @@ fn uninstall_systemd_unit(
 /// The script a Windows logon task runs. It restarts the hub whenever it
 /// exits, as launchd `KeepAlive` and systemd `Restart=always` do: Task
 /// Scheduler only restarts a task that fails to start.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "Only the Windows service manager uses it")
+)]
 pub fn render_windows_launcher(exe: &Path, cwd: &Path) -> String {
     let exe = cmd_escape(exe);
     let cwd = cmd_escape(cwd);
@@ -156,7 +168,10 @@ pub fn render_windows_launcher(exe: &Path, cwd: &Path) -> String {
 
 /// A logon task for `user` alone, which a standard user may register without
 /// admin rights. `StopExisting` makes `schtasks /Run` replace a running instance.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "Only the Windows service manager uses it")
+)]
 pub fn render_windows_task_xml(launcher: &Path, cwd: &Path, user: &str) -> String {
     let launcher = xml_escape(launcher.display());
     let cwd = xml_escape(cwd.display());
@@ -204,7 +219,10 @@ pub fn render_windows_task_xml(launcher: &Path, cwd: &Path, user: &str) -> Strin
 }
 
 /// `schtasks /XML` reads the encoding Task Scheduler exports: UTF-16LE with a BOM.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "Only the Windows service manager uses it")
+)]
 pub fn encode_utf16le_with_bom(text: &str) -> Vec<u8> {
     const BOM: u16 = 0xFEFF;
     std::iter::once(BOM)
@@ -221,7 +239,10 @@ fn xml_escape(text: impl std::fmt::Display) -> String {
 }
 
 /// A batch file expands `%NAME%` even inside quotes; `%%` is a literal `%`.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "Only the Windows service manager uses it")
+)]
 fn cmd_escape(path: &Path) -> String {
     path.display().to_string().replace('%', "%%")
 }

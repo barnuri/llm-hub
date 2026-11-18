@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::ext::{Api, JsonBody};
 
 /// The `request` phase view of one `/v1/*` request, as the client sent it.
+#[derive(Debug)]
 pub struct RequestCtx<'a> {
     method: &'a Method,
     path: &'a str,
@@ -41,6 +42,7 @@ impl<'a> RequestCtx<'a> {
         (headers, self.body.into_bytes())
     }
 
+    /// The HTTP method.
     #[must_use]
     pub fn method(&self) -> &Method {
         self.method
@@ -52,11 +54,13 @@ impl<'a> RequestCtx<'a> {
         self.path
     }
 
+    /// The client API, read from the path.
     #[must_use]
     pub fn api(&self) -> Api {
         Api::from_path(self.path)
     }
 
+    /// The request headers.
     #[must_use]
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
@@ -72,7 +76,7 @@ impl<'a> RequestCtx<'a> {
         self.body.get()
     }
 
-    /// The JSON body for a change. The hub serializes it again only when this was called.
+    /// The JSON body for a change. The hub serializes the body again only after a call to this method.
     pub fn body_mut(&mut self) -> Option<&mut Value> {
         self.body.get_mut()
     }
@@ -90,12 +94,13 @@ impl<'a> RequestCtx<'a> {
             .unwrap_or(false)
     }
 
-    /// Typed data that lives for this request and is shared with the later phases.
+    /// Typed data for this request. The later phases read the same data.
     #[must_use]
     pub fn state(&self) -> &Extensions {
         self.state
     }
 
+    /// Typed data for this request, for a change.
     pub fn state_mut(&mut self) -> &mut Extensions {
         self.state
     }

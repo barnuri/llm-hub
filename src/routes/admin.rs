@@ -384,7 +384,9 @@ pub async fn stats(
         (snap, Vec::new())
     } else {
         let since_ms = since_for_range(range, now_ms())?;
-        let store = state.store().expect("persistent checked above");
+        let store = state
+            .store()
+            .ok_or_else(|| AppError::Internal("the store is not open".to_owned()))?;
         let filter = StatsFilter {
             since_ms,
             profile,
@@ -454,6 +456,7 @@ fn local_midnight_ms(now_ms: u64) -> u64 {
     let secs = libc::time_t::try_from(now_ms / 1000).unwrap_or(libc::time_t::MAX);
     // SAFETY: `localtime_r` writes only into `tm`, which lives on this stack frame.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `secs` and `tm` are valid for the call, and `localtime_r` keeps no pointer to them.
     if unsafe { libc::localtime_r(&raw const secs, &raw mut tm) }.is_null() {
         return now_ms.saturating_sub(86_400_000);
     }

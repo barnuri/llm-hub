@@ -1,4 +1,10 @@
 //! Admin API guard for profiles that authenticate with `LLM_HUB_<NAME>_AUTH`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "Integration tests fail by panicking"
+)]
 
 use std::net::TcpListener;
 use std::path::Path;

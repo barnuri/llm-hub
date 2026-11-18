@@ -1,6 +1,6 @@
-#![deny(clippy::all)]
-#![warn(clippy::pedantic)]
-#![deny(rust_2018_idioms)]
+//! llm-hub: one local endpoint for every LLM provider and coding agent. Use [`Hub`] to run it
+//! with your own [`ext::Extension`]s, or [`run`] for the stock binary.
+#![warn(missing_docs, missing_debug_implementations)]
 
 mod configs;
 mod consts;
@@ -102,30 +102,12 @@ async fn serve(hub: Hub) {
     state.managed().spawn_idle_reaper();
     let managed = std::sync::Arc::clone(state.managed());
     let restart_notify = state.restart_notify();
-    services::update::spawn_auto_update(auto_update, restart_notify.clone());
-    services::config_reload::spawn_env_watcher(state.clone(), restart_notify.clone());
-    let sources = std::sync::Arc::new(ExtensionSources::new(
-        hub.extensions,
-        &vars,
-        std::path::PathBuf::from("."),
-    ));
-    match sources.load_rules(&vars) {
-        Ok(rules) => {
-            if let Some((path, rules)) = &rules {
-                tracing::info!(
-                    "loaded {} extension rules from {}",
-                    rules.len(),
-                    path.display()
-                );
-            }
-            state.set_extensions(sources.compose(rules.map(|(_, rules)| rules)));
-        }
-        Err(e) => {
-            eprintln!("extensions error: {e}");
-            std::process::exit(1);
-        }
-    }
-    extension_loader::spawn_rules_watcher(state.clone(), sources, load_env_vars);
+    services::update::spawn_auto_update(auto_update, std::sync::Arc::clone(&restart_notify));
+    services::config_reload::spawn_env_watcher(
+        state.clone(),
+        std::sync::Arc::clone(&restart_notify),
+    );
+    install_extensions(&state, hub.extensions, &vars);
 
     let mut app = build_router_with(state, hub.routes);
     for change in hub.router_changes {
@@ -160,6 +142,38 @@ async fn serve(hub: Hub) {
         Ok(false) => {}
         Err(e) => eprintln!("restart respawn failed: {e}"),
     }
+}
+
+/// Loads the rules file, sets the running extensions and starts the rules watcher. An invalid
+/// rules file stops startup.
+fn install_extensions(
+    state: &AppState,
+    library: Vec<std::sync::Arc<dyn ext::Extension>>,
+    vars: &HashMap<String, String>,
+) {
+    let sources = std::sync::Arc::new(ExtensionSources::new(library, vars, rules_dir()));
+    match sources.load_rules(vars) {
+        Ok(rules) => {
+            if let Some((path, rules)) = &rules {
+                tracing::info!(
+                    "loaded {} extension rules from {}",
+                    rules.len(),
+                    path.display()
+                );
+            }
+            state.set_extensions(sources.compose(rules.map(|(_, rules)| rules)));
+        }
+        Err(e) => {
+            eprintln!("extensions error: {e}");
+            std::process::exit(1);
+        }
+    }
+    extension_loader::spawn_rules_watcher(state.clone(), sources, load_env_vars);
+}
+
+/// The directory llm-hub looks in for a default rules file: the working directory.
+fn rules_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(".")
 }
 
 /// Console logging always; plus a `./logs/llm-hub.log` file sink when not
@@ -361,7 +375,7 @@ fn run_extensions_command() -> Result<(), String> {
         }
         _ => return Err(EXTENSIONS_USAGE.to_owned()),
     }
-    let sources = ExtensionSources::new(Vec::new(), &vars, std::path::PathBuf::from("."));
+    let sources = ExtensionSources::new(Vec::new(), &vars, rules_dir());
     match sources.load_rules(&vars)? {
         Some((path, rules)) => println!("{}: {} rules, valid", path.display(), rules.len()),
         None => println!("no rules file: set {EXTENSIONS_FILE_VAR} or add extensions.yaml"),

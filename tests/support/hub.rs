@@ -1,5 +1,5 @@
 //! Starts the llm-hub binary for integration tests on a free local port.
-#![allow(dead_code)] // each test file uses only part of this module
+#![allow(dead_code, reason = "Each test file uses only part of this module")]
 
 use std::collections::HashMap;
 use std::process::{Child, Command};

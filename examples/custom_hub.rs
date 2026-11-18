@@ -18,7 +18,7 @@ struct TeamGate {
 struct Team(String);
 
 impl Extension for TeamGate {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "team-gate"
     }
 

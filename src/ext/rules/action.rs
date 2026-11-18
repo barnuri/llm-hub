@@ -4,6 +4,7 @@ use serde_json::{Map, Value};
 use crate::consts::HEADER_FALLBACKS;
 use crate::ext::rules::matcher::{header_name, header_value};
 use crate::ext::rules::rule_spec::{ActionSpec, PhaseName};
+use crate::ext::{AttemptCtx, Flow, RequestCtx, ResponseCtx};
 
 /// One compiled rule action.
 #[derive(Debug)]
@@ -127,6 +128,57 @@ impl Action {
             self,
             Action::SetField(_) | Action::RemoveField(_) | Action::SetModel(_)
         )
+    }
+
+    /// Applies a header, body or reject action to `target`. Returns the rejection when the action
+    /// rejects. The response-only actions are left to the caller.
+    pub fn apply_to(&self, target: &mut impl ActionTarget) -> Option<Flow> {
+        if let Action::Reject(status, message) = self {
+            return Some(Flow::reject(status.as_u16(), message.clone()));
+        }
+        apply_headers(self, target.target_headers());
+        if self.changes_body()
+            && let Some(body) = target.target_body()
+        {
+            apply_body(self, body);
+        }
+        None
+    }
+}
+
+/// What a rule action changes: the headers and the JSON body of one phase.
+pub(crate) trait ActionTarget {
+    fn target_headers(&mut self) -> &mut HeaderMap;
+    fn target_body(&mut self) -> Option<&mut Value>;
+}
+
+impl ActionTarget for RequestCtx<'_> {
+    fn target_headers(&mut self) -> &mut HeaderMap {
+        self.headers_mut()
+    }
+
+    fn target_body(&mut self) -> Option<&mut Value> {
+        self.body_mut()
+    }
+}
+
+impl ActionTarget for AttemptCtx<'_> {
+    fn target_headers(&mut self) -> &mut HeaderMap {
+        self.headers_mut()
+    }
+
+    fn target_body(&mut self) -> Option<&mut Value> {
+        self.body_mut()
+    }
+}
+
+impl ActionTarget for ResponseCtx<'_> {
+    fn target_headers(&mut self) -> &mut HeaderMap {
+        self.headers_mut()
+    }
+
+    fn target_body(&mut self) -> Option<&mut Value> {
+        self.error_body_mut()
     }
 }
 

@@ -4,7 +4,10 @@
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-#[allow(clippy::struct_field_names)] // intentional USD-per-1M suffix on every rate field
+#[allow(
+    clippy::struct_field_names,
+    reason = "Intentional USD-per-1M suffix on every rate field"
+)]
 pub struct TokenRates {
     pub input_per_1m: f64,
     pub output_per_1m: f64,

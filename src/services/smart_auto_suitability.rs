@@ -146,7 +146,11 @@ impl SmartAutoSuitability {
     }
 
     /// Points lost to failures and to a nearly empty quota. Unknown signals cost nothing.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to 0..=130 above
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Clamped to 0..=130 above"
+    )]
     fn penalty(signal: ModelSignal) -> u32 {
         let errors = signal
             .error_rate

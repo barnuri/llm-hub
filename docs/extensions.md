@@ -16,8 +16,9 @@ HTTP hooks for other languages are planned. See [Planned](#planned).
 2. **One model.** Rules and Rust extensions run in the same phases, in the same order, with the
    same context. llm-hub's own built-in changes use the same phases.
 3. **Fail loudly at load, safely at run time.** An unknown key, an action a phase cannot run, an
-   unset `${NAME}` or a duplicate rule name stops startup with the file and the reason. A panic in
-   an extension at run time is logged, and the request goes on as if the extension did nothing.
+   unset `${NAME}` or a duplicate rule name stops startup with the file and the reason. When an
+   extension panics at run time, the hub logs it and goes on with that method's default result.
+   Changes the extension made before the panic stay.
 4. **Streaming stays streaming.** A successful stream is never buffered. Only an error body is
    read, and only when an extension asks for it.
 5. **The hub keeps the truth.** Stats, limit learning and retries read the upstream reply as it
@@ -27,10 +28,23 @@ HTTP hooks for other languages are planned. See [Planned](#planned).
 
 | Phase | When | An extension can |
 |---|---|---|
-| `request` | Once per `/v1/*` request, before the model and fallbacks are resolved. Sees the client's headers and body as sent | Change headers and the body, set the model and fallbacks, reject |
-| `attempt` | Before each upstream call: the primary model and each fallback. Sees the exact headers and body sent | Change this attempt's headers and body, reject |
+| `request` | Once per `/v1/*` request, before the hub resolves the model and fallbacks. Sees the client's headers and body as sent | Change headers and the body, set the model and fallbacks, reject |
+| `attempt` | Before each upstream call: the primary model and each fallback. Sees the body sent, and the headers before the hub adds upstream auth | Change this attempt's headers and body, reject |
 | `response` | When an upstream reply arrives, before the hub delivers it or tries the next fallback | Retry on the next fallback, change the status, headers or error body the client gets |
-| `complete` | After the hub records the outcome, off the response path | Log, count, export metrics |
+| `complete` | Each time the hub records an outcome: every failed attempt, the final reply and keep-warm pings | Log, count, export metrics |
+
+Some requests run only part of this:
+
+- A body over `LLM_HUB_MAX_REPLAY_BYTES` streams through unbuffered, and `GET /v1/models/{id}` has
+  no body. Their `request` phase sees the headers and an empty body, so `model` and `stream`
+  conditions do not match them. They have no `attempt` or `response` phase.
+- `GET /v1/models` runs no phase.
+- On `/v1/messages`, the `request` phase sees the headers without `anthropic-version`.
+- The hub always removes `authorization`, `x-api-key`, `host` and `x-llm-hub-*` headers before it
+  sends a request upstream, then adds the profile's own auth. An `attempt` change to those headers
+  has no effect.
+- `complete` sees the upstream status, before a `response` change. It can run before the next
+  fallback, so keep it fast.
 
 Request and attempt phases run extensions in order: built-ins, then Rust extensions in the order
 you add them, then the rules file. The response phase runs them in reverse, so rules see the
@@ -54,8 +68,8 @@ llm-hub extensions check my-rules.yaml
 ```
 
 A rule has a unique `name`, a `phase`, an optional `match`, and one or more `actions`. Every
-condition in `match` must hold. Rules run in file order. `${NAME}` takes a value from `.env` or the
-process environment.
+condition in `match` must hold. Rules run in file order. `${NAME}` in an action value takes a value
+from `.env` or the process environment.
 
 ```yaml
 rules:
@@ -94,12 +108,12 @@ rules:
     actions:
       - retry_next: true
 
-  # Never forward the caller's Authorization header to a local model.
-  - name: strip-auth-local
+  # A local server that rejects OpenAI's `metadata` field.
+  - name: no-metadata-local
     phase: attempt
     match: { profile: local }
     actions:
-      - remove_header: authorization
+      - remove_field: /metadata
 ```
 
 ### Match conditions
@@ -117,15 +131,16 @@ rules:
 | `status` | response | A status (`400`) or class (`5xx`) |
 | `error_code` | response | `error.code` in the JSON error body |
 
-A key takes one value or a list. A list matches when any value matches. A key that a phase cannot
+`header` takes a map and `stream` takes `true` or `false`. Every other key takes one value or a
+list, and a list matches when any value matches. A key that a phase cannot
 check is a load error.
 
 ### Actions
 
 | Action | Phases | Effect |
 |---|---|---|
-| `set_header`, `remove_header` | all | Request headers in `request` and `attempt`; the client's reply headers in `response` |
-| `set_field`, `remove_field` | all | A JSON Pointer in the body (`/metadata/team`). In `response`, the error body only. `set_field` creates missing objects |
+| `set_header`, `remove_header` | all | Request headers in `request` and `attempt`. The client's reply headers in `response` |
+| `set_field`, `remove_field` | all | A JSON Pointer in the body (`/metadata/team`). In `response`, the error body only, and only when it is uncompressed JSON. `set_field` creates missing objects |
 | `set_model` | request, attempt | The body's `model` field |
 | `set_fallbacks` | request | The fallback chain (`x-llm-hub-fallbacks`) |
 | `reject` | request, attempt | Answer with `status` (4xx or 5xx) and `message`, in the client's API format |
@@ -143,8 +158,9 @@ change to its code.
 ```toml
 # Cargo.toml
 [dependencies]
-llm-hub = { git = "https://github.com/barnuri/llm-hub" }
+llm-hub = { git = "https://github.com/barnuri/llm-hub", tag = "v0.1.70" }
 tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.7", features = ["trace"] }
 ```
 
 ```rust
@@ -187,10 +203,10 @@ async fn main() {
 
 | API | Use |
 |---|---|
-| `Extension` | A trait. Every method has a no-op default, so you override only what you need, and a new phase in a later release does not break you |
+| `Extension` | A trait. Only `name` is required. Every phase method has a no-op default, so you override only what you need, and a new phase in a later release does not break you |
 | `on_request`, `on_attempt` | Return `Flow::Continue` or `Flow::reject(status, message)` |
 | `wants_error_body`, `on_response` | Ask for the error body, then return `ResponseFlow::Continue` or `ResponseFlow::RetryNext` |
-| `on_complete` | Status, model, latency, tokens and error of each finished request |
+| `on_complete` | Profile, model, upstream status, latency, tokens and error of each recorded outcome. It has no request state |
 | `Hub::routes` | Your routes under `/ext`, behind the master key like `/api` |
 | `Hub::router` | Any change to the finished router, such as a `tower` layer around every route |
 
@@ -207,8 +223,8 @@ and can change between minor versions. Pin a tag.
 | Block a model for some callers | Rule: `reject` in `request` |
 | Default fallback chains per model | Rule: `set_fallbacks` |
 | Retry on an error llm-hub does not retry | Rule: `retry_next` in `response` |
-| Per-team metrics or billing export | Rust: request state plus `on_complete` |
-| Custom auth on the inference routes | Rust: `on_request` with `Flow::reject` |
+| Per-team metrics or billing export | Rust: read the team in `on_request`, keep it in request state, and count in `on_response` |
+| Custom auth on the inference routes | Rust: `on_request` with `Flow::reject`. It also runs, headers only, for unbuffered bodies and `GET /v1/models/{id}` |
 | An extra endpoint | Rust: `Hub::routes` |
 | Access log, panic recovery or CORS on every route | Rust: `Hub::router` with a `tower` layer |
 
