@@ -59,3 +59,18 @@ Pending recommendations only. No user acceptance is implied.
 | P3 | Read OpenRouter `pricing.overrides[].min_prompt_tokens` as long-context tiers | Live `openai/gpt-6.1-terra-pro` has a 272000 tier; `listed_prices.rs:56-74` reads only top-level fields | live-observed |
 | P4 | Use Copilot `/models` `billing.token_prices` (batch-scaled, `cache_read_price` or `cache_price`) as a fallback when the docs table lacks a model | `pricing.rs:572-581` never reads it; OpenCode reads it live | source-verified |
 | P5 | Per-model budget or TPM/RPM visibility, only if a quota source reports it | LiteLLM budget table has `model_tpm_limit`/`model_rpm_limit`; llm-hub has none | source-verified |
+
+## 2026-11-18 — Extension model (proposal, not implemented)
+
+Pinned revisions: Bifrost `2ddd8d37`, LiteLLM `e21416aa`, Envoy AI Gateway `f99b015f`, Kong `1c7a0aa7`, Pingora `3f87e92c`, River `0b09036f`.
+Design: `docs/extensions.md`. Pending user approval to implement.
+
+| Id | Recommendation | Reason | Evidence |
+|---|---|---|---|
+| X1 | One `Extension` trait with fixed phases on every route, not only inference | Bifrost transport hooks see only inference routes; plugins cannot add routes | source-verified |
+| X2 | Explicit `phases()` registration, checked at load | Bifrost matches plugins by interface; a plugin missing a new method stops running silently | source-verified |
+| X3 | Declarative rules file compiled into the same trait | River compiles config into Pingora phase modules; Envoy AI Gateway body mutations stay small | source-verified |
+| X4 | HTTP hooks with timeout and fail open/closed, pooled client, no per-request process | LiteLLM generic guardrail API; ext_proc costs 2-5 ms per call | documented |
+| X5 | `lib.rs` plus thin `main.rs`, `Hub` builder with `extension`, `route`, `layer` | Bifrost core, Vector, Pingora embed this way; avoids Go .so-style ABI limits | source-verified |
+| X6 | Zero-cost path when nothing is configured, per-chunk phase opt-in | LiteLLM streaming fast path when no callback overrides the hook | source-verified |
+| X7 | Defer WebAssembly | Bifrost deprecated its WASM plugins; Extism round trip is tens to hundreds of µs | documented |
