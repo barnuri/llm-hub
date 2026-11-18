@@ -115,4 +115,14 @@ mod tests {
         assert!(hub.routes.is_some());
         assert_eq!(hub.router_changes.len(), 1);
     }
+
+    #[test]
+    fn debug_names_the_extensions_and_counts_the_rest() {
+        let hub = Hub::new().extension(Named).router(|router| router);
+
+        assert_eq!(
+            format!("{hub:?}"),
+            r#"Hub { extensions: ["named"], routes: false, router_changes: 1 }"#
+        );
+    }
 }
