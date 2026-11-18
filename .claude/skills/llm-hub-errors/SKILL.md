@@ -4,9 +4,10 @@ description: >
   Read every error llm-hub recorded (the /api/errors feed, the profile health flags, the
   per-profile logs and the launchd logs), group them by root cause, fix the ones the code can
   fix in the llm-hub repo, rebuild and reinstall the service, and report what is left and why.
-  Use when llm-hub shows failing requests or unhealthy profiles, or to clear the error list.
+  Use when llm-hub shows failing requests or unhealthy profiles, when a client (Codex, Claude
+  Code) reports an error from the hub, or to clear the error list.
   Triggers: "fix llm-hub errors", "solve the hub errors", "failed upstream profiles", "why is
-  profile X unhealthy", "clear the errors in llm hub".
+  profile X unhealthy", "clear the errors in llm hub", "codex fails through the hub".
 allowed-tools: Bash, Read, Grep, Glob, Edit, Write, AskUserQuestion
 ---
 
@@ -20,8 +21,22 @@ Read-only collection never needs approval. Editing source, tests, and the rebuil
 approval either. Marking rows solved for a fixed `code` group (step 9) needs no approval. Ask
 (AskUserQuestion) only before a profile `DELETE`, a `.env` change, or a publish.
 
+## Two error sources
+
+- **Upstream errors** reach the feed: the hub sent the request and the upstream answered with an
+  error. They are rows in `/api/errors` and the `requests` table.
+- **Local rejections** never reach the feed or the logs: the hub answers before any upstream
+  attempt (prompt over the known limit, image refused, no eligible `hub/*` model, body too
+  large). A response without the `x-llm-hub-attempts` header came from the hub itself.
+
+When the user brings an error from a client (Codex, Claude Code, opencode) or an external report
+or patch, reproduce it first with `curl -si` against the hub, using the same endpoint, model and
+`stream` value. Read the status, the `x-llm-hub-attempts` header and the body. Do not conclude
+"no errors" from an empty feed.
+
 ## Steps
 
+0. Client report or external patch only: reproduce as above and add the group to step 5.
 1. Collect. Run in parallel:
    - `curl -s "http://127.0.0.1:8888/api/errors?range=7d"`. The open set is the `recent[]` rows with
      `resolved_ms` null: `... | jq '[.recent[] | select(.resolved_ms == null)]'`.
@@ -41,8 +56,10 @@ approval either. Marking rows solved for a fixed `code` group (step 9) needs no 
      without asking.
    - `upstream`: a rate limit, outage, or timeout the hub cannot change. Report it. Check whether
      the last 24 hours still show it. Old rows are history.
+   - `local`: the hub rejected the request itself (see "Two error sources"). Treat it as `code`
+     when the rejection is wrong for a valid request.
 6. Fix each `code` group with a test next to the code. Run the targeted test first:
-   `cargo test --bins <test_name>`. Then run `cargo test` in full.
+   `cargo test --bins <test_name>`. Then run `cargo test` in full. Follow "Fix rules" below.
 7. Rebuild and reinstall (required after Rust or UI changes, per the repo `CLAUDE.md`):
    `npm run build:ui` (only when `ui-src/` changed), `cargo build --release`,
    `./target/release/llm-hub service install`, then `curl -s http://127.0.0.1:8888/healthz` must print `ok`.
@@ -67,6 +84,28 @@ approval either. Marking rows solved for a fixed `code` group (step 9) needs no 
 | `429 too many requests` bursts | Copilot rate limit | upstream, report only |
 | `599 connect error ... githubcopilot.com` | network or Copilot outage | upstream, report only |
 | `408 Timed out reading request body` | very large request on Copilot | upstream or client, report only |
+| `a prompt of about N tokens is over the known limit of L tokens` (400, local, not in the feed) | the estimate is body bytes / 4, so large `encrypted_content` reasoning items and JSON escaping count as tokens. The hub refuses above 150% of the known limit | open. A fix must keep the skip of a too-small model when a fallback remains |
+| Copilot 400 `model_max_prompt_tokens_exceeded` on `/responses`, Codex ends the turn | Codex compacts only on `code: context_length_exceeded` (as an HTTP 400 from Codex 0.169, before that only in a `response.failed` event) | open. Fix: rename the code, keep the status |
+
+## Fix rules
+
+Learned from a reviewed external patch for the two rows above.
+
+- Keep the default behavior. A status code, an error code and an SSE-versus-JSON body are client
+  contracts. Change only the field the client needs, and only for the case that fails.
+- Fix the cause, not the check. When a local estimate rejects valid requests, make the estimate
+  better or let the upstream decide only when no other candidate remains. Do not remove the check
+  for a whole endpoint: it also skips a too-small model so the next fallback serves the request.
+  A 400 is never retried, so a removed skip turns a served request into a client error.
+- Check the client's parser before you shape an error for it. Read the client source for the
+  version the user runs (for Codex: `codex-rs/codex-api/src/api_bridge.rs` and
+  `codex-rs/codex-api/src/sse/responses.rs`).
+- Keep provider-specific logic out of `deliver()` and the attempt loop. Put it in its own module
+  under `src/services/` behind an opt-in or a provider check.
+- Reproduce with a real request shape. A synthetic body (for example trailing whitespace) proves
+  the mechanism, not that real clients hit it.
+- Add a test for the default path next to the fix. For context limits, run the fallback tests
+  too: `cargo test --bins known_limit`.
 
 ## Report format
 

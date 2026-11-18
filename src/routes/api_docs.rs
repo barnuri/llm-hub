@@ -1,4 +1,4 @@
-//! OpenAPI document. Paths come from `#[utoipa::path]` on each handler and are collected by
+//! `OpenAPI` document. Paths come from `#[utoipa::path]` on each handler and are collected by
 //! the `OpenApiRouter` in `build_router`. This module holds the document header, the security
 //! schemes, and the doc-only entries for the pass-through `/v1/{path}` catch-all.
 
@@ -155,7 +155,9 @@ mod tests {
         let mut seen = std::collections::HashMap::new();
         for (path, item) in spec["paths"].as_object().unwrap() {
             for (method, op) in item.as_object().unwrap() {
-                let Some(id) = op["operationId"].as_str() else { continue };
+                let Some(id) = op["operationId"].as_str() else {
+                    continue;
+                };
                 if let Some(prev) = seen.insert(id.to_string(), format!("{method} {path}")) {
                     panic!("operationId {id} used by {prev} and {method} {path}");
                 }
@@ -171,9 +173,12 @@ mod tests {
             .args(["--bun", "@readme/openapi-parser", "validate", SPEC_FILE])
             .output();
         let Ok(out) = out else { return };
-        let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+        let text = String::from_utf8_lossy(&out.stdout).to_string()
+            + &String::from_utf8_lossy(&out.stderr);
         // No network or registry: skip rather than fail.
-        if !out.status.success() && (text.contains("downloading package manifest") || text.contains("registry")) {
+        if !out.status.success()
+            && (text.contains("downloading package manifest") || text.contains("registry"))
+        {
             return;
         }
         assert!(out.status.success(), "openapi-parser failed: {text}");
@@ -181,7 +186,11 @@ mod tests {
 
     fn which_bunx() -> Result<std::path::PathBuf, ()> {
         std::env::var_os("PATH")
-            .and_then(|p| std::env::split_paths(&p).map(|d| d.join("bunx")).find(|c| c.is_file()))
+            .and_then(|p| {
+                std::env::split_paths(&p)
+                    .map(|d| d.join("bunx"))
+                    .find(|c| c.is_file())
+            })
             .ok_or(())
     }
 

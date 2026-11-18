@@ -1,0 +1,50 @@
+name: pr
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm --prefix ui-src ci && npm --prefix ui-src run build
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm --prefix ui-src ci && npm --prefix ui-src run build
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
+
+  # The one check branch protection requires. It passes only when every job above passed.
+  pr-ok:
+    if: always()
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.lint.result }}" = success && test "${{ needs.test.result }}" = success

@@ -1,0 +1,23 @@
+name: Feature request
+description: A new capability for llm-hub.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you cannot do today, and which client or provider it affects.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How it should work. New behavior must be opt-in and keep the current default.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Workarounds you tried, or other designs.
