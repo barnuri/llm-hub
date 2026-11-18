@@ -12,6 +12,7 @@ Every change must keep the request path at the lowest latency available. Measure
 - Prefer an in-process upstream over an extra proxy hop.
 - Review buffering: Balance buffers planning and implementation turns, except plan-backed implementation. Intelligence buffers every turn on chat completions and `/v1/messages` except plan-backed implementation, so a judge or critic can check the draft first. Native Anthropic attempts, `/v1/responses` turns and turns with no eligible reviewer stream. See `docs/smart-auto.md`.
 - When a change touches the request path, compare the hub's time to first byte with a direct `curl` to the upstream. The hub may add at most 50 ms.
+- Measure with the `llm-hub-perf` skill (`.claude/skills/llm-hub-perf/`). It has the bench script, the baseline numbers and the candidate optimizations. Change code for performance only when a measurement shows the need.
 
 ## Extensions
 
