@@ -13,8 +13,8 @@ use crate::consts::{
     LONG_CONTEXT_SUFFIX,
 };
 use crate::dependencies::state::AppState;
-use crate::utils::error_chain::error_chain;
 use crate::services::copilot_descriptions::CopilotDescriptions;
+use crate::utils::error_chain::error_chain;
 use crate::utils::markdown_table;
 
 /// The last fetched price table, keyed by [`CopilotPrices::normalize_id`].
@@ -258,11 +258,7 @@ impl CopilotPrices {
     }
 
     pub(crate) async fn fetch_body(client: &reqwest::Client, url: &str) -> Result<String, String> {
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| error_chain(&e))?;
+        let response = client.get(url).send().await.map_err(|e| error_chain(&e))?;
         let status = response.status();
         if !status.is_success() {
             return Err(format!("status {status}"));

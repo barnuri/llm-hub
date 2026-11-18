@@ -216,7 +216,14 @@ mod tests {
         let models = config_of(&spec_for(&[], &catalog))["provider"]["llm-hub"]["models"].clone();
         let ids: Vec<&String> = models.as_object().unwrap().keys().collect();
 
-        assert_eq!(ids, ["hub/smart-auto-balance", "copilot/auto", "anthropic/a-model"]);
+        assert_eq!(
+            ids,
+            [
+                "hub/smart-auto-balance",
+                "copilot/auto",
+                "anthropic/a-model"
+            ]
+        );
     }
 
     #[test]

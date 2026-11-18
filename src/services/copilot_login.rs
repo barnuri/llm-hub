@@ -241,12 +241,7 @@ async fn request_device_code(
         .json(&json!({ "client_id": client_id, "scope": GITHUB_OAUTH_SCOPE }))
         .send()
         .await
-        .map_err(|e| {
-            format!(
-                "the device code request failed: {}",
-                error_chain(&e)
-            )
-        })?;
+        .map_err(|e| format!("the device code request failed: {}", error_chain(&e)))?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("the device code request returned status {status}"));

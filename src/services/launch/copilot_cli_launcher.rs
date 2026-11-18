@@ -51,7 +51,10 @@ mod tests {
         let spec = CopilotCliLauncher::spec(&endpoint(), LaunchArgs::from_strs(&["--yolo"]), &[]);
 
         assert_eq!(spec.program(), "copilot");
-        assert_eq!(spec.env_value("COPILOT_MODEL"), Some("copilot/claude-opus-5-5"));
+        assert_eq!(
+            spec.env_value("COPILOT_MODEL"),
+            Some("copilot/claude-opus-5-5")
+        );
         assert_eq!(
             spec.env_names(),
             [
