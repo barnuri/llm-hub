@@ -9,14 +9,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || github.run_id }}
+  cancel-in-progress: true
 
 env:
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_TERM_COLOR: always
-  DIFF_COVERAGE_MIN: 80
+  COVERAGE_MIN: 80
 
 jobs:
   changes:
@@ -30,13 +30,16 @@ jobs:
         with:
           fetch-depth: 0
       - id: filter
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          EVENT: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "$EVENT" != "pull_request" ]; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
             echo "ui=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+          changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
           has() { echo "$changed" | grep -qE "$1" && echo true || echo false; }
           echo "rust=$(has '^(src/|tests/|ui/|docs/openapi.json|build.rs|Cargo\.(toml|lock)|rust-toolchain.toml|\.github/workflows/)')" >> "$GITHUB_OUTPUT"
           echo "ui=$(has '^(ui-src/|\.github/workflows/)')" >> "$GITHUB_OUTPUT"
@@ -56,7 +59,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
 
-  # Runs the Linux tests once, with coverage, and fails when the changed lines are under-tested.
   coverage:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -64,8 +66,6 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - run: rustup component add llvm-tools-preview
       - uses: taiki-e/install-action@v2
@@ -75,19 +75,24 @@ jobs:
         with:
           shared-key: coverage
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      - run: cargo llvm-cov --all-targets --lcov --output-path lcov.info
-      - name: Diff coverage
-        if: github.event_name == 'pull_request'
+      - name: Tests with coverage
+        run: cargo llvm-cov --all-targets --json --summary-only --fail-under-lines "$COVERAGE_MIN" --output-path target/coverage.json
+      - name: Every file meets the minimum
         run: |
-          pipx run diff-cover==11.0.3 lcov.info \
-            --compare-branch="origin/${{ github.base_ref }}" \
-            --fail-under="$DIFF_COVERAGE_MIN" \
-            --markdown-report diff-coverage.md
+          jq -r --argjson min "$COVERAGE_MIN" --arg src "$PWD/src/" '
+            .data[0].files[]
+            | select((.filename | startswith($src)) and .summary.lines.percent < $min)
+            | "\(.summary.lines.percent | floor)% \(.filename | ltrimstr($src))"' target/coverage.json > target/below.txt
+          if [ -s target/below.txt ]; then
+            echo "Files under $COVERAGE_MIN% line coverage:"
+            cat target/below.txt
+            exit 1
+          fi
       - name: Coverage summary
-        if: always() && github.event_name == 'pull_request'
+        if: always()
         run: |
-          echo "Changed Rust lines must be at least $DIFF_COVERAGE_MIN% covered." >> "$GITHUB_STEP_SUMMARY"
-          cat diff-coverage.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          jq -r '"Total line coverage: \(.data[0].totals.lines.percent | floor)%"' target/coverage.json >> "$GITHUB_STEP_SUMMARY" || true
+          sed 's/^/- under minimum: /' target/below.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
   test-windows:
     needs: changes
@@ -117,7 +122,7 @@ jobs:
           cache-dependency-path: ui-src/package-lock.json
       - run: npm --prefix ui-src ci && npm --prefix ui-src run build
 
-  # The one check the master ruleset requires. A skipped job counts as passed.
+  # The one check the master ruleset requires.
   pr-ok:
     if: always()
     needs: [changes, lint, coverage, test-windows, ui]

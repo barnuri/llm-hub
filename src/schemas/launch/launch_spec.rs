@@ -182,6 +182,24 @@ mod tests {
         assert_eq!(LaunchSpec::find_on_path("tool", &path, ".exe;;.cmd"), None);
     }
 
+    #[test]
+    fn a_missing_program_cannot_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir
+            .path()
+            .join("absent-harness")
+            .to_string_lossy()
+            .into_owned();
+
+        let error = LaunchSpec::new(&program)
+            .arg("--version")
+            .env("LLM_HUB_API_KEY", "k")
+            .exec()
+            .unwrap_err();
+
+        assert!(error.starts_with(&format!("cannot start {program}: ")));
+    }
+
     #[cfg(windows)]
     #[test]
     fn cmd_shim_runs_through_cmd_exe() {

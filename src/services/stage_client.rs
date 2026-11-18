@@ -101,7 +101,230 @@ impl StageTransport for StageClient {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+    use crate::configs::HubConfig;
+    use crate::schemas::upstream_model::UpstreamModel;
+    use crate::services::fake_gh_cli::FakeGhCli;
+    use crate::services::gh_cli::GhOutcome;
+    use crate::services::memory_credential_store::MemoryCredentialStore;
+
+    const CAP: u64 = 64 * 1024;
+    const CHAT_PATH: &str = "/chat/completions";
+
+    fn client_for(base_url: &str) -> StageClient {
+        let vars: HashMap<String, String> = [
+            ("LLM_HUB_PROFILES", "acme"),
+            ("LLM_HUB_ACME_BASE_URL", base_url),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let state = AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            None,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
+        )
+        .unwrap();
+        StageClient::new(state)
+    }
+
+    fn completion() -> Value {
+        json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        })
+    }
+
+    fn model(raw: &str) -> ModelId {
+        ModelId::parse(raw).expect("parses")
+    }
+
+    async fn upstream_replying(response: ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(CHAT_PATH))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn a_stage_call_returns_the_completion_and_its_byte_count() {
+        let reply = serde_json::to_vec(&completion()).unwrap();
+        let server = upstream_replying(
+            ResponseTemplate::new(200).set_body_raw(reply.clone(), "application/json"),
+        )
+        .await;
+        let client = client_for(&server.uri());
+
+        let result = client
+            .complete(&model("acme/m1"), json!({"messages": []}), CAP)
+            .await
+            .unwrap();
+
+        assert_eq!(result.completion, completion());
+        assert_eq!(result.bytes, reply.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn a_stage_call_sends_the_upstream_id_of_a_listed_model() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(CHAT_PATH))
+            .and(body_partial_json(json!({"model": "Vendor-M1"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(&server.uri());
+        client.state.set_upstream_models(
+            "acme",
+            HashMap::from([(
+                "m1".to_owned(),
+                UpstreamModel {
+                    upstream_id: "Vendor-M1".to_owned(),
+                    native_messages: false,
+                },
+            )]),
+        );
+
+        let result = client
+            .complete(
+                &model("acme/m1"),
+                json!({"model": "hub/x", "messages": []}),
+                CAP,
+            )
+            .await;
+
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stage_call_sends_the_bare_model_when_the_catalog_does_not_list_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(CHAT_PATH))
+            .and(body_partial_json(json!({"model": "m1"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(&server.uri());
+
+        let result = client
+            .complete(&model("acme/m1"), json!({"messages": []}), CAP)
+            .await;
+
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_an_object_is_sent_unchanged() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(CHAT_PATH))
+            .and(body_partial_json(json!(["raw"])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(&server.uri());
+
+        let result = client
+            .complete(&model("acme/m1"), json!(["raw"]), CAP)
+            .await;
+
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_non_success_status_is_an_upstream_error() {
+        let server =
+            upstream_replying(ResponseTemplate::new(503).set_body_json(json!({"error": "busy"})))
+                .await;
+        let client = client_for(&server.uri());
+
+        let result = client
+            .complete(&model("acme/m1"), json!({"messages": []}), CAP)
+            .await;
+
+        assert_eq!(result, Err(StageError::Upstream("HTTP 503".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn a_reply_over_the_byte_cap_is_too_large() {
+        let server =
+            upstream_replying(ResponseTemplate::new(200).set_body_json(completion())).await;
+        let client = client_for(&server.uri());
+
+        let result = client
+            .complete(&model("acme/m1"), json!({"messages": []}), 8)
+            .await;
+
+        assert_eq!(result, Err(StageError::TooLarge));
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_is_not_json_is_malformed() {
+        let server = upstream_replying(
+            ResponseTemplate::new(200).set_body_raw("not json", "application/json"),
+        )
+        .await;
+        let client = client_for(&server.uri());
+
+        let result = client
+            .complete(&model("acme/m1"), json!({"messages": []}), CAP)
+            .await;
+
+        assert!(
+            matches!(result, Err(StageError::Malformed(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_profile_is_an_upstream_error() {
+        let client = client_for("http://127.0.0.1:9");
+
+        let result = client
+            .complete(&model("other/m1"), json!({"messages": []}), CAP)
+            .await;
+
+        assert_eq!(
+            result,
+            Err(StageError::Upstream("unknown profile: other".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hub_target_is_rejected_before_any_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = client_for(&server.uri());
+
+        let result = client
+            .complete(&model("hub/smart-auto-balance"), json!({}), CAP)
+            .await;
+
+        assert_eq!(
+            result,
+            Err(StageError::Recursion("hub/smart-auto-balance".to_owned()))
+        );
+    }
 
     #[test]
     fn every_stage_error_has_a_distinct_reason() {

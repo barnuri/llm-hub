@@ -84,8 +84,8 @@ or patch, reproduce it first with `curl -si` against the hub, using the same end
 | `429 too many requests` bursts | Copilot rate limit | upstream, report only |
 | `599 connect error ... githubcopilot.com` | network or Copilot outage | upstream, report only |
 | `408 Timed out reading request body` | very large request on Copilot | upstream or client, report only |
-| `a prompt of about N tokens is over the known limit of L tokens` (400, local, not in the feed) | the estimate is body bytes / 4, so large `encrypted_content` reasoning items and JSON escaping count as tokens. The hub refuses above 150% of the known limit | fixed: on `/v1/responses` the estimate never refuses alone; a too-small model is still skipped while a fallback remains |
-| Copilot 400 `model_max_prompt_tokens_exceeded` on `/responses`, Codex ends the turn | Codex compacts only on `code: context_length_exceeded` (as an HTTP 400 from Codex 0.169, before that only in a `response.failed` event) | fixed: `services/responses_context.rs` renames the code, keeps the 400 |
+| `a prompt of about N tokens is over the known limit of L tokens` (400, local, not in the feed) | the estimate is body bytes / 4, so large `encrypted_content` reasoning items and JSON escaping count as tokens. The hub refuses above 150% of the known limit | fixed: on `/v1/responses` the estimate never refuses alone. A too-small model is still skipped while a fallback remains |
+| Copilot 400 `model_max_prompt_tokens_exceeded` on `/responses`, Codex ends the turn | Codex compacts only on `code: context_length_exceeded` (as an HTTP 400 from Codex 0.169, before that only in a `response.failed` event) | fixed for Codex 0.169 and later: `src/services/responses_context.rs` renames the code and keeps the 400 |
 
 ## Fix rules
 

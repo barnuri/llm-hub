@@ -94,7 +94,161 @@ fn strip_anthropic_request_headers(headers: &HeaderMap) -> HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use crate::configs::HubConfig;
+    use crate::services::fake_gh_cli::FakeGhCli;
+    use crate::services::gh_cli::GhOutcome;
+    use crate::services::memory_credential_store::MemoryCredentialStore;
+    use axum::body::Body;
+    use axum::http::{HeaderValue, StatusCode};
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const DEAD_BASE_URL: &str = "http://127.0.0.1:9";
+
+    fn state_with(base_url: &str, extra: &[(&str, &str)]) -> AppState {
+        let vars: HashMap<String, String> = [
+            ("LLM_HUB_PROFILES", "solo"),
+            ("LLM_HUB_SOLO_BASE_URL", base_url),
+        ]
+        .iter()
+        .chain(extra)
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
+        AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            None,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
+        )
+        .unwrap()
+    }
+
+    fn request(content_type: &str, body: impl Into<Body>) -> Request {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages")
+            .header("content-type", content_type)
+            .header("anthropic-version", "2023-06-01")
+            .body(body.into())
+            .unwrap()
+    }
+
+    fn messages_body(model: &str) -> String {
+        json!({
+            "model": model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+        .to_string()
+    }
+
+    async fn json_of(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn refusal(state: AppState, req: Request) -> (StatusCode, Value) {
+        let Err(error) = messages(State(state), req).await else {
+            panic!("the request was served, not refused");
+        };
+        let response = axum::response::IntoResponse::into_response(error);
+        (response.status(), json_of(response).await)
+    }
+
+    #[tokio::test]
+    async fn a_multipart_body_is_not_implemented() {
+        let state = state_with(DEAD_BASE_URL, &[]);
+
+        let (status, body) =
+            refusal(state, request("Multipart/Form-Data; boundary=x", "--x--")).await;
+
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["type"], "error");
+        assert_eq!(
+            body["error"]["message"],
+            "multipart bodies are not supported on /v1/messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_replay_cap_is_a_bad_request() {
+        let state = state_with(DEAD_BASE_URL, &[("LLM_HUB_MAX_REPLAY_BYTES", "16")]);
+
+        let (status, body) = refusal(
+            state,
+            request("application/json", messages_body("solo/gpt-main")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("LLM_HUB_MAX_REPLAY_BYTES")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unprefixed_model_is_refused_in_the_anthropic_envelope() {
+        let state = state_with(DEAD_BASE_URL, &[]);
+
+        let (status, body) = refusal(
+            state,
+            request("application/json", messages_body("gpt-main")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn a_message_is_translated_upstream_and_back_without_anthropic_only_headers() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({
+                "model": "gpt-main",
+                "messages": [{"role": "user", "content": "hi"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-7", "object": "chat.completion",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let state = state_with(&upstream.uri(), &[]);
+
+        let response = messages(
+            State(state),
+            request("application/json", messages_body("solo/gpt-main")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_of(response).await;
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["role"], "assistant");
+        assert_eq!(body["content"][0]["text"], "ok");
+        assert_eq!(body["stop_reason"], "end_turn");
+        let sent = upstream.received_requests().await.unwrap();
+        assert!(
+            sent.iter()
+                .all(|req| !req.headers.contains_key("anthropic-version"))
+        );
+    }
 
     #[test]
     fn strips_anthropic_only_request_headers_but_keeps_the_beta() {

@@ -26,3 +26,26 @@ impl RouteReason {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_reason_has_its_snake_case_code() {
+        let cases = [
+            (RouteReason::Pinned, "pinned"),
+            (
+                RouteReason::ToolContinuationReplay,
+                "tool_continuation_replay",
+            ),
+            (RouteReason::Incumbent, "incumbent"),
+            (RouteReason::RoleSwitch, "role_switch"),
+            (RouteReason::Fresh, "fresh"),
+        ];
+
+        for (reason, code) in cases {
+            assert_eq!(reason.as_str(), code);
+        }
+    }
+}

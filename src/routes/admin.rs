@@ -89,6 +89,15 @@ pub async fn upsert_profile(
     State(state): State<AppState>,
     Json(input): Json<ProfileInput>,
 ) -> Result<Json<Value>, AppError> {
+    upsert_profile_in(&state, input, Path::new(ENV_FILE), reload_config)
+}
+
+fn upsert_profile_in(
+    state: &AppState,
+    input: ProfileInput,
+    env_file: &Path,
+    reload: impl Fn(&AppState) -> Result<(), AppError>,
+) -> Result<Json<Value>, AppError> {
     let config = state.config();
     if config.config_readonly {
         return Err(AppError::ReadOnly);
@@ -145,9 +154,8 @@ pub async fn upsert_profile(
     if !names.contains(&profile.name) {
         names.push(profile.name.clone());
     }
-    env_writer::upsert_profile(Path::new(ENV_FILE), &profile, &names)
-        .map_err(AppError::Internal)?;
-    reload_config(&state)?;
+    env_writer::upsert_profile(env_file, &profile, &names).map_err(AppError::Internal)?;
+    reload(state)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -156,13 +164,22 @@ pub async fn set_default_fallbacks(
     State(state): State<AppState>,
     Json(input): Json<FallbacksInput>,
 ) -> Result<Json<Value>, AppError> {
+    set_default_fallbacks_in(&state, &input, Path::new(ENV_FILE), reload_config)
+}
+
+fn set_default_fallbacks_in(
+    state: &AppState,
+    input: &FallbacksInput,
+    env_file: &Path,
+    reload: impl Fn(&AppState) -> Result<(), AppError>,
+) -> Result<Json<Value>, AppError> {
     if state.config().config_readonly {
         return Err(AppError::ReadOnly);
     }
     let chain = crate::services::fallback::validate_chain(&input.fallbacks)
         .map_err(AppError::BadRequest)?;
-    env_writer::set_default_fallbacks(Path::new(ENV_FILE), &chain).map_err(AppError::Internal)?;
-    reload_config(&state)?;
+    env_writer::set_default_fallbacks(env_file, &chain).map_err(AppError::Internal)?;
+    reload(state)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -171,12 +188,21 @@ pub async fn set_copilot_prices(
     State(state): State<AppState>,
     Json(input): Json<CopilotPricesInput>,
 ) -> Result<Json<Value>, AppError> {
+    set_copilot_prices_in(&state, &input, Path::new(ENV_FILE), reload_config)
+}
+
+fn set_copilot_prices_in(
+    state: &AppState,
+    input: &CopilotPricesInput,
+    env_file: &Path,
+    reload: impl Fn(&AppState) -> Result<(), AppError>,
+) -> Result<Json<Value>, AppError> {
     if state.config().config_readonly {
         return Err(AppError::ReadOnly);
     }
-    env_writer::set_copilot_prices_refresh(Path::new(ENV_FILE), input.refresh_secs)
+    env_writer::set_copilot_prices_refresh(env_file, input.refresh_secs)
         .map_err(AppError::Internal)?;
-    reload_config(&state)?;
+    reload(state)?;
     state.copilot_prices().request_refresh();
     Ok(Json(json!({ "ok": true })))
 }
@@ -186,13 +212,22 @@ pub async fn set_keep_warm(
     State(state): State<AppState>,
     Json(input): Json<KeepWarmInput>,
 ) -> Result<Json<Value>, AppError> {
+    set_keep_warm_in(&state, &input, Path::new(ENV_FILE), reload_config)
+}
+
+fn set_keep_warm_in(
+    state: &AppState,
+    input: &KeepWarmInput,
+    env_file: &Path,
+    reload: impl Fn(&AppState) -> Result<(), AppError>,
+) -> Result<Json<Value>, AppError> {
     if state.config().config_readonly {
         return Err(AppError::ReadOnly);
     }
     KeepWarmConfig::check_idle_cap_minutes(input.idle_cap_minutes).map_err(AppError::BadRequest)?;
-    env_writer::set_keep_warm(Path::new(ENV_FILE), input.enabled, input.idle_cap_minutes)
+    env_writer::set_keep_warm(env_file, input.enabled, input.idle_cap_minutes)
         .map_err(AppError::Internal)?;
-    reload_config(&state)?;
+    reload(state)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -206,22 +241,30 @@ pub async fn delete_profile(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
 ) -> Result<Json<Value>, AppError> {
+    delete_profile_in(&state, &name, Path::new(ENV_FILE), reload_config)
+}
+
+fn delete_profile_in(
+    state: &AppState,
+    name: &str,
+    env_file: &Path,
+    reload: impl Fn(&AppState) -> Result<(), AppError>,
+) -> Result<Json<Value>, AppError> {
     let config = state.config();
     if config.config_readonly {
         return Err(AppError::ReadOnly);
     }
-    if config.profile(&name).is_none() {
+    if config.profile(name).is_none() {
         return Err(AppError::NotFound(format!("no such profile: {name}")));
     }
     let remaining: Vec<String> = config
         .profiles
         .iter()
         .map(|p| p.name.clone())
-        .filter(|n| *n != name)
+        .filter(|n| n != name)
         .collect();
-    env_writer::remove_profile(Path::new(ENV_FILE), &name, &remaining)
-        .map_err(AppError::Internal)?;
-    reload_config(&state)?;
+    env_writer::remove_profile(env_file, name, &remaining).map_err(AppError::Internal)?;
+    reload(state)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -783,8 +826,10 @@ async fn insights_catalog(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
+    use tempfile::TempDir;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -797,6 +842,7 @@ mod tests {
     use crate::services::fake_gh_cli::FakeGhCli;
     use crate::services::gh_cli::GhOutcome;
     use crate::services::memory_credential_store::MemoryCredentialStore;
+    use crate::services::store::Store;
 
     const DEAD_BASE_URL: &str = "http://127.0.0.1:9";
     const LOGIN_TOKEN: &str = "gho_from_login";
@@ -806,6 +852,10 @@ mod tests {
     const STATIC_KEY: &str = "sk-static";
 
     fn state_for(vars: &[(&str, &str)]) -> AppState {
+        state_with(vars, None)
+    }
+
+    fn state_with(vars: &[(&str, &str)], hub_store: Option<Store>) -> AppState {
         let vars: HashMap<String, String> = vars
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -820,11 +870,108 @@ mod tests {
         let gh = FakeGhCli::new(GhOutcome::Failed("gh not used".into()));
         AppState::with_seams(
             HubConfig::from_map(&vars).unwrap(),
-            None,
+            hub_store,
             Arc::new(store),
             Arc::new(gh),
         )
         .unwrap()
+    }
+
+    fn persistent_state(kind: &str, vars: &[(&str, &str)]) -> (TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hub.db");
+        let db = db.to_str().unwrap();
+        let mut all = vec![("LLM_HUB_PERSISTENT", "true"), ("LLM_HUB_STORE_PATH", db)];
+        all.extend_from_slice(vars);
+        let state = state_with(&all, Some(Store::open(kind, Some(db)).unwrap()));
+        (dir, state)
+    }
+
+    fn env_file(dir: &TempDir, vars: &[(&str, &str)]) -> PathBuf {
+        let path = dir.path().join(".env");
+        let body: String = vars
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn reload_from(env_file: &Path) -> impl Fn(&AppState) -> Result<(), AppError> + '_ {
+        move |state| {
+            let vars: HashMap<String, String> = dotenvy::from_path_iter(env_file)
+                .unwrap()
+                .flatten()
+                .collect();
+            let config = HubConfig::from_map(&vars).map_err(AppError::Internal)?;
+            state.swap_config(config).map_err(AppError::Internal)
+        }
+    }
+
+    fn outcome(model_key: &str, status: u16) -> RequestOutcome {
+        RequestOutcome {
+            profile: model_key.split('/').next().unwrap().to_string(),
+            model_key: model_key.to_string(),
+            status,
+            ts_ms: now_ms(),
+            latency_ms: 1000,
+            ttft_ms: Some(100),
+            tokens_in: 1000,
+            tokens_out: 100,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            error: (status >= 400).then(|| format!("{model_key} failed with {status}")),
+            client: None,
+            worker: None,
+            routed_by: None,
+            attempt: None,
+            role: None,
+        }
+    }
+
+    fn record(state: &AppState, outcomes: &[RequestOutcome]) -> Vec<i64> {
+        let store = state.store().unwrap();
+        outcomes
+            .iter()
+            .map(|outcome| store.record(outcome).unwrap().unwrap())
+            .collect()
+    }
+
+    fn profile_input(name: &str, base_url: &str, api_key: Option<&str>) -> ProfileInput {
+        ProfileInput {
+            name: name.to_string(),
+            display_name: None,
+            base_url: base_url.to_string(),
+            api_key: api_key.map(str::to_string),
+            headers: None,
+            timeout_ms: None,
+            enabled: None,
+            keep_warm: None,
+            models: None,
+        }
+    }
+
+    fn assert_saved(result: Result<Json<Value>, AppError>) {
+        let Json(body) = result.unwrap();
+        assert_eq!(body, json!({"ok": true}));
+    }
+
+    fn keys(rows: &Value) -> Vec<String> {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["key"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn insights_query(range: Option<&str>, profile: Option<&str>) -> InsightsQuery {
+        InsightsQuery {
+            range: range.map(str::to_string),
+            profile: profile.map(str::to_string),
+            min_requests: None,
+            by: None,
+        }
     }
 
     #[test]
@@ -991,5 +1138,675 @@ mod tests {
         assert_eq!(retried["ok"], true, "{retried}");
         let received = copilot.received_requests().await.unwrap();
         assert!(received[0].headers.contains_key(HEADER_API_VERSION));
+    }
+
+    #[tokio::test]
+    async fn test_profile_reports_an_unknown_profile_as_not_found() {
+        let result = test_profile(State(state_for(&[])), UrlPath("ghost".into())).await;
+
+        assert!(matches!(result, Err(AppError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_profile_marks_an_unreachable_upstream_unhealthy() {
+        let state = state_for(&[
+            ("LLM_HUB_PROFILES", "dead"),
+            ("LLM_HUB_DEAD_BASE_URL", DEAD_BASE_URL),
+        ]);
+
+        let body = probe(&state, "dead").await;
+
+        assert_eq!(body["ok"], false, "{body}");
+        assert!(body["error"].is_string(), "{body}");
+        assert_eq!(state.upstream_health().get("dead").copied(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn profiles_list_masks_keys_and_reports_auth() {
+        let state = state_for(&[
+            ("LLM_HUB_PROFILES", "groq"),
+            ("LLM_HUB_GROQ_BASE_URL", DEAD_BASE_URL),
+            ("LLM_HUB_GROQ_API_KEY", "sk-groq-secret-value"),
+            ("LLM_HUB_GROQ_DISPLAY_NAME", "Groq Cloud"),
+            ("LLM_HUB_GROQ_HEADERS", r#"{"x-org":"me"}"#),
+            ("LLM_HUB_MASTER_KEY", "secret"),
+        ]);
+
+        let Json(body) = list_profiles(State(state)).await;
+
+        let groq = &body["profiles"][0];
+        assert_eq!(groq["name"], "groq");
+        assert_eq!(groq["display_name"], "Groq Cloud");
+        assert_eq!(groq["headers"], json!({"x-org": "me"}));
+        assert_ne!(groq["api_key_masked"], "sk-groq-secret-value");
+        assert_eq!(groq["managed"], false);
+        assert_eq!(groq["copilot"], false);
+        assert_eq!(groq["running"], false);
+        assert_eq!(body["auth_enabled"], true);
+    }
+
+    #[test]
+    fn upsert_profile_refuses_a_read_only_hub() {
+        let state = state_for(&[("LLM_HUB_CONFIG_READONLY", "true")]);
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+
+        let result = upsert_profile_in(
+            &state,
+            profile_input("groq", DEAD_BASE_URL, None),
+            &env,
+            reload_from(&env),
+        );
+
+        assert!(matches!(result, Err(AppError::ReadOnly)));
+    }
+
+    #[test]
+    fn upsert_profile_rejects_bad_names_and_base_urls() {
+        let state = state_for(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+
+        for input in [
+            profile_input("a/b", DEAD_BASE_URL, None),
+            profile_input("  ", DEAD_BASE_URL, None),
+            profile_input("groq", "ftp://example.test", None),
+        ] {
+            let result = upsert_profile_in(&state, input, &env, reload_from(&env));
+            assert!(matches!(result, Err(AppError::BadRequest(_))));
+        }
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), "");
+    }
+
+    #[test]
+    fn upsert_profile_refuses_an_api_key_for_a_copilot_profile() {
+        let state = state_for(&[
+            ("LLM_HUB_PROFILES", "copilot"),
+            ("LLM_HUB_COPILOT_BASE_URL", DEAD_BASE_URL),
+            ("LLM_HUB_COPILOT_AUTH", CopilotFlow::Vscode.auth_value()),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+
+        let result = upsert_profile_in(
+            &state,
+            profile_input("copilot", DEAD_BASE_URL, Some("sk-nope")),
+            &env,
+            reload_from(&env),
+        );
+
+        let Err(AppError::BadRequest(message)) = result else {
+            panic!("expected a bad request");
+        };
+        assert!(message.contains("LLM_HUB_COPILOT_AUTH"), "{message}");
+    }
+
+    #[test]
+    fn upsert_profile_saves_a_new_profile_and_keeps_its_key_on_update() {
+        let state = state_for(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+        let mut created = profile_input("groq", "https://api.groq.test/v1/", Some("sk-groq"));
+        created.display_name = Some("  Groq  ".into());
+        created.timeout_ms = Some(30_000);
+        created.keep_warm = Some(false);
+        created.models = Some(vec!["llama".into()]);
+
+        assert_saved(upsert_profile_in(&state, created, &env, reload_from(&env)));
+        let mut renamed = profile_input("groq", "https://api.groq.test/v2", Some(""));
+        renamed.display_name = Some("   ".into());
+        assert_saved(upsert_profile_in(&state, renamed, &env, reload_from(&env)));
+
+        let config = state.config();
+        let groq = config.profile("groq").unwrap();
+        assert_eq!(groq.base_url, "https://api.groq.test/v2");
+        assert_eq!(groq.api_key, "sk-groq");
+        assert_eq!(groq.display_name, None);
+        assert!(!groq.keep_warm);
+        assert!(groq.enabled);
+    }
+
+    #[test]
+    fn upsert_profile_reports_an_unwritable_env_file() {
+        let state = state_for(&[]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = upsert_profile_in(
+            &state,
+            profile_input("groq", DEAD_BASE_URL, None),
+            dir.path(),
+            reload_from(dir.path()),
+        );
+
+        assert!(matches!(result, Err(AppError::Internal(_))));
+    }
+
+    #[test]
+    fn delete_profile_removes_it_and_reloads() {
+        let vars = [
+            ("LLM_HUB_PROFILES", "a,b"),
+            ("LLM_HUB_A_BASE_URL", DEAD_BASE_URL),
+            ("LLM_HUB_B_BASE_URL", DEAD_BASE_URL),
+        ];
+        let state = state_for(&vars);
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &vars);
+
+        assert_saved(delete_profile_in(&state, "a", &env, reload_from(&env)));
+
+        let config = state.config();
+        assert!(config.profile("a").is_none());
+        assert!(config.profile("b").is_some());
+    }
+
+    #[test]
+    fn delete_profile_refuses_unknown_profiles_and_read_only_hubs() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+
+        let missing = delete_profile_in(&state_for(&[]), "ghost", &env, reload_from(&env));
+        let read_only = delete_profile_in(
+            &state_for(&[("LLM_HUB_CONFIG_READONLY", "true")]),
+            "ghost",
+            &env,
+            reload_from(&env),
+        );
+
+        assert!(matches!(missing, Err(AppError::NotFound(_))));
+        assert!(matches!(read_only, Err(AppError::ReadOnly)));
+    }
+
+    #[test]
+    fn set_default_fallbacks_saves_the_trimmed_chain() {
+        let state = state_for(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+        let input = FallbacksInput {
+            fallbacks: vec![" a/m1 ".into(), "b/m2".into()],
+        };
+
+        assert_saved(set_default_fallbacks_in(
+            &state,
+            &input,
+            &env,
+            reload_from(&env),
+        ));
+
+        assert_eq!(state.config().default_fallbacks, vec!["a/m1", "b/m2"]);
+    }
+
+    #[test]
+    fn set_default_fallbacks_rejects_empty_entries_and_read_only_hubs() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+        let input = FallbacksInput {
+            fallbacks: vec![" ".into()],
+        };
+
+        let invalid = set_default_fallbacks_in(&state_for(&[]), &input, &env, reload_from(&env));
+        let read_only = set_default_fallbacks_in(
+            &state_for(&[("LLM_HUB_CONFIG_READONLY", "true")]),
+            &input,
+            &env,
+            reload_from(&env),
+        );
+
+        assert!(matches!(invalid, Err(AppError::BadRequest(_))));
+        assert!(matches!(read_only, Err(AppError::ReadOnly)));
+    }
+
+    #[test]
+    fn set_copilot_prices_saves_the_refresh_interval() {
+        let state = state_for(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+        let input = CopilotPricesInput { refresh_secs: 600 };
+
+        assert_saved(set_copilot_prices_in(
+            &state,
+            &input,
+            &env,
+            reload_from(&env),
+        ));
+
+        assert_eq!(
+            state.config().copilot_prices_refresh,
+            Some(std::time::Duration::from_mins(10))
+        );
+    }
+
+    #[test]
+    fn set_copilot_prices_refuses_a_read_only_hub() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+
+        let result = set_copilot_prices_in(
+            &state_for(&[("LLM_HUB_CONFIG_READONLY", "true")]),
+            &CopilotPricesInput { refresh_secs: 0 },
+            &env,
+            reload_from(&env),
+        );
+
+        assert!(matches!(result, Err(AppError::ReadOnly)));
+    }
+
+    #[test]
+    fn set_keep_warm_saves_the_switch_and_idle_cap() {
+        let state = state_for(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+        let input = KeepWarmInput {
+            enabled: false,
+            idle_cap_minutes: 10,
+        };
+
+        assert_saved(set_keep_warm_in(&state, &input, &env, reload_from(&env)));
+
+        let config = state.config();
+        assert!(!config.keep_warm.enabled);
+        assert_eq!(config.keep_warm.idle_cap.as_secs(), 600);
+    }
+
+    #[test]
+    fn since_for_range_maps_each_label_to_its_lower_bound() {
+        let now = 100 * 86_400_000;
+
+        assert!(since_for_range("today", now).unwrap().unwrap() <= now);
+        assert_eq!(since_for_range("1d", now).unwrap(), Some(now - 86_400_000));
+        assert_eq!(
+            since_for_range("7d", now).unwrap(),
+            Some(now - 7 * 86_400_000)
+        );
+        assert_eq!(
+            since_for_range("30d", now).unwrap(),
+            Some(now - 30 * 86_400_000)
+        );
+        assert_eq!(since_for_range("all", now).unwrap(), None);
+        assert!(matches!(
+            since_for_range("90d", now),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    fn stats_query(range: Option<&str>, profile: Option<&str>, model: Option<&str>) -> StatsQuery {
+        StatsQuery {
+            range: range.map(str::to_string),
+            profile: profile.map(str::to_string),
+            model: model.map(str::to_string),
+            routed_by: Some(" ".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_stats_narrow_rows_to_the_profile_and_model_filters() {
+        let state = state_for(&[]);
+        state.stats().record(&outcome("a/m1", 200));
+        state.stats().record(&outcome("b/m2", 200));
+
+        let Json(by_profile) = stats(
+            State(state.clone()),
+            Query(stats_query(None, Some(" a "), None)),
+        )
+        .await
+        .unwrap();
+        let Json(by_model) = stats(State(state), Query(stats_query(None, None, Some("b/m2"))))
+            .await
+            .unwrap();
+
+        assert_eq!(keys(&by_profile["profiles"]), vec!["a"]);
+        assert_eq!(keys(&by_profile["models"]), vec!["a/m1"]);
+        assert_eq!(keys(&by_model["models"]), vec!["b/m2"]);
+        assert_eq!(by_model["by_tier_role"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn stats_fall_back_to_live_without_persistence() {
+        let Json(body) = stats(
+            State(state_for(&[])),
+            Query(stats_query(Some("7d"), None, None)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(body["range"], "live");
+        assert_eq!(body["filterable"], false);
+        assert_eq!(body["overview"]["persisted"], false);
+    }
+
+    #[tokio::test]
+    async fn stored_stats_read_the_window_from_the_store() {
+        let (_dir, state) = persistent_state("sqlite", &[]);
+        record(&state, &[outcome("a/m1", 200), outcome("a/m1", 500)]);
+
+        let Json(body) = stats(
+            State(state),
+            Query(stats_query(Some("7d"), Some("a"), Some("a/m1"))),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(body["range"], "7d");
+        assert_eq!(body["overview"]["requests"], 2);
+        assert_eq!(body["overview"]["errors"], 1);
+        assert!(body["by_tier_role"].is_array());
+    }
+
+    #[tokio::test]
+    async fn stored_stats_keep_live_range_and_reject_unknown_ranges() {
+        let (_dir, state) = persistent_state("sqlite", &[]);
+
+        let Json(live) = stats(State(state.clone()), Query(stats_query(None, None, None)))
+            .await
+            .unwrap();
+        let unknown = stats(State(state), Query(stats_query(Some("90d"), None, None))).await;
+
+        assert_eq!(live["range"], "live");
+        assert_eq!(live["persistent"], true);
+        assert_eq!(live["overview"]["persisted"], true);
+        assert!(matches!(unknown, Err(AppError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn persistence_off_refuses_the_history_endpoints() {
+        let state = state_for(&[]);
+
+        let usage = usage(State(state.clone())).await;
+        let errors = errors(State(state.clone()), Query(ErrorsQuery::default())).await;
+        let resolve = resolve_errors(
+            State(state.clone()),
+            Json(ResolveErrorsInput {
+                ids: vec![1],
+                solved: true,
+            }),
+        )
+        .await;
+        let create = create_api_key(
+            State(state.clone()),
+            Json(ApiKeyInput { name: "ci".into() }),
+        )
+        .await;
+        let delete = delete_api_key(State(state.clone()), UrlPath("ci".into())).await;
+        let insights = insights(State(state), Query(InsightsQuery::default())).await;
+
+        for result in [usage, errors, resolve, create, delete, insights] {
+            assert!(matches!(result, Err(AppError::BadRequest(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_reports_stored_requests() {
+        let (_dir, state) = persistent_state("sqlite", &[]);
+        record(&state, &[outcome("a/m1", 200), outcome("a/m1", 502)]);
+
+        let Json(body) = usage(State(state)).await.unwrap();
+
+        assert_eq!(body["total_requests"], 2);
+        assert_eq!(body["total_errors"], 1);
+    }
+
+    #[tokio::test]
+    async fn errors_count_open_failures_until_they_are_resolved() {
+        let (_dir, state) = persistent_state("sqlite", &[]);
+        let ids = record(
+            &state,
+            &[
+                outcome("a/m1", 200),
+                outcome("a/m1", 500),
+                outcome("b/m2", 429),
+            ],
+        );
+
+        let Json(solved) = resolve_errors(
+            State(state.clone()),
+            Json(ResolveErrorsInput {
+                ids: vec![ids[1]],
+                solved: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(report) = errors(
+            State(state.clone()),
+            Query(ErrorsQuery {
+                range: Some("all".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(reopened) = resolve_errors(
+            State(state),
+            Json(ResolveErrorsInput {
+                ids: vec![ids[1]],
+                solved: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(solved, json!({"updated": 1, "solved": true}));
+        assert_eq!(report["range"], "all");
+        assert_eq!(report["total_errors"], 2);
+        assert_eq!(report["open_errors"], 1);
+        assert_eq!(report["recent"].as_array().unwrap().len(), 2);
+        assert_eq!(reopened, json!({"updated": 1, "solved": false}));
+    }
+
+    #[tokio::test]
+    async fn errors_accept_each_window_and_reject_unknown_ones() {
+        let (_dir, state) = persistent_state("sqlite", &[]);
+        record(&state, &[outcome("a/m1", 500)]);
+
+        for range in [None, Some("1d"), Some("7d"), Some("30d")] {
+            let Json(body) = errors(
+                State(state.clone()),
+                Query(ErrorsQuery {
+                    range: range.map(str::to_string),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(body["total_errors"], 1, "{range:?}");
+        }
+        let unknown = errors(
+            State(state),
+            Query(ErrorsQuery {
+                range: Some("90d".into()),
+            }),
+        )
+        .await;
+        assert!(matches!(unknown, Err(AppError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn resolve_errors_bounds_the_id_list() {
+        let (_dir, state) = persistent_state("sqlite", &[]);
+
+        let empty = resolve_errors(
+            State(state.clone()),
+            Json(ResolveErrorsInput {
+                ids: Vec::new(),
+                solved: true,
+            }),
+        )
+        .await;
+        let too_many = resolve_errors(
+            State(state),
+            Json(ResolveErrorsInput {
+                ids: (0..=i64::try_from(MAX_RESOLVE_IDS).unwrap()).collect(),
+                solved: true,
+            }),
+        )
+        .await;
+
+        assert!(matches!(empty, Err(AppError::BadRequest(_))));
+        assert!(matches!(too_many, Err(AppError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn resolve_errors_reports_a_store_without_row_ids() {
+        let (_dir, state) = persistent_state("json", &[]);
+
+        let result = resolve_errors(
+            State(state),
+            Json(ResolveErrorsInput {
+                ids: vec![1],
+                solved: true,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::Internal(_))));
+    }
+
+    #[tokio::test]
+    async fn api_keys_are_listed_without_persistence_as_empty() {
+        let Json(body) = list_api_keys(State(state_for(&[]))).await.unwrap();
+
+        assert_eq!(body, json!({"persistent": false, "keys": []}));
+    }
+
+    #[tokio::test]
+    async fn api_keys_are_created_once_listed_masked_and_deleted() {
+        let (_dir, state) = persistent_state("sqlite", &[]);
+
+        let Json(created) = create_api_key(
+            State(state.clone()),
+            Json(ApiKeyInput {
+                name: " ci ".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let duplicate = create_api_key(
+            State(state.clone()),
+            Json(ApiKeyInput { name: "ci".into() }),
+        )
+        .await;
+        let Json(listed) = list_api_keys(State(state.clone())).await.unwrap();
+        let hashes_after_create = state.api_key_hashes().len();
+        assert_saved(delete_api_key(State(state.clone()), UrlPath("ci".into())).await);
+        let Json(after_delete) = list_api_keys(State(state.clone())).await.unwrap();
+
+        let key = created["key"].as_str().unwrap();
+        assert_eq!(created["name"], "ci");
+        assert!(key.starts_with("sk-hub-"), "{key}");
+        assert_eq!(key.len(), "sk-hub-".len() + 48);
+        assert!(matches!(duplicate, Err(AppError::BadRequest(_))));
+        assert_eq!(listed["keys"][0]["name"], "ci");
+        assert_ne!(listed["keys"][0]["masked"], key);
+        assert_eq!(listed["keys"][0]["enabled"], true);
+        assert_eq!(hashes_after_create, 1);
+        assert_eq!(after_delete["keys"], json!([]));
+        assert!(state.api_key_hashes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_api_key_rejects_a_blank_name() {
+        let (_dir, state) = persistent_state("sqlite", &[]);
+
+        let result = create_api_key(State(state), Json(ApiKeyInput { name: "  ".into() })).await;
+
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+    }
+
+    const INSIGHT_PROFILES: [(&str, &str); 5] = [
+        ("LLM_HUB_PROFILES", "a,b,c"),
+        ("LLM_HUB_A_BASE_URL", DEAD_BASE_URL),
+        ("LLM_HUB_B_BASE_URL", DEAD_BASE_URL),
+        ("LLM_HUB_C_BASE_URL", DEAD_BASE_URL),
+        ("LLM_HUB_C_ENABLED", "false"),
+    ];
+
+    fn insights_state() -> (TempDir, AppState) {
+        let (dir, state) = persistent_state("sqlite", &INSIGHT_PROFILES);
+        state.set_model_cache(json!({"data": [
+            {"id": "a/m1"},
+            {"id": "b/m2"},
+            {"id": "c/m3"},
+        ]}));
+        let calls: Vec<RequestOutcome> = (0..5).map(|_| outcome("a/m1", 200)).collect();
+        record(&state, &calls);
+        (dir, state)
+    }
+
+    fn model_ids(models: &Value) -> Vec<String> {
+        let mut ids: Vec<String> = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["model"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn insights_list_enabled_catalog_models_beside_measured_ones() {
+        let (_dir, state) = insights_state();
+
+        let Json(body) = insights(State(state), Query(insights_query(Some("all"), None)))
+            .await
+            .unwrap();
+
+        assert_eq!(body["range"], "all");
+        assert_eq!(model_ids(&body["models"]), vec!["a/m1", "b/m2"]);
+    }
+
+    #[tokio::test]
+    async fn insights_accept_each_window_and_reject_unknown_ones() {
+        let (_dir, state) = insights_state();
+
+        for range in ["1d", "7d", "30d"] {
+            let Json(body) = insights(
+                State(state.clone()),
+                Query(insights_query(Some(range), None)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(body["range"], range);
+        }
+        let unknown = insights(State(state), Query(insights_query(Some("90d"), None))).await;
+        assert!(matches!(unknown, Err(AppError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn insights_pick_returns_the_ranked_model_or_not_found() {
+        let (_dir, state) = insights_state();
+        let mut strict = insights_query(None, None);
+        strict.min_requests = Some(50);
+
+        let Json(picked) = insights_pick(State(state.clone()), Query(insights_query(None, None)))
+            .await
+            .unwrap();
+        let none = insights_pick(State(state), Query(strict)).await;
+
+        assert_eq!(picked["model"], "a/m1");
+        assert_eq!(picked["by"], "overall");
+        assert!(matches!(none, Err(AppError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn insights_agent_report_narrows_to_the_profile() {
+        let (_dir, state) = insights_state();
+
+        let Json(body) =
+            insights_agent_report(State(state), Query(insights_query(None, Some(" b "))))
+                .await
+                .unwrap();
+
+        assert_eq!(body["profile"], "b");
+        assert_eq!(model_ids(&body["models"]), vec!["b/m2"]);
+    }
+
+    #[tokio::test]
+    async fn insights_refresh_a_cold_model_list() {
+        let (_dir, state) = persistent_state("sqlite", &[]);
+
+        let Json(body) = insights(State(state.clone()), Query(insights_query(None, None)))
+            .await
+            .unwrap();
+
+        assert_eq!(body["models"], json!([]));
+        assert!(state.model_cache().is_some());
     }
 }

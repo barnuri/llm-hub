@@ -951,10 +951,8 @@ enum Refusal {
     Estimated { reason: String, limit: u64 },
 }
 
-/// The chain models that may serve the request, in order, or the 400 naming every refusal.
-/// On a Responses call the size estimate never refuses alone: opaque reasoning items make the
-/// byte count unreliable, so when it would leave no model, the one with the largest known limit
-/// is kept and the upstream decides. A smaller model is still skipped while another remains.
+/// The chain models that may serve the request, or the 400 naming every refusal. On a Responses
+/// call, when only the size estimate refuses every model, the one with the largest known limit stays.
 fn servable_chain(
     state: &AppState,
     config: &HubConfig,
@@ -7145,6 +7143,50 @@ mod tests {
                     1
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn responses_prompt_over_every_known_limit_goes_to_the_largest_limit() {
+            const BIG_ID: &str = "gpt-5-mini";
+            let copilot = copilot().await;
+            copilot.state.set_upstream_models(
+                PROFILE,
+                HashMap::from([
+                    (PLAIN_ID.to_string(), entry(PLAIN_ID, false)),
+                    (BIG_ID.to_string(), entry(BIG_ID, false)),
+                ]),
+            );
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 1_000, 1);
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, BIG_ID, 2_000, 1);
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(200).set_body_json(responses_text_reply("ok")))
+                .mount(&copilot.upstream)
+                .await;
+            let body =
+                json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "x".repeat(16_000)});
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &fallback_to(BIG_ID),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent_json(&sent[0])["model"], BIG_ID);
         }
 
         #[tokio::test]

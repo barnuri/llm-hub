@@ -1,6 +1,5 @@
-//! Copilot names a Responses context overflow `model_max_prompt_tokens_exceeded`. `OpenAI`
-//! clients such as Codex compact the conversation only on `context_length_exceeded`, and end the
-//! turn on any other code. The hub renames the code and keeps the status and the rest of the body.
+//! Renames Copilot's Responses context overflow code `model_max_prompt_tokens_exceeded` to
+//! `context_length_exceeded`, the only code on which `OpenAI` clients such as Codex compact.
 
 use axum::body::{Body, Bytes};
 use axum::http::{StatusCode, header};
@@ -165,11 +164,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_compressed_400_is_not_read() {
-        let compressed = b"\x1f\x8b not json";
+        let body = br#"{"error":{"code":"model_max_prompt_tokens_exceeded"}}"#;
         let response = Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header(header::CONTENT_ENCODING, "gzip")
-            .body(Body::from(&compressed[..]))
+            .body(Body::from(&body[..]))
             .unwrap();
 
         let out = rename_context_code(response).await;
@@ -177,7 +176,7 @@ mod tests {
         let raw = axum::body::to_bytes(out.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(&raw[..], compressed);
+        assert_eq!(&raw[..], body);
     }
 
     #[tokio::test]

@@ -30,16 +30,16 @@
 ## Tests
 
 <!-- The tests that cover this change. A bug fix needs a test that fails before the fix.
-     Every new branch in src/ needs a unit test: success path, edge cases, error path.
-     The `coverage` check fails when fewer than 80% of the changed Rust lines are covered. -->
+     Every new code path in src/ needs a unit test: success path, edge cases, error path.
+     The `coverage` check fails when any file under src/ is below 80% line coverage. -->
 
-- Diff coverage (from the `coverage` check summary or `uvx diff-cover`): <!-- e.g. 92% -->
+- Coverage of the files this PR changes (from the `coverage` check summary): <!-- e.g. src/services/x.rs 93% -->
 
 ## Checklist
 
 - [ ] `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` pass
-- [ ] Every new or changed function in `src/` is covered by unit tests, and diff coverage is at least 80%
-- [ ] A new opt-in feature has a test for the on state and a test that the default state is unchanged
+- [ ] Unit tests cover every new code path in `src/`, and every file under `src/` has at least 80% line coverage
+- [ ] A new opt-in feature has a test for the on state and a test for the default state
 - [ ] Follows [CONTRIBUTING.md](../CONTRIBUTING.md): SOLID, one responsibility per module, no new per-request network call or disk read
 - [ ] Request-path changes: time to first byte measured against a direct upstream call (at most 50 ms added)
 - [ ] Docs in `docs/` updated for a new option or behavior

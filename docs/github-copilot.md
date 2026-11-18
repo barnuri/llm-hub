@@ -133,11 +133,11 @@ and Grok models on `/responses`. The hub ships limits measured with oversized pr
    limit of M" for GPT) and uses it from then on.
 3. With `LLM_HUB_PERSISTENT=true`, the store keeps learned limits across restarts.
 
-On `/v1/responses`, the hub renames Copilot's `model_max_prompt_tokens_exceeded` code to
-`context_length_exceeded`, the code `OpenAI` clients such as Codex read to compact the
-conversation. The status stays 400 and the message stays Copilot's.
-
 A seeded limit never replaces a learned one. The hub never sends probe requests.
+
+On `/v1/responses`, the hub renames Copilot's `model_max_prompt_tokens_exceeded` code to
+`context_length_exceeded`. Codex 0.169 and later compact the conversation on that code. The
+status stays 400 and the message stays Copilot's.
 
 ## Cache keep-warm
 
