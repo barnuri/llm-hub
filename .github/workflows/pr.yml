@@ -27,7 +27,7 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       ui: ${{ steps.filter.outputs.ui }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: filter
@@ -51,10 +51,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install
       - id: cargo-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -66,7 +66,7 @@ jobs:
       - run: scripts/check.sh fast
       - if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
         run: cargo clean -p llm-hub
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v6
         if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
         with:
           path: |
@@ -82,18 +82,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install
       - run: rustup component add llvm-tools-preview
       - id: llvm-cov
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/cargo-llvm-cov
           key: cargo-llvm-cov-${{ runner.os }}-${{ env.CARGO_LLVM_COV_VERSION }}
       - if: steps.llvm-cov.outputs.cache-hit != 'true'
         run: cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
       - id: cargo-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -110,7 +110,7 @@ jobs:
           jq -r '"Total line coverage: \(.data[0].totals.lines.percent | floor)%"' target/coverage.json >> "$GITHUB_STEP_SUMMARY" || true
       - if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
         run: cargo clean -p llm-hub
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v6
         if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
         with:
           path: |
@@ -126,10 +126,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install
       - id: cargo-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -141,7 +141,7 @@ jobs:
       - run: cargo test --all-targets
       - if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
         run: cargo clean -p llm-hub
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v6
         if: github.ref == 'refs/heads/master' && steps.cargo-cache.outputs.cache-hit != 'true'
         with:
           path: |
@@ -157,8 +157,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
