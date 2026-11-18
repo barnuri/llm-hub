@@ -51,8 +51,9 @@ body or status is a behavior change.
   the background.
 - Stream responses through. Buffer only error bodies or opt-in features that need the whole
   answer.
-- For a request-path change, compare the hub's time to first byte with a direct `curl` to the
-  upstream. The hub may add at most 50 ms.
+- For a request-path change, run `.claude/skills/llm-hub-perf/scripts/bench.sh` on `master` and
+  on your branch, and paste the medians in the pull request under Performance. The hub may add
+  at most 50 ms to the time to first byte of a direct upstream call.
 
 ### 4. Test it
 

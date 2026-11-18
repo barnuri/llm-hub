@@ -56,7 +56,26 @@ Apply one only when a measurement shows its cost. Each line names the measuremen
 | C3 | The request and attempt phases build contexts and clone `Bytes` handles when no extension overrides those phases. Let `ExtensionSet` record at build time which phases have an override, through a `fn phases()` hint on built-ins and rules | Sub-microsecond | Only with a profile (`cargo flamegraph`) that shows the phase loop |
 | C4 | `panic = "unwind"` in the release profile adds unwind tables (13.1 MB to 16.4 MB binary with the YAML parser). It is needed to catch a panicking extension | Binary size, not latency | Do not change without a decision about extension panics |
 
+## When to run
+
+Run it for every change to the request path: `src/routes/proxy.rs`, `src/routes/anthropic.rs`, `src/ext/`, the `src/services/` modules the proxy calls, `src/utils/headers.rs`, or `Cargo.toml` dependencies and release profile. Bench `master` and the branch, with a 1 KB
+and a 200 KB body, and also with `RULES` when the change touches `src/ext/`.
+
 ## Report
 
-Lead with the verdict: "no regression" or "regression of N ms at the median in <case>". Then the
-table of medians per round. End with one next action.
+Put the result in the PR body under `## Performance`, in this shape:
+
+```markdown
+## Performance
+
+No regression. Medians of time to first byte, mock upstream, 300 runs per build, 2 rounds:
+
+| Build | 1 KB median | 200 KB median |
+|---|---|---|
+| master | 0.81–0.85 ms | 1.06–1.10 ms |
+| this PR | 0.80–0.86 ms | 1.05–1.11 ms |
+```
+
+Lead with the verdict: "No regression", or "Regression of N ms at the median in <case>", with the
+cause. Give the range across rounds for each build. A regression above the noise needs a fix or
+a stated reason before merge.

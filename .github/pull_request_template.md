@@ -27,6 +27,18 @@
 <!-- UI changes: before and after screenshots. API changes: the request and the response
      (status, body or SSE events). Remove tokens, hosts and personal data. -->
 
+## Performance
+
+<!-- Required when this PR changes the request path: src/routes/proxy.rs, src/routes/anthropic.rs,
+     src/ext/, the src/services/ modules the proxy calls, src/utils/headers.rs, or Cargo.toml
+     dependencies and the release profile. Run the llm-hub-perf skill (.claude/skills/llm-hub-perf/)
+     on master and on this branch, and paste its table. Otherwise write "Not on the request path." -->
+
+| Build | 1 KB median | 200 KB median |
+|---|---|---|
+| master | | |
+| this PR | | |
+
 ## Tests
 
 <!-- The tests that cover this change. A bug fix needs a test that fails before the fix.
@@ -41,6 +53,6 @@
 - [ ] Unit tests cover every new code path in `src/`, and every file under `src/` has at least 80% line coverage
 - [ ] A new opt-in feature has a test for the on state and a test for the default state
 - [ ] Follows [CONTRIBUTING.md](../CONTRIBUTING.md): SOLID, one responsibility per module, no new per-request network call or disk read
-- [ ] Request-path changes: time to first byte measured against a direct upstream call (at most 50 ms added)
+- [ ] Request-path changes: the Performance table above comes from the `llm-hub-perf` skill (at most 50 ms added)
 - [ ] Docs in `docs/` updated for a new option or behavior
 - [ ] No secrets, internal hosts, quotas or personal paths in code, tests or the description
