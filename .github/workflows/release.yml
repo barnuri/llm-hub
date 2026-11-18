@@ -51,18 +51,22 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - run: rustup toolchain install && rustup target add ${{ matrix.target }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: ui-src/package-lock.json
       - run: npm --prefix ui-src ci && npm --prefix ui-src run build
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
         with:
-          key: ${{ matrix.target }}
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-release-${{ matrix.target }}-
       # Windows perl refuses to edit in place without a backup suffix.
       - name: Stamp version
         run: |
@@ -83,9 +87,10 @@ jobs:
         with:
           path: assets
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ needs.tag.outputs.version }}
-          name: v${{ needs.tag.outputs.version }}
-          generate_release_notes: true
-          files: assets/*
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.tag.outputs.version }}
+        run: >
+          gh release create "$TAG" assets/*
+          --repo "${{ github.repository }}" --target "${{ github.sha }}"
+          --title "$TAG" --generate-notes
