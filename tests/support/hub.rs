@@ -18,22 +18,29 @@ impl Drop for HubProcess {
 }
 
 /// Starts the hub with `vars` set and returns it with its base URL once `/healthz` answers.
+/// A hub that exits before it is ready lost its port to another listener, so the next port is tried.
 pub async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
-    let port = free_port();
-    let dir = tempfile::tempdir().unwrap().keep();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_llm-hub"));
-    command
-        .current_dir(&dir)
-        .env("LLM_HUB_PORT", port.to_string())
-        .env("LLM_HUB_AUTO_UPDATE", "0");
-    for (key, value) in vars {
-        command.env(key, value);
+    for _ in 0..START_ATTEMPTS {
+        let port = free_port();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_llm-hub"));
+        command
+            .current_dir(&dir)
+            .env("LLM_HUB_PORT", port.to_string())
+            .env("LLM_HUB_AUTO_UPDATE", "0");
+        for (key, value) in &vars {
+            command.env(key, value);
+        }
+        let mut hub = HubProcess(command.spawn().expect("hub starts"));
+        let base = format!("http://127.0.0.1:{port}");
+        if wait_ready(&base, &mut hub.0).await {
+            return (hub, base);
+        }
     }
-    let child = command.spawn().expect("hub starts");
-    let base = format!("http://127.0.0.1:{port}");
-    wait_ready(&base).await;
-    (HubProcess(child), base)
+    panic!("hub did not start on {START_ATTEMPTS} ports");
 }
+
+const START_ATTEMPTS: usize = 5;
 
 /// A local port that nothing listens on yet.
 pub fn free_port() -> u16 {
@@ -44,12 +51,20 @@ pub fn free_port() -> u16 {
         .port()
 }
 
-async fn wait_ready(base: &str) {
+/// True once `/healthz` answers `ok` while `child` still runs. False when `child` exits first.
+async fn wait_ready(base: &str, child: &mut Child) -> bool {
     let client = reqwest::Client::new();
     // A loaded machine can take well over 5 s to start a hub; allow 30 s before failing.
     for _ in 0..300 {
-        if client.get(format!("{base}/healthz")).send().await.is_ok() {
-            return;
+        if child.try_wait().unwrap().is_some() {
+            return false;
+        }
+        if let Ok(response) = client.get(format!("{base}/healthz")).send().await
+            && response.status().is_success()
+            && response.text().await.is_ok_and(|text| text == "ok")
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            return child.try_wait().unwrap().is_none();
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
