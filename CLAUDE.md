@@ -14,6 +14,7 @@ Every change must keep the request path at the lowest latency available. Measure
 - When a change touches the request path, compare the hub's time to first byte with a direct `curl` to the upstream. The hub may add at most 50 ms.
 - A change to the request path (`src/routes/proxy.rs`, `src/routes/anthropic.rs`, `src/ext/`, the `src/services/` modules the proxy calls, `src/utils/headers.rs`, or `Cargo.toml` dependencies and release profile) runs the `llm-hub-perf` skill on `master` and on the branch. Its table of medians goes in the PR body under `## Performance`. The skill holds the bench script, the baseline and the candidate optimizations.
 - Change code for performance only when a measurement shows the need.
+- Keep the binary small. The `binary-size` check fails a PR whose release binary grows more than 2% against the latest release, unless the PR body has a `## Binary size` section that says what added the size and why it is worth it. Check locally with `cargo build --release && scripts/binary-size.sh`. Prefer a feature flag or a smaller crate to a large dependency.
 
 ## Extensions
 

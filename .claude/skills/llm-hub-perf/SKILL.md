@@ -45,6 +45,21 @@ run-to-run spread (about ±0.1 ms at the median on a laptop) is noise.
 | llm-hub with extensions, no rules file | 0.81–0.85 ms | 1.06–1.10 ms |
 | With 2 rules, one changes the body | 0.87–0.88 ms | 1.21–1.23 ms |
 
+## Binary size
+
+`scripts/binary-size.sh [BINARY]` compares a release binary with the same platform's asset in the
+latest release and exits 1 above 2% growth. The `binary-size` CI check runs it on Linux for every
+PR. Growth over 2% needs a `## Binary size` section in the PR body with the cause and the reason.
+
+Find the cause before you explain it: build the branch with and without the suspect change (a
+dependency, a feature flag, `panic = "unwind"`), compare sizes, and name the biggest part.
+
+| Build (macOS arm64) | Size | Cause |
+|---|---|---|
+| v0.1.69, before extensions | 12.51 MiB | |
+| Extensions with `panic = "abort"` | 13.57 MiB | Extension code and the `serde-saphyr` YAML parser, +1.06 MiB |
+| Extensions with `panic = "unwind"` | 15.62 MiB | Unwind tables, +2.05 MiB, so a panicking extension does not abort the hub |
+
 ## Candidate optimizations
 
 Apply one only when a measurement shows its cost. Each line names the measurement to take first.

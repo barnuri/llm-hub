@@ -54,6 +54,9 @@ body or status is a behavior change.
 - For a request-path change, run `.claude/skills/llm-hub-perf/scripts/bench.sh` on `master` and
   on your branch, and paste the medians in the pull request under Performance. The hub may add
   at most 50 ms to the time to first byte of a direct upstream call.
+- Keep the binary small. The `binary-size` check fails when the release binary grows more than
+  2% against the latest release, unless the pull request explains the growth under
+  `## Binary size`. Check it with `cargo build --release && scripts/binary-size.sh`.
 
 ### 4. Test it
 
