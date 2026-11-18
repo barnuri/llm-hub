@@ -52,9 +52,14 @@ body or status is a behavior change.
 
 - A bug fix comes with a test that fails before the fix.
 - A feature comes with tests for the on state and the off (default) state.
+- Every new branch in `src/` has a unit test: the success path, the edge cases and the error path.
+- The `coverage` check fails when fewer than 80% of the changed Rust lines are covered. Check it
+  locally with `cargo llvm-cov --lcov --output-path lcov.info` and
+  `uvx diff-cover lcov.info --compare-branch=origin/master`.
 - Upstream calls in tests use `wiremock`. Tests never call a real provider.
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` must pass.
-  The `pr` workflow runs all three on Linux and Windows.
+  The `pr` workflow runs the lint on Linux, the tests on Linux (with coverage) and Windows, and
+  skips the Rust jobs when a pull request changes only docs.
 
 ### 5. Keep the scope small
 

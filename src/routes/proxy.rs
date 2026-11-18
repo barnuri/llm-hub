@@ -7148,6 +7148,135 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn responses_body_padded_with_json_whitespace_reaches_the_upstream() {
+            const KNOWN_LIMIT: u64 = 922_000;
+            const PADDED_BYTES: usize = 5_546_304;
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, KNOWN_LIMIT, 1);
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(200).set_body_json(responses_text_reply("ok")))
+                .mount(&copilot.upstream)
+                .await;
+            let mut body = json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "hi"})
+                .to_string()
+                .into_bytes();
+            body.resize(PADDED_BYTES, b' ');
+            let estimate = estimated_prompt_tokens(body.len());
+            assert!(estimate * 100 > KNOWN_LIMIT * PROMPT_REFUSAL_MARGIN_PERCENT);
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &client_headers(),
+                Bytes::from(body),
+                RouteKind::OpenAi,
+            )
+            .await
+            .expect("whitespace is not prompt tokens");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(requests_to(&copilot, RESPONSES_ENDPOINT).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn responses_unrelated_upstream_error_passes_through_unchanged() {
+            let copilot = copilot().await;
+            let error =
+                json!({"error": {"code": "invalid_request_error", "message": "bad tool schema"}});
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(400).set_body_json(&error))
+                .mount(&copilot.upstream)
+                .await;
+            let body =
+                json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "hi", "stream": true});
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &client_headers(),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let raw = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&raw).unwrap(), error);
+        }
+
+        #[tokio::test]
+        async fn responses_image_to_a_text_only_model_is_still_refused_without_an_upstream_call() {
+            let copilot = copilot().await;
+            copilot.state.set_model_descriptors(vec![described(
+                &format!("{PROFILE}/{PLAIN_ID}"),
+                Some(false),
+            )]);
+            let body = json!({
+                "model": format!("{PROFILE}/{PLAIN_ID}"),
+                "input": [{"role": "user", "content": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                ]}],
+            });
+
+            let message = refused_message(
+                &copilot,
+                "/v1/responses",
+                RouteKind::OpenAi,
+                &client_headers(),
+                &body,
+            )
+            .await;
+
+            assert_eq!(message, "copilot/gpt-4.1: image input is not supported");
+            assert!(requests_to(&copilot, RESPONSES_ENDPOINT).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn chat_completions_prompt_over_the_only_known_limit_is_still_refused() {
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 1_000, 1);
+            let body = json!({
+                "model": format!("{PROFILE}/{PLAIN_ID}"),
+                "messages": [{"role": "user", "content": "x".repeat(8_000)}],
+            });
+
+            let message = refused_message(
+                &copilot,
+                "/v1/chat/completions",
+                RouteKind::OpenAi,
+                &client_headers(),
+                &body,
+            )
+            .await;
+
+            assert!(
+                message.ends_with("is over the known limit of 1000 tokens"),
+                "{message}"
+            );
+            assert!(
+                copilot
+                    .upstream
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
         async fn model_with_no_known_limit_is_still_tried_with_a_large_prompt() {
             let copilot = copilot().await;
             Mock::given(method("POST"))

@@ -162,4 +162,55 @@ mod tests {
         let raw = axum::body::to_bytes(replay, usize::MAX).await.unwrap();
         assert_eq!(&raw[..], b"abcdefgh");
     }
+
+    #[tokio::test]
+    async fn a_compressed_400_is_not_read() {
+        let compressed = b"\x1f\x8b not json";
+        let response = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(Body::from(&compressed[..]))
+            .unwrap();
+
+        let out = rename_context_code(response).await;
+
+        let raw = axum::body::to_bytes(out.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&raw[..], compressed);
+    }
+
+    #[tokio::test]
+    async fn a_400_over_the_cap_reaches_the_client_whole() {
+        let oversized = vec![b' '; MAX_TRANSFORM_BUFFER_BYTES + 1];
+        let response = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(oversized.clone()))
+            .unwrap();
+
+        let out = rename_context_code(response).await;
+
+        assert_eq!(out.status(), StatusCode::BAD_REQUEST);
+        let raw = axum::body::to_bytes(out.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(raw.len(), oversized.len());
+    }
+
+    #[tokio::test]
+    async fn a_read_error_replays_the_bytes_read_then_the_error() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"ab")),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let body = Body::from_stream(stream::iter(chunks));
+
+        let Err(replay) = read_capped(body, 1_024).await else {
+            panic!("the read failed");
+        };
+
+        let mut replayed = replay.into_data_stream();
+        assert_eq!(&replayed.next().await.unwrap().unwrap()[..], b"ab");
+        assert!(replayed.next().await.unwrap().is_err());
+    }
 }
