@@ -26,7 +26,10 @@ pub fn status() -> Result<(), String> {
     platform::status()
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "Only the macOS service manager uses it")
+)]
 pub fn render_launchd_plist(exe: &Path, cwd: &Path) -> String {
     let exe = xml_escape(exe.display());
     let cwd = xml_escape(cwd.display());
