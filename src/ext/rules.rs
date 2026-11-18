@@ -7,7 +7,10 @@ mod rules_extension;
 
 use std::path::{Path, PathBuf};
 
+pub(crate) use action::{Action, ActionTarget, expand};
+pub(crate) use matcher::{Facts, Matcher, header_name, header_value};
 use rule_spec::RuleFile;
+pub(crate) use rule_spec::{MatchSpec, PhaseName, RuleMode};
 pub(crate) use rules_extension::RulesExtension;
 
 /// File names looked up in the working directory when `LLM_HUB_EXTENSIONS_FILE` is not set.
@@ -45,7 +48,7 @@ pub(crate) fn parse(
     } else {
         serde_saphyr::from_str(text).map_err(|e| e.to_string())?
     };
-    RulesExtension::compile(file.rules, env)
+    RulesExtension::compile(file.rules, file.hooks, env)
 }
 
 fn is_json(path: &Path) -> bool {

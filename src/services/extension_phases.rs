@@ -9,15 +9,16 @@ use futures_util::{StreamExt, stream};
 use serde_json::Value;
 
 use crate::consts::MAX_TRANSFORM_BUFFER_BYTES;
+use crate::dependencies::state::AppState;
 use crate::ext::{
-    AttemptCtx, AttemptTarget, ExtensionSet, Flow, RequestCtx, ResponseCtx, ResponseFlow,
-    ResponseTarget,
+    AttemptCtx, AttemptTarget, ConfigChangeCtx, ConfigKind, ExtensionSet, Flow, RequestCtx,
+    ResponseCtx, ResponseFlow, ResponseTarget,
 };
 use crate::schemas::app_error::AppError;
 use crate::services::upstream_reply::rebuilt_response;
 
 /// The client request after the `request` phase: changed headers, if any, and the body to use.
-pub(crate) fn request_phase(
+pub(crate) async fn request_phase(
     set: &ExtensionSet,
     method: &Method,
     path: &str,
@@ -27,11 +28,14 @@ pub(crate) fn request_phase(
 ) -> Result<(Option<HeaderMap>, Bytes), AppError> {
     let mut ctx = RequestCtx::new(method, path, headers, body, state);
     rejected(set.request(&mut ctx))?;
+    if let Some(hooks) = set.hooks() {
+        rejected(hooks.request(&mut ctx).await)?;
+    }
     Ok(ctx.into_parts())
 }
 
 /// One attempt after the `attempt` phase: changed headers, if any, and the body to send.
-pub(crate) fn attempt_phase(
+pub(crate) async fn attempt_phase(
     set: &ExtensionSet,
     target: AttemptTarget<'_>,
     headers: &HeaderMap,
@@ -40,7 +44,29 @@ pub(crate) fn attempt_phase(
 ) -> Result<(Option<HeaderMap>, Bytes), AppError> {
     let mut ctx = AttemptCtx::new(target, headers, body, state);
     rejected(set.attempt(&mut ctx))?;
+    if let Some(hooks) = set.hooks() {
+        rejected(hooks.attempt(&mut ctx).await)?;
+    }
     Ok(ctx.into_parts())
+}
+
+/// Runs `apply` between the `config_change` phase, which can stop the save, and the
+/// `config_changed` phase, which runs only after a successful save.
+///
+/// # Errors
+/// `AppError::Rejected` when an extension rejects the change, else what `apply` returns.
+pub(crate) fn changing<T>(
+    state: &AppState,
+    kind: ConfigKind,
+    subject: Option<&str>,
+    apply: impl FnOnce() -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    let extensions = state.extensions();
+    let ctx = ConfigChangeCtx::new(kind, subject);
+    rejected(extensions.config_change(&ctx))?;
+    let saved = apply()?;
+    extensions.config_changed(&ctx);
+    Ok(saved)
 }
 
 fn rejected(flow: Flow) -> Result<(), AppError> {

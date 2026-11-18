@@ -1,22 +1,63 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use crate::ext::{AttemptCtx, CompleteCtx, Extension, Flow, RequestCtx, ResponseCtx, ResponseFlow};
+use crate::ext::hooks::HookSet;
+use crate::ext::{
+    AttemptCtx, CompleteCtx, ConfigChangeCtx, Extension, Flow, HttpRequestCtx, HttpResponseCtx,
+    RequestCtx, ResponseCtx, ResponseFlow,
+};
 
 /// The extensions of a running hub, in the order request phases run them.
 #[derive(Clone, Default)]
 pub(crate) struct ExtensionSet {
     extensions: Vec<Arc<dyn Extension>>,
+    hooks: Option<Arc<HookSet>>,
 }
 
 impl ExtensionSet {
     pub(crate) fn new(extensions: Vec<Arc<dyn Extension>>) -> ExtensionSet {
-        ExtensionSet { extensions }
+        ExtensionSet {
+            extensions,
+            hooks: None,
+        }
+    }
+
+    /// The set with HTTP hooks that run after the extensions in the `request` and `attempt`
+    /// phases, and as `complete` hooks.
+    pub(crate) fn with_hooks(mut self, hooks: Option<Arc<HookSet>>) -> ExtensionSet {
+        self.hooks = hooks;
+        self
+    }
+
+    pub(crate) fn hooks(&self) -> Option<&Arc<HookSet>> {
+        self.hooks.as_ref()
     }
 
     #[cfg(test)]
     pub(crate) fn names(&self) -> Vec<&str> {
         self.extensions.iter().map(|ext| ext.name()).collect()
+    }
+
+    /// Runs `on_http_request` in order. The first rejection stops the phase.
+    pub(crate) fn http_request(&self, ctx: &mut HttpRequestCtx<'_>) -> Flow {
+        for ext in &self.extensions {
+            let flow = guarded(ext.as_ref(), "http_request", Flow::Continue, || {
+                ext.on_http_request(ctx)
+            });
+            if flow != Flow::Continue {
+                return flow;
+            }
+        }
+        Flow::Continue
+    }
+
+    /// Runs `on_http_response` in reverse order.
+    pub(crate) fn http_response(&self, ctx: &mut HttpResponseCtx<'_>) {
+        for ext in self.extensions.iter().rev() {
+            guarded(ext.as_ref(), "http_response", (), || {
+                ext.on_http_response(ctx);
+            });
+        }
     }
 
     /// Runs `on_request` in order. The first rejection stops the phase.
@@ -68,10 +109,35 @@ impl ExtensionSet {
         decided
     }
 
+    /// Runs `on_config_change` in order. The first rejection stops the phase.
+    pub(crate) fn config_change(&self, ctx: &ConfigChangeCtx<'_>) -> Flow {
+        for ext in &self.extensions {
+            let flow = guarded(ext.as_ref(), "config_change", Flow::Continue, || {
+                ext.on_config_change(ctx)
+            });
+            if flow != Flow::Continue {
+                return flow;
+            }
+        }
+        Flow::Continue
+    }
+
+    /// Runs `on_config_changed` in order.
+    pub(crate) fn config_changed(&self, ctx: &ConfigChangeCtx<'_>) {
+        for ext in &self.extensions {
+            guarded(ext.as_ref(), "config_changed", (), || {
+                ext.on_config_changed(ctx);
+            });
+        }
+    }
+
     /// Runs `on_complete` in order.
     pub(crate) fn complete(&self, ctx: &CompleteCtx<'_>) {
         for ext in &self.extensions {
             guarded(ext.as_ref(), "complete", (), || ext.on_complete(ctx));
+        }
+        if let Some(hooks) = &self.hooks {
+            hooks.complete(ctx);
         }
     }
 }
@@ -92,9 +158,9 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::ext::Api;
     use crate::ext::attempt_ctx::AttemptTarget;
     use crate::ext::response_ctx::ResponseTarget;
+    use crate::ext::{Api, ConfigKind};
     use crate::services::stats::RequestOutcome;
 
     /// Records every call into a shared log, and answers with fixed flows.
@@ -131,6 +197,24 @@ mod tests {
     impl Extension for Probe {
         fn name(&self) -> &'static str {
             self.name
+        }
+
+        fn on_http_request(&self, _ctx: &mut HttpRequestCtx<'_>) -> Flow {
+            self.note("http_request");
+            self.request.clone()
+        }
+
+        fn on_http_response(&self, _ctx: &mut HttpResponseCtx<'_>) {
+            self.note("http_response");
+        }
+
+        fn on_config_change(&self, _ctx: &ConfigChangeCtx<'_>) -> Flow {
+            self.note("config_change");
+            self.request.clone()
+        }
+
+        fn on_config_changed(&self, _ctx: &ConfigChangeCtx<'_>) {
+            self.note("config_changed");
         }
 
         fn on_request(&self, _ctx: &mut RequestCtx<'_>) -> Flow {
@@ -225,7 +309,7 @@ mod tests {
         run_request(&set);
         run_attempt(&set);
         run_response(&set);
-        set.complete(&CompleteCtx::new(&RequestOutcome::default()));
+        set.complete(&CompleteCtx::new(&RequestOutcome::default(), None));
 
         assert_eq!(
             *log.lock().unwrap(),
@@ -243,6 +327,76 @@ mod tests {
             ]
         );
         assert_eq!(set.names(), ["a", "b"]);
+    }
+
+    fn run_http(set: &ExtensionSet) -> Flow {
+        let mut headers = HeaderMap::new();
+        let flow = set.http_request(&mut HttpRequestCtx::new(
+            &Method::GET,
+            "/healthz",
+            &mut headers,
+        ));
+        let mut ctx = HttpResponseCtx::new(&Method::GET, "/healthz", StatusCode::OK, &mut headers);
+        set.http_response(&mut ctx);
+        flow
+    }
+
+    #[test]
+    fn config_phases_run_in_order_and_a_rejection_stops_only_the_first() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut gate = Probe::new("gate", &log);
+        gate.request = Flow::reject(403, "frozen");
+        let set = set(vec![Probe::new("a", &log), gate, Probe::new("b", &log)]);
+        let ctx = ConfigChangeCtx::new(ConfigKind::KeepWarm, None);
+
+        assert_eq!(set.config_change(&ctx), Flow::reject(403, "frozen"));
+        set.config_changed(&ctx);
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "a:config_change",
+                "gate:config_change",
+                "a:config_changed",
+                "gate:config_changed",
+                "b:config_changed"
+            ]
+        );
+    }
+
+    #[test]
+    fn http_request_runs_in_order_and_http_response_in_reverse() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let set = set(vec![Probe::new("a", &log), Probe::new("b", &log)]);
+
+        assert_eq!(run_http(&set), Flow::Continue);
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "a:http_request",
+                "b:http_request",
+                "b:http_response",
+                "a:http_response"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_panic_in_an_http_phase_is_skipped_and_a_rejection_stops_http_request() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut broken = Probe::new("broken", &log);
+        broken.panics = true;
+        let mut gate = Probe::new("gate", &log);
+        gate.request = Flow::reject(403, "no");
+        let set = set(vec![broken, gate, Probe::new("after", &log)]);
+
+        assert_eq!(run_http(&set), Flow::reject(403, "no"));
+
+        let calls = log.lock().unwrap().clone();
+        assert!(calls.contains(&"gate:http_request".to_owned()));
+        assert!(!calls.contains(&"after:http_request".to_owned()));
+        assert!(calls.contains(&"after:http_response".to_owned()));
     }
 
     #[test]
@@ -285,7 +439,7 @@ mod tests {
 
         assert_eq!(run_request(&set), Flow::Continue);
         assert_eq!(run_response(&set), (false, ResponseFlow::Continue));
-        set.complete(&CompleteCtx::new(&RequestOutcome::default()));
+        set.complete(&CompleteCtx::new(&RequestOutcome::default(), None));
 
         assert!(log.lock().unwrap().contains(&"ok:complete".to_owned()));
     }
@@ -297,7 +451,7 @@ mod tests {
         assert_eq!(run_request(&set), Flow::Continue);
         assert_eq!(run_attempt(&set), Flow::Continue);
         assert_eq!(run_response(&set), (false, ResponseFlow::Continue));
-        set.complete(&CompleteCtx::new(&RequestOutcome::default()));
+        set.complete(&CompleteCtx::new(&RequestOutcome::default(), None));
         assert!(ExtensionSet::default().names().is_empty());
     }
 }

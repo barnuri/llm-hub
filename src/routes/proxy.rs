@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -144,7 +145,8 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Respon
         // Over the replay cap: stream straight through, fallbacks disabled.
         Some(rest) => {
             let changed =
-                headers_only_request_phase(&state, &parts.method, &path_and_query, &parts.headers)?;
+                headers_only_request_phase(&state, &parts.method, &path_and_query, &parts.headers)
+                    .await?;
             passthrough_oversized(
                 &state,
                 parts.method,
@@ -171,7 +173,7 @@ pub async fn proxy(State(state): State<AppState>, req: Request) -> Result<Respon
 
 /// The `request` phase for a request whose body the hub does not buffer. Extensions see the
 /// headers and an empty body, so a rule on `model` or `stream` does not match it.
-fn headers_only_request_phase(
+async fn headers_only_request_phase(
     state: &AppState,
     method: &Method,
     path: &str,
@@ -185,7 +187,8 @@ fn headers_only_request_phase(
         headers,
         Bytes::new(),
         &mut ext_state,
-    )?;
+    )
+    .await?;
     Ok(changed)
 }
 
@@ -202,7 +205,7 @@ pub async fn get_model_by_id(
     })?;
     let target = format!("/v1/models/{}", id.model);
     let changed =
-        headers_only_request_phase(&state, &Method::GET, parts.uri.path(), &parts.headers)?;
+        headers_only_request_phase(&state, &Method::GET, parts.uri.path(), &parts.headers).await?;
     attempt_single(
         &state,
         Method::GET,
@@ -245,7 +248,8 @@ pub(crate) async fn attempt_loop(
         headers,
         body,
         &mut ext_state,
-    )?;
+    )
+    .await?;
     let headers = changed_headers.as_ref().unwrap_or(headers);
     let config = state.config();
     let (bodies, requested_id) =
@@ -349,13 +353,23 @@ pub(crate) async fn attempt_loop(
             client_path: path_and_query,
             upstream_path: attempt.path.as_str(),
         };
-        let (changed, body) = extension_phases::attempt_phase(
+        let (changed, body) = match extension_phases::attempt_phase(
             &extensions,
             target,
             attempt.headers,
             std::mem::take(&mut attempt.body),
             &mut ext_state,
-        )?;
+        )
+        .await
+        {
+            Ok(phased) => phased,
+            Err(rejection) => {
+                if let Some(event) = &selection {
+                    record_transition(state, event, SelectionState::Rejected, None);
+                }
+                return Err(rejection);
+            }
+        };
         attempt.body = body;
         attempt_headers = changed;
         if let Some(changed) = &attempt_headers {
@@ -430,6 +444,7 @@ pub(crate) async fn attempt_loop(
                 } else {
                     client_changes
                 };
+                let request_state = (!ext_state.is_empty()).then(|| Arc::new(ext_state.clone()));
                 let status = response.status().as_u16();
                 attempts_trail.push(format!("{}={status}", model_id.qualified()));
                 let retry =
@@ -471,6 +486,7 @@ pub(crate) async fn attempt_loop(
                                 commit,
                                 transition.filter(|_| succeeded),
                                 routed_by.clone(),
+                                request_state.clone(),
                             )
                             .await?
                         }
@@ -490,6 +506,7 @@ pub(crate) async fn attempt_loop(
                                 shape_body.clone(),
                                 routed_by.clone(),
                                 stream_lease,
+                                request_state.clone(),
                             )
                             .await
                         }
@@ -547,6 +564,7 @@ pub(crate) async fn attempt_loop(
                         client: client_path,
                         upstream: attempt.path.as_str(),
                     },
+                    request_state.as_ref(),
                 );
             }
             Err(reason) => {
@@ -568,6 +586,9 @@ pub(crate) async fn attempt_loop(
                         client: client_path,
                         upstream: attempt.path.as_str(),
                     },
+                    (!ext_state.is_empty())
+                        .then(|| Arc::new(ext_state.clone()))
+                        .as_ref(),
                 );
                 if index == last_index {
                     return Err(AppError::UpstreamUnavailable(format!(
@@ -1697,6 +1718,7 @@ async fn deliver(
     prompt_body: Option<Bytes>,
     routed_by: String,
     keep_warm: Option<KeepWarmLease>,
+    request_state: Option<Arc<Extensions>>,
 ) -> Response {
     let (route, plan, upstream_path) = (attempt.route, attempt.plan, attempt.path.as_str());
     let is_sse = is_event_stream(&response);
@@ -1719,6 +1741,7 @@ async fn deliver(
             selection,
             prompt_body,
             routed_by,
+            request_state,
         )
         .await
     } else {
@@ -1739,6 +1762,7 @@ async fn deliver(
             prompt_body,
             routed_by,
             keep_warm,
+            request_state,
         )
     };
     if let Some(applied) = plan.header_value() {
@@ -1798,6 +1822,7 @@ async fn review_deliver(
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
     routed_by: String,
+    request_state: Option<Arc<Extensions>>,
 ) -> Result<Response, AppError> {
     let Some(graph) = plan.review.as_ref() else {
         return Err(AppError::UpstreamUnavailable(
@@ -1913,7 +1938,7 @@ async fn review_deliver(
             .unwrap_or(0)
     };
     let (attempt, role) = outcome_attempt(selection.as_ref());
-    let request_stats = RequestOutcome {
+    let reviewed_outcome = RequestOutcome {
         profile: solver.profile.clone(),
         model_key: outcome.served.qualified(),
         status,
@@ -1942,11 +1967,11 @@ async fn review_deliver(
             save_answer(&state_for_text, &attempt, &raw);
         });
     }
-    finish_selection(state, selection, &request_stats, None);
-    state.record_outcome(&request_stats);
-    state.publish_live(&request_stats);
+    finish_selection(state, selection, &reviewed_outcome, None);
+    state.record_outcome(&reviewed_outcome, request_state.as_ref());
+    state.publish_live(&reviewed_outcome);
     if let Some(store) = state.store()
-        && let Err(e) = store.record(&request_stats)
+        && let Err(e) = store.record(&reviewed_outcome)
     {
         tracing::warn!("store record failed: {e}");
     }
@@ -2031,6 +2056,7 @@ async fn attempt_single(
         None,
         None,
         ROUTED_BY_PINNED.to_owned(),
+        None,
         None,
     ))
 }
@@ -2277,6 +2303,7 @@ async fn retry_without_rejected_fields(
         rebuilt,
         ext_state,
     )
+    .await
     .map_err(|e| e.message())?;
     let response = sender.send(retried.clone()).await?;
     Ok((response, Some(retried)))
@@ -2438,7 +2465,7 @@ pub(crate) async fn send_keep_warm_ping(state: &AppState, ping: PingPlan) {
         attempt: None,
         role: None,
     };
-    state.record_outcome(&outcome);
+    state.record_outcome(&outcome, None);
     state.publish_live(&outcome);
     record_request(state, &outcome, None).await;
     state
@@ -3035,6 +3062,7 @@ fn build_response(
     prompt_body: Option<Bytes>,
     routed_by: String,
     keep_warm: Option<KeepWarmLease>,
+    request_state: Option<Arc<Extensions>>,
 ) -> Response {
     let status = upstream.status();
     let limit_model =
@@ -3183,7 +3211,7 @@ fn build_response(
             summary.upstream_end,
         );
         finish_selection(&state_for_stats, selection, &outcome, stop);
-        state_for_stats.record_outcome(&outcome);
+        state_for_stats.record_outcome(&outcome, request_state.as_ref());
         state_for_stats.publish_live(&outcome);
         record_request(&state_for_stats, &outcome, prompt_body).await;
     });
@@ -3462,6 +3490,7 @@ async fn build_anthropic_response(
     selection: Option<SelectionEvent>,
     prompt_body: Option<Bytes>,
     routed_by: String,
+    request_state: Option<Arc<Extensions>>,
 ) -> Response {
     let upstream_status = upstream.status();
     let limit_model = prompt_limit_model(
@@ -3584,7 +3613,7 @@ async fn build_anthropic_response(
         if let Some(attempt) = answer_attempt {
             save_answer(&state_for_stats, &attempt, &raw);
         }
-        state_for_stats.record_outcome(&outcome);
+        state_for_stats.record_outcome(&outcome, request_state.as_ref());
         state_for_stats.publish_live(&outcome);
         if let Some(commit) = commit.filter(|_| outcome.error.is_none()) {
             commit.apply(&state_for_stats);
@@ -3718,6 +3747,7 @@ fn record_failure(
     routed_by: String,
     selection: Option<&SelectionEvent>,
     paths: LogPaths<'_>,
+    request_state: Option<&Arc<Extensions>>,
 ) {
     let latency_ms = crate::utils::time::elapsed_ms(started);
     let (attempt, role) = outcome_attempt(selection);
@@ -3745,7 +3775,7 @@ fn record_failure(
         UpstreamEnd::Complete
     };
     log_failure(&outcome, paths, 0, upstream_end);
-    state.record_outcome(&outcome);
+    state.record_outcome(&outcome, request_state);
     state.publish_live(&outcome);
     if let Some(store) = state.store() {
         let _ = store.record(&outcome);
@@ -3834,6 +3864,7 @@ async fn passthrough_oversized(
         None,
         None,
         ROUTED_BY_PINNED.to_owned(),
+        None,
         None,
     ))
 }
@@ -7258,12 +7289,178 @@ mod tests {
 
         fn with_rules(copilot: &Copilot, yaml: &str) {
             let env = |_: &str| None;
-            let rules = crate::ext::rules::parse(yaml, false, &env).unwrap();
+            let mut rules = crate::ext::rules::parse(yaml, false, &env).unwrap();
+            let hooks = rules.take_hooks();
             let mut all = crate::ext::builtin::builtins();
             all.push(std::sync::Arc::new(rules));
             copilot
                 .state
+                .set_extensions(crate::ext::ExtensionSet::new(all).with_hooks(hooks));
+        }
+
+        #[derive(Clone)]
+        struct Team(&'static str);
+
+        /// Stores a `Team` when a request starts and reports it when the outcome is recorded.
+        struct Stash(std::sync::Arc<std::sync::Mutex<Vec<(String, u16)>>>);
+
+        impl crate::ext::Extension for Stash {
+            fn name(&self) -> &'static str {
+                "stash"
+            }
+
+            fn on_request(&self, ctx: &mut crate::ext::RequestCtx<'_>) -> crate::ext::Flow {
+                ctx.state_mut().insert(Team("blue"));
+                crate::ext::Flow::Continue
+            }
+
+            fn on_complete(&self, ctx: &crate::ext::CompleteCtx<'_>) {
+                let team = ctx.state().get::<Team>().map_or("none", |team| team.0);
+                self.0.lock().unwrap().push((team.to_owned(), ctx.status()));
+            }
+        }
+
+        #[tokio::test]
+        async fn request_state_reaches_the_complete_phase() {
+            let copilot = copilot().await;
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut all = crate::ext::builtin::builtins();
+            all.push(std::sync::Arc::new(Stash(std::sync::Arc::clone(&seen))));
+            copilot
+                .state
                 .set_extensions(crate::ext::ExtensionSet::new(all));
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(200).set_body_json(responses_text_reply("ok")))
+                .mount(&copilot.upstream)
+                .await;
+            let body = json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "hi"});
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &client_headers(),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            for _ in 0..100 {
+                if !seen.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            assert_eq!(*seen.lock().unwrap(), [("blue".to_owned(), 200)]);
+        }
+
+        #[tokio::test]
+        async fn an_attempt_hook_patches_the_body_the_upstream_receives() {
+            let copilot = copilot().await;
+            let hook = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/tune"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "action": "patch",
+                    "set_headers": {"x-reviewed": "1"},
+                    "body_patch": [{"op": "add", "path": "/metadata/reviewed", "value": true}],
+                })))
+                .mount(&hook)
+                .await;
+            with_rules(
+                &copilot,
+                &format!(
+                    "hooks: [{{name: tune, phase: attempt, url: '{}/tune', match: {{profile: copilot}}}}]",
+                    hook.uri()
+                ),
+            );
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(200).set_body_json(responses_text_reply("ok")))
+                .mount(&copilot.upstream)
+                .await;
+            let body = json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "hi"});
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &client_headers(),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
+            assert_eq!(sent_json(&sent[0])["metadata"]["reviewed"], true);
+            assert_eq!(sent[0].headers["x-reviewed"], "1");
+            assert_eq!(hook.received_requests().await.unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_request_hook_that_fails_closed_stops_the_request_before_the_upstream() {
+            let copilot = copilot().await;
+            with_rules(
+                &copilot,
+                "hooks: [{name: guard, phase: request, url: 'http://127.0.0.1:9/check', fail: closed, timeout_ms: 200}]",
+            );
+            let body = json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "hi"});
+
+            let error = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &client_headers(),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                error.message().contains("`guard` failed"),
+                "{}",
+                error.message()
+            );
+            assert!(requests_to(&copilot, RESPONSES_ENDPOINT).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_attempt_reject_ends_the_smart_auto_selection() {
+            let copilot = copilot().await;
+            with_rules(
+                &copilot,
+                "rules: [{name: closed, phase: attempt, actions: [{reject: {status: 503, message: closed}}]}]",
+            );
+            let body = json!({
+                "model": format!("{PROFILE}/{COPILOT_AUTO_MODEL}"),
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+
+            let error = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/chat/completions",
+                &with_session("attempt-reject"),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let events = selection_events(&copilot, 2).await;
+            let states: Vec<_> = events.iter().map(|event| event.state).collect();
+            assert_eq!(states, [SelectionState::Selected, SelectionState::Rejected]);
+            assert!(requests_to(&copilot, UPSTREAM_CHAT_PATH).await.is_empty());
         }
 
         #[tokio::test]
@@ -7278,6 +7475,7 @@ mod tests {
 
             let error =
                 headers_only_request_phase(&copilot.state, &Method::POST, "/v1/responses", &ci)
+                    .await
                     .unwrap_err();
             let tagged = headers_only_request_phase(
                 &copilot.state,
@@ -7285,6 +7483,7 @@ mod tests {
                 "/v1/models/copilot/gpt-5",
                 &client_headers(),
             )
+            .await
             .unwrap();
 
             assert_eq!(error.status(), StatusCode::FORBIDDEN);

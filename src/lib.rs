@@ -151,7 +151,7 @@ fn install_extensions(
     library: Vec<std::sync::Arc<dyn ext::Extension>>,
     vars: &HashMap<String, String>,
 ) {
-    let sources = std::sync::Arc::new(ExtensionSources::new(library, vars, rules_dir()));
+    let sources = std::sync::Arc::new(ExtensionSources::new(library, rules_dir()));
     match sources.load_rules(vars) {
         Ok(rules) => {
             if let Some((path, rules)) = &rules {
@@ -375,9 +375,17 @@ fn run_extensions_command() -> Result<(), String> {
         }
         _ => return Err(EXTENSIONS_USAGE.to_owned()),
     }
-    let sources = ExtensionSources::new(Vec::new(), &vars, rules_dir());
+    let sources = ExtensionSources::new(Vec::new(), rules_dir());
     match sources.load_rules(&vars)? {
-        Some((path, rules)) => println!("{}: {} rules, valid", path.display(), rules.len()),
+        Some((path, rules)) => {
+            let (hooks, shadow_hooks) = rules.hook_counts();
+            println!(
+                "{}: {} rules ({} in shadow mode), {hooks} hooks ({shadow_hooks} in shadow mode), valid",
+                path.display(),
+                rules.len(),
+                rules.shadow_count()
+            );
+        }
         None => println!("no rules file: set {EXTENSIONS_FILE_VAR} or add extensions.yaml"),
     }
     Ok(())
@@ -520,11 +528,16 @@ fn build_router_with(state: AppState, ext_routes: Option<Router>) -> Router {
     let (health, _) = OpenApiRouter::<AppState>::new()
         .routes(routes!(routes::admin::healthz))
         .split_for_parts();
+    let phases_state = state.clone();
     Router::new()
         .merge(health)
         .merge(protected)
         .fallback(routes::ui::serve)
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            phases_state,
+            services::extension_http::run_phases,
+        ))
 }
 
 fn open_store(config: &HubConfig) -> Result<Option<Store>, String> {
@@ -578,6 +591,65 @@ mod tests {
         let router = build_router(state.clone());
         tokio::spawn(async move { axum::serve(listener, router).await });
         (base, state)
+    }
+
+    #[tokio::test]
+    async fn http_rules_run_on_every_route_including_the_fallback_and_a_rejection() {
+        let (base, state) = serve_hub_with_auth_state().await;
+        let env = |_: &str| None;
+        let rules = crate::ext::rules::parse(
+            "rules:\n  - name: tag\n    phase: http_response\n    actions:\n      - set_header: {x-hub: on}\n  - name: block\n    phase: http_request\n    match: {path: /api/*, header: {x-block: '1'}}\n    actions:\n      - reject: {status: 403, message: blocked}\n  - name: accepted\n    phase: http_response\n    match: {path: /healthz, method: GET}\n    actions:\n      - set_status: 202\n      - remove_header: content-type\n  - name: trial\n    phase: http_request\n    mode: shadow\n    actions:\n      - reject: {status: 500, message: never}\n",
+            false,
+            &env,
+        )
+        .unwrap();
+        let mut all = crate::ext::builtin::builtins();
+        all.push(Arc::new(rules));
+        state.set_extensions(crate::ext::ExtensionSet::new(all));
+        let client = reqwest::Client::new();
+
+        let health = client.get(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(health.status(), 202);
+        assert_eq!(health.headers()["x-hub"], "on");
+        assert!(health.headers().get("content-type").is_none());
+        assert_eq!(health.text().await.unwrap(), "ok");
+
+        let page = client
+            .get(format!("{base}/no-such-page"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), 200);
+        assert_eq!(page.headers()["x-hub"], "on");
+
+        let blocked = client
+            .get(format!("{base}/api/profiles"))
+            .bearer_auth(MASTER_KEY)
+            .header("x-block", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), 403);
+        assert_eq!(blocked.headers()["x-hub"], "on");
+        let body: serde_json::Value = blocked.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "blocked");
+
+        let blocked_before_the_key_check = client
+            .get(format!("{base}/api/profiles"))
+            .header("x-block", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked_before_the_key_check.status(), 403);
+
+        let allowed = client
+            .get(format!("{base}/api/profiles"))
+            .bearer_auth(MASTER_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), 200);
+        assert_eq!(allowed.headers()["x-hub"], "on");
     }
 
     #[tokio::test]

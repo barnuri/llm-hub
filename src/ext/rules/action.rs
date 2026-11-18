@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 use crate::consts::HEADER_FALLBACKS;
 use crate::ext::rules::matcher::{header_name, header_value};
 use crate::ext::rules::rule_spec::{ActionSpec, PhaseName};
-use crate::ext::{AttemptCtx, Flow, RequestCtx, ResponseCtx};
+use crate::ext::{AttemptCtx, Flow, HttpRequestCtx, HttpResponseCtx, RequestCtx, ResponseCtx};
 
 /// One compiled rule action.
 #[derive(Debug)]
@@ -28,6 +28,9 @@ impl Action {
     ) -> Result<Action, String> {
         let name = spec.name();
         let allowed: &[&str] = match phase {
+            PhaseName::HttpRequest => &["set_header", "remove_header", "reject"],
+            PhaseName::HttpResponse => &["set_header", "remove_header", "set_status"],
+            PhaseName::Complete => &[],
             PhaseName::Request => &[
                 "set_header",
                 "remove_header",
@@ -122,6 +125,20 @@ impl Action {
         })
     }
 
+    /// The action as a short phrase for a log line, such as `reject(403)`.
+    pub fn describe(&self) -> String {
+        match self {
+            Action::SetHeader(_) => "set_header".to_owned(),
+            Action::RemoveHeader(_) => "remove_header".to_owned(),
+            Action::SetField(_) => "set_field".to_owned(),
+            Action::RemoveField(_) => "remove_field".to_owned(),
+            Action::SetModel(_) => "set_model".to_owned(),
+            Action::Reject(status, _) => format!("reject({})", status.as_u16()),
+            Action::RetryNext => "retry_next".to_owned(),
+            Action::SetStatus(status) => format!("set_status({})", status.as_u16()),
+        }
+    }
+
     /// True when the action changes a JSON body.
     pub fn changes_body(&self) -> bool {
         matches!(
@@ -169,6 +186,26 @@ impl ActionTarget for AttemptCtx<'_> {
 
     fn target_body(&mut self) -> Option<&mut Value> {
         self.body_mut()
+    }
+}
+
+impl ActionTarget for HttpRequestCtx<'_> {
+    fn target_headers(&mut self) -> &mut HeaderMap {
+        self.headers_mut()
+    }
+
+    fn target_body(&mut self) -> Option<&mut Value> {
+        None
+    }
+}
+
+impl ActionTarget for HttpResponseCtx<'_> {
+    fn target_headers(&mut self) -> &mut HeaderMap {
+        self.headers_mut()
+    }
+
+    fn target_body(&mut self) -> Option<&mut Value> {
+        None
     }
 }
 

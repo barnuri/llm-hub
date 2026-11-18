@@ -13,6 +13,7 @@ use crate::consts::{
     SELECTION_HISTORY_MAX_LIMIT,
 };
 use crate::dependencies::state::AppState;
+use crate::ext::ConfigKind;
 use crate::routes::proxy::{concrete_profiles, hub_policy};
 use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::app_error::AppError;
@@ -39,6 +40,7 @@ use crate::schemas::smart_auto_role_tiers::{ROLE_TIER_DEFAULTS, role_from_name};
 use crate::schemas::smart_auto_rules::SmartAutoRules;
 use crate::schemas::smart_auto_tier::SmartAutoTier;
 use crate::schemas::turn_signals::TurnSignals;
+use crate::services::extension_phases;
 use crate::services::model_health::HealthRow;
 use crate::services::selection_log::SelectionLog;
 use crate::services::smart_auto_live::SmartAutoLive;
@@ -337,7 +339,10 @@ pub async fn get_rules(State(state): State<AppState>) -> Response {
 /// `PUT /api/smart-auto/rules`: validates the body, saves it atomically and returns the saved rules.
 #[utoipa::path(put, path = "/api/smart-auto/rules", tag = "smart-auto", summary = "Replace the rules", request_body(content = Object, description = "Smart Auto rules document", content_type = "application/json"), responses((status = 200, description = "The saved rules", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 403, description = "Config is read-only (LLM_HUB_CONFIG_READONLY=true).", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn put_rules(State(state): State<AppState>, body: Bytes) -> Response {
-    match state.smart_auto_rules().replace(&body) {
+    let saved = extension_phases::changing(&state, ConfigKind::SmartAutoRules, None, || {
+        state.smart_auto_rules().replace(&body)
+    });
+    match saved {
         Ok(loaded) => rules_response(&loaded),
         Err(error) => error.into_response(),
     }
@@ -1119,6 +1124,40 @@ mod tests {
             })
             .collect();
         assert_eq!(eligible, BTreeMap::from([(ALPHA, true), (BETA, false)]));
+    }
+
+    struct FreezeRules;
+
+    impl crate::ext::Extension for FreezeRules {
+        fn name(&self) -> &'static str {
+            "freeze-rules"
+        }
+
+        fn on_config_change(&self, ctx: &crate::ext::ConfigChangeCtx<'_>) -> crate::ext::Flow {
+            if ctx.kind() == ConfigKind::SmartAutoRules {
+                crate::ext::Flow::reject(423, "Smart Auto rules are frozen")
+            } else {
+                crate::ext::Flow::Continue
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_extension_can_stop_a_smart_auto_rules_save() {
+        let hub = with_models(Persistence::Off, &[ALPHA, BETA]);
+        let mut all = crate::ext::builtin::builtins();
+        all.push(std::sync::Arc::new(FreezeRules));
+        hub.state.set_extensions(crate::ext::ExtensionSet::new(all));
+
+        let response = put_rules(
+            State(hub.state.clone()),
+            Bytes::from_static(br#"{"exclude":["beta/*"]}"#),
+        )
+        .await;
+        let (_, rules) = json_of(get_rules(State(hub.state.clone())).await).await;
+
+        assert_eq!(response.status().as_u16(), 423);
+        assert_eq!(rules["rules"]["exclude"], serde_json::json!([]));
     }
 
     #[tokio::test]
