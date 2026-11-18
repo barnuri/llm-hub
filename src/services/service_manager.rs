@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::consts::{SERVICE_BIND, SERVICE_LABEL, SERVICE_PORT};
+use crate::consts::{SERVICE_BIND, SERVICE_LABEL, SERVICE_NAME, SERVICE_PORT};
 
 /// `ping -n 3` waits about two seconds, so a hub that keeps crashing does not spin.
 const WINDOWS_RESTART_DELAY_PINGS: u32 = 3;
@@ -90,6 +90,46 @@ RestartSec=2
 WantedBy=default.target
 "#
     )
+}
+
+/// Writes the unit to `unit` and (re)starts it through `run`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn install_systemd_unit(
+    unit: &Path,
+    exe: &Path,
+    cwd: &Path,
+    mut run: impl FnMut(&str, &[&str]) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(dir) = unit.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(unit, render_systemd_unit(exe, cwd)).map_err(|e| e.to_string())?;
+    println!("wrote {}", unit.display());
+    run("systemctl", &["--user", "daemon-reload"])?;
+    run("systemctl", &["--user", "enable", "--now", SERVICE_NAME])?;
+    // enable --now is a no-op when already running — restart so a
+    // reinstall always picks up the rewritten unit.
+    run("systemctl", &["--user", "restart", SERVICE_NAME])?;
+    println!(
+        "hint: run `loginctl enable-linger $USER` so the service starts at boot without a login session"
+    );
+    Ok(())
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn uninstall_systemd_unit(
+    unit_path: impl FnOnce() -> Result<PathBuf, String>,
+    mut run: impl FnMut(&str, &[&str]) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Err(e) = run("systemctl", &["--user", "disable", "--now", SERVICE_NAME]) {
+        println!("note: {e} (service may not be running)");
+    }
+    let unit = unit_path()?;
+    if unit.exists() {
+        std::fs::remove_file(&unit).map_err(|e| e.to_string())?;
+        println!("removed {}", unit.display());
+    }
+    run("systemctl", &["--user", "daemon-reload"])
 }
 
 /// The script a Windows logon task runs. It restarts the hub whenever it
@@ -311,43 +351,21 @@ mod platform {
 
     use crate::consts::SERVICE_NAME;
 
-    use super::{render_systemd_unit, run};
+    use super::{install_systemd_unit, run, uninstall_systemd_unit};
 
     pub fn install(exe: &Path, cwd: &Path) -> Result<(), String> {
-        let unit = unit_path()?;
-        if let Some(dir) = unit.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&unit, render_systemd_unit(exe, cwd)).map_err(|e| e.to_string())?;
-        println!("wrote {}", unit.display());
-        run("systemctl", &["--user", "daemon-reload"])?;
-        run("systemctl", &["--user", "enable", "--now", SERVICE_NAME])?;
-        // enable --now is a no-op when already running — restart so a
-        // reinstall always picks up the rewritten unit.
-        run("systemctl", &["--user", "restart", SERVICE_NAME])?;
-        println!(
-            "hint: run `loginctl enable-linger $USER` so the service starts at boot without a login session"
-        );
-        Ok(())
+        install_systemd_unit(&unit_path()?, exe, cwd, run)
     }
 
     pub fn uninstall() -> Result<(), String> {
-        if let Err(e) = run("systemctl", &["--user", "disable", "--now", SERVICE_NAME]) {
-            println!("note: {e} (service may not be running)");
-        }
-        let unit = unit_path()?;
-        if unit.exists() {
-            std::fs::remove_file(&unit).map_err(|e| e.to_string())?;
-            println!("removed {}", unit.display());
-        }
-        run("systemctl", &["--user", "daemon-reload"])
+        uninstall_systemd_unit(unit_path, run)
     }
 
     pub fn status() -> Result<(), String> {
         run("systemctl", &["--user", "status", SERVICE_NAME])
     }
 
-    fn unit_path() -> Result<PathBuf, String> {
+    pub(super) fn unit_path() -> Result<PathBuf, String> {
         let home = std::env::home_dir().ok_or("cannot determine home directory")?;
         Ok(home
             .join(".config/systemd/user")
@@ -543,5 +561,225 @@ mod tests {
 
         assert!(out.contains("<string>/a&amp;b/llm-hub</string>"));
         assert!(!out.contains("/a&b/"));
+    }
+
+    #[derive(Default)]
+    struct FakeRunner {
+        calls: Vec<String>,
+        fail_on: Vec<&'static str>,
+    }
+
+    impl FakeRunner {
+        fn failing_on(commands: &[&'static str]) -> Self {
+            Self {
+                calls: Vec::new(),
+                fail_on: commands.to_vec(),
+            }
+        }
+
+        fn run(&mut self, program: &str, args: &[&str]) -> Result<(), String> {
+            let call = format!("{program} {}", args.join(" "));
+            self.calls.push(call.clone());
+            if self.fail_on.iter().any(|f| call.contains(f)) {
+                return Err(format!("{program} exited with exit status: 1"));
+            }
+            Ok(())
+        }
+    }
+
+    fn systemctl(args: &str) -> String {
+        format!("systemctl --user {args}")
+    }
+
+    #[test]
+    fn systemd_install_writes_the_unit_then_reloads_enables_and_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("systemd/user/llm-hub.service");
+        let mut runner = FakeRunner::default();
+
+        install_systemd_unit(
+            &unit,
+            Path::new("/opt/bin/llm-hub"),
+            Path::new("/srv/hub"),
+            |p, a| runner.run(p, a),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&unit).unwrap(),
+            render_systemd_unit(Path::new("/opt/bin/llm-hub"), Path::new("/srv/hub"))
+        );
+        assert_eq!(
+            runner.calls,
+            vec![
+                systemctl("daemon-reload"),
+                systemctl(&format!("enable --now {SERVICE_NAME}")),
+                systemctl(&format!("restart {SERVICE_NAME}")),
+            ]
+        );
+    }
+
+    #[test]
+    fn systemd_install_overwrites_a_previous_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("llm-hub.service");
+        std::fs::write(&unit, "stale").unwrap();
+        let mut runner = FakeRunner::default();
+
+        install_systemd_unit(&unit, Path::new("/new/llm-hub"), dir.path(), |p, a| {
+            runner.run(p, a)
+        })
+        .unwrap();
+
+        let written = std::fs::read_to_string(&unit).unwrap();
+        assert!(written.contains("ExecStart=\"/new/llm-hub\""));
+        assert!(!written.contains("stale"));
+    }
+
+    #[test]
+    fn systemd_install_stops_at_the_first_failed_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("llm-hub.service");
+        let mut runner = FakeRunner::failing_on(&["enable"]);
+
+        let err = install_systemd_unit(&unit, Path::new("/opt/llm-hub"), dir.path(), |p, a| {
+            runner.run(p, a)
+        })
+        .unwrap_err();
+
+        assert_eq!(err, "systemctl exited with exit status: 1");
+        assert_eq!(
+            runner.calls,
+            vec![
+                systemctl("daemon-reload"),
+                systemctl(&format!("enable --now {SERVICE_NAME}")),
+            ]
+        );
+    }
+
+    #[test]
+    fn systemd_install_fails_without_running_systemctl_when_the_unit_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "").unwrap();
+        let mut runner = FakeRunner::default();
+
+        let result = install_systemd_unit(
+            &blocker.join("llm-hub.service"),
+            Path::new("/opt/llm-hub"),
+            dir.path(),
+            |p, a| runner.run(p, a),
+        );
+
+        assert!(result.is_err());
+        assert!(runner.calls.is_empty());
+    }
+
+    #[test]
+    fn systemd_uninstall_disables_removes_the_unit_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("llm-hub.service");
+        std::fs::write(&unit, "unit").unwrap();
+        let mut runner = FakeRunner::default();
+
+        uninstall_systemd_unit(|| Ok(unit.clone()), |p, a| runner.run(p, a)).unwrap();
+
+        assert!(!unit.exists());
+        assert_eq!(
+            runner.calls,
+            vec![
+                systemctl(&format!("disable --now {SERVICE_NAME}")),
+                systemctl("daemon-reload"),
+            ]
+        );
+    }
+
+    #[test]
+    fn systemd_uninstall_tolerates_a_stopped_service_and_a_missing_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("llm-hub.service");
+        let mut runner = FakeRunner::failing_on(&["disable"]);
+
+        let result = uninstall_systemd_unit(|| Ok(unit.clone()), |p, a| runner.run(p, a));
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(runner.calls.last(), Some(&systemctl("daemon-reload")));
+    }
+
+    #[test]
+    fn systemd_uninstall_reports_a_failed_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = FakeRunner::failing_on(&["daemon-reload"]);
+
+        let result = uninstall_systemd_unit(
+            || Ok(dir.path().join("llm-hub.service")),
+            |p, a| runner.run(p, a),
+        );
+
+        assert_eq!(result, Err("systemctl exited with exit status: 1".into()));
+    }
+
+    #[test]
+    fn systemd_uninstall_fails_when_the_unit_path_is_unknown() {
+        let mut runner = FakeRunner::default();
+
+        let result = uninstall_systemd_unit(
+            || Err("cannot determine home directory".to_string()),
+            |p, a| runner.run(p, a),
+        );
+
+        assert_eq!(result, Err("cannot determine home directory".into()));
+        assert_eq!(
+            runner.calls,
+            vec![systemctl(&format!("disable --now {SERVICE_NAME}"))]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_unit_lives_in_the_user_unit_dir() {
+        let unit = platform::unit_path().unwrap();
+
+        assert!(unit.ends_with(format!(".config/systemd/user/{SERVICE_NAME}.service")));
+    }
+
+    #[test]
+    fn xml_escape_replaces_markup_characters() {
+        assert_eq!(xml_escape("a<b>&c"), "a&lt;b&gt;&amp;c");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn run_reports_a_program_that_cannot_start() {
+        let err = run("llm-hub-test-no-such-program", &["--version"]).unwrap_err();
+
+        assert!(
+            err.starts_with("failed to run llm-hub-test-no-such-program: "),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_succeeds_when_the_program_exits_zero() {
+        assert_eq!(run("sh", &["-c", "exit 0"]), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_reports_a_nonzero_exit_status() {
+        let err = run("sh", &["-c", "exit 3"]).unwrap_err();
+
+        assert!(err.starts_with("sh exited with "), "{err}");
+        assert!(err.contains('3'), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_reports_a_nonzero_exit_status() {
+        let err = run("cmd", &["/C", "exit 3"]).unwrap_err();
+
+        assert!(err.starts_with("cmd exited with "), "{err}");
+        assert!(err.contains('3'), "{err}");
     }
 }

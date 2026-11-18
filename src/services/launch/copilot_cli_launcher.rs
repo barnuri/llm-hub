@@ -80,4 +80,37 @@ mod tests {
         assert_eq!(spec.env_value("COPILOT_MODEL"), Some("other"));
         assert_eq!(spec.env_value("COPILOT_PROVIDER_MAX_PROMPT_TOKENS"), None);
     }
+
+    #[test]
+    fn a_catalog_model_with_a_window_gets_prompt_and_output_budgets() {
+        let catalog = [HubModel::new("copilot/m", Some(128_000))];
+
+        let spec = CopilotCliLauncher::spec(
+            &endpoint(),
+            LaunchArgs::from_strs(&["copilot/m", "--yolo"]),
+            &catalog,
+        );
+
+        assert_eq!(spec.env_value("COPILOT_MODEL"), Some("copilot/m"));
+        assert_eq!(
+            spec.env_value("COPILOT_PROVIDER_MAX_PROMPT_TOKENS"),
+            Some("96000")
+        );
+        assert_eq!(
+            spec.env_value("COPILOT_PROVIDER_MAX_OUTPUT_TOKENS"),
+            Some("32000")
+        );
+        assert_eq!(spec.argv(), ["--yolo"]);
+    }
+
+    #[test]
+    fn a_catalog_model_without_a_window_gets_no_budgets() {
+        let catalog = [HubModel::new("copilot/m", None).with_max_output_tokens(64_000)];
+
+        let spec =
+            CopilotCliLauncher::spec(&endpoint(), LaunchArgs::from_strs(&["copilot/m"]), &catalog);
+
+        assert_eq!(spec.env_value("COPILOT_PROVIDER_MAX_PROMPT_TOKENS"), None);
+        assert_eq!(spec.env_value("COPILOT_PROVIDER_MAX_OUTPUT_TOKENS"), None);
+    }
 }

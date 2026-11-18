@@ -90,17 +90,33 @@ impl LaunchCommand {
 /// Returns a message when the hub is unreachable, the pi extension cannot be
 /// written, the harness binary cannot start, or the Smart Auto flags do not fit the harness.
 pub async fn run(command: LaunchCommand) -> Result<(), String> {
+    prepare(command, |name| std::env::var(name).ok())
+        .await?
+        .exec()
+}
+
+/// The harness command for `command`, once the hub at `lookup`'s `LLM_HUB_URL` answers.
+async fn prepare(
+    command: LaunchCommand,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<LaunchSpec, String> {
     let LaunchCommand {
         harness,
         profiles,
         smart_auto,
         args,
     } = command;
-    let endpoint = HubEndpoint::from_lookup(|name| std::env::var(name).ok());
+    let endpoint = HubEndpoint::from_lookup(&lookup);
     let client = HubClient::new(endpoint)?.with_profiles(profiles);
     client.check_reachable().await?;
-    let spec = build_spec(harness, &client, LaunchArgs::parse(args), &smart_auto).await?;
-    spec.exec()
+    build_spec(
+        harness,
+        &client,
+        LaunchArgs::parse(args),
+        &smart_auto,
+        &lookup,
+    )
+    .await
 }
 
 async fn build_spec(
@@ -108,12 +124,13 @@ async fn build_spec(
     client: &HubClient,
     args: LaunchArgs,
     smart_auto: &SmartAutoFlags,
+    lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<LaunchSpec, String> {
     let endpoint = client.endpoint();
     let spec = match harness {
         Harness::Claude => {
-            let inherited = std::env::var(ClaudeLauncher::custom_headers_var()).ok();
-            let model = ClaudeLauncher::inherited_model(|name| std::env::var(name).ok());
+            let inherited = lookup(ClaudeLauncher::custom_headers_var());
+            let model = ClaudeLauncher::inherited_model(&lookup);
             let args = header_transport_model(args, smart_auto, model.as_deref())?;
             ClaudeLauncher::spec(
                 endpoint,
@@ -146,7 +163,7 @@ async fn build_spec(
         }
         Harness::Pi => {
             let args = preset_args(args, smart_auto)?;
-            let extension = PiLauncher::write_extension(|name| std::env::var(name).ok())?;
+            let extension = PiLauncher::write_extension(&lookup)?;
             PiLauncher::spec(endpoint, args, &extension, client.profiles())
         }
     };
@@ -214,6 +231,10 @@ async fn catalog_for(client: &HubClient, args: &LaunchArgs) -> Vec<HubModel> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
     use crate::schemas::smart_auto_tier::SmartAutoTier;
 
@@ -451,5 +472,263 @@ mod tests {
         let flags = flags_of(&["--smart-auto-role=planning"]);
 
         assert!(preset_args(LaunchArgs::from_strs(&[]), &flags).is_err());
+    }
+
+    fn lookup_of(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    async fn hub() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/healthz"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [
+                {"id": "copilot/m", "context_window": 128_000},
+            ]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/claude-code/settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"x":1}"#))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn client_for(server: &MockServer) -> HubClient {
+        HubClient::new(HubEndpoint::from_lookup(lookup_of(&[(
+            "LLM_HUB_URL",
+            &server.uri(),
+        )])))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_hub_that_does_not_answer_stops_the_launch() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/healthz"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let error = prepare(
+            parsed(&["codex"]),
+            lookup_of(&[("LLM_HUB_URL", &server.uri())]),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            format!("llm-hub is not reachable at {}", server.uri())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reachable_hub_gives_the_harness_spec_from_the_lookup() {
+        let server = hub().await;
+
+        let spec = prepare(
+            parsed(&[
+                "--profiles",
+                "copilot",
+                "copilot-cli",
+                "copilot/m",
+                "--yolo",
+            ]),
+            lookup_of(&[("LLM_HUB_URL", &server.uri()), ("LLM_HUB_API_KEY", "k")]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(spec.program(), "copilot");
+        assert_eq!(
+            spec.env_value("COPILOT_PROVIDER_BASE_URL"),
+            Some(format!("{}/v1", server.uri()).as_str())
+        );
+        assert_eq!(spec.env_value("COPILOT_PROVIDER_API_KEY"), Some("k"));
+        assert_eq!(
+            spec.env_value("COPILOT_PROVIDER_MAX_PROMPT_TOKENS"),
+            Some("96000")
+        );
+        assert_eq!(spec.argv(), ["--yolo"]);
+    }
+
+    #[tokio::test]
+    async fn claude_gets_the_hub_settings_and_keeps_the_inherited_headers() {
+        let server = hub().await;
+        let fast = flags_of(&["--smart-auto-tier=fast"]);
+
+        let spec = build_spec(
+            Harness::Claude,
+            &client_for(&server),
+            LaunchArgs::from_strs(&["-p"]),
+            &fast,
+            lookup_of(&[("ANTHROPIC_CUSTOM_HEADERS", "X-Own: 1")]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(spec.program(), "claude");
+        assert_eq!(
+            spec.env_value("ANTHROPIC_MODEL"),
+            Some("hub/smart-auto-fast")
+        );
+        assert!(
+            spec.env_value("ANTHROPIC_CUSTOM_HEADERS")
+                .unwrap()
+                .starts_with("X-Own: 1\n")
+        );
+        assert_eq!(spec.argv(), ["--settings", r#"{"x":1}"#, "-p"]);
+    }
+
+    #[tokio::test]
+    async fn claude_with_an_inherited_concrete_model_rejects_smart_auto_flags() {
+        let server = hub().await;
+        let fast = flags_of(&["--smart-auto-tier=fast"]);
+
+        let result = build_spec(
+            Harness::Claude,
+            &client_for(&server),
+            LaunchArgs::from_strs(&[]),
+            &fast,
+            lookup_of(&[("ANTHROPIC_MODEL", "copilot/m")]),
+        )
+        .await;
+
+        assert!(result.unwrap_err().contains("copilot/m is not one"));
+    }
+
+    #[tokio::test]
+    async fn codex_sizes_a_named_model_from_the_catalog() {
+        let server = hub().await;
+
+        let spec = build_spec(
+            Harness::Codex,
+            &client_for(&server),
+            LaunchArgs::from_strs(&["copilot/m"]),
+            &SmartAutoFlags::default(),
+            lookup_of(&[]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(spec.program(), "codex");
+        assert!(
+            spec.argv()
+                .contains(&"model_context_window=128000".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_without_a_model_does_not_fetch_the_catalog() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let spec = build_spec(
+            Harness::Codex,
+            &client_for(&server),
+            LaunchArgs::from_strs(&[]),
+            &SmartAutoFlags::default(),
+            lookup_of(&[]),
+        )
+        .await
+        .unwrap();
+
+        assert!(!spec.argv().iter().any(|arg| arg.starts_with("model=")));
+    }
+
+    #[tokio::test]
+    async fn codex_rejects_smart_auto_flags_next_to_a_model() {
+        let server = hub().await;
+
+        let result = build_spec(
+            Harness::Codex,
+            &client_for(&server),
+            LaunchArgs::from_strs(&["copilot/m"]),
+            &flags_of(&["--smart-auto-tier=fast"]),
+            lookup_of(&[]),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn opencode_lists_the_catalog_and_defaults_to_balance() {
+        let server = hub().await;
+
+        let spec = build_spec(
+            Harness::Opencode,
+            &client_for(&server),
+            LaunchArgs::from_strs(&[]),
+            &SmartAutoFlags::default(),
+            lookup_of(&[]),
+        )
+        .await
+        .unwrap();
+
+        let config = spec.env_value("OPENCODE_CONFIG_CONTENT").unwrap();
+        assert_eq!(spec.program(), "opencode");
+        assert!(config.contains("copilot/m"));
+        assert!(config.contains("hub/smart-auto-balance"));
+    }
+
+    #[tokio::test]
+    async fn pi_writes_its_extension_under_the_looked_up_cache_dir() {
+        let server = hub().await;
+        let cache = tempfile::tempdir().unwrap();
+        let cache_path = cache.path().to_string_lossy().into_owned();
+
+        let spec = build_spec(
+            Harness::Pi,
+            &client_for(&server),
+            LaunchArgs::from_strs(&["copilot/m"]),
+            &SmartAutoFlags::default(),
+            lookup_of(&[("XDG_CACHE_HOME", &cache_path)]),
+        )
+        .await
+        .unwrap();
+
+        let extension = cache.path().join("llm-hub").join("pi-extension.ts");
+        assert_eq!(spec.program(), "pi");
+        assert_eq!(spec.argv()[0], "-e");
+        assert_eq!(std::path::Path::new(&spec.argv()[1]), extension);
+        assert!(extension.is_file());
+    }
+
+    #[tokio::test]
+    async fn pi_without_a_cache_dir_is_an_error() {
+        let server = hub().await;
+
+        let result = build_spec(
+            Harness::Pi,
+            &client_for(&server),
+            LaunchArgs::from_strs(&[]),
+            &SmartAutoFlags::default(),
+            lookup_of(&[]),
+        )
+        .await;
+
+        assert!(result.unwrap_err().starts_with("cannot find a cache dir"));
     }
 }

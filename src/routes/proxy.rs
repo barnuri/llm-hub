@@ -70,6 +70,7 @@ use crate::services::model_health::FailureKind;
 use crate::services::multipart_model;
 use crate::services::request_images::request_has_image;
 use crate::services::responses_chat::{self, ChatStream};
+use crate::services::responses_context;
 use crate::services::responses_item_ids::ResponsesItemIds;
 use crate::services::review_graph::ReviewGraph;
 use crate::services::review_orchestrator::ReviewOrchestrator;
@@ -232,20 +233,7 @@ pub(crate) async fn attempt_loop(
         input: bodies.auto_input(),
         prompt_tokens: estimated_prompt_tokens(bodies.original.len()),
     };
-    let mut refusals: Vec<String> = Vec::new();
-    let chain: Vec<ModelId> = chain
-        .into_iter()
-        .filter_map(|model| match refusal(state, &config, &model, &needs) {
-            None => Some(model),
-            Some(reason) => {
-                refusals.push(reason);
-                None
-            }
-        })
-        .collect();
-    if chain.is_empty() {
-        return Err(AppError::BadRequest(refusals.join("; ")));
-    }
+    let chain = servable_chain(state, &config, chain, &needs)?;
 
     let client_path = bare_path(path_and_query);
     if client_path == NATIVE_COUNT_TOKENS_PATH && !serves_native_count_tokens(state, &chain[0]) {
@@ -955,6 +943,49 @@ struct RequestNeeds<'a> {
     prompt_tokens: u64,
 }
 
+/// Why a model may not serve a request.
+enum Refusal {
+    /// The model cannot serve it: an image to a text-only model, or Copilot Auto off the chat path.
+    Certain(String),
+    /// The size estimate is over the model's known `limit` by more than the margin.
+    Estimated { reason: String, limit: u64 },
+}
+
+/// The chain models that may serve the request, or the 400 naming every refusal. On a Responses
+/// call, when only the size estimate refuses every model, the one with the largest known limit stays.
+fn servable_chain(
+    state: &AppState,
+    config: &HubConfig,
+    chain: Vec<ModelId>,
+    needs: &RequestNeeds<'_>,
+) -> Result<Vec<ModelId>, AppError> {
+    let mut servable = Vec::new();
+    let mut refusals = Vec::new();
+    let mut roomiest: Option<(ModelId, u64)> = None;
+    for model in chain {
+        match refusal(state, config, &model, needs) {
+            None => servable.push(model),
+            Some(Refusal::Certain(reason)) => refusals.push(reason),
+            Some(Refusal::Estimated { reason, limit }) => {
+                refusals.push(reason);
+                if roomiest.as_ref().is_none_or(|(_, best)| limit > *best) {
+                    roomiest = Some((model, limit));
+                }
+            }
+        }
+    }
+    if servable.is_empty()
+        && is_responses_endpoint(bare_path(needs.path))
+        && let Some((model, _)) = roomiest
+    {
+        servable.push(model);
+    }
+    if servable.is_empty() {
+        return Err(AppError::BadRequest(refusals.join("; ")));
+    }
+    Ok(servable)
+}
+
 /// Why `model_id` cannot serve the request, or `None` when it may be tried. Reads memory only.
 /// A prompt within `PROMPT_REFUSAL_MARGIN_PERCENT` of the limit is tried, because the estimate overstates.
 fn refusal(
@@ -962,7 +993,7 @@ fn refusal(
     config: &HubConfig,
     model_id: &ModelId,
     needs: &RequestNeeds<'_>,
-) -> Option<String> {
+) -> Option<Refusal> {
     let qualified = model_id.qualified();
     let is_copilot = config
         .profile(&model_id.profile)
@@ -970,10 +1001,10 @@ fn refusal(
     if is_copilot && AutoTier::from_model(&model_id.model).is_some() {
         // Copilot Auto checks the image and the prompt size of the model it picks.
         return (!serves_chat_path(needs.path)).then(|| {
-            format!(
+            Refusal::Certain(format!(
                 "{qualified} routes chat requests only; pick a model for {}",
                 bare_path(needs.path)
-            )
+            ))
         });
     }
     let snapshot = state.model_descriptors();
@@ -982,14 +1013,19 @@ fn refusal(
     let refuses_images = descriptor.and_then(|found| found.vision) == Some(false)
         || state.vision_unsupported(&model_id.profile, &upstream);
     if refuses_images && request_has_image(needs.input.0, needs.input.1) {
-        return Some(format!("{qualified}: image input is not supported"));
+        return Some(Refusal::Certain(format!(
+            "{qualified}: image input is not supported"
+        )));
     }
     let limit = known_prompt_limit(state, model_id, is_copilot, &upstream, descriptor)?;
     (needs.prompt_tokens.saturating_mul(100) > limit.saturating_mul(PROMPT_REFUSAL_MARGIN_PERCENT)).then(|| {
-        format!(
-            "{qualified}: a prompt of about {} tokens is over the known limit of {limit} tokens",
-            needs.prompt_tokens
-        )
+        Refusal::Estimated {
+            reason: format!(
+                "{qualified}: a prompt of about {} tokens is over the known limit of {limit} tokens",
+                needs.prompt_tokens
+            ),
+            limit,
+        }
     })
 }
 
@@ -1609,6 +1645,12 @@ async fn deliver(
     };
     if let Some(applied) = plan.header_value() {
         insert_header(out.headers_mut(), HEADER_TRANSFORMS, &applied);
+    }
+    if route == RouteKind::OpenAi
+        && is_responses_endpoint(bare_path(client_path))
+        && is_copilot_profile(state, model_id)
+    {
+        out = responses_context::rename_context_code(out).await;
     }
     out
 }
@@ -6968,6 +7010,312 @@ mod tests {
 
             assert_eq!(status, 200);
             assert_eq!(chat_models(&copilot).await, [TRANSLATED_UPSTREAM_ID]);
+        }
+
+        #[tokio::test]
+        async fn responses_fallback_whose_primary_known_limit_is_below_the_prompt_is_used() {
+            const BIG_ID: &str = "gpt-5-mini";
+            let copilot = copilot().await;
+            copilot.state.set_upstream_models(
+                PROFILE,
+                HashMap::from([
+                    (PLAIN_ID.to_string(), entry(PLAIN_ID, false)),
+                    (BIG_ID.to_string(), entry(BIG_ID, false)),
+                ]),
+            );
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 1_000, 1);
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .and(body_partial_json(json!({"model": PLAIN_ID})))
+                .respond_with(prompt_too_long())
+                .mount(&copilot.upstream)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .and(body_partial_json(json!({"model": BIG_ID})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(responses_text_reply("ok")))
+                .mount(&copilot.upstream)
+                .await;
+            let body =
+                json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "x".repeat(8_000)});
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &fallback_to(BIG_ID),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(requests_to(&copilot, RESPONSES_ENDPOINT).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn responses_prompt_estimated_over_every_known_limit_reaches_the_upstream() {
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 1_000, 1);
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(200).set_body_json(responses_text_reply("ok")))
+                .expect(2)
+                .mount(&copilot.upstream)
+                .await;
+
+            for input in [
+                json!([{"role": "user", "content": "x".repeat(8_000)}]),
+                json!([
+                    {"type": "reasoning", "summary": [], "encrypted_content": "a".repeat(8_000)},
+                    {"role": "user", "content": "hi"},
+                ]),
+            ] {
+                let body = json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": input});
+                let response = attempt_loop(
+                    &copilot.state,
+                    Method::POST,
+                    "/v1/responses?test=1",
+                    &client_headers(),
+                    Bytes::from(body.to_string()),
+                    RouteKind::OpenAi,
+                )
+                .await
+                .expect("the upstream decides when no other model remains");
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+
+        #[tokio::test]
+        async fn responses_context_rejection_is_renamed_and_still_teaches_the_limit() {
+            for streams in [true, false] {
+                let copilot = copilot().await;
+                Mock::given(method("POST"))
+                    .and(path(RESPONSES_ENDPOINT))
+                    .respond_with(prompt_too_long())
+                    .mount(&copilot.upstream)
+                    .await;
+                let body = json!({
+                    "model": format!("{PROFILE}/{PLAIN_ID}"),
+                    "input": "hi",
+                    "stream": streams,
+                });
+
+                let response = attempt_loop(
+                    &copilot.state,
+                    Method::POST,
+                    "/v1/responses",
+                    &client_headers(),
+                    Bytes::from(body.to_string()),
+                    RouteKind::OpenAi,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let raw = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let error = serde_json::from_slice::<Value>(&raw).unwrap()["error"].clone();
+                assert_eq!(error["code"], "context_length_exceeded");
+                assert_eq!(
+                    error["message"],
+                    "prompt is too long: 1200000 tokens > 900000 maximum"
+                );
+                for _ in 0..100 {
+                    if learned_limit(&copilot, PLAIN_ID).is_some()
+                        && copilot.state.stats().snapshot("all", false).overview.errors == 1
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(learned_limit(&copilot, PLAIN_ID), Some(900_000));
+                assert_eq!(
+                    copilot.state.stats().snapshot("all", false).overview.errors,
+                    1
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn responses_prompt_over_every_known_limit_goes_to_the_largest_limit() {
+            const BIG_ID: &str = "gpt-5-mini";
+            let copilot = copilot().await;
+            copilot.state.set_upstream_models(
+                PROFILE,
+                HashMap::from([
+                    (PLAIN_ID.to_string(), entry(PLAIN_ID, false)),
+                    (BIG_ID.to_string(), entry(BIG_ID, false)),
+                ]),
+            );
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 1_000, 1);
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, BIG_ID, 2_000, 1);
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(200).set_body_json(responses_text_reply("ok")))
+                .mount(&copilot.upstream)
+                .await;
+            let body =
+                json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "x".repeat(16_000)});
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &fallback_to(BIG_ID),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent_json(&sent[0])["model"], BIG_ID);
+        }
+
+        #[tokio::test]
+        async fn responses_body_padded_with_json_whitespace_reaches_the_upstream() {
+            const KNOWN_LIMIT: u64 = 922_000;
+            const PADDED_BYTES: usize = 5_546_304;
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, KNOWN_LIMIT, 1);
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(200).set_body_json(responses_text_reply("ok")))
+                .mount(&copilot.upstream)
+                .await;
+            let mut body = json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "hi"})
+                .to_string()
+                .into_bytes();
+            body.resize(PADDED_BYTES, b' ');
+            let estimate = estimated_prompt_tokens(body.len());
+            assert!(estimate * 100 > KNOWN_LIMIT * PROMPT_REFUSAL_MARGIN_PERCENT);
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &client_headers(),
+                Bytes::from(body),
+                RouteKind::OpenAi,
+            )
+            .await
+            .expect("whitespace is not prompt tokens");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(requests_to(&copilot, RESPONSES_ENDPOINT).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn responses_unrelated_upstream_error_passes_through_unchanged() {
+            let copilot = copilot().await;
+            let error =
+                json!({"error": {"code": "invalid_request_error", "message": "bad tool schema"}});
+            Mock::given(method("POST"))
+                .and(path(RESPONSES_ENDPOINT))
+                .respond_with(ResponseTemplate::new(400).set_body_json(&error))
+                .mount(&copilot.upstream)
+                .await;
+            let body =
+                json!({"model": format!("{PROFILE}/{PLAIN_ID}"), "input": "hi", "stream": true});
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &client_headers(),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let raw = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&raw).unwrap(), error);
+        }
+
+        #[tokio::test]
+        async fn responses_image_to_a_text_only_model_is_still_refused_without_an_upstream_call() {
+            let copilot = copilot().await;
+            copilot.state.set_model_descriptors(vec![described(
+                &format!("{PROFILE}/{PLAIN_ID}"),
+                Some(false),
+            )]);
+            let body = json!({
+                "model": format!("{PROFILE}/{PLAIN_ID}"),
+                "input": [{"role": "user", "content": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                ]}],
+            });
+
+            let message = refused_message(
+                &copilot,
+                "/v1/responses",
+                RouteKind::OpenAi,
+                &client_headers(),
+                &body,
+            )
+            .await;
+
+            assert_eq!(message, "copilot/gpt-4.1: image input is not supported");
+            assert!(requests_to(&copilot, RESPONSES_ENDPOINT).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn chat_completions_prompt_over_the_only_known_limit_is_still_refused() {
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 1_000, 1);
+            let body = json!({
+                "model": format!("{PROFILE}/{PLAIN_ID}"),
+                "messages": [{"role": "user", "content": "x".repeat(8_000)}],
+            });
+
+            let message = refused_message(
+                &copilot,
+                "/v1/chat/completions",
+                RouteKind::OpenAi,
+                &client_headers(),
+                &body,
+            )
+            .await;
+
+            assert!(
+                message.ends_with("is over the known limit of 1000 tokens"),
+                "{message}"
+            );
+            assert!(
+                copilot
+                    .upstream
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
 
         #[tokio::test]

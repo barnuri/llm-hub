@@ -121,8 +121,136 @@ impl SmartAutoLive {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+    use crate::configs::HubConfig;
     use crate::configs::token_rates::TokenRates;
+    use crate::services::fake_gh_cli::FakeGhCli;
+    use crate::services::gh_cli::GhOutcome;
+    use crate::services::memory_credential_store::MemoryCredentialStore;
+    use crate::services::model_health::FailureKind;
+    use crate::services::profile_usage::{self, UsageKey};
+
+    const ENDPOINT: &str = "/v1/chat/completions";
+    const QUOTA_PROFILE: &str = "llmgw";
+    const HOUR_MS: u64 = 3_600_000;
+
+    fn state(quota_base_url: &str) -> AppState {
+        let vars: HashMap<String, String> = [
+            ("LLM_HUB_PROFILES", "home,remote,llmgw"),
+            ("LLM_HUB_HOME_BASE_URL", "http://127.0.0.1:9"),
+            (
+                "LLM_HUB_REMOTE_BASE_URL",
+                "https://remote.example.invalid/v1",
+            ),
+            ("LLM_HUB_LLMGW_BASE_URL", quota_base_url),
+            ("LLM_HUB_LLMGW_API_KEY", "sk-bf-secret"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            None,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
+        )
+        .unwrap()
+    }
+
+    async fn quota_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/governance/virtual-keys/quota"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "budgets": [
+                    {"max_limit": 100.0, "current_usage": 40.0, "reset_duration": "1M"},
+                    {"max_limit": 10.0, "current_usage": 8.0, "reset_duration": "1d"},
+                ],
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn seed_quota(state: &AppState, fetched_at_ms: u64) {
+        let key = UsageKey::for_profile(&state.config(), QUOTA_PROFILE).unwrap();
+        let client = state.client(QUOTA_PROFILE).unwrap();
+        profile_usage::usage_at(state, &client, QUOTA_PROFILE, &key, fetched_at_ms)
+            .await
+            .expect("quota fetched");
+    }
+
+    fn descriptors(ids: &[&str]) -> Vec<ModelDescriptor> {
+        ids.iter().map(|id| ModelDescriptor::for_test(id)).collect()
+    }
+
+    #[tokio::test]
+    async fn collect_reads_health_cost_and_the_least_quota_left() {
+        let server = quota_server().await;
+        let state = state(&format!("{}/v1", server.uri()));
+        let pool = descriptors(&["home/cooled", "home/fast[1m]", "remote/m", "llmgw/m"]);
+        state.set_model_descriptors(pool.clone());
+        seed_quota(&state, now_ms()).await;
+        let now = Instant::now();
+        let health = state.model_health();
+        health.record_failure("home/cooled", ENDPOINT, FailureKind::Status(503), now);
+        for _ in 0..5 {
+            health.record_ttft("home/fast", ENDPOINT, 500, now);
+            health.record_success("home/fast", ENDPOINT, now);
+        }
+        let pool_refs: Vec<&ModelDescriptor> = pool.iter().collect();
+
+        let collected = SmartAutoLive::collect(&state, ENDPOINT, &pool_refs, now);
+
+        assert_eq!(
+            collected.unavailable,
+            HashSet::from(["home/cooled".to_owned()])
+        );
+        let fast = collected.signals.get("home/fast[1m]");
+        assert_eq!(fast.cost, Some(10));
+        assert_eq!(fast.speed, Some(10));
+        assert_eq!(fast.error_rate, Some(0.0));
+        assert_eq!(fast.quota_remaining_pct, None);
+        let remote = collected.signals.get("remote/m");
+        assert_eq!((remote.cost, remote.speed), (None, None));
+        assert_eq!(
+            collected.signals.get("llmgw/m").quota_remaining_pct,
+            Some(20.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn health_on_another_endpoint_does_not_cool_a_model() {
+        let state = state("http://127.0.0.1:9/v1");
+        let pool = descriptors(&["home/m"]);
+        let now = Instant::now();
+        state
+            .model_health()
+            .record_failure("home/m", "/v1/messages", FailureKind::Transport, now);
+        let pool_refs: Vec<&ModelDescriptor> = pool.iter().collect();
+
+        let collected = SmartAutoLive::collect(&state, ENDPOINT, &pool_refs, now);
+
+        assert!(collected.unavailable.is_empty());
+        assert_eq!(collected.signals.get("home/m").error_rate, None);
+    }
+
+    #[tokio::test]
+    async fn a_stale_quota_snapshot_is_not_trusted() {
+        let server = quota_server().await;
+        let state = state(&format!("{}/v1", server.uri()));
+        seed_quota(&state, now_ms() - 2 * HOUR_MS).await;
+
+        let quota = SmartAutoLive::quota_left(&state, QUOTA_PROFILE);
+
+        assert_eq!(quota, None);
+    }
 
     fn book() -> PricingBook {
         PricingBook {

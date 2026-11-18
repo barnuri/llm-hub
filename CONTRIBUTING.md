@@ -52,9 +52,16 @@ body or status is a behavior change.
 
 - A bug fix comes with a test that fails before the fix.
 - A feature comes with tests for the on state and the off (default) state.
+- Every new code path in `src/` has a unit test: the success path, the edge cases and the error path.
+- The `coverage` check fails when the line coverage of any file under `src/` is below 80%.
+  Run `cargo llvm-cov --all-targets --summary-only --fail-under-lines 80` locally (needs
+  `cargo-llvm-cov` and `rustup component add llvm-tools-preview`). Every row in its Lines column
+  must be 80% or more. CI measures on Linux, so code for another OS counts only there.
 - Upstream calls in tests use `wiremock`. Tests never call a real provider.
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` must pass.
-  The `pr` workflow runs all three on Linux and Windows.
+  The `pr` workflow runs the lint on Linux. It runs the tests on Linux (with coverage) and on
+  Windows. It skips these jobs when a pull request changes no Rust input (`src/`, `tests/`, `ui/`,
+  Cargo files, `build.rs`, `docs/openapi.json`, workflows).
 
 ### 5. Keep the scope small
 

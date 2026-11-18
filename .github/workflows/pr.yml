@@ -3,48 +3,136 @@ name: pr
 on:
   pull_request:
     branches: [master]
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: pr-${{ github.event.pull_request.number }}
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || github.run_id }}
   cancel-in-progress: true
 
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_TERM_COLOR: always
+  COVERAGE_MIN: 80
+
 jobs:
-  lint:
+  changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      ui: ${{ steps.filter.outputs.ui }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "ui=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
+          has() { echo "$changed" | grep -qE "$1" && echo true || echo false; }
+          echo "rust=$(has '^(src/|tests/|ui/|docs/openapi.json|build.rs|Cargo\.(toml|lock)|rust-toolchain.toml|\.github/workflows/)')" >> "$GITHUB_OUTPUT"
+          echo "ui=$(has '^(ui-src/|\.github/workflows/)')" >> "$GITHUB_OUTPUT"
+
+  lint:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: npm --prefix ui-src ci && npm --prefix ui-src run build
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
 
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.runner }}
+  coverage:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - run: rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Tests with coverage
+        run: cargo llvm-cov --all-targets --json --summary-only --fail-under-lines "$COVERAGE_MIN" --output-path target/coverage.json
+      - name: Every file meets the minimum
+        run: |
+          jq -r --argjson min "$COVERAGE_MIN" --arg src "$PWD/src/" '
+            .data[0].files[]
+            | select((.filename | startswith($src)) and .summary.lines.percent < $min)
+            | "\(.summary.lines.percent | floor)% \(.filename | ltrimstr($src))"' target/coverage.json > target/below.txt
+          if [ -s target/below.txt ]; then
+            echo "Files under $COVERAGE_MIN% line coverage:"
+            cat target/below.txt
+            exit 1
+          fi
+      - name: Coverage summary
+        if: always()
+        run: |
+          jq -r '"Total line coverage: \(.data[0].totals.lines.percent | floor)%"' target/coverage.json >> "$GITHUB_STEP_SUMMARY" || true
+          sed 's/^/- under minimum: /' target/below.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+  test-windows:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-windows
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: cargo test --all-targets
+
+  ui:
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: ui-src/package-lock.json
       - run: npm --prefix ui-src ci && npm --prefix ui-src run build
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-targets
 
-  # The one check branch protection requires. It passes only when every job above passed.
+  # The one check the master ruleset requires.
   pr-ok:
     if: always()
-    needs: [lint, test]
+    needs: [changes, lint, coverage, test-windows, ui]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - run: test "${{ needs.lint.result }}" = success && test "${{ needs.test.result }}" = success
+      - run: |
+          for result in ${{ join(needs.*.result, ' ') }}; do
+            if [ "$result" != success ] && [ "$result" != skipped ]; then
+              echo "a required job ended as $result"
+              exit 1
+            fi
+          done

@@ -62,3 +62,72 @@ impl IntoResponse for AppError {
         (self.status(), Json(body)).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn render(error: AppError) -> (StatusCode, serde_json::Value) {
+        let response = error.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn every_variant_renders_its_status_and_error_type() {
+        let cases = [
+            (
+                AppError::BadRequest("bad".into()),
+                400,
+                "invalid_request_error",
+            ),
+            (AppError::Unauthorized, 401, "authentication_error"),
+            (AppError::NotFound("gone".into()), 404, "not_found_error"),
+            (
+                AppError::NotImplemented("later".into()),
+                501,
+                "not_implemented_error",
+            ),
+            (AppError::ReadOnly, 403, "read_only_error"),
+            (AppError::Conflict("taken".into()), 409, "conflict_error"),
+            (AppError::Internal("boom".into()), 500, "internal_error"),
+            (
+                AppError::UpstreamUnavailable("down".into()),
+                502,
+                "upstream_error",
+            ),
+        ];
+
+        for (error, status, kind) in cases {
+            let (actual_status, body) = render(error).await;
+
+            assert_eq!(actual_status.as_u16(), status);
+            assert_eq!(body["error"]["type"], kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_variant_with_a_message_renders_that_message() {
+        let (_, body) = render(AppError::Conflict("name already taken".into())).await;
+
+        assert_eq!(
+            body,
+            json!({ "error": { "message": "name already taken", "type": "conflict_error" } })
+        );
+    }
+
+    #[test]
+    fn unauthorized_and_read_only_carry_fixed_messages() {
+        assert_eq!(
+            AppError::Unauthorized.message(),
+            "missing or invalid api key"
+        );
+        assert_eq!(
+            AppError::ReadOnly.message(),
+            "config is read-only (LLM_HUB_CONFIG_READONLY=true)"
+        );
+    }
+}

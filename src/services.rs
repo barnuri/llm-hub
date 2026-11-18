@@ -45,6 +45,7 @@ pub mod prompt_shape_reader;
 pub mod quota_snapshots;
 pub mod request_images;
 pub mod responses_chat;
+pub mod responses_context;
 pub mod responses_item_ids;
 pub mod restart;
 pub mod review_graph;

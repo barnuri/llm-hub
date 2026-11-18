@@ -13,6 +13,15 @@ Every change must keep the request path at the lowest latency available. Measure
 - Review buffering: Balance buffers planning and implementation turns, except plan-backed implementation. Intelligence buffers every turn on chat completions and `/v1/messages` except plan-backed implementation, so a judge or critic can check the draft first. Native Anthropic attempts, `/v1/responses` turns and turns with no eligible reviewer stream. See `docs/smart-auto.md`.
 - When a change touches the request path, compare the hub's time to first byte with a direct `curl` to the upstream. The hub may add at most 50 ms.
 
+## Tests and coverage
+
+Every change to `src/` comes with unit tests in the same change. The `coverage` check fails when the line coverage of any file under `src/` is below 80%.
+
+- Cover every new code path: the success path, the edge cases and the error path. A bug fix adds a test that fails before the fix.
+- Test a new opt-in feature in the on state. Also test that the default (off) state keeps the old behavior.
+- Mock upstreams with `wiremock`. Never call a real provider, service manager or keychain from a test.
+- Before you push, run `cargo llvm-cov --all-targets --summary-only --fail-under-lines 80` (needs `cargo-llvm-cov` and `rustup component add llvm-tools-preview`). Every row in the Lines column must be 80% or more. CI measures on Linux, so code for another OS counts only there.
+
 ## After finishing work here
 
 Source and `ui-src/` changes are invisible to the running service until you rebuild and reinstall:
@@ -30,6 +39,7 @@ Then confirm `http://127.0.0.1:8888/healthz` is 200. `service install` is reinst
 | Command | Description |
 |---------|-------------|
 | `cargo test` | Unit + integration tests |
+| `cargo llvm-cov --all-targets --summary-only --fail-under-lines 80` | Tests with per-file line coverage |
 | `cargo run` | Foreground on `.env` (default `:8410`) |
 | `npm run build:ui` | Typecheck + Vite build into `ui/` |
 | `./target/release/llm-hub service install` | Reload LaunchAgent to the new release binary |

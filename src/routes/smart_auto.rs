@@ -661,7 +661,134 @@ fn non_empty(value: Option<String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_scope_key_prefix;
+    use super::*;
+    use crate::configs::HubConfig;
+    use crate::schemas::work_role::WorkRole;
+    use crate::services::fake_gh_cli::FakeGhCli;
+    use crate::services::gh_cli::GhOutcome;
+    use crate::services::memory_credential_store::MemoryCredentialStore;
+    use crate::services::model_health::FailureKind;
+    use crate::services::store::Store;
+    use axum::http::StatusCode;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    const ALPHA: &str = "alpha/claude-sonnet-4.5";
+    const BETA: &str = "beta/gpt-4.1";
+
+    #[derive(Clone, Copy)]
+    enum Persistence {
+        Off,
+        Sqlite,
+        Json,
+    }
+
+    struct Hub {
+        state: AppState,
+        _dir: TempDir,
+    }
+
+    fn hub(persistence: Persistence, extra: &[(&str, &str)]) -> Hub {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stats.db");
+        let path = path.to_str().unwrap();
+        let store = match persistence {
+            Persistence::Off => None,
+            Persistence::Sqlite => Some(Store::open("sqlite", Some(path)).unwrap()),
+            Persistence::Json => Some(Store::open("json", Some(path)).unwrap()),
+        };
+        let vars: HashMap<String, String> = [("LLM_HUB_STORE_PATH", path)]
+            .iter()
+            .chain(extra)
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        let state = AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            store,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
+        )
+        .unwrap();
+        Hub { state, _dir: dir }
+    }
+
+    fn with_models(persistence: Persistence, ids: &[&str]) -> Hub {
+        let hub = hub(persistence, &[]);
+        hub.state.set_model_descriptors(
+            ids.iter()
+                .map(|id| ModelDescriptor {
+                    endpoints: PIN_ENDPOINTS.iter().map(|e| (*e).to_owned()).collect(),
+                    ..ModelDescriptor::for_test(id)
+                })
+                .collect(),
+        );
+        hub
+    }
+
+    async fn json_of(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn worker_key(state: &AppState, raw: &str) -> String {
+        state.selection_log().scope_key(ScopeKind::Worker, raw)
+    }
+
+    fn event(
+        worker: Option<&str>,
+        stage: SelectionStage,
+        selection_state: SelectionState,
+        model: &str,
+    ) -> SelectionEvent {
+        SelectionEvent {
+            worker: worker.map(str::to_owned),
+            ..SelectionEvent::new(stage, selection_state, model)
+        }
+    }
+
+    async fn get_current(state: &AppState, worker: Option<&str>, session: Option<&str>) -> Value {
+        let query = CurrentQuery {
+            worker: worker.map(str::to_owned),
+            session: session.map(str::to_owned),
+        };
+        let (status, body) = json_of(current(State(state.clone()), Query(query)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        body
+    }
+
+    async fn get_history(state: &AppState, params: HistoryParams) -> (StatusCode, Value) {
+        json_of(history(State(state.clone()), Query(params)).await).await
+    }
+
+    fn models_of(body: &Value) -> Vec<&str> {
+        body["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["model"].as_str().unwrap())
+            .collect()
+    }
+
+    async fn post_outcome(state: &AppState, body: Value) -> (StatusCode, Value) {
+        let body: OutcomeBody = serde_json::from_value(body).unwrap();
+        json_of(report_outcome(State(state.clone()), Json(body)).await).await
+    }
+
+    async fn post_resolve(state: &AppState, body: Value) -> (StatusCode, Value) {
+        let body: ResolveBody = serde_json::from_value(body).unwrap();
+        json_of(resolve(State(state.clone()), Json(body)).await).await
+    }
+
+    async fn get_attempt(state: &AppState, attempt: Option<&str>) -> (StatusCode, Value) {
+        let params = AttemptParams {
+            attempt: attempt.map(str::to_owned),
+        };
+        json_of(attempt_text(State(state.clone()), Query(params)).await).await
+    }
 
     #[test]
     fn scope_key_prefix_is_8_to_64_lowercase_hex() {
@@ -671,5 +798,531 @@ mod tests {
         assert!(!is_scope_key_prefix(&"f".repeat(65)));
         assert!(!is_scope_key_prefix("0123ABCD"));
         assert!(!is_scope_key_prefix("0123abcg"));
+    }
+
+    #[tokio::test]
+    async fn current_without_a_worker_or_session_is_a_bad_request() {
+        let hub = hub(Persistence::Off, &[]);
+        let query = CurrentQuery {
+            worker: Some(String::new()),
+            session: None,
+        };
+
+        let (status, _) = json_of(current(State(hub.state), Query(query)).await).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn current_finds_a_worker_by_raw_session_or_by_key_prefix() {
+        let hub = hub(Persistence::Off, &[]);
+        let key = worker_key(&hub.state, "session-1");
+        hub.state.selection_log().record(event(
+            Some(&key),
+            SelectionStage::Solver,
+            SelectionState::Selected,
+            ALPHA,
+        ));
+
+        let by_session = get_current(&hub.state, None, Some("session-1")).await;
+        let by_prefix = get_current(&hub.state, Some(&key[..12]), None).await;
+        let unknown = get_current(&hub.state, Some("someone-else"), None).await;
+
+        assert_eq!(by_session["selection"]["main"]["model"], ALPHA);
+        assert_eq!(by_prefix["selection"]["main"]["model"], ALPHA);
+        assert!(unknown["selection"].is_null());
+    }
+
+    #[tokio::test]
+    async fn history_filters_by_worker_and_workflow_and_pages_after_since_seq() {
+        let hub = hub(Persistence::Off, &[]);
+        let log = hub.state.selection_log();
+        let one = worker_key(&hub.state, "w1");
+        let two = worker_key(&hub.state, "w2");
+        log.record(event(
+            Some(&one),
+            SelectionStage::Solver,
+            SelectionState::Selected,
+            "m1",
+        ));
+        log.record(SelectionEvent {
+            workflow: Some(log.scope_key(ScopeKind::Workflow, "flow")),
+            ..event(
+                Some(&two),
+                SelectionStage::Solver,
+                SelectionState::Selected,
+                "m2",
+            )
+        });
+        log.record(event(
+            Some(&one),
+            SelectionStage::Solver,
+            SelectionState::Completed,
+            "m3",
+        ));
+
+        let (status, worker) = get_history(
+            &hub.state,
+            HistoryParams {
+                worker: Some("w1".into()),
+                since_ts_ms: Some(0),
+                ..HistoryParams::default()
+            },
+        )
+        .await;
+        let (_, workflow) = get_history(
+            &hub.state,
+            HistoryParams {
+                workflow: Some("flow".into()),
+                ..HistoryParams::default()
+            },
+        )
+        .await;
+        let (_, paged) = get_history(
+            &hub.state,
+            HistoryParams {
+                since_seq: Some(1),
+                limit: Some(1),
+                ..HistoryParams::default()
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(models_of(&worker), ["m1", "m3"]);
+        assert!(worker["events"][1].get("outcome").is_none());
+        assert_eq!(models_of(&workflow), ["m2"]);
+        assert_eq!(models_of(&paged), ["m2"]);
+    }
+
+    #[tokio::test]
+    async fn history_attaches_stored_outcomes_to_completed_solver_events_only() {
+        let hub = hub(Persistence::Sqlite, &[]);
+        let completed = SelectionEvent {
+            attempt: Some("attempt-1".into()),
+            ..event(
+                None,
+                SelectionStage::Solver,
+                SelectionState::Completed,
+                "m1",
+            )
+        };
+        let selected = SelectionEvent {
+            attempt: Some("attempt-1".into()),
+            ..event(None, SelectionStage::Solver, SelectionState::Selected, "m1")
+        };
+        hub.state.selection_log().record(selected);
+        hub.state.selection_log().record(completed);
+        let outcome = AttemptOutcome {
+            code: OutcomeCode::TestsPassed,
+            source: OutcomeSource::Client,
+        };
+        hub.state
+            .store()
+            .unwrap()
+            .save_attempt_outcome("attempt-1", None, &outcome, now_ms())
+            .unwrap();
+
+        let (status, body) = get_history(&hub.state, HistoryParams::default()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["events"][0].get("outcome").is_none());
+        assert_eq!(
+            body["events"][1]["outcome"],
+            json!({"code": "tests_passed", "source": "client"})
+        );
+    }
+
+    #[tokio::test]
+    async fn history_since_a_time_reads_the_saved_events_past_the_ring() {
+        let hub = hub(Persistence::Sqlite, &[]);
+        let now = now_ms();
+        let saved = SelectionEvent {
+            seq: 7,
+            ts_ms: now,
+            ..event(
+                None,
+                SelectionStage::Solver,
+                SelectionState::Selected,
+                "saved",
+            )
+        };
+        hub.state
+            .store()
+            .unwrap()
+            .save_selection_events(&[saved], now, -1)
+            .unwrap();
+
+        let (_, from_ring) = get_history(&hub.state, HistoryParams::default()).await;
+        let (status, from_store) = get_history(
+            &hub.state,
+            HistoryParams {
+                since_ts_ms: Some(now - 1_000),
+                ..HistoryParams::default()
+            },
+        )
+        .await;
+
+        assert!(models_of(&from_ring).is_empty());
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(models_of(&from_store), ["saved"]);
+    }
+
+    #[tokio::test]
+    async fn an_outcome_naming_no_attempt_session_or_worker_is_a_bad_request() {
+        let hub = hub(Persistence::Sqlite, &[]);
+
+        let (status, _) = post_outcome(&hub.state, json!({"code": "tests_passed"})).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_outcome_for_a_worker_without_a_completed_attempt_is_not_found() {
+        let hub = hub(Persistence::Sqlite, &[]);
+
+        let (status, _) =
+            post_outcome(&hub.state, json!({"worker": "abc", "code": "tests_failed"})).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_outcome_without_persistence_is_a_bad_request() {
+        let hub = hub(Persistence::Off, &[]);
+
+        let (status, body) = post_outcome(
+            &hub.state,
+            json!({"attempt": "attempt-1", "code": "user_accepted"}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.to_string().contains("persistence is off"));
+    }
+
+    #[tokio::test]
+    async fn a_session_outcome_lands_on_its_last_completed_attempt() {
+        let hub = hub(Persistence::Sqlite, &[]);
+        let worker = worker_key(&hub.state, "session-1");
+        hub.state
+            .attempt_tracker()
+            .note_completed(&worker, "attempt-9");
+
+        let (status, body) = post_outcome(
+            &hub.state,
+            json!({"session_id": "session-1", "code": "user_corrected"}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"attempt": "attempt-9", "outcome": {"code": "user_corrected", "source": "client"}})
+        );
+        let stored = hub
+            .state
+            .store()
+            .unwrap()
+            .load_attempt_outcomes(&["attempt-9".to_owned()])
+            .unwrap();
+        assert_eq!(stored["attempt-9"].code, OutcomeCode::UserCorrected);
+        assert_eq!(stored["attempt-9"].source, OutcomeSource::Client);
+    }
+
+    #[tokio::test]
+    async fn decisions_are_newest_first_and_the_limit_is_clamped() {
+        let hub = hub(Persistence::Off, &[]);
+        for ts_ms in 1..=3 {
+            hub.state.smart_auto_decisions().record(SmartAutoDecision {
+                ts_ms,
+                session: None,
+                tier: "balance",
+                role: WorkRole::Conversation,
+                effort: None,
+                model: ALPHA.into(),
+                reason: "fresh",
+            });
+        }
+        let fetch = |limit| {
+            let state = hub.state.clone();
+            async move { json_of(decisions(State(state), Query(DecisionsQuery { limit })).await).await }
+        };
+
+        let (status, two) = fetch(Some(2)).await;
+        let (_, clamped) = fetch(Some(0)).await;
+        let (_, default) = fetch(None).await;
+
+        let stamps = |body: &Value| -> Vec<u64> {
+            body["decisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["ts_ms"].as_u64().unwrap())
+                .collect()
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stamps(&two), [3, 2]);
+        assert_eq!(stamps(&clamped), [3]);
+        assert_eq!(stamps(&default), [3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn health_reports_a_cooled_model() {
+        let hub = hub(Persistence::Off, &[]);
+        hub.state.model_health().record_failure(
+            ALPHA,
+            RESOLVE_ENDPOINT,
+            FailureKind::Timeout,
+            Instant::now(),
+        );
+
+        let (status, body) = json_of(health(State(hub.state)).await).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["models"][0]["model"], ALPHA);
+        assert_eq!(body["models"][0]["failures"], 1);
+        assert!(body["models"][0]["cooled_for_ms"].as_u64().unwrap() > 0);
+        assert!(body["costs"].is_object());
+    }
+
+    #[tokio::test]
+    async fn saved_rules_are_read_back_and_change_each_models_effect() {
+        let hub = with_models(Persistence::Off, &[ALPHA, BETA]);
+
+        let (_, before) = json_of(get_rules(State(hub.state.clone())).await).await;
+        let (put_status, saved) = json_of(
+            put_rules(
+                State(hub.state.clone()),
+                Bytes::from_static(br#"{"exclude":["beta/*"]}"#),
+            )
+            .await,
+        )
+        .await;
+        let (_, after) = json_of(get_rules(State(hub.state.clone())).await).await;
+        let (_, effect) = json_of(rules_effect(State(hub.state.clone())).await).await;
+
+        assert_eq!(before["source"], "none");
+        assert_eq!(put_status, StatusCode::OK);
+        assert_eq!(saved["source"], "file");
+        assert_eq!(saved["readonly"], false);
+        assert_eq!(after["rules"]["exclude"], json!(["beta/*"]));
+        let eligible: BTreeMap<&str, bool> = effect["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["qualified_id"].as_str().unwrap(),
+                    row["eligible"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(eligible, BTreeMap::from([(ALPHA, true), (BETA, false)]));
+    }
+
+    #[tokio::test]
+    async fn invalid_rules_are_a_bad_request() {
+        let hub = hub(Persistence::Off, &[]);
+
+        let response = put_rules(State(hub.state), Bytes::from_static(b"not json")).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn env_rules_are_read_only() {
+        let hub = hub(
+            Persistence::Off,
+            &[("LLM_HUB_SMART_AUTO_RULES", r#"{"exclude":["*preview*"]}"#)],
+        );
+
+        let (_, rules) = json_of(get_rules(State(hub.state.clone())).await).await;
+        let response = put_rules(State(hub.state), Bytes::from_static(b"{}")).await;
+
+        assert_eq!(rules["source"], "env");
+        assert_eq!(rules["readonly"], true);
+        assert!(response.status().is_client_error());
+    }
+
+    #[tokio::test]
+    async fn attempt_text_needs_an_attempt() {
+        let hub = hub(Persistence::Sqlite, &[]);
+
+        let (status, _) = get_attempt(&hub.state, Some("")).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn attempt_text_without_persistence_is_null() {
+        let hub = hub(Persistence::Off, &[]);
+
+        let (status, body) = get_attempt(&hub.state, Some("attempt-1")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"attempt": "attempt-1", "prompt": null, "answer": null})
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_text_returns_the_saved_prompt_and_answer() {
+        let hub = hub(Persistence::Sqlite, &[]);
+        let store = hub.state.store().unwrap();
+        store
+            .save_selection_prompt("attempt-1", now_ms(), "the prompt")
+            .unwrap();
+        store
+            .save_selection_answer("attempt-1", now_ms(), "the answer")
+            .unwrap();
+
+        let (_, saved) = get_attempt(&hub.state, Some("attempt-1")).await;
+        let (status, unknown) = get_attempt(&hub.state, Some("attempt-2")).await;
+
+        assert_eq!(saved["prompt"], "the prompt");
+        assert_eq!(saved["answer"], "the answer");
+        assert_eq!(status, StatusCode::OK);
+        assert!(unknown["prompt"].is_null() && unknown["answer"].is_null());
+    }
+
+    #[tokio::test]
+    async fn attempt_text_on_the_json_store_is_an_internal_error() {
+        let hub = hub(Persistence::Json, &[]);
+
+        let (status, body) = get_attempt(&hub.state, Some("attempt-1")).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.to_string().contains("selection text cannot be read"));
+    }
+
+    #[tokio::test]
+    async fn resolve_refuses_an_unknown_tier_or_role() {
+        let hub = with_models(Persistence::Off, &[ALPHA]);
+
+        let (tier, _) = post_resolve(&hub.state, json!({"tier": "turbo"})).await;
+        let (role, _) = post_resolve(&hub.state, json!({"role": "juggling"})).await;
+
+        assert_eq!(tier, StatusCode::BAD_REQUEST);
+        assert_eq!(role, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn resolve_without_an_eligible_model_is_a_conflict() {
+        let hub = with_models(Persistence::Off, &[ALPHA]);
+
+        let (empty, _) = post_resolve(&hub.state, json!({"exclude": ["alpha/*"]})).await;
+        let (filtered, body) = post_resolve(&hub.state, json!({"profiles": "beta"})).await;
+
+        assert_eq!(empty, StatusCode::CONFLICT);
+        assert_eq!(filtered, StatusCode::CONFLICT);
+        assert!(body.to_string().contains("smart-auto-balance"));
+    }
+
+    #[tokio::test]
+    async fn resolve_picks_a_model_and_lists_the_others_as_alternatives() {
+        let hub = with_models(Persistence::Off, &[ALPHA, BETA]);
+
+        let (status, body) = post_resolve(
+            &hub.state,
+            json!({"tier": "efficiency", "role": "validation", "text": "run the tests", "include": ["", "*"]}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tier"], "efficiency");
+        assert_eq!(body["role"], "validation");
+        assert_eq!(body["pinned"], false);
+        let model = body["model"].as_str().unwrap();
+        let other = if model == ALPHA { BETA } else { ALPHA };
+        assert_eq!(body["alternatives"], json!([other]));
+    }
+
+    #[tokio::test]
+    async fn resolve_keeps_to_the_profiles_filter_and_skips_a_cooled_model() {
+        let hub = with_models(Persistence::Off, &[ALPHA, BETA]);
+
+        let (_, only_beta) = post_resolve(&hub.state, json!({"profiles": "beta"})).await;
+        hub.state.model_health().record_failure(
+            BETA,
+            RESOLVE_ENDPOINT,
+            FailureKind::Timeout,
+            Instant::now(),
+        );
+        let (_, cooled_beta) = post_resolve(&hub.state, json!({})).await;
+        let (_, only_cooled) = post_resolve(&hub.state, json!({"profiles": "beta"})).await;
+
+        assert_eq!(only_beta["model"], BETA);
+        assert_eq!(cooled_beta["model"], ALPHA);
+        assert_eq!(only_cooled["model"], BETA);
+    }
+
+    #[tokio::test]
+    async fn resolve_reports_a_pin_kept_on_another_client_route() {
+        let hub = with_models(Persistence::Off, &[ALPHA, BETA]);
+        let mut body = ResolveBody {
+            worker: Some("worker-1".into()),
+            ..ResolveBody::default()
+        };
+        let caller = resolve_caller(&mut body).unwrap();
+        let selector = tier_selector(
+            &hub.state.config().smart_auto_presets,
+            SmartAutoTier::default(),
+        )
+        .unwrap();
+        let policy = hub_policy(&hub.state.smart_auto_rules().current(), &selector, &caller);
+        let signals = TurnSignals {
+            estimated_prompt_tokens: 0,
+            tool_continuation: false,
+            user_turns: 0,
+            last_user_text: None,
+            has_tools: false,
+            has_image: false,
+            session_id: None,
+            prompt_cache_key: None,
+            content_key: None,
+        };
+        let key = AffinityKey::new(&signals, &caller, &policy, "/v1/chat/completions").unwrap();
+        let (_, fresh) = post_resolve(&hub.state, json!({"worker": "worker-1"})).await;
+        let fresh_model = fresh["model"].as_str().unwrap();
+        let pinned_model = if fresh_model == ALPHA { BETA } else { ALPHA };
+        let role = role_from_name(fresh["role"].as_str().unwrap()).unwrap();
+        assert!(hub.state.smart_auto_affinity().commit(
+            &key,
+            pinned_model,
+            role,
+            false,
+            0,
+            Instant::now(),
+        ));
+
+        let (status, pinned) = post_resolve(&hub.state, json!({"worker": "worker-1"})).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(pinned["model"], pinned_model);
+        assert_eq!(pinned["reason"], "pinned");
+        assert_eq!(pinned["pinned"], true);
+    }
+
+    #[tokio::test]
+    async fn tiers_list_every_tier_pool_and_the_role_defaults() {
+        let hub = with_models(Persistence::Off, &[ALPHA, BETA]);
+
+        let (status, body) = json_of(tiers(State(hub.state)).await).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["default_tier"], "balance");
+        let names: Vec<&str> = body["tiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["efficiency", "balance", "intelligence", "fast"]);
+        assert_eq!(body["tiers"][1]["selector"], "hub/smart-auto-balance");
+        assert_eq!(body["tiers"][1]["pool"], json!([ALPHA, BETA]));
+        assert_eq!(body["roles"].as_array().unwrap().len(), 5);
+        assert_eq!(body["role_tier_defaults"]["planning"], "intelligence");
     }
 }

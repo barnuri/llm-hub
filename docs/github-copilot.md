@@ -135,6 +135,10 @@ and Grok models on `/responses`. The hub ships limits measured with oversized pr
 
 A seeded limit never replaces a learned one. The hub never sends probe requests.
 
+On `/v1/responses`, the hub renames Copilot's `model_max_prompt_tokens_exceeded` code to
+`context_length_exceeded`. Codex 0.169 and later compact the conversation on that code. The
+status stays 400 and the message stays Copilot's.
+
 ## Cache keep-warm
 
 Prompt caches expire when they are not used. Copilot's cache for Claude models lasts about five

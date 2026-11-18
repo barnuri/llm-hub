@@ -63,6 +63,82 @@ fn spa_eligible(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    async fn get(path: &str) -> Response {
+        serve(path.parse::<Uri>().unwrap()).await
+    }
+
+    fn header_of(response: &Response, name: header::HeaderName) -> &str {
+        response.headers()[name].to_str().unwrap()
+    }
+
+    async fn body_of(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    fn index_bytes() -> Vec<u8> {
+        UiAssets::get("index.html").unwrap().data.into_owned()
+    }
+
+    #[tokio::test]
+    async fn the_root_serves_index_html_for_revalidation() {
+        let response = get("/").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_of(&response, header::CONTENT_TYPE), "text/html");
+        assert_eq!(
+            header_of(&response, header::CACHE_CONTROL),
+            CACHE_REVALIDATE
+        );
+        assert_eq!(body_of(response).await, index_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_hashed_asset_is_served_as_immutable_with_its_mime_type() {
+        let asset = UiAssets::iter()
+            .find(|file| file.starts_with(HASHED_ASSET_PREFIX) && file.ends_with(".css"))
+            .expect("the embedded UI has a hashed stylesheet");
+
+        let response = get(&format!("/{asset}")).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_of(&response, header::CONTENT_TYPE), "text/css");
+        assert_eq!(
+            header_of(&response, header::CACHE_CONTROL),
+            CACHE_HASHED_ASSET
+        );
+        assert_eq!(
+            body_of(response).await,
+            UiAssets::get(&asset).unwrap().data.into_owned()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_spa_route_falls_back_to_index_html() {
+        let response = get("/keys/some-name").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_of(&response, header::CONTENT_TYPE), "text/html");
+        assert_eq!(body_of(response).await, index_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_missing_asset_or_api_path_is_not_found() {
+        for path in [
+            "/assets/missing.js",
+            "/api/unknown",
+            "/v1/nothing",
+            "/healthz",
+        ] {
+            let response = get(path).await;
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(body_of(response).await, b"not found", "{path}");
+        }
+    }
+
     #[test]
     fn spa_eligible_accepts_extensionless_routes() {
         assert!(spa_eligible("profiles"));
