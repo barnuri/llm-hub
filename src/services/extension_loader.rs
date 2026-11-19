@@ -261,7 +261,7 @@ mod tests {
         assert!(sources.load_rules(&HashMap::new()).unwrap().is_none());
         assert_eq!(
             sources.compose(None).names(),
-            ["copilot-context-code", "library"]
+            ["copilot-context-code", "payload-too-large", "library"]
         );
     }
 
@@ -280,7 +280,12 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(
             sources.compose(Some(rules)).names(),
-            ["copilot-context-code", "library", "rules"]
+            [
+                "copilot-context-code",
+                "payload-too-large",
+                "library",
+                "rules"
+            ]
         );
     }
 
@@ -323,7 +328,7 @@ mod tests {
         assert!(reload(&state, &sources, &vars).unwrap().contains("cleared"));
         assert_eq!(
             state.extensions().names(),
-            ["copilot-context-code", "library"]
+            ["copilot-context-code", "payload-too-large", "library"]
         );
     }
 

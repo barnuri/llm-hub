@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use crate::configs::ProfileConfig;
 use crate::consts::{CONTEXT_TOKENS_1M, MODELS_CACHE_TTL, MODELS_FANOUT_TIMEOUT};
 use crate::dependencies::state::AppState;
+use crate::routes::proxy::hub_policy;
 use crate::schemas::error_body::ErrorBody;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::profile_filter::ProfileFilter;
@@ -22,6 +23,7 @@ use crate::schemas::model_context::{
 };
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
+use crate::schemas::smart_auto_headers::SmartAutoHeaders;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
 use crate::schemas::upstream_model::UpstreamModel;
 use crate::services::copilot_auto::{
@@ -32,6 +34,7 @@ use crate::services::listed_prices;
 use crate::services::model_descriptors::ModelDescriptors;
 use crate::services::model_limits::ModelLimit;
 use crate::services::smart_auto_pool::SmartAutoPool;
+use crate::services::smart_auto_rules::LoadedRules;
 use crate::services::upstream_auth;
 
 pub(crate) const MODELS_PATH: &str = "/models";
@@ -150,7 +153,10 @@ pub async fn refresh_models(state: &AppState) -> Value {
         &copilot_profiles,
         &state.copilot_descriptions().snapshot(),
     );
-    merged.extend(smart_auto_entries(&state.model_descriptors()));
+    merged.extend(smart_auto_entries(
+        &state.model_descriptors(),
+        &state.smart_auto_rules().current(),
+    ));
     let payload = json!({ "object": "list", "data": merged });
     state.set_model_cache(payload.clone());
     payload
@@ -602,14 +608,15 @@ fn limit_provenance(evidence: &LimitEvidence) -> Value {
     entry
 }
 
-/// The virtual `hub/*` Smart Auto entries, each limited to the pool it can pick from.
-fn smart_auto_entries(snapshot: &ModelDescriptorSnapshot) -> Vec<Value> {
+/// The virtual `hub/*` Smart Auto entries, each limited to the pool the active rules let it pick from.
+fn smart_auto_entries(snapshot: &ModelDescriptorSnapshot, rules: &LoadedRules) -> Vec<Value> {
     HubSelector::builtin_names()
         .into_iter()
         .filter_map(|name| {
             let id = format!("{}/{name}", HubSelector::NAMESPACE);
             let selector = HubSelector::parse(&id, &BTreeMap::new()).ok()??;
-            let pool = eligible_pool(snapshot, &selector.policy);
+            let policy = hub_policy(rules, &selector, &SmartAutoHeaders::default());
+            let pool = eligible_pool(snapshot, &policy);
             Some(smart_auto_entry(&id, &selector, &pool))
         })
         .collect()
@@ -1634,7 +1641,7 @@ mod tests {
             chat_model("copilot/small", 200_000, None),
         ]);
 
-        let entries = smart_auto_entries(&snapshot);
+        let entries = smart_auto_entries(&snapshot, &rules(None));
         let entry = |id: &str| {
             entries
                 .iter()
@@ -1655,6 +1662,39 @@ mod tests {
         assert_eq!(long["display_name"], "Smart Auto (Balance, 1M context)");
         assert_eq!(long["context_length"], CONTEXT_TOKENS_1M);
         assert_eq!(long["max_output_tokens"], 128_000);
+    }
+
+    fn rules(json: Option<&str>) -> Arc<LoadedRules> {
+        let dir = std::env::temp_dir().join("llm-hub-models-rules-absent");
+        crate::services::smart_auto_rules::SmartAutoRulesStore::open(&dir, json)
+            .unwrap()
+            .current()
+    }
+
+    #[test]
+    fn smart_auto_entries_leave_out_models_the_active_rules_exclude() {
+        let snapshot = ModelDescriptorSnapshot::new(vec![
+            chat_model("copilot/known", 272_000, Some(128_000)),
+            ModelDescriptor {
+                chat: true,
+                ..ModelDescriptor::for_test("local/unknown")
+            },
+        ]);
+
+        let unruled = smart_auto_entries(&snapshot, &rules(None));
+        let ruled = smart_auto_entries(&snapshot, &rules(Some(r#"{"exclude":["local/*"]}"#)));
+
+        let balance = |entries: &[Value]| {
+            entries
+                .iter()
+                .find(|model| model["id"] == "hub/smart-auto-balance")
+                .cloned()
+                .unwrap()
+        };
+        assert!(balance(&unruled).get("context_window").is_none());
+        let balance = balance(&ruled);
+        assert_eq!(balance["context_window"], 272_000);
+        assert_eq!(balance["max_output_tokens"], 128_000);
     }
 
     #[test]

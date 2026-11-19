@@ -125,6 +125,13 @@ impl<'a> ResponseCtx<'a> {
         Some(body)
     }
 
+    /// Replaces the reply body with `body`, also when the upstream body was not JSON or was not read.
+    /// The caller sets any header the new body needs, such as `content-type`.
+    pub fn replace_error_body(&mut self, body: Value) {
+        self.error_body = Some(body);
+        self.error_body_changed = true;
+    }
+
     /// The `error.code` of the error body, when there is one.
     #[must_use]
     pub fn error_code(&self) -> Option<&str> {
