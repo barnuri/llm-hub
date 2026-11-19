@@ -9,6 +9,7 @@ use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::model_id::ModelId;
 use crate::schemas::stage_error::StageError;
 use crate::schemas::stage_reply::StageReply;
+use crate::services::split_choices::SplitChoices;
 use crate::services::stage_transport::StageTransport;
 
 /// The production transport: a concrete, non-streaming call through the proxy's pooled client.
@@ -54,8 +55,9 @@ impl StageClient {
         if !Self::SUCCESS_STATUS.contains(&status) {
             return Err(StageError::Upstream(format!("HTTP {status}")));
         }
-        let completion: Value =
+        let mut completion: Value =
             serde_json::from_slice(&raw).map_err(|e| StageError::Malformed(e.to_string()))?;
+        SplitChoices::merge(&mut completion);
         Ok(StageReply {
             completion,
             bytes: raw.len() as u64,
