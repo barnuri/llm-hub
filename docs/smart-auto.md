@@ -222,7 +222,7 @@ Checks run only on chat completions (`/v1/chat/completions` and `/v1/messages`).
 | Checkers | Run in parallel. Balance uses one checker. Intelligence uses up to two. Checkers come from the same pool and rules, must fit the request's estimated prompt, and never include the answering model. Another profile is preferred, not required. |
 | Verdict | `accept`, `repair` (with issues) or `reject` (with issues). |
 | Fix | At most one repair call, by the answering model, using the issues the checkers named. |
-| Reject | The draft is not sent. The client gets an error. No fix or fallback follows. |
+| Reject | Handled like a repair: at most one repair call within the budget. If no repair is possible (budget spent, the repair fails or times out), the draft is sent. The client never gets an error for a rejection. The `rejected` event and the review outcome still record it. |
 
 Each check has a budget:
 
@@ -293,4 +293,3 @@ Set `LLM_HUB_STORE_PATH` to choose the store file. See [Configuration](configura
 
 - **Fast tier comment.** The comment in `src/schemas/smart_auto_tier.rs` says "lowest measured latency". The router uses the built-in speed seed and no measurement. This doc describes the seed.
 - **Status line consumer.** I found no code in this repository that reads `/api/smart-auto/current` for the status line.
-- **Rejected check status.** A rejected draft becomes `AppError::UpstreamUnavailable`. I did not check which HTTP status that maps to.

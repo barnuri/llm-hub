@@ -15,7 +15,7 @@ pub struct ReviewOutcome {
     pub review_failed: Option<&'static str>,
     /// True when at least one verdict was read, or a repair was written.
     pub reviewed: bool,
-    /// True when a reviewer rejected the draft, which is then not sent and gets no repair.
+    /// True when a reviewer rejected the draft. The draft still gets one repair, or is sent as is.
     pub rejected: bool,
     /// True when the caller dropped the review and every in-flight stage was cancelled.
     pub aborted: bool,

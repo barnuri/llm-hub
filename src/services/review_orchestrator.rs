@@ -44,7 +44,7 @@ impl ReviewOrchestrator {
     pub const REASON_REPAIR_UNAVAILABLE: &'static str = "repair_unavailable";
     /// The solver wrote no text to review.
     pub const REASON_NO_DRAFT_TEXT: &'static str = "no_draft_text";
-    /// A reviewer rejected the draft as unusable, so the caller gets no repair.
+    /// A reviewer rejected the draft as unusable; it gets one repair like any other issue list.
     pub const REASON_DRAFT_REJECTED: &'static str = "draft_rejected";
     /// Every planned reviewer was the answering solver or skipped, so no independent verdict exists.
     pub const REASON_NO_INDEPENDENT_REVIEWER: &'static str = "no_independent_reviewer";
@@ -159,14 +159,13 @@ impl ReviewOrchestrator {
             JudgeRound::Aborted => return Ok(Self::aborted(solver_model, stages)),
             JudgeRound::Done { verdicts, failure } => (verdicts, failure),
         };
-        // A rejection outranks a failed sibling: the draft is unusable, so no repair is written.
-        if verdicts
+        let rejected = verdicts
             .iter()
-            .any(|verdict| matches!(verdict, ReviewVerdict::Reject { .. }))
+            .any(|verdict| matches!(verdict, ReviewVerdict::Reject { .. }));
+        // A rejection outranks a failed sibling: the draft still gets its one repair.
+        if let Some(reason) = failure
+            && !rejected
         {
-            return Ok(Self::rejected(completion, solver_model, stages));
-        }
-        if let Some(reason) = failure {
             let reviewed = !verdicts.is_empty();
             return Ok(Self::finished(
                 completion,
@@ -185,12 +184,15 @@ impl ReviewOrchestrator {
             return Ok(Self::finished(completion, solver_model, stages, None, true));
         }
         if !graph.repair {
-            return Ok(Self::finished(
-                completion,
-                solver_model,
-                stages,
-                Some(Self::REASON_REPAIR_UNAVAILABLE),
-                true,
+            return Ok(Self::marked(
+                Self::finished(
+                    completion,
+                    solver_model,
+                    stages,
+                    Some(Self::REASON_REPAIR_UNAVAILABLE),
+                    true,
+                ),
+                rejected,
             ));
         }
         Self::repair_once(
@@ -206,6 +208,7 @@ impl ReviewOrchestrator {
             wall_deadline,
         )
         .await
+        .map(|outcome| Self::marked(outcome, rejected))
     }
 }
 
@@ -500,11 +503,11 @@ impl ReviewOrchestrator {
         }
     }
 
-    /// Builds the outcome of a draft a reviewer rejected: it gets no repair and is not sent.
-    fn rejected(completion: Value, served: &ModelId, stages: Vec<StageRecord>) -> ReviewOutcome {
+    /// Marks `outcome` as rejected when a reviewer rejected the draft, so telemetry still counts it.
+    fn marked(outcome: ReviewOutcome, rejected: bool) -> ReviewOutcome {
         ReviewOutcome {
-            rejected: true,
-            ..Self::finished(completion, served, stages, None, true)
+            rejected: rejected && !outcome.aborted,
+            ..outcome
         }
     }
 
@@ -919,9 +922,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rejected_draft_is_not_repaired() {
+    async fn a_rejected_draft_gets_one_repair() {
         let transport = Scripted::new(
-            vec![reply(r#"{"verdict":"reject","issues":["wrong answer"]}"#)],
+            vec![
+                reply(r#"{"verdict":"reject","issues":["wrong answer"]}"#),
+                reply("The sum is 5."),
+            ],
             Duration::ZERO,
         );
         let outcome = ReviewOrchestrator::run(
@@ -934,21 +940,140 @@ mod tests {
         )
         .await
         .expect("solver succeeds");
+        assert_eq!(text_of(&outcome), "The sum is 5.");
         assert!(
             outcome.review_failed.is_none(),
             "a rejection is not a failed review"
         );
         assert!(outcome.rejected && outcome.reviewed && !outcome.aborted);
-        assert_eq!(transport.calls(), 1);
-        assert!(stage_states(&outcome, SelectionStage::Repair).is_empty());
+        assert_eq!(transport.calls(), 2);
+        let repair_body = transport.bodies.lock().unwrap()[1].to_string();
+        assert!(repair_body.contains("wrong answer"));
         assert_eq!(
             stage_states(&outcome, SelectionStage::Judge),
             [SelectionState::Started, SelectionState::Rejected]
         );
         assert_eq!(
-            outcome.stages.last().and_then(|record| record.reason),
+            stage_states(&outcome, SelectionStage::Repair),
+            [SelectionState::Started, SelectionState::Completed]
+        );
+        let judge_reason = outcome
+            .stages
+            .iter()
+            .find(|record| record.stage == SelectionStage::Judge && record.reason.is_some())
+            .and_then(|record| record.reason);
+        assert_eq!(
+            judge_reason,
             Some(ReviewOrchestrator::REASON_DRAFT_REJECTED)
         );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_draft_with_no_repair_budget_is_sent_as_is() {
+        let transport = Scripted::new(
+            vec![reply(r#"{"verdict":"reject","issues":["wrong answer"]}"#)],
+            Duration::ZERO,
+        );
+        let mut tight = graph(SmartAutoTier::Balance, 1);
+        // Two calls are left: the solver and the judge take them, so no repair is admitted.
+        assert!(tight.budget.admit_call());
+        let outcome = ReviewOrchestrator::run(
+            std::future::ready(reply("The sum is 6.")),
+            &solver(),
+            &tight,
+            &transport,
+            evidence(),
+            never(),
+        )
+        .await
+        .expect("solver succeeds");
+        assert_eq!(text_of(&outcome), "The sum is 6.");
+        assert!(outcome.rejected && outcome.reviewed && !outcome.aborted);
+        assert_eq!(
+            outcome.review_failed,
+            Some(ReviewOrchestrator::REASON_BUDGET)
+        );
+        assert_eq!(transport.calls(), 1);
+        assert_eq!(
+            stage_states(&outcome, SelectionStage::Repair),
+            [SelectionState::Rejected]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_draft_is_sent_as_is_when_its_repair_fails() {
+        let transport = Scripted::new(
+            vec![
+                reply(r#"{"verdict":"reject","issues":["wrong answer"]}"#),
+                Err(StageError::Upstream("HTTP 503".to_owned())),
+            ],
+            Duration::ZERO,
+        );
+        let outcome = ReviewOrchestrator::run(
+            std::future::ready(reply("The sum is 6.")),
+            &solver(),
+            &graph(SmartAutoTier::Balance, 1),
+            &transport,
+            evidence(),
+            never(),
+        )
+        .await
+        .expect("solver succeeds");
+        assert_eq!(text_of(&outcome), "The sum is 6.");
+        assert!(outcome.rejected && outcome.review_failed.is_some());
+        assert_eq!(transport.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_draft_is_sent_as_is_when_the_graph_allows_no_repair() {
+        let transport = Scripted::new(
+            vec![reply(r#"{"verdict":"reject","issues":["wrong answer"]}"#)],
+            Duration::ZERO,
+        );
+        let mut no_repair = graph(SmartAutoTier::Balance, 1);
+        no_repair.repair = false;
+        let outcome = ReviewOrchestrator::run(
+            std::future::ready(reply("The sum is 6.")),
+            &solver(),
+            &no_repair,
+            &transport,
+            evidence(),
+            never(),
+        )
+        .await
+        .expect("solver succeeds");
+        assert_eq!(text_of(&outcome), "The sum is 6.");
+        assert!(outcome.rejected);
+        assert_eq!(
+            outcome.review_failed,
+            Some(ReviewOrchestrator::REASON_REPAIR_UNAVAILABLE)
+        );
+        assert_eq!(transport.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rejection_with_a_failed_sibling_still_gets_its_repair() {
+        let transport = Scripted::new(
+            vec![
+                reply(r#"{"verdict":"reject","issues":["wrong answer"]}"#),
+                reply("not a verdict"),
+                reply("The sum is 5."),
+            ],
+            Duration::ZERO,
+        );
+        let outcome = ReviewOrchestrator::run(
+            std::future::ready(reply("The sum is 6.")),
+            &solver(),
+            &graph(SmartAutoTier::Intelligence, 2),
+            &transport,
+            evidence(),
+            never(),
+        )
+        .await
+        .expect("solver succeeds");
+        assert_eq!(text_of(&outcome), "The sum is 5.");
+        assert!(outcome.rejected && outcome.review_failed.is_none());
+        assert_eq!(transport.calls(), 3);
     }
 
     #[tokio::test]
