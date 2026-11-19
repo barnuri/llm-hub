@@ -168,6 +168,58 @@ async fn balance_tier_streams_the_reviewed_answer_as_sse_for_a_streaming_client(
     assert!(text.ends_with("data: [DONE]\n\n"));
 }
 
+/// An upstream whose solver reply is split the way Copilot splits a Claude reply: text in choice 0,
+/// one tool call in each later choice.
+async fn split_tool_call_upstream(model: &str) -> MockServer {
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"object": "list", "data": [{"id": model}]})),
+        )
+        .mount(&upstream)
+        .await;
+    let call = |id: &str, name: &str| serde_json::json!({"id": id, "type": "function", "function": {"name": name, "arguments": "{}"}});
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-split", "object": "chat.completion", "created": 1, "model": model,
+            "choices": [
+                {"index": 0, "finish_reason": "tool_calls",
+                 "message": {"role": "assistant", "content": "Checking both."}},
+                {"index": 1, "finish_reason": "tool_calls",
+                 "message": {"role": "assistant", "tool_calls": [call("a", "get_weather")]}},
+                {"index": 2, "finish_reason": "tool_calls",
+                 "message": {"role": "assistant", "tool_calls": [call("b", "get_time")]}},
+            ],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 9, "total_tokens": 14}
+        })))
+        .mount(&upstream)
+        .await;
+    upstream
+}
+
+#[tokio::test]
+async fn balance_tier_streams_every_tool_call_of_a_split_copilot_reply() {
+    let alpha = split_tool_call_upstream("m1").await;
+    let beta = split_tool_call_upstream("m2").await;
+    let (_hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&chat_body("hub/smart-auto-balance", true))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("Checking both."));
+    assert!(text.contains("get_weather"), "first tool call lost: {text}");
+    assert!(text.contains("get_time"), "second tool call lost: {text}");
+}
+
 #[tokio::test]
 async fn responses_route_skips_review() {
     let alpha = review_upstream("m1", "The sum is 5.").await;

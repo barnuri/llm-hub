@@ -67,6 +67,7 @@ pub mod smart_auto_router;
 pub mod smart_auto_rules;
 pub mod smart_auto_suitability;
 pub mod source_install;
+pub mod split_choices;
 pub mod sse;
 pub mod stage_client;
 pub mod stage_transport;

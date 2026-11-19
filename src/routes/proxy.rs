@@ -81,6 +81,7 @@ use crate::services::smart_auto_live::SmartAutoLive;
 use crate::services::smart_auto_pool::SmartAutoPool;
 use crate::services::smart_auto_router::SmartAutoRouter;
 use crate::services::smart_auto_rules::LoadedRules;
+use crate::services::split_choices::SplitChoices;
 use crate::services::stage_client::StageClient;
 use crate::services::stats::{RequestOutcome, ScrapedUsage, scrape_stream_usage, scrape_usage};
 use crate::services::store::now_ms;
@@ -1851,8 +1852,9 @@ async fn review_deliver(
             .bytes()
             .await
             .map_err(|e| StageError::Upstream(format!("read error: {e}")))?;
-        let completion: Value =
+        let mut completion: Value =
             serde_json::from_slice(&raw).map_err(|e| StageError::Malformed(e.to_string()))?;
+        SplitChoices::merge(&mut completion);
         Ok::<StageReply, StageError>(StageReply {
             completion,
             bytes: raw.len() as u64,
