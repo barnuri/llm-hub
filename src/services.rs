@@ -58,6 +58,7 @@ pub mod service_manager;
 pub mod session_insights;
 pub mod smart_auto_affinity;
 pub mod smart_auto_decisions;
+pub mod smart_auto_directive;
 pub mod smart_auto_effort;
 pub mod smart_auto_live;
 pub mod smart_auto_pool;

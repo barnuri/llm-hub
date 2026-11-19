@@ -367,6 +367,24 @@ type SelectionRole = "planning" | "investigation" | "implementation" | "validati
 
 type SelectionEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
+/** The score parts of one Smart Auto pick. */
+export interface SelectionScore {
+  readonly quality: number;
+  readonly cost: number;
+  readonly speed: number;
+  readonly penalty: number;
+  readonly capable: boolean;
+  readonly total: number;
+}
+
+/** Why the router chose a model: codes and numbers only. */
+export interface SelectionWhy {
+  readonly role_reason: string | null;
+  readonly directive: "applied" | "cleared" | "no_match" | null;
+  readonly score: SelectionScore | null;
+  readonly runners_up: readonly { readonly model: string; readonly score: number }[];
+}
+
 /** One row of `GET /api/smart-auto/history`. Scope keys are salted hashes; no prompt or response text is present. */
 export interface SelectionEvent {
   readonly seq: number;
@@ -384,6 +402,8 @@ export interface SelectionEvent {
   readonly model: string;
   readonly state: SelectionState;
   readonly reason: string | null;
+  /** Why the router chose the model. Absent on events before policy version 2 and on non-solver events. */
+  readonly why?: SelectionWhy | null;
   readonly policy_version: number;
   readonly requested_effort: SelectionEffort | null;
   readonly selected_effort: SelectionEffort | null;

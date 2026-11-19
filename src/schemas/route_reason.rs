@@ -11,6 +11,10 @@ pub enum RouteReason {
     RoleSwitch,
     /// No usable pin or incumbent exists, so the best model for the role was picked.
     Fresh,
+    /// The user text named the model, which wins over every routing rule.
+    UserDirective,
+    /// An earlier user directive pinned the model, and the turn stays on it.
+    UserPinned,
 }
 
 impl RouteReason {
@@ -23,6 +27,8 @@ impl RouteReason {
             RouteReason::Incumbent => "incumbent",
             RouteReason::RoleSwitch => "role_switch",
             RouteReason::Fresh => "fresh",
+            RouteReason::UserDirective => "user_directive",
+            RouteReason::UserPinned => "user_pinned",
         }
     }
 }
@@ -42,6 +48,8 @@ mod tests {
             (RouteReason::Incumbent, "incumbent"),
             (RouteReason::RoleSwitch, "role_switch"),
             (RouteReason::Fresh, "fresh"),
+            (RouteReason::UserDirective, "user_directive"),
+            (RouteReason::UserPinned, "user_pinned"),
         ];
 
         for (reason, code) in cases {

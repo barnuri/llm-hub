@@ -696,6 +696,8 @@ struct SmartAutoPlan {
     /// The effort sent to the routed model.
     effort: Option<EffortLevel>,
     reason: RouteReason,
+    /// A user directive chose the model, so its successful answer keeps the pin as the user's.
+    user_pin: bool,
     /// The selection event each dispatch of this route starts from.
     template: SelectionEvent,
     /// The review of this route's answers; `None` serves a single stream.
@@ -712,6 +714,8 @@ struct SmartAutoCommit {
     role: WorkRole,
     plan_backed: bool,
     turn: usize,
+    /// The pin is a user directive's, which role changes do not move.
+    user_pin: bool,
 }
 
 impl SmartAutoCommit {
@@ -725,6 +729,11 @@ impl SmartAutoCommit {
             self.turn,
             Instant::now(),
         );
+        if self.user_pin {
+            state
+                .smart_auto_affinity()
+                .mark_user_pin(&self.key, &self.model);
+        }
     }
 }
 
@@ -756,9 +765,11 @@ impl SmartAutoPlan {
         if !SUCCESS_STATUS_RANGE.contains(&status) {
             return None;
         }
+        let model = served.qualified();
         Some(SmartAutoCommit {
             key,
-            model: served.qualified(),
+            user_pin: self.user_pin && model == self.model,
+            model,
             role: self.role,
             plan_backed: self.plan_backed,
             turn: self.turn,
@@ -869,6 +880,7 @@ fn resolve_hub(
         effort: decision.effort.map(EffortLevel::as_str),
         model: decision.model.qualified_id.clone(),
         reason: decision.reason.as_str(),
+        why: decision.why.clone(),
     });
     let log = state.selection_log();
     let worker_raw = caller.worker.clone().or_else(|| signals.session_id.clone());
@@ -898,6 +910,7 @@ fn resolve_hub(
         affinity_scope,
         pin_miss: decision.pin_miss,
         reason: Some(decision.reason.as_str().to_owned()),
+        why: Some(decision.why),
         requested_effort: requested,
         ..SelectionEvent::new(
             SelectionStage::Solver,
@@ -946,6 +959,7 @@ fn resolve_hub(
         model: decision.model.qualified_id.clone(),
         effort: decision.effort,
         reason: decision.reason,
+        user_pin: decision.user_pin,
         template,
         review,
         task: signals.last_user_text.clone(),
@@ -4149,6 +4163,7 @@ mod tests {
             model: "alpha/m1".to_owned(),
             effort: None,
             reason: RouteReason::Fresh,
+            user_pin: false,
             review: None,
             task: None,
             template: SelectionEvent::new(
@@ -4167,6 +4182,57 @@ mod tests {
         assert_eq!(
             plan.commit(200, &served).map(|commit| commit.model),
             Some("alpha/m1".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_user_pin_commits_only_for_the_directed_model() {
+        let signals = TurnSignals::from_body(
+            "/chat/completions",
+            &serde_json::json!({}),
+            0,
+            Some("session-1".to_owned()),
+        );
+        let plan = SmartAutoPlan {
+            key: AffinityKey::new(
+                &signals,
+                &SmartAutoHeaders::default(),
+                &SmartAutoPolicy::default(),
+                "/chat/completions",
+            ),
+            tier: SmartAutoTier::Balance,
+            role: WorkRole::Conversation,
+            plan_backed: false,
+            turn: 1,
+            requested: None,
+            model: "alpha/m1".to_owned(),
+            effort: None,
+            reason: RouteReason::UserDirective,
+            user_pin: true,
+            review: None,
+            task: None,
+            template: SelectionEvent::new(
+                SelectionStage::Solver,
+                SelectionState::Selected,
+                "alpha/m1",
+            ),
+        };
+        let directed = ModelId {
+            profile: "alpha".to_owned(),
+            model: "m1".to_owned(),
+        };
+        let fallback = ModelId {
+            profile: "beta".to_owned(),
+            model: "m2".to_owned(),
+        };
+
+        assert_eq!(
+            plan.commit(200, &directed).map(|commit| commit.user_pin),
+            Some(true)
+        );
+        assert_eq!(
+            plan.commit(200, &fallback).map(|commit| commit.user_pin),
+            Some(false)
         );
     }
 

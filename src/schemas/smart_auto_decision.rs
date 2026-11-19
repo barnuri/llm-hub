@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+use crate::schemas::selection_why::SelectionWhy;
 use crate::schemas::work_role::WorkRole;
 
 /// One Smart Auto route: the tier, role, effort and model a request was sent with.
@@ -13,4 +14,6 @@ pub struct SmartAutoDecision {
     /// The qualified id the route chose first.
     pub model: String,
     pub reason: &'static str,
+    /// Why the router chose the model.
+    pub why: SelectionWhy,
 }

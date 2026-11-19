@@ -3,20 +3,25 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::schemas::affinity_key::AffinityKey;
+use crate::schemas::directive_outcome::DirectiveOutcome;
 use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::live_signals::LiveSignals;
 use crate::schemas::model_context::strip_1m_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
+use crate::schemas::model_directive::ModelDirective;
 use crate::schemas::pin_miss::PinMiss;
+use crate::schemas::ranked_model::RankedModel;
 use crate::schemas::role_decision::RoleDecision;
 use crate::schemas::role_reason::RoleReason;
 use crate::schemas::route_decision::RouteDecision;
 use crate::schemas::route_reason::RouteReason;
+use crate::schemas::selection_why::SelectionWhy;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
 use crate::schemas::smart_auto_tier::SmartAutoTier;
 use crate::schemas::turn_signals::TurnSignals;
 use crate::schemas::work_role::WorkRole;
 use crate::services::smart_auto_affinity::SmartAutoAffinity;
+use crate::services::smart_auto_directive::SmartAutoDirective;
 use crate::services::smart_auto_effort::SmartAutoEffort;
 use crate::services::smart_auto_roles::SmartAutoRoles;
 use crate::services::smart_auto_suitability::SmartAutoSuitability;
@@ -26,11 +31,41 @@ use crate::services::smart_auto_suitability::SmartAutoSuitability;
 #[derive(Debug)]
 pub struct SmartAutoRouter;
 
+/// One routing choice before effort and the selection reason are added.
+struct Choice<'a> {
+    model: &'a ModelDescriptor,
+    turn: RoleDecision,
+    reason: RouteReason,
+    pin_miss: Option<PinMiss>,
+    directive: Option<DirectiveOutcome>,
+    user_pin: bool,
+}
+
+impl<'a> Choice<'a> {
+    fn routed(
+        model: &'a ModelDescriptor,
+        turn: RoleDecision,
+        reason: RouteReason,
+        pin_miss: Option<PinMiss>,
+    ) -> Choice<'a> {
+        Choice {
+            model,
+            turn,
+            reason,
+            pin_miss,
+            directive: None,
+            user_pin: false,
+        }
+    }
+}
+
 impl SmartAutoRouter {
     const USAGE_BITS_PER_POINT: u32 = 8;
     const MAX_USAGE_POINTS: u32 = 2;
     /// A conversation turn this short is an approval that continues the kept model's work.
     const APPROVAL_MAX_WORDS: usize = 3;
+    /// How many other models a selection reason lists.
+    const RECORDED_RUNNERS_UP: usize = 3;
     /// The role a step-down is scored as: the cheap worker of plan-backed implementation.
     const CHEAP_WORK: RoleDecision = RoleDecision {
         role: WorkRole::Implementation,
@@ -56,23 +91,65 @@ impl SmartAutoRouter {
         now: Instant,
     ) -> Option<RouteDecision<'a>> {
         let tier = policy.tier.unwrap_or_default();
-        let (model, turn, reason, pin_miss) =
-            Self::choose(pool, policy, signals, anchor, usage, live, now)?;
+        let choice = Self::choose(pool, policy, signals, anchor, usage, live, now)?;
+        let turn = choice.turn;
         let effort = SmartAutoEffort::select(
             tier,
             turn.role,
             turn.plan_backed,
             requested,
-            &model.effort_levels,
+            &choice.model.effort_levels,
         );
+        let why = Self::why(pool, tier, &choice, usage, live);
         Some(RouteDecision {
-            model,
+            model: choice.model,
             role: turn.role,
             plan_backed: turn.plan_backed,
             effort,
-            reason,
-            pin_miss,
+            reason: choice.reason,
+            pin_miss: choice.pin_miss,
+            user_pin: choice.user_pin,
+            why,
         })
+    }
+
+    /// The role rule, the directive outcome, the chosen model's score parts and the best
+    /// other models, so the selection can be studied later.
+    fn why(
+        pool: &[&ModelDescriptor],
+        tier: SmartAutoTier,
+        choice: &Choice<'_>,
+        usage: &HashMap<String, u64>,
+        live: &LiveSignals,
+    ) -> SelectionWhy {
+        let turn = choice.turn;
+        let score = SmartAutoSuitability::breakdown(
+            &choice.model.qualified_id,
+            turn.role,
+            turn.plan_backed,
+            tier,
+            live.get(&choice.model.qualified_id),
+        );
+        let mut others: Vec<&ModelDescriptor> = pool
+            .iter()
+            .copied()
+            .filter(|model| !std::ptr::eq(*model, choice.model))
+            .collect();
+        others.sort_by_key(|model| Reverse(Self::rank(model, tier, turn, usage, live)));
+        let runners_up = others
+            .into_iter()
+            .take(Self::RECORDED_RUNNERS_UP)
+            .map(|model| RankedModel {
+                model: model.qualified_id.clone(),
+                score: Self::rank(model, tier, turn, usage, live).0,
+            })
+            .collect();
+        SelectionWhy {
+            role_reason: Some(turn.reason),
+            directive: choice.directive,
+            score: Some(score),
+            runners_up,
+        }
     }
 
     fn choose<'a>(
@@ -83,12 +160,76 @@ impl SmartAutoRouter {
         usage: &HashMap<String, u64>,
         live: &LiveSignals,
         now: Instant,
-    ) -> Option<(
-        &'a ModelDescriptor,
-        RoleDecision,
-        RouteReason,
-        Option<PinMiss>,
-    )> {
+    ) -> Option<Choice<'a>> {
+        let tier = policy.tier.unwrap_or_default();
+        let directive = Self::directive(signals);
+        let outcome = match &directive {
+            Some(ModelDirective::Model(names)) => {
+                let turn = SmartAutoRoles::classify_user_text(signals, policy.role);
+                if let Some(model) = Self::directed(pool, names, tier, turn, usage, live) {
+                    return Some(Choice {
+                        directive: Some(DirectiveOutcome::Applied),
+                        user_pin: true,
+                        ..Choice::routed(model, turn, RouteReason::UserDirective, None)
+                    });
+                }
+                Some(DirectiveOutcome::NoMatch)
+            }
+            Some(ModelDirective::Auto) => Some(DirectiveOutcome::Cleared),
+            None => None,
+        };
+        let released = outcome == Some(DirectiveOutcome::Cleared);
+        let mut choice =
+            Self::choose_by_rules(pool, policy, signals, anchor, usage, live, now, released)?;
+        choice.directive = outcome;
+        Some(choice)
+    }
+
+    /// The model directive of a user turn. A tool continuation carries no new user text.
+    fn directive(signals: &TurnSignals) -> Option<ModelDirective> {
+        if signals.tool_continuation {
+            return None;
+        }
+        SmartAutoDirective::parse(&SmartAutoRoles::visible_text(
+            signals.last_user_text.as_deref()?,
+        ))
+    }
+
+    /// The best pool model the directive names. The names go most specific first.
+    fn directed<'a>(
+        pool: &[&'a ModelDescriptor],
+        names: &[String],
+        tier: SmartAutoTier,
+        turn: RoleDecision,
+        usage: &HashMap<String, u64>,
+        live: &LiveSignals,
+    ) -> Option<&'a ModelDescriptor> {
+        names.iter().find_map(|name| {
+            let matching: Vec<&ModelDescriptor> = pool
+                .iter()
+                .copied()
+                .filter(|model| SmartAutoDirective::names_model(name, &model.qualified_id))
+                .collect();
+            Self::best(&matching, tier, turn, usage, live)
+        })
+    }
+
+    /// The route without a model directive. `released` drops a user pin's hold, so the pin
+    /// follows the usual switch rules again.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Each input is a separate per-request value; a bundle would only rename them"
+    )]
+    fn choose_by_rules<'a>(
+        pool: &[&'a ModelDescriptor],
+        policy: &SmartAutoPolicy,
+        signals: &TurnSignals,
+        anchor: Option<(&SmartAutoAffinity, &AffinityKey)>,
+        usage: &HashMap<String, u64>,
+        live: &LiveSignals,
+        now: Instant,
+        released: bool,
+    ) -> Option<Choice<'a>> {
         let tier = policy.tier.unwrap_or_default();
         let pin = match anchor {
             None => Err(PinMiss::NoKey),
@@ -109,18 +250,28 @@ impl SmartAutoRouter {
                 let (model, reason) =
                     Self::pick(pool, tier, turn, incumbent, usage, live, RouteReason::Fresh)?;
                 let pin_miss = (reason == RouteReason::Fresh).then_some(miss);
-                return Some((model, turn, reason, pin_miss));
+                return Some(Choice::routed(model, turn, reason, pin_miss));
             }
         };
+        let user_pin = !released && affinity.is_user_pin(key, now);
         if signals.tool_continuation {
             let turn = RoleDecision {
                 role: pinned_role,
                 plan_backed: pinned_plan_backed,
-                reason: RoleReason::CallerHint,
+                reason: RoleReason::KeptRole,
             };
-            return Some((pinned, turn, RouteReason::ToolContinuationReplay, None));
+            return Some(Choice {
+                user_pin,
+                ..Choice::routed(pinned, turn, RouteReason::ToolContinuationReplay, None)
+            });
         }
         let turn = SmartAutoRoles::classify_user_text(signals, policy.role);
+        if user_pin {
+            return Some(Choice {
+                user_pin,
+                ..Choice::routed(pinned, turn, RouteReason::UserPinned, None)
+            });
+        }
         let step_down_allowed = affinity.step_down_allowed(key, signals.user_turns, now);
         if Self::steps_down(
             pinned_role,
@@ -135,7 +286,7 @@ impl SmartAutoRouter {
             } else {
                 RouteReason::RoleSwitch
             };
-            return Some((model, turn, reason, None));
+            return Some(Choice::routed(model, turn, reason, None));
         }
         let settled = affinity.soft_switch_allowed(key, signals.user_turns, now);
         let switches = SmartAutoAffinity::should_switch(
@@ -147,7 +298,7 @@ impl SmartAutoRouter {
             settled,
         );
         if !switches {
-            return Some((pinned, turn, RouteReason::Pinned, None));
+            return Some(Choice::routed(pinned, turn, RouteReason::Pinned, None));
         }
         let incumbent = Self::incumbent(pool, anchor, turn.role, now);
         let (model, reason) = Self::pick(
@@ -164,7 +315,7 @@ impl SmartAutoRouter {
         } else {
             reason
         };
-        Some((model, turn, reason, None))
+        Some(Choice::routed(model, turn, reason, None))
     }
 
     /// Whether a heavy pin steps down to the cheap pick at the start of a user turn. Only
@@ -250,19 +401,7 @@ impl SmartAutoRouter {
             .copied()
             .filter(|model| !taken.contains(&strip_1m_suffix(&model.qualified_id)))
             .collect();
-        ranked.sort_by_key(|model| {
-            Reverse((
-                SmartAutoSuitability::score(
-                    &model.qualified_id,
-                    turn.role,
-                    turn.plan_backed,
-                    tier,
-                    live.get(&model.qualified_id),
-                ),
-                Self::usage_points(model, usage),
-                Reverse(model.qualified_id.as_str()),
-            ))
-        });
+        ranked.sort_by_key(|model| Reverse(Self::rank(model, tier, turn, usage, live)));
         let picked_profile = pool
             .iter()
             .find(|model| taken.first() == Some(&strip_1m_suffix(&model.qualified_id)))
@@ -289,19 +428,30 @@ impl SmartAutoRouter {
         usage: &HashMap<String, u64>,
         live: &LiveSignals,
     ) -> Option<&'a ModelDescriptor> {
-        pool.iter().copied().max_by_key(|model| {
-            (
-                SmartAutoSuitability::score(
-                    &model.qualified_id,
-                    turn.role,
-                    turn.plan_backed,
-                    tier,
-                    live.get(&model.qualified_id),
-                ),
-                Self::usage_points(model, usage),
-                Reverse(model.qualified_id.as_str()),
-            )
-        })
+        pool.iter()
+            .copied()
+            .max_by_key(|model| Self::rank(model, tier, turn, usage, live))
+    }
+
+    /// The ranking key: the score, then the usage points, then the lowest qualified id.
+    fn rank<'m>(
+        model: &'m ModelDescriptor,
+        tier: SmartAutoTier,
+        turn: RoleDecision,
+        usage: &HashMap<String, u64>,
+        live: &LiveSignals,
+    ) -> (u32, u32, Reverse<&'m str>) {
+        (
+            SmartAutoSuitability::score(
+                &model.qualified_id,
+                turn.role,
+                turn.plan_backed,
+                tier,
+                live.get(&model.qualified_id),
+            ),
+            Self::usage_points(model, usage),
+            Reverse(model.qualified_id.as_str()),
+        )
     }
 
     /// 0 below 128 requests, 1 below 32,768, else 2: usage separates only near ties.
@@ -326,6 +476,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::schemas::directive_outcome::DirectiveOutcome;
     use crate::schemas::evidence_source::EvidenceSource;
     use crate::schemas::limit_evidence::LimitEvidence;
     use crate::schemas::live_signals::ModelSignal;
@@ -762,6 +913,145 @@ mod tests {
         let next = runners(&pool, &["acme/model-a"], &LiveSignals::default(), 2);
 
         assert_eq!(next, ["beta/model-z", "acme/model-b"]);
+    }
+
+    #[test]
+    fn a_directive_beats_the_role_pick() {
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let decision = route_fresh(
+            &pool,
+            SmartAutoTier::Balance,
+            "use sonnet. plan the storage layer",
+        );
+        assert_eq!(decision.model.qualified_id, SONNET);
+        assert_eq!(decision.reason, RouteReason::UserDirective);
+        assert_eq!(decision.role, WorkRole::Planning);
+        assert!(decision.user_pin);
+        assert_eq!(decision.why.directive, Some(DirectiveOutcome::Applied));
+    }
+
+    #[test]
+    fn a_directive_for_a_model_outside_the_pool_leaves_the_route_to_the_rules() {
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let decision = route_fresh(
+            &pool,
+            SmartAutoTier::Balance,
+            "use gemini. plan the storage layer",
+        );
+        assert_eq!(decision.model.qualified_id, OPUS);
+        assert_eq!(decision.reason, RouteReason::Fresh);
+        assert!(!decision.user_pin);
+        assert_eq!(decision.why.directive, Some(DirectiveOutcome::NoMatch));
+    }
+
+    #[test]
+    fn a_tool_continuation_ignores_directive_text() {
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let decision = SmartAutoRouter::route(
+            &pool,
+            &policy(SmartAutoTier::Balance),
+            &signals("use haiku. plan the storage layer", 1, true),
+            None,
+            &HashMap::new(),
+            &LiveSignals::default(),
+            None,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(decision.model.qualified_id, OPUS);
+        assert_eq!(decision.why.directive, None);
+    }
+
+    fn user_pinned_store(model: &str, now: Instant) -> SmartAutoAffinity {
+        let affinity = pinned_store(model, WorkRole::Conversation, false, now);
+        affinity.mark_user_pin(&key(&policy(SmartAutoTier::Balance)), model);
+        affinity
+    }
+
+    #[test]
+    fn a_user_pin_holds_across_a_role_change() {
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let now = Instant::now();
+        let affinity = user_pinned_store(HAIKU, now);
+        let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
+
+        let decision = route_pinned(&pool, &affinity, &signals(PLANNING_TEXT, 5, false), cold);
+
+        assert_eq!(decision.model.qualified_id, HAIKU);
+        assert_eq!(decision.reason, RouteReason::UserPinned);
+        assert!(decision.user_pin);
+    }
+
+    #[test]
+    fn a_tool_continuation_keeps_the_user_pin() {
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let now = Instant::now();
+        let affinity = user_pinned_store(HAIKU, now);
+
+        let decision = route_pinned(&pool, &affinity, &signals("", 1, true), now);
+
+        assert_eq!(decision.model.qualified_id, HAIKU);
+        assert_eq!(decision.reason, RouteReason::ToolContinuationReplay);
+        assert!(decision.user_pin);
+        assert_eq!(decision.why.role_reason, Some(RoleReason::KeptRole));
+    }
+
+    #[test]
+    fn use_auto_releases_the_user_pin() {
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let now = Instant::now();
+        let affinity = user_pinned_store(HAIKU, now);
+        let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
+
+        let decision = route_pinned(
+            &pool,
+            &affinity,
+            &signals("use auto. plan the storage layer", 5, false),
+            cold,
+        );
+
+        assert_eq!(decision.model.qualified_id, OPUS);
+        assert_ne!(decision.reason, RouteReason::UserPinned);
+        assert!(!decision.user_pin);
+        assert_eq!(decision.why.directive, Some(DirectiveOutcome::Cleared));
+    }
+
+    #[test]
+    fn the_reason_records_the_score_and_the_best_other_models() {
+        let owned = models(&[HAIKU, OPUS, SONNET, LOCAL_CODER, "copilot/gpt-5-mini"]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+
+        let decision = route_fresh(&pool, SmartAutoTier::Balance, PLANNING_TEXT);
+
+        let why = &decision.why;
+        assert_eq!(why.role_reason, Some(RoleReason::PlanningCue));
+        let score = why.score.unwrap();
+        assert_eq!(score.quality, 10);
+        assert!(score.capable);
+        assert_eq!(
+            score.total,
+            SmartAutoSuitability::score(
+                OPUS,
+                WorkRole::Planning,
+                false,
+                SmartAutoTier::Balance,
+                ModelSignal::default(),
+            )
+        );
+        assert_eq!(why.runners_up.len(), SmartAutoRouter::RECORDED_RUNNERS_UP);
+        assert!(why.runners_up.iter().all(|ranked| ranked.model != OPUS));
+        assert!(
+            why.runners_up
+                .windows(2)
+                .all(|pair| pair[0].score >= pair[1].score)
+        );
+        assert!(why.runners_up[0].score <= score.total);
     }
 
     #[test]
