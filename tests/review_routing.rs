@@ -168,6 +168,81 @@ async fn balance_tier_streams_the_reviewed_answer_as_sse_for_a_streaming_client(
     assert!(text.ends_with("data: [DONE]\n\n"));
 }
 
+/// The marker only a repair request carries: it lists the reviewers' issues.
+const REPAIR_MARKER: &str = "<issues>";
+
+/// An upstream whose judge rejects every draft, and whose repair call answers with `repair`.
+async fn rejecting_upstream(model: &str, draft: &str, repair: ResponseTemplate) -> MockServer {
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"object": "list", "data": [{"id": model}]})),
+        )
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyLacks(JUDGE_MARKER))
+        .respond_with(completion(draft))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyHas(JUDGE_MARKER))
+        .and(BodyLacks(REPAIR_MARKER))
+        .respond_with(completion(
+            r#"{"verdict":"reject","issues":["the sum is wrong"]}"#,
+        ))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(BodyHas(REPAIR_MARKER))
+        .respond_with(repair)
+        .mount(&upstream)
+        .await;
+    upstream
+}
+
+#[tokio::test]
+async fn a_rejected_draft_is_repaired_and_sent_with_200() {
+    let alpha = rejecting_upstream("m1", "The sum is 6.", completion("The sum is 5.")).await;
+    let beta = rejecting_upstream("m2", "The sum is 6.", completion("The sum is 5.")).await;
+    let (_hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&chat_body("hub/smart-auto-balance", false))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "The sum is 5.");
+}
+
+#[tokio::test]
+async fn a_rejected_draft_whose_repair_fails_is_sent_as_is_with_200() {
+    let failing = || ResponseTemplate::new(500).set_body_string("repair down");
+    let alpha = rejecting_upstream("m1", "The sum is 6.", failing()).await;
+    let beta = rejecting_upstream("m2", "The sum is 6.", failing()).await;
+    let (_hub, base) = start_alpha_beta_hub(&alpha, &beta).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&chat_body("hub/smart-auto-balance", false))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "The sum is 6.");
+}
+
 /// An upstream whose solver reply is split the way Copilot splits a Claude reply: text in choice 0,
 /// one tool call in each later choice.
 async fn split_tool_call_upstream(model: &str) -> MockServer {

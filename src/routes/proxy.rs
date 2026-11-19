@@ -1940,11 +1940,6 @@ async fn review_deliver(
             );
         }
     }
-    if outcome.rejected {
-        return Err(AppError::UpstreamUnavailable(
-            "review rejected the draft".to_owned(),
-        ));
-    }
 
     let usage = outcome.completion.get("usage");
     let count = |pointer: &str| {
