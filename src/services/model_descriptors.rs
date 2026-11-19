@@ -67,8 +67,9 @@ impl ModelDescriptors {
                 LimitEvidence::new(value, EvidenceSource::Listed, &scope, LISTED_CONFIDENCE)
             })
             .or_else(|| runtime_context.clone());
-        let output =
-            Self::listed_u64(item, "/capabilities/limits/max_output_tokens").map(|value| {
+        let output = Self::listed_u64(item, "/capabilities/limits/max_output_tokens")
+            .or_else(|| Self::listed_u64(item, "/max_output_tokens"))
+            .map(|value| {
                 LimitEvidence::new(value, EvidenceSource::Listed, &scope, LISTED_CONFIDENCE)
             });
         Some(ModelDescriptor {
@@ -378,6 +379,16 @@ mod tests {
         assert_eq!(descriptor.context.unwrap().value, 1_000_000);
         assert_eq!(descriptor.vision, None);
         assert_eq!(descriptor.tool_support, None);
+    }
+
+    #[test]
+    fn generic_listed_entry_top_level_output_is_listed() {
+        let item =
+            json!({ "id": "gpt-5", "context_length": 272_000, "max_output_tokens": 128_000 });
+        let descriptor = ModelDescriptors::describe(&profile("llmgw", false), &item, None).unwrap();
+        let output = descriptor.output.unwrap();
+        assert_eq!(output.value, 128_000);
+        assert_eq!(output.source, EvidenceSource::Listed);
     }
 
     #[test]

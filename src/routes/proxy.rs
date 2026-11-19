@@ -7355,6 +7355,56 @@ mod tests {
             }
         }
 
+        #[tokio::test]
+        async fn chat_plain_413_becomes_a_context_overflow_the_client_compacts_on() {
+            for streams in [true, false] {
+                let copilot = copilot().await;
+                Mock::given(method("POST"))
+                    .and(path(UPSTREAM_CHAT_PATH))
+                    .respond_with(
+                        ResponseTemplate::new(413)
+                            .insert_header("content-type", "text/plain")
+                            .set_body_string("Request Entity Too Large"),
+                    )
+                    .mount(&copilot.upstream)
+                    .await;
+                let body = json!({
+                    "model": format!("{PROFILE}/{PLAIN_ID}"),
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": streams,
+                });
+
+                let response = attempt_loop(
+                    &copilot.state,
+                    Method::POST,
+                    "/v1/chat/completions",
+                    &client_headers(),
+                    Bytes::from(body.to_string()),
+                    RouteKind::OpenAi,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "application/json",
+                    "streams={streams}"
+                );
+                let raw = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let error = serde_json::from_slice::<Value>(&raw).unwrap()["error"].clone();
+                assert_eq!(error["code"], "context_length_exceeded");
+                assert!(
+                    error["message"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("prompt is too long")
+                );
+            }
+        }
+
         fn with_rules(copilot: &Copilot, yaml: &str) {
             let env = |_: &str| None;
             let mut rules = crate::ext::rules::parse(yaml, false, &env).unwrap();
