@@ -144,6 +144,108 @@ fn uninstall_systemd_unit(
     run("systemctl", &["--user", "daemon-reload"])
 }
 
+/// The macOS Application Firewall tool that `allow_through_firewall` drives.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "Only the macOS service manager uses it")
+)]
+const FIREWALL: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
+
+/// Writes the plist to `plist` and (re)loads it into the `gui/<uid>` domain through `run`.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "Only the macOS service manager uses it")
+)]
+fn install_launchd_agent(
+    plist: &Path,
+    uid: &str,
+    exe: &Path,
+    cwd: &Path,
+    mut run: impl FnMut(&str, &[&str]) -> Result<(), String>,
+    is_loaded: impl FnMut(&str) -> bool,
+    firewall_on: bool,
+) -> Result<(), String> {
+    if let Some(dir) = plist.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(plist, render_launchd_plist(exe, cwd)).map_err(|e| e.to_string())?;
+    println!("wrote {}", plist.display());
+    let domain = format!("gui/{uid}");
+    let plist_arg = plist.display().to_string();
+    // Reinstall-safe: unload any previous registration first (ignore
+    // "not loaded"), so rerunning install applies the fresh definition.
+    let target = format!("{domain}/{SERVICE_LABEL}");
+    if run("launchctl", &["bootout", &target]).is_err() {
+        println!("note: service was not previously loaded");
+    }
+    wait_until_unloaded(&target, is_loaded);
+    run("launchctl", &["bootstrap", &domain, &plist_arg])?;
+    if firewall_on {
+        allow_through_firewall(exe, run);
+    }
+    println!("service {SERVICE_LABEL} installed and running");
+    Ok(())
+}
+
+/// `bootout` returns before a graceful shutdown (stopping managed children) ends,
+/// and `bootstrap` fails with status 5 while the old instance is still registered.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "Only the macOS service manager uses it")
+)]
+fn wait_until_unloaded(target: &str, mut is_loaded: impl FnMut(&str) -> bool) {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(200);
+    const MAX_POLLS: u32 = 100;
+    for _ in 0..MAX_POLLS {
+        if !is_loaded(target) {
+            return;
+        }
+        std::thread::sleep(POLL);
+    }
+    println!("note: {target} still loaded after 20s; trying bootstrap anyway");
+}
+
+/// The macOS Application Firewall blocks inbound connections to unsigned
+/// background binaries per-app (any port), so a LAN bind needs the binary
+/// on its allow list. Best-effort: install still succeeds if this fails —
+/// sudo prompts in the terminal, and on failure we print the manual fix.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "Only the macOS service manager uses it")
+)]
+fn allow_through_firewall(exe: &Path, mut run: impl FnMut(&str, &[&str]) -> Result<(), String>) {
+    let exe_arg = exe.display().to_string();
+    println!("macOS firewall is on — allowing {exe_arg} (sudo may prompt)");
+    let allowed = run("sudo", &[FIREWALL, "--add", &exe_arg])
+        .and_then(|()| run("sudo", &[FIREWALL, "--unblockapp", &exe_arg]));
+    if let Err(e) = allowed {
+        println!("could not update the firewall ({e}); run manually:");
+        println!("  sudo {FIREWALL} --add \"{exe_arg}\"");
+        println!("  sudo {FIREWALL} --unblockapp \"{exe_arg}\"");
+    }
+}
+
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "Only the macOS service manager uses it")
+)]
+fn uninstall_launchd_agent(
+    uid: &str,
+    plist_path: impl FnOnce() -> Result<PathBuf, String>,
+    mut run: impl FnMut(&str, &[&str]) -> Result<(), String>,
+) -> Result<(), String> {
+    let target = format!("gui/{uid}/{SERVICE_LABEL}");
+    if let Err(e) = run("launchctl", &["bootout", &target]) {
+        println!("note: {e} (service may not be running)");
+    }
+    let plist = plist_path()?;
+    if plist.exists() {
+        std::fs::remove_file(&plist).map_err(|e| e.to_string())?;
+        println!("removed {}", plist.display());
+    }
+    Ok(())
+}
+
 /// The script a Windows logon task runs. It restarts the hub whenever it
 /// exits, as launchd `KeepAlive` and systemd `Restart=always` do: Task
 /// Scheduler only restarts a task that fails to start.
@@ -269,83 +371,23 @@ mod platform {
 
     use crate::consts::SERVICE_LABEL;
 
-    use super::{render_launchd_plist, run};
+    use super::{FIREWALL, install_launchd_agent, run, uninstall_launchd_agent};
 
     pub fn install(exe: &Path, cwd: &Path) -> Result<(), String> {
-        let plist = plist_path()?;
-        if let Some(dir) = plist.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&plist, render_launchd_plist(exe, cwd)).map_err(|e| e.to_string())?;
-        println!("wrote {}", plist.display());
-        let domain = format!("gui/{}", uid()?);
-        let plist_arg = plist.display().to_string();
-        // Reinstall-safe: unload any previous registration first (ignore
-        // "not loaded"), so rerunning install applies the fresh definition.
-        let target = format!("{domain}/{SERVICE_LABEL}");
-        if run("launchctl", &["bootout", &target]).is_err() {
-            println!("note: service was not previously loaded");
-        }
-        wait_until_unloaded(&target);
-        run("launchctl", &["bootstrap", &domain, &plist_arg])?;
-        allow_through_firewall(exe);
-        println!("service {SERVICE_LABEL} installed and running");
-        Ok(())
-    }
-
-    /// `bootout` returns before a graceful shutdown (stopping managed children) ends,
-    /// and `bootstrap` fails with status 5 while the old instance is still registered.
-    fn wait_until_unloaded(target: &str) {
-        const POLL: std::time::Duration = std::time::Duration::from_millis(200);
-        const MAX_POLLS: u32 = 100;
-        for _ in 0..MAX_POLLS {
-            let loaded = std::process::Command::new("launchctl")
-                .args(["print", target])
-                .output()
-                .is_ok_and(|out| out.status.success());
-            if !loaded {
-                return;
-            }
-            std::thread::sleep(POLL);
-        }
-        println!("note: {target} still loaded after 20s; trying bootstrap anyway");
-    }
-
-    /// The macOS Application Firewall blocks inbound connections to unsigned
-    /// background binaries per-app (any port), so a LAN bind needs the binary
-    /// on its allow list. Best-effort: install still succeeds if this fails —
-    /// sudo prompts in the terminal, and on failure we print the manual fix.
-    fn allow_through_firewall(exe: &Path) {
-        const FIREWALL: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
-        let enabled = std::process::Command::new(FIREWALL)
-            .arg("--getglobalstate")
-            .output()
-            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("enabled"));
-        if !enabled {
-            return;
-        }
-        let exe_arg = exe.display().to_string();
-        println!("macOS firewall is on — allowing {exe_arg} (sudo may prompt)");
-        let allowed = run("sudo", &[FIREWALL, "--add", &exe_arg])
-            .and_then(|()| run("sudo", &[FIREWALL, "--unblockapp", &exe_arg]));
-        if let Err(e) = allowed {
-            println!("could not update the firewall ({e}); run manually:");
-            println!("  sudo {FIREWALL} --add \"{exe_arg}\"");
-            println!("  sudo {FIREWALL} --unblockapp \"{exe_arg}\"");
-        }
+        let firewall_on = firewall_enabled();
+        install_launchd_agent(
+            &plist_path()?,
+            &uid()?,
+            exe,
+            cwd,
+            run,
+            is_loaded,
+            firewall_on,
+        )
     }
 
     pub fn uninstall() -> Result<(), String> {
-        let target = format!("gui/{}/{SERVICE_LABEL}", uid()?);
-        if let Err(e) = run("launchctl", &["bootout", &target]) {
-            println!("note: {e} (service may not be running)");
-        }
-        let plist = plist_path()?;
-        if plist.exists() {
-            std::fs::remove_file(&plist).map_err(|e| e.to_string())?;
-            println!("removed {}", plist.display());
-        }
-        Ok(())
+        uninstall_launchd_agent(&uid()?, plist_path, run)
     }
 
     pub fn status() -> Result<(), String> {
@@ -353,14 +395,28 @@ mod platform {
         run("launchctl", &["print", &target])
     }
 
-    fn plist_path() -> Result<PathBuf, String> {
+    fn is_loaded(target: &str) -> bool {
+        std::process::Command::new("launchctl")
+            .args(["print", target])
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    fn firewall_enabled() -> bool {
+        std::process::Command::new(FIREWALL)
+            .arg("--getglobalstate")
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("enabled"))
+    }
+
+    pub(super) fn plist_path() -> Result<PathBuf, String> {
         let home = std::env::home_dir().ok_or("cannot determine home directory")?;
         Ok(home
             .join("Library/LaunchAgents")
             .join(format!("{SERVICE_LABEL}.plist")))
     }
 
-    fn uid() -> Result<String, String> {
+    pub(super) fn uid() -> Result<String, String> {
         let out = std::process::Command::new("id")
             .arg("-u")
             .output()
@@ -765,6 +821,218 @@ mod tests {
         let unit = platform::unit_path().unwrap();
 
         assert!(unit.ends_with(format!(".config/systemd/user/{SERVICE_NAME}.service")));
+    }
+
+    fn launchctl(args: &str) -> String {
+        format!("launchctl {args}")
+    }
+
+    fn sudo_firewall(args: &str) -> String {
+        format!("sudo {FIREWALL} {args}")
+    }
+
+    #[test]
+    fn launchd_install_writes_the_plist_then_reloads_it_in_the_user_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("LaunchAgents/llm-hub.plist");
+        let mut runner = FakeRunner::default();
+
+        install_launchd_agent(
+            &plist,
+            "501",
+            Path::new("/opt/bin/llm-hub"),
+            Path::new("/srv/hub"),
+            |p, a| runner.run(p, a),
+            |_| false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&plist).unwrap(),
+            render_launchd_plist(Path::new("/opt/bin/llm-hub"), Path::new("/srv/hub"))
+        );
+        assert_eq!(
+            runner.calls,
+            vec![
+                launchctl(&format!("bootout gui/501/{SERVICE_LABEL}")),
+                launchctl(&format!("bootstrap gui/501 {}", plist.display())),
+            ]
+        );
+    }
+
+    #[test]
+    fn launchd_install_waits_for_the_old_instance_and_tolerates_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("llm-hub.plist");
+        let mut runner = FakeRunner::failing_on(&["bootout"]);
+        let mut probes = 0;
+
+        install_launchd_agent(
+            &plist,
+            "501",
+            Path::new("/opt/llm-hub"),
+            dir.path(),
+            |p, a| runner.run(p, a),
+            |_| {
+                probes += 1;
+                probes < 2
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(probes, 2);
+        assert_eq!(runner.calls.len(), 2);
+    }
+
+    #[test]
+    fn launchd_install_reports_a_failed_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = FakeRunner::failing_on(&["bootstrap"]);
+
+        let result = install_launchd_agent(
+            &dir.path().join("llm-hub.plist"),
+            "501",
+            Path::new("/opt/llm-hub"),
+            dir.path(),
+            |p, a| runner.run(p, a),
+            |_| false,
+            true,
+        );
+
+        assert_eq!(result, Err("launchctl exited with exit status: 1".into()));
+        assert!(!runner.calls.iter().any(|c| c.starts_with("sudo")));
+    }
+
+    #[test]
+    fn launchd_install_fails_without_running_launchctl_when_the_plist_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "").unwrap();
+        let mut runner = FakeRunner::default();
+
+        let result = install_launchd_agent(
+            &blocker.join("llm-hub.plist"),
+            "501",
+            Path::new("/opt/llm-hub"),
+            dir.path(),
+            |p, a| runner.run(p, a),
+            |_| false,
+            false,
+        );
+
+        assert!(result.is_err());
+        assert!(runner.calls.is_empty());
+    }
+
+    #[test]
+    fn launchd_install_allows_the_binary_through_an_enabled_firewall() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = FakeRunner::default();
+
+        install_launchd_agent(
+            &dir.path().join("llm-hub.plist"),
+            "501",
+            Path::new("/opt/llm-hub"),
+            dir.path(),
+            |p, a| runner.run(p, a),
+            |_| false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runner.calls[2..],
+            [
+                sudo_firewall("--add /opt/llm-hub"),
+                sudo_firewall("--unblockapp /opt/llm-hub"),
+            ]
+        );
+    }
+
+    #[test]
+    fn launchd_install_succeeds_when_the_firewall_update_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = FakeRunner::failing_on(&["--add"]);
+
+        let result = install_launchd_agent(
+            &dir.path().join("llm-hub.plist"),
+            "501",
+            Path::new("/opt/llm-hub"),
+            dir.path(),
+            |p, a| runner.run(p, a),
+            |_| false,
+            true,
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            runner.calls.last(),
+            Some(&sudo_firewall("--add /opt/llm-hub"))
+        );
+    }
+
+    #[test]
+    fn launchd_uninstall_boots_out_and_removes_the_plist() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("llm-hub.plist");
+        std::fs::write(&plist, "plist").unwrap();
+        let mut runner = FakeRunner::default();
+
+        uninstall_launchd_agent("501", || Ok(plist.clone()), |p, a| runner.run(p, a)).unwrap();
+
+        assert!(!plist.exists());
+        assert_eq!(
+            runner.calls,
+            vec![launchctl(&format!("bootout gui/501/{SERVICE_LABEL}"))]
+        );
+    }
+
+    #[test]
+    fn launchd_uninstall_tolerates_a_stopped_service_and_a_missing_plist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = FakeRunner::failing_on(&["bootout"]);
+
+        let result = uninstall_launchd_agent(
+            "501",
+            || Ok(dir.path().join("llm-hub.plist")),
+            |p, a| runner.run(p, a),
+        );
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn launchd_uninstall_fails_when_the_plist_path_is_unknown() {
+        let mut runner = FakeRunner::default();
+
+        let result = uninstall_launchd_agent(
+            "501",
+            || Err("cannot determine home directory".to_string()),
+            |p, a| runner.run(p, a),
+        );
+
+        assert_eq!(result, Err("cannot determine home directory".into()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_plist_lives_in_the_user_launch_agents_dir() {
+        let plist = platform::plist_path().unwrap();
+
+        assert!(plist.ends_with(format!("Library/LaunchAgents/{SERVICE_LABEL}.plist")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uid_is_the_numeric_user_id() {
+        let uid = platform::uid().unwrap();
+
+        assert!(
+            !uid.is_empty() && uid.chars().all(|c| c.is_ascii_digit()),
+            "{uid}"
+        );
     }
 
     #[test]

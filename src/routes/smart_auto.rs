@@ -33,6 +33,7 @@ use crate::schemas::scope_kind::ScopeKind;
 use crate::schemas::selection_event::SelectionEvent;
 use crate::schemas::selection_stage::SelectionStage;
 use crate::schemas::selection_state::SelectionState;
+use crate::schemas::selection_why::SelectionWhy;
 use crate::schemas::smart_auto_decision::SmartAutoDecision;
 use crate::schemas::smart_auto_headers::SmartAutoHeaders;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
@@ -430,6 +431,7 @@ struct ResolveReply {
     reason: &'static str,
     pinned: bool,
     alternatives: Vec<String>,
+    why: SelectionWhy,
 }
 
 #[derive(Serialize)]
@@ -600,9 +602,10 @@ fn resolve_dry_run(state: &AppState, mut body: ResolveBody) -> Result<ResolveRep
         reason: decision.reason.as_str(),
         pinned: matches!(
             decision.reason,
-            RouteReason::Pinned | RouteReason::ToolContinuationReplay
+            RouteReason::Pinned | RouteReason::ToolContinuationReplay | RouteReason::UserPinned
         ),
         alternatives,
+        why: decision.why,
     })
 }
 
@@ -1047,6 +1050,7 @@ mod tests {
                 effort: None,
                 model: ALPHA.into(),
                 reason: "fresh",
+                why: SelectionWhy::default(),
             });
         }
         let fetch = |limit| {

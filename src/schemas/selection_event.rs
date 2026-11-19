@@ -5,6 +5,7 @@ use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::pin_miss::PinMiss;
 use crate::schemas::selection_stage::SelectionStage;
 use crate::schemas::selection_state::SelectionState;
+use crate::schemas::selection_why::SelectionWhy;
 use crate::schemas::work_role::WorkRole;
 
 /// One selection or dispatch outcome. It holds salted scope keys and metadata, never prompt, response or tool text.
@@ -45,6 +46,10 @@ pub struct SelectionEvent {
     pub state: SelectionState,
     /// The route's reason code, such as `pinned` or `fresh`.
     pub reason: Option<String>,
+    /// Why the router chose the model. `None` on events that predate this field and on
+    /// events other than a solver selection.
+    #[serde(default)]
+    pub why: Option<SelectionWhy>,
     /// The routing policy version that made the selection.
     pub policy_version: u32,
     /// The effort the caller asked for.
@@ -71,7 +76,7 @@ pub struct SelectionEvent {
 
 impl SelectionEvent {
     /// The version of the Smart Auto routing policy that made a selection.
-    const POLICY_VERSION: u32 = 1;
+    const POLICY_VERSION: u32 = 2;
 
     /// An event in `selection_state` for `model` with no scope keys or metrics; the log assigns `seq` and `ts_ms`.
     pub fn new(
@@ -96,6 +101,7 @@ impl SelectionEvent {
             model: model.into(),
             state: selection_state,
             reason: None,
+            why: None,
             policy_version: Self::POLICY_VERSION,
             requested_effort: None,
             selected_effort: None,
@@ -167,6 +173,7 @@ mod tests {
             "tier",
             "tokens_in",
             "tokens_out",
+            "why",
             "ts_ms",
             "turn",
             "worker",

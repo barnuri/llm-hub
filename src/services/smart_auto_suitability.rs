@@ -1,5 +1,6 @@
 use crate::schemas::live_signals::ModelSignal;
 use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::score_parts::ScoreParts;
 use crate::schemas::smart_auto_tier::SmartAutoTier;
 use crate::schemas::work_role::WorkRole;
 
@@ -121,6 +122,18 @@ impl SmartAutoSuitability {
         tier: SmartAutoTier,
         signal: ModelSignal,
     ) -> u32 {
+        Self::breakdown(model_id, role, plan_backed, tier, signal).total
+    }
+
+    /// The parts of [`Self::score`], so a selection can record why a model ranked where it did.
+    #[must_use]
+    pub fn breakdown(
+        model_id: &str,
+        role: WorkRole,
+        plan_backed: bool,
+        tier: SmartAutoTier,
+        signal: ModelSignal,
+    ) -> ScoreParts {
         let model_seed = Self::seed(model_id);
         let quality = model_seed.quality[Self::column(role, plan_backed)];
         let weights = Self::weights(tier);
@@ -137,12 +150,21 @@ impl SmartAutoSuitability {
         let weighted = weights.quality * u32::from(quality)
             + weights.cheapness * u32::from(cost)
             + weights.speed * speed;
-        let weighted = if quality >= Self::CAPABLE_FLOOR {
+        let capable = quality >= Self::CAPABLE_FLOOR;
+        let weighted = if capable {
             weighted + Self::CAPABLE_BONUS
         } else {
             weighted
         };
-        weighted.saturating_sub(Self::penalty(signal))
+        let penalty = Self::penalty(signal);
+        ScoreParts {
+            quality,
+            cost,
+            speed,
+            penalty,
+            capable,
+            total: weighted.saturating_sub(penalty),
+        }
     }
 
     /// Points lost to failures and to a nearly empty quota. Unknown signals cost nothing.

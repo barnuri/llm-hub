@@ -77,6 +77,7 @@ The steps:
    5. The estimated prompt, about one token per four request bytes, fits any known prompt or context limit. A lower-bound observation is never a limit.
    6. The caller's `x-llm-hub-profiles` filter allows its profile. A filter that names only `hub` leaves the pool open.
 5. **Role and plan-backed.** See [Roles](#roles).
+   - **Model directive.** A model the user names in the text wins over every step below. See [Model directives](#model-directives).
 6. **Keep same model.** See [Affinity and switches](#affinity-and-switches).
 7. **Router.** Picks the model that answers. A session with a kept model keeps it. A new session takes the model it last used for this role, if that model is still eligible. Otherwise the highest seed score wins. See [Scoring](#scoring).
 8. **Effort.** See [Effort](#effort).
@@ -107,7 +108,7 @@ Response headers on a Smart Auto answer:
 - `x-llm-hub-model`: the model that served the answer, after any check.
 - `x-llm-hub-attempts`: each attempt and its status.
 - `x-llm-hub-smart-auto-tier` and `x-llm-hub-smart-auto-role`.
-- `x-llm-hub-smart-auto-reason`: `fresh`, `pinned`, `incumbent`, `role_switch` or `tool_continuation_replay`.
+- `x-llm-hub-smart-auto-reason`: `fresh`, `pinned`, `incumbent`, `role_switch`, `tool_continuation_replay`, `user_directive` or `user_pinned`.
 - `x-llm-hub-smart-auto-effort`: missing when the model publishes no levels.
 
 When no model is eligible, the 400 names every active restriction:
@@ -124,7 +125,7 @@ The Claude launcher sends them as lines in `ANTHROPIC_CUSTOM_HEADERS`. If no mod
 
 ### Roles
 
-The role comes from the latest real user text. System reminders are removed. Instructions inside the text are treated as data.
+The role comes from the latest real user text. System reminders are removed. Instructions inside the text are treated as data, except a [model directive](#model-directives).
 
 - The earliest cue word in the text sets the role.
   - Planning cues: `plan`, `planning`, `design`, `architecture`, `spec`, `specs`, "how should we/I".
@@ -135,6 +136,16 @@ The role comes from the latest real user text. System reminders are removed. Ins
 - A plan marker is `plan.md`, `tasks.md`, `agent-spec/`, a `<command-name>` tag, or a leading lowercase `/skill` token. A marker makes the turn **plan-backed**. A plan word in the system prompt does not count.
 - The caller's `role` header or a preset's role beats every rule. It still sets plan-backed from the text.
 - A tool continuation (a tool result with no new user text) keeps the kept role and plan flag.
+
+### Model directives
+
+A user can name the model in the prompt. The directive wins over the role, the score and the switch rules.
+
+- **Forms.** `use <model>` at the start of the text, after `.`, `!`, `?`, `;`, `:` or `,`, or after `please`, `and`, `then`, `now` or `just`. `switch to <model>` and `route to <model>` anywhere. `model: <model>` and `model:<model>` anywhere. "why does it use opus" is not a directive, because `use` is inside a clause. The last directive in the text wins.
+- **Names.** A name matches a full qualified id (`copilot/gpt-6.1-sol`), a model id, or a run of `-` separated parts of a model id (`opus` matches `claude-opus-5-5`). `.` and `_` read as `-`, so `sonnet-5.5` matches `claude-sonnet-5-5`. Two words are tried joined first (`claude opus` as `claude-opus`), then the first word alone. When several pool models match, the highest score wins.
+- **Pool.** A directive picks only from the eligible pool. Rules, minimums, image and size gates and cooldowns still apply. A name with no match leaves the route to the usual rules, and history records `no_match`.
+- **Sticky.** A directed answer that succeeds marks the pin as the user's. Later turns stay on it with reason `user_pinned`: no step-down and no role switch. The pin ends at another directive, at `use auto` (or `switch to auto`), after 10 idle minutes, or when the model leaves the pool. A fallback that answers instead of the directed model does not get the mark.
+- **Tool continuations** carry no new user text, so they never read a directive. They replay the pin and keep its mark.
 
 ### Affinity and switches
 
@@ -236,23 +247,30 @@ If a check runs out of budget, times out or returns a bad verdict, the draft is 
 - **Smart Auto tab in the UI.** The panels are:
   - *Current selection*: the worker's current model and its active stages.
   - *Rules*: global include and exclude, per-profile rules, and a results table. The table shows each known model's outcome and the glob that decided it.
-  - *Stage and turn timeline*: the history, newest first, with salted keys.
+  - *Stage and turn timeline*: the history, newest first, with salted keys. The Reason cell shows the selection reason under the route code; hover it for the score parts and the runners-up.
   - *How Smart Auto works*: a summary of the request path, tiers and where to see things.
 - **Status line.** Shows the current model. The code that reads `/api/smart-auto/current` is not in this repository, so this doc does not name it.
 - **HTTP routes.** All need a key when hub auth is on.
   - `GET /api/smart-auto/current?worker=<id>` or `?session=<id>`: the worker's main model, its active stages, `age_ms`, and `stale` (true after 10 minutes). `selection` is `null` before the first event. Returns 400 without either parameter.
   - `GET /api/smart-auto/history?workflow=&worker=&since_seq=&limit=`: events after `since_seq`, oldest first. `limit` defaults to 200 and is capped at 1,000.
-  - `GET /api/smart-auto/decisions?limit=N`: the newest routes first, from memory. `limit` defaults to 50 and is capped at 200.
+  - `GET /api/smart-auto/decisions?limit=N`: the newest routes first, from memory, each with its `why`. `limit` defaults to 50 and is capped at 200.
   - `GET /api/smart-auto/health`: each `(model, route)` the hub attempted, with `failures` in a row, `last_failure`, `cooled_for_ms` (above 0 means skipped), `error_rate`, `outcomes`, `ttft_ms`, `samples` and `speed`. `costs` holds the cost score of each priced model.
   - `GET /api/smart-auto/rules`: the active rules, their source (`file`, `env` or `none`), and whether they are read-only.
   - `PUT /api/smart-auto/rules`: checks the JSON, saves it atomically and makes it active. Refused when env rules own the rules.
   - `GET /api/smart-auto/rules/effect`: each known model's outcome under the current rules, with the reason and the glob that decided it.
-  - `POST /api/smart-auto/resolve`: a dry run. It builds the same pool and policy as a `hub/smart-auto-<tier>` turn on `/v1/messages` and returns the pick. It makes no upstream call and writes no affinity, history or decisions. Body fields, all optional: `tier` (default `balance`), `role`, `worker`, `session`, `parent`, `policy_handle`, `include` and `exclude` (glob lists), `min_context` (tokens), `profiles` and `text`. `profiles` is comma-separated, the same filter as the `x-llm-hub-profiles` header. `text` is user text for role classification. `parent` and `policy_handle` match the `x-llm-hub-smart-auto-parent` and `x-llm-hub-smart-auto-policy` headers; send them when the turn sent them, because the pin key includes them. With `worker` or `session`, the dry run reports a kept pin, whichever client route set it (`/v1/messages`, chat completions or Responses). When more than one route holds a pin, the most recently used one wins, and the dry run uses that route's pool. A pin the filters leave out is not dropped. Reply: `{"model", "tier", "role", "plan_backed", "effort", "reason", "pinned", "alternatives"}`, where `alternatives` holds up to 4 other eligible models, best first. An unknown tier or role returns 400. An empty pool returns 409.
+  - `POST /api/smart-auto/resolve`: a dry run. It builds the same pool and policy as a `hub/smart-auto-<tier>` turn on `/v1/messages` and returns the pick. It makes no upstream call and writes no affinity, history or decisions. Body fields, all optional: `tier` (default `balance`), `role`, `worker`, `session`, `parent`, `policy_handle`, `include` and `exclude` (glob lists), `min_context` (tokens), `profiles` and `text`. `profiles` is comma-separated, the same filter as the `x-llm-hub-profiles` header. `text` is user text for role classification. `parent` and `policy_handle` match the `x-llm-hub-smart-auto-parent` and `x-llm-hub-smart-auto-policy` headers; send them when the turn sent them, because the pin key includes them. With `worker` or `session`, the dry run reports a kept pin, whichever client route set it (`/v1/messages`, chat completions or Responses). When more than one route holds a pin, the most recently used one wins, and the dry run uses that route's pool. A pin the filters leave out is not dropped. Reply: `{"model", "tier", "role", "plan_backed", "effort", "reason", "pinned", "alternatives", "why"}`, where `alternatives` holds up to 4 other eligible models, best first. `text` is also read for a [model directive](#model-directives). An unknown tier or role returns 400. An empty pool returns 409.
   - `GET /api/smart-auto/tiers`: `{"default_tier", "tiers": [{"name", "selector", "pool"}], "roles", "role_tier_defaults"}`. `pool` lists the models eligible for the tier under the current rules. `role_tier_defaults` maps each role to a suggested tier for clients. The hub does not apply it.
 
 ### Privacy and storage
 
-An event holds salted scope keys and metadata: selector, tier, role, stage, model, state, reason, effort, status, latency and token counts. A solver event also holds `affinity_scope` (which part formed the affinity key: `session_header`, `prompt_cache_key`, `content_hash` or `worker_header`) and, on a `fresh` route, `pin_miss` (why no kept model applied: `no_key`, `no_pin`, `idle_expired` or `left_pool`). Both are codes, never raw values. It never holds prompt, response or tool text. The salt is random per install and kept in the store. A stored key does not reveal the id it stands for.
+An event holds salted scope keys and metadata: selector, tier, role, stage, model, state, reason, effort, status, latency and token counts. A solver event also holds `affinity_scope` (which part formed the affinity key: `session_header`, `prompt_cache_key`, `content_hash` or `worker_header`) and, on a `fresh` route, `pin_miss` (why no kept model applied: `no_key`, `no_pin`, `idle_expired` or `left_pool`). Both are codes, never raw values. A solver `selected` event also holds `why`, the selection reason:
+
+- `role_reason`: the rule that set the role, such as `planning_cue`, `plan_marker`, `caller_hint`, `kept_role` (a tool continuation) or `no_cue`.
+- `directive`: `applied`, `cleared` or `no_match` when the text held a [model directive](#model-directives).
+- `score`: the chosen model's `quality`, `cost` and `speed` (0 to 10), the `penalty` for errors and quota, `capable`, and the `total` the router ranks by.
+- `runners_up`: the 3 best other pool models with their totals, best first.
+
+Events from policy version 2 carry `why`. It never holds prompt, response or tool text. The salt is random per install and kept in the store. A stored key does not reveal the id it stands for.
 
 - Events are saved to the store (`LLM_HUB_STORE`, SQLite by default) by a writer thread. If the writer queue is full, the save is dropped. The in-memory event is kept.
 - The store keeps every event from the last 60 days, with no count limit. Memory holds the newest 2,000.

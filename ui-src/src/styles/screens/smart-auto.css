@@ -313,6 +313,11 @@
   overflow-wrap: anywhere;
 }
 
+.smart-auto-table .smart-auto-why {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
 .smart-auto-table tr.turn-start td {
   border-top: 1px solid var(--border-strong);
 }

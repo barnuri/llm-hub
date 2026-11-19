@@ -22,6 +22,7 @@ import type {
   CurrentSelectionResponse,
   ProfileRow,
   SelectionEvent,
+  SelectionWhy,
   SelectionState,
   SmartAutoEffectReason,
   SmartAutoEffectResponse,
@@ -169,6 +170,33 @@ function FilterSelect({
   );
 }
 
+function whyText(why: SelectionWhy): string {
+  const parts: string[] = [];
+  if (why.directive) {
+    parts.push(`directive ${why.directive}`);
+  }
+  if (why.role_reason) {
+    parts.push(why.role_reason);
+  }
+  if (why.score) {
+    parts.push(`score ${why.score.total}`);
+  }
+  const next = why.runners_up[0];
+  if (next) {
+    parts.push(`next ${next.model} ${next.score}`);
+  }
+  return parts.join(" · ");
+}
+
+function whyTitle(why: SelectionWhy | null | undefined): string | undefined {
+  if (!why?.score) {
+    return undefined;
+  }
+  const { quality, cost, speed, penalty, total } = why.score;
+  const others = why.runners_up.map((ranked) => `${ranked.model} ${ranked.score}`).join(", ");
+  return `quality ${quality}, cost ${cost}, speed ${speed}, penalty ${penalty}, total ${total}. Others: ${others || "none"}`;
+}
+
 function EventRow({
   event,
   startsTurn,
@@ -201,8 +229,9 @@ function EventRow({
           {event.state}
         </Pill>
       </td>
-      <td className="smart-auto-reason" data-label="Reason">
+      <td className="smart-auto-reason" data-label="Reason" title={whyTitle(event.why)}>
         {event.reason ?? UNSET}
+        {event.why ? <div className="smart-auto-why">{whyText(event.why)}</div> : null}
       </td>
       <td data-label="Role">{event.role ?? UNSET}</td>
       <td className="mono" title={effortTitle(event)} data-label="Effort">

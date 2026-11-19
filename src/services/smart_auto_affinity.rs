@@ -41,6 +41,8 @@ struct ActivePin {
     role: WorkRole,
     plan_backed: bool,
     since_turn: usize,
+    /// A user directive in the text chose the model, so role changes keep it.
+    by_user: bool,
 }
 
 /// How much a role needs from its model. A switch toward `Light` never pays for a cold cache.
@@ -214,6 +216,7 @@ impl SmartAutoAffinity {
             role,
             plan_backed,
             since_turn,
+            by_user: false,
         });
         match entry
             .incumbents
@@ -226,6 +229,30 @@ impl SmartAutoAffinity {
         table.compact();
         table.evict_over_capacity(key);
         true
+    }
+
+    /// Marks the live pin under `key` as chosen by a user directive, when it pins `model`.
+    /// Call it after [`Self::commit`], which clears the mark.
+    pub fn mark_user_pin(&self, key: &AffinityKey, model: &str) {
+        let mut table = self.lock();
+        if let Some(pin) = table
+            .entries
+            .get_mut(key)
+            .and_then(|entry| entry.active.as_mut())
+            .filter(|pin| pin.model == model)
+        {
+            pin.by_user = true;
+        }
+    }
+
+    /// Whether a user directive chose the live pin under `key`. Changes nothing.
+    #[must_use]
+    pub fn is_user_pin(&self, key: &AffinityKey, now: Instant) -> bool {
+        let table = self.lock();
+        table.entries.get(key).is_some_and(|entry| {
+            now.saturating_duration_since(entry.last_used) <= Self::IDLE
+                && entry.active.as_ref().is_some_and(|pin| pin.by_user)
+        })
     }
 
     /// Whether the main solver leaves its pin for a turn now classified as `new_role`.
@@ -396,6 +423,25 @@ mod tests {
         fn refs(&self) -> Vec<&ModelDescriptor> {
             self.0.iter().collect()
         }
+    }
+
+    #[test]
+    fn mark_user_pin_holds_until_the_next_commit() {
+        let store = SmartAutoAffinity::new();
+        let key = key_for("s-user", None);
+        let now = Instant::now();
+        assert!(!store.is_user_pin(&key, now));
+        store.commit(&key, OPUS, WorkRole::Planning, false, 1, now);
+        assert!(!store.is_user_pin(&key, now));
+
+        store.mark_user_pin(&key, MINI);
+        assert!(!store.is_user_pin(&key, now));
+        store.mark_user_pin(&key, OPUS);
+        assert!(store.is_user_pin(&key, now));
+        assert!(!store.is_user_pin(&key, now + Duration::from_mins(11)));
+
+        store.commit(&key, OPUS, WorkRole::Planning, false, 2, now);
+        assert!(!store.is_user_pin(&key, now));
     }
 
     #[test]

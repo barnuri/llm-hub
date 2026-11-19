@@ -2,10 +2,11 @@ use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::pin_miss::PinMiss;
 use crate::schemas::route_reason::RouteReason;
+use crate::schemas::selection_why::SelectionWhy;
 use crate::schemas::work_role::WorkRole;
 
 /// One Smart Auto routing decision. The proxy commits it to affinity only on success.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RouteDecision<'a> {
     /// The concrete model to call.
     pub model: &'a ModelDescriptor,
@@ -19,4 +20,8 @@ pub struct RouteDecision<'a> {
     pub reason: RouteReason,
     /// Why no pin served the turn. `None` unless the route is `fresh`.
     pub pin_miss: Option<PinMiss>,
+    /// A user directive chose the model, so a successful answer marks the pin as the user's.
+    pub user_pin: bool,
+    /// Why the router chose this model, for the selection history.
+    pub why: SelectionWhy,
 }

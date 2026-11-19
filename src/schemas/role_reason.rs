@@ -1,8 +1,13 @@
+use serde::{Deserialize, Serialize};
+
 /// Why the classifier chose a role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RoleReason {
     /// The caller named the role.
     CallerHint,
+    /// A tool continuation keeps the role of its pinned turn.
+    KeptRole,
     /// The earliest cue in the user text is a planning word.
     PlanningCue,
     /// The earliest cue in the user text is an investigation word.

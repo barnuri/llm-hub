@@ -39,6 +39,7 @@ impl SmartAutoDecisionLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schemas::selection_why::SelectionWhy;
     use crate::schemas::work_role::WorkRole;
 
     fn decision(ts_ms: u64) -> SmartAutoDecision {
@@ -50,6 +51,7 @@ mod tests {
             effort: Some("medium"),
             model: "alpha/m1".to_owned(),
             reason: "fresh",
+            why: SelectionWhy::default(),
         }
     }
 

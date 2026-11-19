@@ -19,7 +19,7 @@ impl RoleDecision {
     #[must_use]
     pub fn source(self) -> RoleSource {
         match self.reason {
-            RoleReason::CallerHint => RoleSource::Hint,
+            RoleReason::CallerHint | RoleReason::KeptRole => RoleSource::Hint,
             RoleReason::NoUserText | RoleReason::NoCue => RoleSource::Default,
             RoleReason::PlanningCue
             | RoleReason::InvestigationCue
