@@ -828,7 +828,7 @@ pub async fn insights_analysis_models(
         book.estimate(
             model,
             input_tokens,
-            insights_analysis::ANALYSIS_MAX_OUTPUT_TOKENS,
+            insights_analysis::ANALYSIS_EXPECTED_OUTPUT_TOKENS,
             0,
             0,
         )
@@ -836,6 +836,7 @@ pub async fn insights_analysis_models(
     Ok(Json(json!({
         "estimated_input_tokens": input_tokens,
         "max_output_tokens": insights_analysis::ANALYSIS_MAX_OUTPUT_TOKENS,
+        "expected_output_tokens": insights_analysis::ANALYSIS_EXPECTED_OUTPUT_TOKENS,
         "fair_run_usd": insights_analysis::FAIR_RUN_USD,
         "candidates": candidates,
     })))
@@ -873,14 +874,21 @@ pub async fn insights_analyze(
         .then(|| insights_analysis::reply_text(&reply.body))
         .flatten()
         .ok_or_else(|| {
+            let detail = insights_analysis::empty_reply_reason(&reply.body)
+                .filter(|_| reply.ok)
+                .map_or_else(
+                    || {
+                        String::from_utf8_lossy(&reply.body)
+                            .chars()
+                            .take(300)
+                            .collect()
+                    },
+                    str::to_string,
+                );
             AppError::UpstreamUnavailable(format!(
-                "{} failed the analysis: HTTP {}: {}",
+                "{} failed the analysis: HTTP {}: {detail}",
                 model_id.qualified(),
                 reply.status,
-                String::from_utf8_lossy(&reply.body)
-                    .chars()
-                    .take(300)
-                    .collect::<String>()
             ))
         })?;
     Ok(Json(json!({
@@ -2243,6 +2251,25 @@ mod tests {
         assert_eq!(
             logged[0].client.as_deref(),
             Some(insights_analysis::ANALYSIS_CLIENT)
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_explains_a_reply_that_spent_its_budget_thinking() {
+        let reply = json!({"choices": [{"finish_reason": "length", "message": {"content": ""}}]});
+        let (_server, _dir, state) = analysis_upstream(200, reply).await;
+
+        let spent = insights_analyze(
+            State(state),
+            Query(insights_query(Some("all"), None)),
+            Json(InsightsAnalysisInput {
+                model: "w/small".into(),
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(spent, Err(AppError::UpstreamUnavailable(reason)) if reason.contains("token budget"))
         );
     }
 

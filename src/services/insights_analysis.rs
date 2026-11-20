@@ -11,8 +11,10 @@ use crate::schemas::insights::model_insight::ModelInsight;
 
 /// The request log records analysis runs under this client.
 pub const ANALYSIS_CLIENT: &str = "llm-hub/insights-analysis";
-/// The analysis reply is capped at this many tokens.
-pub const ANALYSIS_MAX_OUTPUT_TOKENS: u64 = 1500;
+/// The analysis reply is capped at this many tokens. Reasoning models spend part of it thinking.
+pub const ANALYSIS_MAX_OUTPUT_TOKENS: u64 = 4000;
+/// A run's cost estimate assumes this many output tokens, a typical 500-word answer.
+pub const ANALYSIS_EXPECTED_OUTPUT_TOKENS: u64 = 1500;
 /// A run estimated at or below this many US dollars counts as a fair cost.
 pub const FAIR_RUN_USD: f64 = 0.05;
 const CHARS_PER_TOKEN: u64 = 4;
@@ -122,6 +124,16 @@ pub fn request_body(model: &str, input: &Value) -> Value {
             {"role": "user", "content": format!("Insights report (JSON):\n{input}")},
         ],
     })
+}
+
+/// Why a 200 reply has no answer text: a reasoning model spent the whole budget thinking.
+#[must_use]
+pub fn empty_reply_reason(body: &[u8]) -> Option<&'static str> {
+    let reply: Value = serde_json::from_slice(body).ok()?;
+    let choice = reply.pointer("/choices/0")?;
+    (choice.get("finish_reason").and_then(Value::as_str) == Some("length")).then_some(
+        "the model used its whole token budget before it wrote an answer; pick a model that does not reason at length",
+    )
 }
 
 /// The answer text of a chat completion reply, or `None` when it has none.
@@ -327,6 +339,15 @@ mod tests {
         );
         assert_eq!(reply_text(br#"{"error":{}}"#), None);
         assert_eq!(reply_text(b"not json"), None);
+    }
+
+    #[test]
+    fn empty_reply_reason_names_a_spent_budget_only() {
+        let spent = br#"{"choices":[{"finish_reason":"length","message":{"content":""}}]}"#;
+        let stopped = br#"{"choices":[{"finish_reason":"stop","message":{"content":""}}]}"#;
+        assert!(empty_reply_reason(spent).unwrap().contains("token budget"));
+        assert_eq!(empty_reply_reason(stopped), None);
+        assert_eq!(empty_reply_reason(b"x"), None);
     }
 
     #[test]

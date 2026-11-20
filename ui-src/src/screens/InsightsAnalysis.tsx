@@ -18,6 +18,7 @@ interface AnalysisCandidate {
 interface AnalysisModels {
   readonly estimated_input_tokens: number;
   readonly max_output_tokens: number;
+  readonly expected_output_tokens: number;
   readonly fair_run_usd: number;
   readonly candidates: readonly AnalysisCandidate[];
 }
@@ -107,9 +108,9 @@ export function InsightsAnalysis({ query }: { readonly query: string }) {
       </div>
       {selected ? (
         <p className="dim insights-panel-note">
-          {selected.reason}. Sends about {formatCompact(models.estimated_input_tokens)} tokens and gets at most{" "}
-          {formatCompact(models.max_output_tokens)} back. Recommended is the best quality at or below{" "}
-          {formatUsd(models.fair_run_usd)} per run.
+          {selected.reason}. Sends about {formatCompact(models.estimated_input_tokens)} tokens and expects about{" "}
+          {formatCompact(models.expected_output_tokens)} back (at most {formatCompact(models.max_output_tokens)}).
+          Recommended is the best quality at or below {formatUsd(models.fair_run_usd)} per run.
         </p>
       ) : null}
       {error ? (
