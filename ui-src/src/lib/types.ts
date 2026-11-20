@@ -289,6 +289,13 @@ export interface ModelInsight {
   readonly free: boolean;
   /** Overall score per US cent per successful call. */
   readonly value_score: number | null;
+  /** Smart Auto attempts this model solved that got a tests, review or user outcome. */
+  readonly verified_outcomes: number;
+  readonly verified_passed: number;
+  readonly verified_pass_pct: number | null;
+  /** Verified sessions this model led, and how many it solved. */
+  readonly sessions_verified: number;
+  readonly sessions_solved: number;
   readonly by_harness: readonly HarnessInsight[];
   readonly best_harness: string | null;
 }
@@ -296,6 +303,7 @@ export interface ModelInsight {
 export interface InsightLeaders {
   readonly best_overall: readonly string[];
   readonly most_stable: readonly string[];
+  readonly best_verified: readonly string[];
   readonly fastest_first_token: readonly string[];
   readonly fastest_decode: readonly string[];
   readonly fastest_prefill: readonly string[];
@@ -310,8 +318,17 @@ export interface InsightsReport {
   readonly best_for: readonly UseCasePick[];
   readonly best_free: readonly string[];
   readonly best_value: readonly string[];
+  readonly sessions: SessionsInsight;
   readonly harnesses: readonly HarnessInsight[];
   readonly models: readonly ModelInsight[];
+}
+
+export interface SessionsInsight {
+  readonly total: number;
+  readonly verified: number;
+  readonly solved: number;
+  readonly solved_pct: number | null;
+  readonly best_models: readonly string[];
 }
 
 export interface ModelPick {

@@ -11,4 +11,6 @@ pub mod model_insight;
 pub mod model_pick;
 pub mod pick_by;
 pub mod pick_candidate;
+pub mod sessions_insight;
+pub mod solver_verdict;
 pub mod use_case_pick;

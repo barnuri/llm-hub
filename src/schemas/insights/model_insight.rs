@@ -46,6 +46,14 @@ pub struct ModelInsight {
     pub free: bool,
     /// Overall score per US cent per successful call. Higher is better value.
     pub value_score: Option<f64>,
+    /// Smart Auto attempts this model solved that got a tests, review or user outcome.
+    pub verified_outcomes: u64,
+    pub verified_passed: u64,
+    /// Passing share of `verified_outcomes`; `None` with none.
+    pub verified_pass_pct: Option<f64>,
+    /// Verified sessions this model led, and how many of them it solved.
+    pub sessions_verified: u64,
+    pub sessions_solved: u64,
     pub by_harness: Vec<HarnessInsight>,
     pub best_harness: Option<String>,
 }

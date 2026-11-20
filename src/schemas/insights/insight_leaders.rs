@@ -5,6 +5,8 @@ use serde::Serialize;
 pub struct InsightLeaders {
     pub best_overall: Vec<String>,
     pub most_stable: Vec<String>,
+    /// By the lower bound of the verified pass rate.
+    pub best_verified: Vec<String>,
     pub fastest_first_token: Vec<String>,
     pub fastest_decode: Vec<String>,
     pub fastest_prefill: Vec<String>,

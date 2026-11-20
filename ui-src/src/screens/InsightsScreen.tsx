@@ -15,6 +15,7 @@ import type {
   InsightsReport,
   ModelInsight,
   ModelPick,
+  SessionsInsight,
   UseCasePick,
 } from "../lib/types";
 import { HealthPill, InsightsModelsTable } from "./InsightsModelsTable";
@@ -211,6 +212,10 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
 
       {report ? <ValuePicks report={report} modelsById={modelsById} onCopy={onCopy} /> : null}
 
+      {report && report.sessions.total > 0 ? (
+        <Sessions sessions={report.sessions} modelsById={modelsById} onCopy={onCopy} />
+      ) : null}
+
       {report && report.best_for.length > 0 ? <BestFor picks={report.best_for} modelsById={modelsById} onCopy={onCopy} /> : null}
 
       {ranked.length > 0 ? (
@@ -314,6 +319,57 @@ function ValuePicks({
         />
       </Panel>
     </div>
+  );
+}
+
+function Sessions({
+  sessions,
+  modelsById,
+  onCopy,
+}: {
+  readonly sessions: SessionsInsight;
+  readonly modelsById: ReadonlyMap<string, ModelInsight>;
+  readonly onCopy: (text: string) => void;
+}) {
+  const items: TopListItem[] = byIds(modelsById, sessions.best_models).map((model) => ({
+    model: model.model,
+    value: `${formatNumber(model.sessions_solved)}/${formatNumber(model.sessions_verified)}`,
+    sub: "sessions solved",
+  }));
+  return (
+    <Panel
+      title="Sessions"
+      sub="one session per agent worker · solved when its last test, review or user verdict passed"
+      className="insights-sessions"
+    >
+      <div className="insights-session-grid">
+        <div className="insights-session-kpis">
+          <div>
+            <span className="kpi-label">Sessions</span>
+            <span className="kpi-value">{formatCompact(sessions.total)}</span>
+          </div>
+          <div>
+            <span className="kpi-label">Verified</span>
+            <span className="kpi-value">{formatCompact(sessions.verified)}</span>
+          </div>
+          <div>
+            <span className="kpi-label">Solved</span>
+            <span className="kpi-value">
+              {sessions.solved_pct === null ? "—" : formatPct(sessions.solved_pct)}
+            </span>
+          </div>
+        </div>
+        <div>
+          <span className="kpi-label">Best session models</span>
+          <TopList
+            items={items}
+            onCopy={onCopy}
+            empty="No model led three verified sessions yet. Smart Auto records verdicts."
+            limit={TOP_COUNT}
+          />
+        </div>
+      </div>
+    </Panel>
   );
 }
 
@@ -424,6 +480,12 @@ function Leaders({
       ids: leaders.most_stable,
       value: (model) => formatPct(model.success_rate_pct),
       sub: (model) => `${formatNumber(model.requests)} calls`,
+    },
+    {
+      label: "Best verified",
+      ids: leaders.best_verified,
+      value: (model) => formatPct(model.verified_pass_pct ?? 0),
+      sub: (model) => `${formatCompact(model.verified_outcomes)} tests, reviews, user verdicts`,
     },
     {
       label: "Quickest first token",

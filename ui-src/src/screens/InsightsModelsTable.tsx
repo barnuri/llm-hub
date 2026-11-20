@@ -186,6 +186,25 @@ const COLUMNS: readonly Column[] = [
     render: (m) => (m.value_score === null ? "—" : formatCompact(m.value_score)),
   },
   {
+    key: "verified_pass_pct",
+    label: "Verified",
+    title: "Pass share of tests, reviews and user verdicts on Smart Auto attempts",
+    numeric: true,
+    value: (m) => m.verified_pass_pct,
+    render: (m) =>
+      m.verified_pass_pct === null
+        ? "—"
+        : `${formatPct(m.verified_pass_pct)} of ${formatCompact(m.verified_outcomes)}`,
+  },
+  {
+    key: "sessions_solved",
+    label: "Sessions",
+    title: "Verified sessions this model led: solved / verified",
+    numeric: true,
+    value: (m) => (m.sessions_verified > 0 ? m.sessions_solved / m.sessions_verified : null),
+    render: (m) => (m.sessions_verified > 0 ? `${m.sessions_solved}/${m.sessions_verified}` : "—"),
+  },
+  {
     key: "quality_score",
     label: "Quality",
     title: "Public capability tier of the model family, 0-100",

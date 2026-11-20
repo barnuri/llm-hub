@@ -288,3 +288,28 @@
 .insights-free-tag {
   margin-left: 6px;
 }
+
+.insights-session-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.insights-session-kpis {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.insights-session-kpis > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+@media (max-width: 760px) {
+  .insights-session-grid {
+    grid-template-columns: 1fr;
+  }
+}

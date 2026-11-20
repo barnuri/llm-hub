@@ -799,7 +799,7 @@ pub async fn insights_agent_report(
         window.profile,
         window.min_requests,
         now_ms(),
-        &window.costs,
+        &window.evidence,
     );
     serde_json::to_value(report)
         .map(Json)
@@ -809,7 +809,7 @@ pub async fn insights_agent_report(
 struct InsightsWindow {
     outcomes: Vec<RequestOutcome>,
     catalog: HashMap<String, ModelCatalogEntry>,
-    costs: insights::ModelCosts,
+    evidence: insights::ModelEvidence,
     range: String,
     profile: Option<String>,
     min_requests: u64,
@@ -826,7 +826,7 @@ async fn insights_report(
         &window.range,
         window.min_requests,
         now_ms(),
-        &window.costs,
+        &window.evidence,
     ))
 }
 
@@ -869,10 +869,20 @@ async fn insights_window(
     let catalog = insights_catalog(state, profile.as_deref()).await;
     let book = state.pricing_book();
     let costs = model_costs(&outcomes, &book);
+    let verdicts = store
+        .solver_verdicts(since_ms)
+        .map_err(AppError::Internal)?
+        .into_iter()
+        .filter(|verdict| {
+            profile
+                .as_deref()
+                .is_none_or(|wanted| verdict.model.split('/').next() == Some(wanted))
+        })
+        .collect();
     Ok(InsightsWindow {
         outcomes,
         catalog,
-        costs,
+        evidence: insights::ModelEvidence { costs, verdicts },
         range: range.to_string(),
         profile,
         min_requests: query

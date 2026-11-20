@@ -5,6 +5,7 @@ use super::harness_insight::HarnessInsight;
 use super::insight_leaders::InsightLeaders;
 use super::model_insight::ModelInsight;
 use super::model_pick::ModelPick;
+use super::sessions_insight::SessionsInsight;
 use super::use_case_pick::UseCasePick;
 
 /// Self-contained insights for an agent choosing a model: plain-language
@@ -23,6 +24,7 @@ pub struct AgentReport {
     pub best_for: Vec<UseCasePick>,
     pub best_free: Vec<String>,
     pub best_value: Vec<String>,
+    pub sessions: SessionsInsight,
     pub harnesses: Vec<HarnessInsight>,
     pub failure_reasons: Vec<FailureReason>,
     pub models: Vec<ModelInsight>,
