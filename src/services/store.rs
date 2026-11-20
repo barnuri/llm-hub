@@ -76,6 +76,9 @@ struct JsonState {
     /// Profile -> upstream models that refused image input. Absent from older files.
     #[serde(default)]
     vision_refusals: HashMap<String, Vec<String>>,
+    /// Media fallback key -> the text made from that media. Absent from older files.
+    #[serde(default)]
+    media_texts: HashMap<String, String>,
     /// Smart Auto selection events, oldest first. Absent from older files.
     #[serde(default)]
     selection_events: Vec<SelectionEvent>,
@@ -286,6 +289,14 @@ impl Store {
                 learned_at INTEGER NOT NULL,
                 PRIMARY KEY (profile, model),
                 CONSTRAINT ck_vision_refusals_source CHECK (source IN ('learned'))
+            );
+            CREATE TABLE IF NOT EXISTS media_texts (
+                key TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                model TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_ms INTEGER NOT NULL,
+                CONSTRAINT ck_media_texts_kind CHECK (kind IN ('image', 'audio', 'document'))
             );
             CREATE TABLE IF NOT EXISTS selection_events (
                 seq INTEGER PRIMARY KEY,
@@ -1536,6 +1547,78 @@ impl Store {
         }
     }
 
+    /// The saved media fallback texts of `keys`, by key. Keys with no text are left out.
+    pub fn load_media_texts(&self, keys: &[String]) -> Result<HashMap<String, String>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut stmt = guard
+                    .prepare_cached("SELECT text FROM media_texts WHERE key = ?1")
+                    .map_err(|e| e.to_string())?;
+                let mut found = HashMap::new();
+                for key in keys {
+                    let text: Option<String> = stmt
+                        .query_row([key], |r| r.get(0))
+                        .optional()
+                        .map_err(|e| e.to_string())?;
+                    if let Some(text) = text {
+                        found.insert(key.clone(), text);
+                    }
+                }
+                Ok(found)
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                Ok(keys
+                    .iter()
+                    .filter_map(|key| {
+                        guard
+                            .state
+                            .media_texts
+                            .get(key)
+                            .map(|text| (key.clone(), text.clone()))
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    /// Saves the text made from one media item under its `key`. A saved key keeps its first text.
+    pub fn save_media_text(
+        &self,
+        key: &str,
+        kind: &str,
+        model: &str,
+        text: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                guard
+                    .execute(
+                        "INSERT INTO media_texts (key, kind, model, text, created_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(key) DO NOTHING",
+                        rusqlite::params![key, kind, model, text, db_i64(now_ms)],
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                if guard.state.media_texts.contains_key(key) {
+                    return Ok(());
+                }
+                guard
+                    .state
+                    .media_texts
+                    .insert(key.to_owned(), text.to_owned());
+                guard.flush()
+            }
+        }
+    }
+
     /// The salt of the selection scope keys. Stores `fresh` when none is saved yet, and returns the saved salt.
     pub fn install_salt(&self, fresh: &str) -> Result<String, String> {
         match self {
@@ -2755,6 +2838,45 @@ mod tests {
                 ("other".to_string(), "mini".to_string()),
             ]
         );
+    }
+
+    fn media_texts_round_trip(kind: &str, file: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        let path_str = path.to_str().unwrap();
+        {
+            let store = Store::open(kind, Some(path_str)).unwrap();
+            store
+                .save_media_text("k1", "image", "local/v", "a cat", 1)
+                .unwrap();
+            store
+                .save_media_text("k1", "image", "local/v", "a dog", 2)
+                .unwrap();
+            store
+                .save_media_text("k2", "audio", "local/s", "hello", 3)
+                .unwrap();
+        }
+        let store = Store::open(kind, Some(path_str)).unwrap();
+        let found = store
+            .load_media_texts(&["k1".to_owned(), "k3".to_owned(), "k2".to_owned()])
+            .unwrap();
+        assert_eq!(
+            found,
+            HashMap::from([
+                ("k1".to_owned(), "a cat".to_owned()),
+                ("k2".to_owned(), "hello".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn sqlite_media_texts_survive_reopen_and_keep_the_first_text() {
+        media_texts_round_trip("sqlite", "t.db");
+    }
+
+    #[test]
+    fn json_media_texts_survive_reopen_and_keep_the_first_text() {
+        media_texts_round_trip("json", "s.json");
     }
 
     #[test]

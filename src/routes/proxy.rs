@@ -15,7 +15,8 @@ use crate::consts::{
     ANTHROPIC_UPSTREAM_PATH, AUTO_REASON_HEADER_MAX_CHARS, ERROR_REASON_MAX_CHARS,
     ERROR_STATUS_MIN, HEADER_ATTEMPTS, HEADER_AUTO_PICK, HEADER_AUTO_REASON, HEADER_SERVED_MODEL,
     HEADER_TRANSFORMS, KEEP_WARM_CLIENT, MAX_MULTIPART_BYTES, MAX_TRANSFORM_BUFFER_BYTES,
-    PROMPT_REFUSAL_MARGIN_PERCENT, SSE_KEEPALIVE_FRAME, USAGE_SCRAPE_TAIL_BYTES,
+    MEDIA_FALLBACK_CLIENT, PROMPT_REFUSAL_MARGIN_PERCENT, SSE_KEEPALIVE_FRAME,
+    USAGE_SCRAPE_TAIL_BYTES,
 };
 use crate::dependencies::state::AppState;
 use crate::ext::{Api, AttemptTarget, ResponseFlow, ResponseTarget};
@@ -69,6 +70,7 @@ use crate::services::fallback::{
 };
 use crate::services::harness::client_signature;
 use crate::services::keep_warm::{ApiShape, KeepWarm, KeepWarmLease, PingPlan, PingTarget};
+use crate::services::media_fallback;
 use crate::services::model_health::FailureKind;
 use crate::services::multipart_model;
 use crate::services::request_images::request_has_image;
@@ -279,6 +281,9 @@ pub(crate) async fn attempt_loop(
         prompt_tokens: estimated_prompt_tokens(bodies.original.len()),
     };
     let chain = servable_chain(state, &config, chain, &needs)?;
+    // Media fallback scans the parsed body once per request, and only when it is on.
+    let media_fallback = config.media_fallback.enabled
+        && media_fallback::request_has_media(needs.input.0, needs.input.1);
 
     let client_path = bare_path(path_and_query);
     if client_path == NATIVE_COUNT_TOKENS_PATH && !serves_native_count_tokens(state, &chain[0]) {
@@ -347,6 +352,13 @@ pub(crate) async fn attempt_loop(
             let body = std::mem::take(&mut attempt.body);
             attempt.body = non_streaming(body);
         }
+        // The built-in media fallback runs first in the attempt phase, so extensions see the text.
+        let text_only = media_fallback
+            && media_fallback::targets_text_only(state, &config.media_fallback, model_id);
+        if text_only {
+            let body = std::mem::take(&mut attempt.body);
+            attempt.body = media_fallback::convert(state, attempt.path.as_str(), body).await;
+        }
         let target = AttemptTarget {
             profile: &model_id.profile,
             model: &qualified,
@@ -394,7 +406,11 @@ pub(crate) async fn attempt_loop(
             session_token,
         );
         let mut keep_warm = keep_warm_lease(state, &attempt, model_id, worker.as_deref());
-        let (result, retried_body) = match sender.send(attempt.body.clone()).await {
+        let mut sent = sender.send(attempt.body.clone()).await;
+        if media_fallback && !text_only {
+            sent = resend_as_text(state, model_id, &sender, &mut attempt, sent).await;
+        }
+        let (result, retried_body) = match sent {
             Ok(response) if attempt.native_messages => {
                 let rephase = AttemptRephase {
                     extensions: &extensions,
@@ -1141,9 +1157,11 @@ fn refusal(
     let snapshot = state.model_descriptors();
     let descriptor = snapshot.for_model(&model_id.profile, &model_id.model);
     let upstream = upstream_key(state, model_id);
-    let refuses_images = descriptor.and_then(|found| found.vision) == Some(false)
-        || state.vision_unsupported(&model_id.profile, &upstream);
-    if refuses_images && request_has_image(needs.input.0, needs.input.1) {
+    // With media fallback on, the attempt turns images into text, so the model may still serve.
+    if !config.media_fallback.enabled
+        && refuses_images(state, model_id)
+        && request_has_image(needs.input.0, needs.input.1)
+    {
         return Some(Refusal::Certain(format!(
             "{qualified}: image input is not supported"
         )));
@@ -1206,10 +1224,57 @@ fn serves_chat_path(path: &str) -> bool {
 }
 
 /// The model id `model_id` is sent as: the catalog's upstream id, else the id the client wrote.
-fn upstream_key(state: &AppState, model_id: &ModelId) -> String {
+pub(crate) fn upstream_key(state: &AppState, model_id: &ModelId) -> String {
     state
         .upstream_model(&model_id.profile, &model_id.model)
         .map_or_else(|| model_id.model.clone(), |entry| entry.upstream_id)
+}
+
+/// When `sent` is a 500 that refuses image input, learns the refusal and sends the attempt once
+/// more with its media as text. Any other reply comes back unchanged.
+async fn resend_as_text(
+    state: &AppState,
+    model_id: &ModelId,
+    sender: &AttemptSender<'_>,
+    attempt: &mut Attempt<'_>,
+    sent: Result<reqwest::Response, String>,
+) -> Result<reqwest::Response, String> {
+    let response = match sent {
+        Ok(response) if response.status() == StatusCode::INTERNAL_SERVER_ERROR => response,
+        other => return other,
+    };
+    let (status, version, headers) = (
+        response.status(),
+        response.version(),
+        response.headers().clone(),
+    );
+    let (raw, _) = read_upstream_capped(response, MAX_TRANSFORM_BUFFER_BYTES).await;
+    if !String::from_utf8_lossy(&raw).contains(IMAGE_INPUT_REJECTION) {
+        return Ok(rebuilt_response(
+            status,
+            version,
+            headers,
+            reqwest::Body::from(raw),
+        ));
+    }
+    learn_image_refusal(state, model_id, status.as_u16(), &raw);
+    tracing::info!(
+        model = %model_id.qualified(),
+        "the model refused an image; media fallback sends the attempt again as text"
+    );
+    let body = std::mem::take(&mut attempt.body);
+    attempt.body = media_fallback::convert(state, attempt.path.as_str(), body).await;
+    sender.send(attempt.body.clone()).await
+}
+
+/// Whether `model_id` cannot read images: its descriptor reports no vision, or it refused one before.
+pub(crate) fn refuses_images(state: &AppState, model_id: &ModelId) -> bool {
+    let snapshot = state.model_descriptors();
+    snapshot
+        .for_model(&model_id.profile, &model_id.model)
+        .and_then(|found| found.vision)
+        == Some(false)
+        || state.vision_unsupported(&model_id.profile, &upstream_key(state, model_id))
 }
 
 /// Learns that `model_id` refuses image input when an upstream 500 body says so.
@@ -2516,7 +2581,40 @@ async fn send_internal(
         ),
     };
     let ok = SUCCESS_STATUS_RANGE.contains(&status) && upstream_end == UpstreamEnd::Complete;
-    let usage = scrape_usage(&raw);
+    let cost_usd = record_internal_call(
+        state,
+        model_id,
+        InternalCall {
+            status,
+            ok,
+            started,
+            raw: &raw,
+            client,
+            worker,
+        },
+    )
+    .await;
+    InternalReply {
+        status,
+        body: raw,
+        ok,
+        cost_usd,
+    }
+}
+
+/// The result of one call the hub made on its own behalf, as [`record_internal_call`] records it.
+struct InternalCall<'a> {
+    status: u16,
+    ok: bool,
+    started: Instant,
+    raw: &'a [u8],
+    client: &'a str,
+    worker: Option<String>,
+}
+
+/// Records a call the hub made on its own behalf under its `client` marker, and returns its cost.
+async fn record_internal_call(state: &AppState, model_id: &ModelId, call: InternalCall<'_>) -> f64 {
+    let usage = scrape_usage(call.raw);
     let model_key = model_id.qualified();
     let cost_usd = state.pricing_book().estimate(
         &model_key,
@@ -2528,17 +2626,17 @@ async fn send_internal(
     let outcome = RequestOutcome {
         profile: model_id.profile.clone(),
         model_key,
-        status,
+        status: call.status,
         ts_ms: now_ms(),
-        latency_ms: crate::utils::time::elapsed_ms(started),
+        latency_ms: crate::utils::time::elapsed_ms(call.started),
         ttft_ms: None,
         tokens_in: usage.tokens_in,
         tokens_out: usage.tokens_out,
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
-        error: (!ok).then(|| error_reason(status, &raw)),
-        client: Some(client.to_string()),
-        worker,
+        error: (!call.ok).then(|| error_reason(call.status, call.raw)),
+        client: Some(call.client.to_string()),
+        worker: call.worker,
         routed_by: Some(ROUTED_BY_PINNED.to_owned()),
         attempt: None,
         role: None,
@@ -2546,11 +2644,71 @@ async fn send_internal(
     state.record_outcome(&outcome, None);
     state.publish_live(&outcome);
     record_request(state, &outcome, None).await;
-    InternalReply {
-        status,
-        body: raw,
-        ok,
-        cost_usd,
+    cost_usd
+}
+
+/// Sends one media fallback call to `model_id` on the profile's pooled client, records it under
+/// the media fallback client, and returns the reply body of a 2xx answer.
+///
+/// # Errors
+/// The transport error, `timeout`, or `HTTP <status>` of an answer that is not a complete 2xx.
+pub(crate) async fn send_media_call(
+    state: &AppState,
+    model_id: &ModelId,
+    path: &str,
+    content_type: &str,
+    body: Bytes,
+    timeout: Duration,
+) -> Result<Bytes, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type).map_err(|e| e.to_string())?,
+    );
+    let method = Method::POST;
+    let sender = AttemptSender {
+        state,
+        method: &method,
+        path: UpstreamPath::Strip(path),
+        headers: &headers,
+        model_id,
+        attempt_timeout: Some(timeout),
+        force_identity_encoding: true,
+        session_token: None,
+    };
+    let started = Instant::now();
+    let (status, raw, upstream_end, failure) = match sender.send(body).await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let (raw, upstream_end) =
+                read_upstream_capped(response, MAX_TRANSFORM_BUFFER_BYTES).await;
+            (status, raw, upstream_end, format!("HTTP {status}"))
+        }
+        Err(reason) => (
+            StatusCode::BAD_GATEWAY.as_u16(),
+            reason.clone().into_bytes(),
+            UpstreamEnd::Error,
+            reason,
+        ),
+    };
+    let ok = SUCCESS_STATUS_RANGE.contains(&status) && upstream_end == UpstreamEnd::Complete;
+    record_internal_call(
+        state,
+        model_id,
+        InternalCall {
+            status,
+            ok,
+            started,
+            raw: &raw,
+            client: MEDIA_FALLBACK_CLIENT,
+            worker: None,
+        },
+    )
+    .await;
+    if ok {
+        Ok(Bytes::from(raw))
+    } else {
+        Err(failure)
     }
 }
 

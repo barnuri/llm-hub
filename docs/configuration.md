@@ -45,6 +45,24 @@ every remote profile, on chat completions, messages and responses calls. See
 The Models page writes both variables to `.env`. A value set in the process environment wins over
 `.env`, so the page shows its controls disabled when the service environment sets either variable.
 
+## Media fallback
+
+Media fallback turns images, audio and files into text before an attempt goes to a model that
+cannot read them. Off by default. See [Media fallback](media-fallback.md).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_HUB_MEDIA_FALLBACK` | `false` | Turns media fallback on. |
+| `LLM_HUB_MEDIA_FALLBACK_VISION_MODEL` | `llama_swap/muse-glimmer-30b` | The `<profile>/<model>` that captions images. Empty: images become placeholders. |
+| `LLM_HUB_MEDIA_FALLBACK_STT_MODEL` | unset | The `<profile>/<model>` that transcribes audio through `/v1/audio/transcriptions`. Unset: audio becomes a placeholder. |
+| `LLM_HUB_MEDIA_FALLBACK_TEXT_ONLY` | empty | Comma-separated model globs (`llama_swap/*`) that always get text, on top of the models the hub knows cannot read images. |
+| `LLM_HUB_MEDIA_FALLBACK_MAX_ITEM_BYTES` | `20971520` (20 MiB) | Largest encoded media item that is converted. A larger one becomes a placeholder. |
+| `LLM_HUB_MEDIA_FALLBACK_MAX_ITEMS` | `16` | Conversions per request that are not cached. Later items become placeholders. |
+| `LLM_HUB_MEDIA_FALLBACK_TIMEOUT_MS` | `120000` | Longest wait for one conversion. A local model may have to load first. |
+
+The Models page writes the first three variables to `.env`, and shows its controls disabled when
+the service environment sets one of them.
+
 ## Persistence
 
 | Variable | Default | Purpose |

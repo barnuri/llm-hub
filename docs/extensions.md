@@ -58,8 +58,17 @@ A request carries typed state from `request` to `attempt`, `response` and `compl
 stood after the last `response` phase. A value must implement `Clone`.
 
 `config_change` runs for these admin calls: save or delete a profile, set the default fallbacks,
-the Copilot price refresh, keep-warm, create or delete an API key, and save the Smart Auto rules.
-It sees the kind of change and, for a profile or key, its name. It never sees a secret.
+the Copilot price refresh, keep-warm, media fallback, create or delete an API key, and save the
+Smart Auto rules. It sees the kind of change and, for a profile or key, its name. It never sees a secret.
+
+## Built-ins
+
+Most built-ins are sync extensions that change error replies. One built-in is async, because it
+can call a model, so the hub runs it itself instead of through the sync `Extension` trait:
+
+| Built-in | Phase | What it does |
+|---|---|---|
+| Media fallback | `attempt` | Off by default (`LLM_HUB_MEDIA_FALLBACK`). Before the other attempt extensions, it turns the images, audio and files of an attempt to a text-only model into text: captions from a vision model, transcripts from a speech model, PDF text. Extensions in the same phase see the text. See [Media fallback](media-fallback.md) |
 
 ## Rules
 

@@ -214,3 +214,16 @@ pub const KEEP_WARM_MIN_CACHED_TOKENS: u64 = 2_048;
 pub const KEEP_WARM_CLIENT: &str = "llm-hub/keep-warm";
 /// The harness a keep-warm ping classifies as. Pings are not user requests.
 pub const KEEP_WARM_HARNESS: &str = "llm-hub-keep-warm";
+
+/// Default for `LLM_HUB_MEDIA_FALLBACK_VISION_MODEL`: a free local vision model.
+pub const DEFAULT_MEDIA_FALLBACK_VISION_MODEL: &str = "llama_swap/muse-glimmer-30b";
+/// Default for `LLM_HUB_MEDIA_FALLBACK_MAX_ITEM_BYTES`: the encoded size of one media item.
+pub const DEFAULT_MEDIA_FALLBACK_MAX_ITEM_BYTES: usize = 20 * 1024 * 1024;
+/// Default for `LLM_HUB_MEDIA_FALLBACK_MAX_ITEMS`: model calls per request.
+pub const DEFAULT_MEDIA_FALLBACK_MAX_ITEMS: usize = 16;
+/// Default for `LLM_HUB_MEDIA_FALLBACK_TIMEOUT_MS`: a local model may need to load first.
+pub const DEFAULT_MEDIA_FALLBACK_TIMEOUT_MS: u64 = 120_000;
+/// The `client` signature that media fallback model calls record under.
+pub const MEDIA_FALLBACK_CLIENT: &str = "llm-hub/media-fallback";
+/// Media texts kept in memory. The store keeps every one.
+pub const MEDIA_FALLBACK_CACHE_ENTRIES: usize = 1_024;

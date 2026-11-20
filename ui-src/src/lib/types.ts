@@ -51,6 +51,16 @@ export interface KeepWarmSettings {
   readonly overridden_by_env: boolean;
 }
 
+export interface MediaFallbackSettings {
+  readonly enabled: boolean;
+  /** The `<profile>/<model>` that captions images; `null` when captions are off. */
+  readonly vision_model: string | null;
+  /** The `<profile>/<model>` that transcribes audio; `null` when transcripts are off. */
+  readonly stt_model: string | null;
+  /** The service environment sets one of the variables, so a saved value does not take effect. */
+  readonly overridden_by_env: boolean;
+}
+
 /** Keep-warm pings and their estimated savings. Pings are counted in cost, not in requests. */
 export interface KeepWarmFigures {
   readonly keepwarm_pings: number;
@@ -71,6 +81,7 @@ export interface HubMeta {
   /** `LLM_HUB_COPILOT_PRICES_REFRESH_SECS`; 0 means the fetch is off. */
   readonly copilot_prices_refresh_secs: number;
   readonly keep_warm: KeepWarmSettings;
+  readonly media_fallback: MediaFallbackSettings;
   readonly persistent: boolean;
   readonly auth_enabled: boolean;
   readonly version: string;

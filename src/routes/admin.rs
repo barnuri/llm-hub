@@ -28,6 +28,8 @@ use crate::schemas::insights::pick_by::PickBy;
 use crate::schemas::insights_analysis_input::InsightsAnalysisInput;
 use crate::schemas::keep_warm_input::KeepWarmInput;
 use crate::schemas::keep_warm_summary::KeepWarmSummary;
+use crate::schemas::media_fallback_input::MediaFallbackInput;
+use crate::schemas::model_id::ModelId;
 use crate::schemas::profile_input::ProfileInput;
 use crate::schemas::usage_report::UsageReport;
 use crate::services::env_writer;
@@ -84,6 +86,12 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
             "enabled": config.keep_warm.enabled,
             "idle_cap_minutes": config.keep_warm.idle_cap.as_secs() / 60,
             "overridden_by_env": keep_warm_pinned_by(|key| std::env::var_os(key).is_some()),
+        },
+        "media_fallback": {
+            "enabled": config.media_fallback.enabled,
+            "vision_model": config.media_fallback.vision_model.as_ref().map(ModelId::qualified),
+            "stt_model": config.media_fallback.stt_model.as_ref().map(ModelId::qualified),
+            "overridden_by_env": media_fallback_pinned_by(|key| std::env::var_os(key).is_some()),
         },
         "persistent": config.persistent,
         "auth_enabled": config.master_key.is_some() || !state.api_key_hashes().is_empty(),
@@ -281,6 +289,50 @@ fn set_keep_warm_apply(
         .map_err(AppError::Internal)?;
     reload(state)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[utoipa::path(post, path = "/api/media-fallback", tag = "profiles", summary = "Configure media fallback", request_body(content = MediaFallbackInput, description = "Media fallback switch and its models", content_type = "application/json"), responses((status = 200, description = "Saved", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 403, description = "Config is read-only (LLM_HUB_CONFIG_READONLY=true).", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
+pub async fn set_media_fallback(
+    State(state): State<AppState>,
+    Json(input): Json<MediaFallbackInput>,
+) -> Result<Json<Value>, AppError> {
+    set_media_fallback_in(&state, &input, Path::new(ENV_FILE), reload_config)
+}
+
+fn set_media_fallback_in(
+    state: &AppState,
+    input: &MediaFallbackInput,
+    env_file: &Path,
+    reload: impl Fn(&AppState) -> Result<(), AppError>,
+) -> Result<Json<Value>, AppError> {
+    extension_phases::changing(state, ConfigKind::MediaFallback, None, || {
+        if state.config().config_readonly {
+            return Err(AppError::ReadOnly);
+        }
+        let (vision, stt) = (input.vision_model.trim(), input.stt_model.trim());
+        for model in [vision, stt] {
+            if !model.is_empty() && ModelId::parse(model).is_none() {
+                return Err(AppError::BadRequest(format!(
+                    "model must be <profile>/<model>: {model}"
+                )));
+            }
+        }
+        env_writer::set_media_fallback(env_file, input.enabled, vision, stt)
+            .map_err(AppError::Internal)?;
+        reload(state)?;
+        Ok(Json(json!({ "ok": true })))
+    })
+}
+
+/// True when the service environment sets a media fallback variable the UI saves.
+fn media_fallback_pinned_by(is_set: impl Fn(&str) -> bool) -> bool {
+    [
+        "LLM_HUB_MEDIA_FALLBACK",
+        "LLM_HUB_MEDIA_FALLBACK_VISION_MODEL",
+        "LLM_HUB_MEDIA_FALLBACK_STT_MODEL",
+    ]
+    .into_iter()
+    .any(is_set)
 }
 
 /// True when the service environment sets a keep-warm variable, which a saved `.env` value cannot override.
@@ -1820,6 +1872,81 @@ mod tests {
         );
 
         assert!(matches!(result, Err(AppError::ReadOnly)));
+    }
+
+    #[test]
+    fn set_media_fallback_saves_the_switch_and_models_and_checks_them() {
+        let state = state_for(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+        let input = MediaFallbackInput {
+            enabled: true,
+            vision_model: " local/eye ".to_owned(),
+            stt_model: String::new(),
+        };
+
+        assert_saved(set_media_fallback_in(
+            &state,
+            &input,
+            &env,
+            reload_from(&env),
+        ));
+
+        let config = state.config();
+        assert!(config.media_fallback.enabled);
+        assert_eq!(
+            config
+                .media_fallback
+                .vision_model
+                .as_ref()
+                .map(ModelId::qualified),
+            Some("local/eye".to_owned())
+        );
+        assert!(config.media_fallback.stt_model.is_none());
+
+        let bad = MediaFallbackInput {
+            stt_model: "no-slash".to_owned(),
+            ..input.clone()
+        };
+        let result = set_media_fallback_in(&state, &bad, &env, reload_from(&env));
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+
+        let read_only = set_media_fallback_in(
+            &state_for(&[("LLM_HUB_CONFIG_READONLY", "true")]),
+            &input,
+            &env,
+            reload_from(&env),
+        );
+        assert!(matches!(read_only, Err(AppError::ReadOnly)));
+    }
+
+    #[tokio::test]
+    async fn set_media_fallback_route_refuses_a_read_only_hub() {
+        let result = set_media_fallback(
+            State(state_for(&[("LLM_HUB_CONFIG_READONLY", "true")])),
+            Json(MediaFallbackInput {
+                enabled: false,
+                vision_model: String::new(),
+                stt_model: String::new(),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::ReadOnly)));
+    }
+
+    #[tokio::test]
+    async fn profiles_list_reports_the_media_fallback_settings() {
+        let Json(body) = list_profiles(State(state_for(&[]))).await;
+        assert_eq!(body["media_fallback"]["enabled"], json!(false));
+        assert_eq!(
+            body["media_fallback"]["vision_model"],
+            json!("llama_swap/muse-glimmer-30b")
+        );
+        assert_eq!(body["media_fallback"]["stt_model"], Value::Null);
+        assert!(media_fallback_pinned_by(
+            |key| key == "LLM_HUB_MEDIA_FALLBACK_STT_MODEL"
+        ));
+        assert!(!media_fallback_pinned_by(|_| false));
     }
 
     #[test]
