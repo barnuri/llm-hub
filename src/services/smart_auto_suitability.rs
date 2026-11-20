@@ -77,13 +77,15 @@ impl SmartAutoSuitability {
     const UNKNOWN: FamilySeed = FamilySeed::contains(&[], [5, 5, 5, 5, 5, 5], 3, 3);
     // Quality columns: planning, investigation, implementation, plan-backed implementation,
     // validation, conversation. The first matching row wins, so size markers come first.
-    const SEEDS: [FamilySeed; 24] = [
+    const SEEDS: [FamilySeed; 27] = [
         FamilySeed::contains(&["nano"], [2, 3, 4, 6, 3, 6], 10, 10),
         FamilySeed::contains(&["-mini"], [4, 5, 6, 8, 5, 7], 9, 9),
         FamilySeed::contains(&["flash"], [4, 5, 6, 8, 5, 7], 9, 9),
         FamilySeed::contains(&["-luna"], [4, 6, 6, 8, 6, 7], 8, 8),
         FamilySeed::contains(&["haiku"], [4, 6, 6, 8, 6, 7], 8, 9),
         FamilySeed::contains(&["opus"], [10, 10, 10, 9, 10, 9], 1, 3),
+        FamilySeed::contains(&["fable"], [10, 10, 10, 9, 10, 9], 1, 3),
+        FamilySeed::contains(&["-astra"], [10, 10, 10, 9, 10, 9], 1, 2),
         FamilySeed::contains(&["-sol"], [10, 9, 9, 9, 9, 9], 2, 3),
         FamilySeed::contains(&["gemini", "pro"], [9, 8, 8, 8, 8, 8], 4, 5),
         FamilySeed::contains(&["sonnet"], [8, 9, 9, 9, 8, 8], 4, 5),
@@ -101,6 +103,7 @@ impl SmartAutoSuitability {
         FamilySeed::contains(&["gemma"], [3, 4, 5, 6, 4, 6], 10, 7),
         FamilySeed::contains(&["llama"], [3, 4, 4, 5, 3, 6], 10, 7),
         FamilySeed::prefix(&["phi"], [2, 3, 4, 5, 3, 5], 10, 8),
+        FamilySeed::contains(&["mai-code-2"], [8, 8, 9, 9, 8, 7], 6, 6),
         FamilySeed::contains(&["mai-", "code"], [6, 6, 7, 8, 6, 6], 6, 7),
     ];
 
@@ -282,6 +285,25 @@ mod tests {
         assert!((planning - 100.0).abs() < 1e-9);
         assert!((SmartAutoSuitability::quality_pct(opus, None) - 96.666).abs() < 0.01);
         assert!((SmartAutoSuitability::quality_pct("x/unknown", None) - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn newer_top_tier_families_are_not_average() {
+        for id in [
+            "copilot/gpt-6-astra",
+            "copilot/gpt-6.2-astra",
+            "copilot/claude-fable-5-2",
+        ] {
+            assert_eq!(quality(id, WorkRole::Planning, false), 10, "{id}");
+        }
+        assert_eq!(
+            quality("copilot/mai-code-2", WorkRole::Implementation, false),
+            9
+        );
+        assert_eq!(
+            SmartAutoSuitability::seed("copilot/mai-code-2-flash").cheapness,
+            9
+        );
     }
 
     #[test]
