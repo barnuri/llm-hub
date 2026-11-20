@@ -74,6 +74,7 @@ pub(crate) struct MatchSpec {
     pub stream: Option<bool>,
     pub status: Option<OneOrMany<StatusSpec>>,
     pub error_code: Option<OneOrMany<String>>,
+    pub error_message: Option<OneOrMany<String>>,
 }
 
 /// One value or a list of values.

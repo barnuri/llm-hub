@@ -32,4 +32,5 @@ pub(crate) use json_body::JsonBody;
 pub use request_ctx::RequestCtx;
 pub use response_ctx::ResponseCtx;
 pub(crate) use response_ctx::ResponseTarget;
+pub(crate) use response_ctx::error_message_of;
 pub use response_flow::ResponseFlow;

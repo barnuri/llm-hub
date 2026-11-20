@@ -313,3 +313,11 @@
     grid-template-columns: 1fr;
   }
 }
+
+.insights-analysis-controls {
+  align-items: center;
+}
+
+.insights-analysis-model {
+  min-width: min(520px, 100%);
+}

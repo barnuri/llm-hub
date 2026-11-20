@@ -17,6 +17,8 @@ pub(crate) struct Matcher {
     stream: Option<bool>,
     statuses: Vec<StatusMatch>,
     error_codes: Vec<String>,
+    /// Lowercase parts of the error message.
+    error_messages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +39,7 @@ pub(crate) struct Facts<'a> {
     pub stream: Option<bool>,
     pub status: Option<u16>,
     pub error_code: Option<&'a str>,
+    pub error_message: Option<&'a str>,
 }
 
 impl Matcher {
@@ -74,12 +77,16 @@ impl Matcher {
                 .map(parse_status)
                 .collect::<Result<_, _>>()?,
             error_codes: list(spec.error_code),
+            error_messages: list(spec.error_message)
+                .iter()
+                .map(|part| part.to_lowercase())
+                .collect(),
         })
     }
 
     /// True when the rule needs the body of an error reply to decide.
     pub fn needs_error_body(&self) -> bool {
-        !self.error_codes.is_empty()
+        !self.error_codes.is_empty() || !self.error_messages.is_empty()
     }
 
     /// True when the request model or stream flag is part of the match.
@@ -87,7 +94,7 @@ impl Matcher {
         !self.models.is_empty() || self.stream.is_some()
     }
 
-    /// True when every condition holds. `error_code` is skipped when `skip_error_code` is set,
+    /// True when every condition holds. `error_code` and `error_message` are skipped when `skip_error_code` is set,
     /// for the check made before the error body is read.
     pub fn matches(&self, facts: &Facts<'_>, skip_error_code: bool) -> bool {
         let path = facts.path.map(|p| p.split('?').next().unwrap_or(p));
@@ -116,7 +123,21 @@ impl Matcher {
                 facts.status.is_some_and(|status| s.matches(status))
             })
             && (skip_error_code
-                || any_or_empty(&self.error_codes, |c| facts.error_code == Some(c.as_str())))
+                || (any_or_empty(&self.error_codes, |c| facts.error_code == Some(c.as_str()))
+                    && self.error_message_matches(facts.error_message)))
+    }
+
+    /// True when no message part is set, or the message holds one of them, in any case.
+    fn error_message_matches(&self, message: Option<&str>) -> bool {
+        if self.error_messages.is_empty() {
+            return true;
+        }
+        let Some(message) = message.map(str::to_lowercase) else {
+            return false;
+        };
+        self.error_messages
+            .iter()
+            .any(|part| message.contains(part))
     }
 }
 
@@ -162,6 +183,7 @@ fn check_keys(spec: &MatchSpec, phase: PhaseName) -> Result<(), String> {
             "header_absent",
             "status",
             "error_code",
+            "error_message",
         ],
     };
     let used = [
@@ -175,6 +197,7 @@ fn check_keys(spec: &MatchSpec, phase: PhaseName) -> Result<(), String> {
         ("stream", spec.stream.is_some()),
         ("status", spec.status.is_some()),
         ("error_code", spec.error_code.is_some()),
+        ("error_message", spec.error_message.is_some()),
     ];
     match used
         .iter()
@@ -327,6 +350,28 @@ mod tests {
         assert!(!matcher.matches(&facts(429, Some("rate_limit")), false));
         assert!(!matcher.matches(&facts(400, None), false));
         assert!(matcher.matches(&facts(400, None), true));
+    }
+
+    #[test]
+    fn error_messages_match_a_part_in_any_case() {
+        let matcher = Matcher::compile(
+            spec("{status: 400, error_message: [Failed to initialize samplers, 'not ready']}"),
+            PhaseName::Response,
+        )
+        .unwrap();
+        let facts = |message| Facts {
+            status: Some(400),
+            error_message: message,
+            ..Facts::default()
+        };
+
+        assert!(matcher.needs_error_body());
+        assert!(matcher.matches(&facts(Some("error: FAILED to initialize SAMPLERS")), false));
+        assert!(matcher.matches(&facts(Some("model not ready yet")), false));
+        assert!(!matcher.matches(&facts(Some("messages: field required")), false));
+        assert!(!matcher.matches(&facts(None), false));
+        assert!(matcher.matches(&facts(None), true));
+        assert!(Matcher::compile(spec("{error_message: x}"), PhaseName::Attempt).is_err());
     }
 
     #[test]

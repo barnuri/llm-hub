@@ -11,6 +11,8 @@ pub enum ConfigKind {
     CopilotPrices,
     /// `POST /api/keep-warm`: the keep-warm switch and idle cap.
     KeepWarm,
+    /// `POST /api/media-fallback`: the media fallback switch and its models.
+    MediaFallback,
     /// `POST /api/keys`: an API key is created. The subject is its name.
     ApiKeyCreated,
     /// `DELETE /api/keys/{name}`. The subject is the name.

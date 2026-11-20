@@ -420,6 +420,68 @@
         }
       }
     },
+    "/api/errors/resolve-group": {
+      "post": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Mark a whole error group solved or reopen it",
+        "operationId": "resolve_error_group",
+        "requestBody": {
+          "description": "Group signature, window and the solved flag",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveErrorGroupInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated count",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/fallbacks": {
       "post": {
         "tags": [
@@ -544,6 +606,205 @@
               "application/json": {
                 "schema": {
                   "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/insights/analysis": {
+      "post": {
+        "tags": [
+          "insights"
+        ],
+        "summary": "Run an AI analysis of the insights",
+        "operationId": "insights_analyze",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "`1d`, `7d` (default), `30d`, or `all`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "min_requests",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "by",
+            "in": "query",
+            "description": "Criterion for `/api/insights/pick`; `overall` when omitted.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PickBy"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The model to run on",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InsightsAnalysisInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Analysis Markdown and the run's cost",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model call failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/insights/analysis/models": {
+      "get": {
+        "tags": [
+          "insights"
+        ],
+        "summary": "Models for an AI analysis of the insights",
+        "operationId": "insights_analysis_models",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "`1d`, `7d` (default), `30d`, or `all`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "min_requests",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "by",
+            "in": "query",
+            "description": "Criterion for `/api/insights/pick`; `overall` when omitted.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PickBy"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Candidates, recommended first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -1004,6 +1265,78 @@
           },
           "401": {
             "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/media-fallback": {
+      "post": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Configure media fallback",
+        "operationId": "set_media_fallback",
+        "requestBody": {
+          "description": "Media fallback switch and its models",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MediaFallbackInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Config is read-only (LLM_HUB_CONFIG_READONLY=true).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2746,6 +3079,18 @@
           }
         }
       },
+      "InsightsAnalysisInput": {
+        "type": "object",
+        "description": "The model a manual insights analysis runs on, as `<profile>/<model>`.",
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          }
+        }
+      },
       "KeepWarmInput": {
         "type": "object",
         "required": [
@@ -2760,6 +3105,26 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "MediaFallbackInput": {
+        "type": "object",
+        "description": "The media fallback settings the UI saves. An empty model turns that conversion off.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "stt_model": {
+            "type": "string",
+            "description": "The `<profile>/<model>` that transcribes audio."
+          },
+          "vision_model": {
+            "type": "string",
+            "description": "The `<profile>/<model>` that captions images."
           }
         }
       },
@@ -2978,6 +3343,29 @@
           }
         },
         "additionalProperties": false
+      },
+      "ResolveErrorGroupInput": {
+        "type": "object",
+        "required": [
+          "signature"
+        ],
+        "properties": {
+          "range": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Window the group came from: `1d`, `7d` (default), `30d`, or `all`."
+          },
+          "signature": {
+            "type": "string",
+            "description": "`groups[].signature` from `/api/errors`."
+          },
+          "solved": {
+            "type": "boolean",
+            "description": "`true` (default) marks the group's open errors solved, `false` reopens its solved ones."
+          }
+        }
       },
       "ResolveErrorsInput": {
         "type": "object",

@@ -4,12 +4,14 @@ use std::time::Duration;
 use super::copilot_auth::CopilotAuth;
 use super::keep_warm_config::KeepWarmConfig;
 use super::managed_command::ManagedCommand;
+use super::media_fallback_config::MediaFallbackConfig;
 use super::profile_config::ProfileConfig;
 use super::usage_source::{BIFROST_KEY_PREFIX, UsageSource};
 use crate::consts::{
     DEFAULT_BIND, DEFAULT_COPILOT_PRICES_REFRESH_SECS, DEFAULT_FIRST_BYTE_TIMEOUT_MS,
     DEFAULT_KEEP_WARM_ENABLED, DEFAULT_KEEP_WARM_IDLE_CAP_MINUTES, DEFAULT_MAX_REPLAY_BYTES,
-    DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_PORT, DEFAULT_SSE_KEEPALIVE_MS,
+    DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_PORT, DEFAULT_QUOTA_COOLDOWN_SECS,
+    DEFAULT_SSE_KEEPALIVE_MS,
 };
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
@@ -69,11 +71,19 @@ pub struct HubConfig {
     /// Longest wait for the first byte of a streamed Smart Auto attempt on a remote profile.
     /// `None` when `LLM_HUB_FIRST_BYTE_TIMEOUT_MS=0`. A model that misses it is cooled.
     pub first_byte_timeout: Option<Duration>,
+    /// How long the hub skips a profile that is out of credits. `None` when
+    /// `LLM_HUB_QUOTA_COOLDOWN_SECS=0`: the hub still tries the next fallback, but cools nothing.
+    pub quota_cooldown: Option<Duration>,
+    /// The default time limit of a whole fallback chain, `LLM_HUB_DEADLINE_MS`. `None`, the
+    /// default, sets none. The `x-llm-hub-deadline-ms` header wins.
+    pub deadline: Option<Duration>,
     /// How often the Copilot price table is fetched. `None` when
     /// `LLM_HUB_COPILOT_PRICES_REFRESH_SECS=0`: the hub never fetches it.
     pub copilot_prices_refresh: Option<Duration>,
     /// Cache keep-warm for idle Copilot Claude streams.
     pub keep_warm: KeepWarmConfig,
+    /// Media parts converted to text for text-only models. Off by default.
+    pub media_fallback: MediaFallbackConfig,
     /// Global USD/1M token defaults when a profile/model has no rates.
     pub pricing: crate::configs::TokenRates,
 }
@@ -163,6 +173,19 @@ impl HubConfig {
             _ => DEFAULT_FIRST_BYTE_TIMEOUT_MS,
         };
 
+        let quota_cooldown_secs: u64 = match get("QUOTA_COOLDOWN_SECS") {
+            Some(v) if !v.is_empty() => v
+                .parse()
+                .map_err(|_| format!("LLM_HUB_QUOTA_COOLDOWN_SECS is not a number: {v}"))?,
+            _ => DEFAULT_QUOTA_COOLDOWN_SECS,
+        };
+        let deadline_ms: u64 = match get("DEADLINE_MS") {
+            Some(v) if !v.is_empty() => v
+                .parse()
+                .map_err(|_| format!("LLM_HUB_DEADLINE_MS is not a number: {v}"))?,
+            _ => 0,
+        };
+
         let copilot_prices_refresh_secs: u64 = match get("COPILOT_PRICES_REFRESH_SECS") {
             Some(v) if !v.is_empty() => v
                 .parse()
@@ -171,6 +194,7 @@ impl HubConfig {
         };
 
         let keep_warm = keep_warm_from_map(&get)?;
+        let media_fallback = MediaFallbackConfig::from_get(&get, is_truthy)?;
 
         let pricing = crate::configs::TokenRates {
             input_per_1m: crate::configs::token_rates::parse_optional_f64(
@@ -223,9 +247,13 @@ impl HubConfig {
             sse_keepalive: (sse_keepalive_ms > 0).then(|| Duration::from_millis(sse_keepalive_ms)),
             first_byte_timeout: (first_byte_timeout_ms > 0)
                 .then(|| Duration::from_millis(first_byte_timeout_ms)),
+            quota_cooldown: (quota_cooldown_secs > 0)
+                .then(|| Duration::from_secs(quota_cooldown_secs)),
+            deadline: (deadline_ms > 0).then(|| Duration::from_millis(deadline_ms)),
             copilot_prices_refresh: (copilot_prices_refresh_secs > 0)
                 .then(|| Duration::from_secs(copilot_prices_refresh_secs)),
             keep_warm,
+            media_fallback,
             pricing,
         })
     }
@@ -833,6 +861,29 @@ mod tests {
             }
             let cfg = HubConfig::from_map(&vars).unwrap();
             assert_eq!(cfg.first_byte_timeout, expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn quota_cooldown_and_deadline_default_parse_and_reject_text() {
+        let cfg = HubConfig::from_map(&HashMap::new()).unwrap();
+        assert_eq!(
+            cfg.quota_cooldown,
+            Some(Duration::from_secs(DEFAULT_QUOTA_COOLDOWN_SECS))
+        );
+        assert_eq!(cfg.deadline, None);
+
+        let mut vars = HashMap::new();
+        vars.insert("LLM_HUB_QUOTA_COOLDOWN_SECS".into(), "0".into());
+        vars.insert("LLM_HUB_DEADLINE_MS".into(), "45000".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert_eq!(cfg.quota_cooldown, None);
+        assert_eq!(cfg.deadline, Some(Duration::from_secs(45)));
+
+        for key in ["LLM_HUB_QUOTA_COOLDOWN_SECS", "LLM_HUB_DEADLINE_MS"] {
+            let vars = HashMap::from([(key.to_owned(), "soon".to_owned())]);
+            let err = HubConfig::from_map(&vars).unwrap_err();
+            assert!(err.contains(key), "{err}");
         }
     }
 

@@ -20,17 +20,23 @@ use crate::schemas::copilot_prices_input::CopilotPricesInput;
 use crate::schemas::error_body::ErrorBody;
 use crate::schemas::errors_report::ErrorsReport;
 use crate::schemas::fallbacks_input::FallbacksInput;
+use crate::schemas::insights::agent_report::AgentReport;
 use crate::schemas::insights::insights_report::InsightsReport;
 use crate::schemas::insights::model_catalog_entry::ModelCatalogEntry;
 use crate::schemas::insights::model_cost::ModelCost;
 use crate::schemas::insights::pick_by::PickBy;
+use crate::schemas::insights_analysis_input::InsightsAnalysisInput;
 use crate::schemas::keep_warm_input::KeepWarmInput;
 use crate::schemas::keep_warm_summary::KeepWarmSummary;
+use crate::schemas::media_fallback_input::MediaFallbackInput;
+use crate::schemas::model_id::ModelId;
 use crate::schemas::profile_input::ProfileInput;
 use crate::schemas::usage_report::UsageReport;
 use crate::services::env_writer;
+use crate::services::error_signature::{error_signature, group_errors};
 use crate::services::extension_phases;
 use crate::services::insights;
+use crate::services::insights_analysis;
 use crate::services::pricing::PricingBook;
 use crate::services::session_insights;
 use crate::services::stats::RequestOutcome;
@@ -80,6 +86,12 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
             "enabled": config.keep_warm.enabled,
             "idle_cap_minutes": config.keep_warm.idle_cap.as_secs() / 60,
             "overridden_by_env": keep_warm_pinned_by(|key| std::env::var_os(key).is_some()),
+        },
+        "media_fallback": {
+            "enabled": config.media_fallback.enabled,
+            "vision_model": config.media_fallback.vision_model.as_ref().map(ModelId::qualified),
+            "stt_model": config.media_fallback.stt_model.as_ref().map(ModelId::qualified),
+            "overridden_by_env": media_fallback_pinned_by(|key| std::env::var_os(key).is_some()),
         },
         "persistent": config.persistent,
         "auth_enabled": config.master_key.is_some() || !state.api_key_hashes().is_empty(),
@@ -277,6 +289,50 @@ fn set_keep_warm_apply(
         .map_err(AppError::Internal)?;
     reload(state)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[utoipa::path(post, path = "/api/media-fallback", tag = "profiles", summary = "Configure media fallback", request_body(content = MediaFallbackInput, description = "Media fallback switch and its models", content_type = "application/json"), responses((status = 200, description = "Saved", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 403, description = "Config is read-only (LLM_HUB_CONFIG_READONLY=true).", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
+pub async fn set_media_fallback(
+    State(state): State<AppState>,
+    Json(input): Json<MediaFallbackInput>,
+) -> Result<Json<Value>, AppError> {
+    set_media_fallback_in(&state, &input, Path::new(ENV_FILE), reload_config)
+}
+
+fn set_media_fallback_in(
+    state: &AppState,
+    input: &MediaFallbackInput,
+    env_file: &Path,
+    reload: impl Fn(&AppState) -> Result<(), AppError>,
+) -> Result<Json<Value>, AppError> {
+    extension_phases::changing(state, ConfigKind::MediaFallback, None, || {
+        if state.config().config_readonly {
+            return Err(AppError::ReadOnly);
+        }
+        let (vision, stt) = (input.vision_model.trim(), input.stt_model.trim());
+        for model in [vision, stt] {
+            if !model.is_empty() && ModelId::parse(model).is_none() {
+                return Err(AppError::BadRequest(format!(
+                    "model must be <profile>/<model>: {model}"
+                )));
+            }
+        }
+        env_writer::set_media_fallback(env_file, input.enabled, vision, stt)
+            .map_err(AppError::Internal)?;
+        reload(state)?;
+        Ok(Json(json!({ "ok": true })))
+    })
+}
+
+/// True when the service environment sets a media fallback variable the UI saves.
+fn media_fallback_pinned_by(is_set: impl Fn(&str) -> bool) -> bool {
+    [
+        "LLM_HUB_MEDIA_FALLBACK",
+        "LLM_HUB_MEDIA_FALLBACK_VISION_MODEL",
+        "LLM_HUB_MEDIA_FALLBACK_STT_MODEL",
+    ]
+    .into_iter()
+    .any(is_set)
 }
 
 /// True when the service environment sets a keep-warm variable, which a saved `.env` value cannot override.
@@ -574,6 +630,22 @@ pub struct ErrorsQuery {
     pub range: Option<String>,
 }
 
+/// Start of an errors window: `1d`, `7d`, `30d`, or `all` (no start).
+fn errors_since_ms(range: &str) -> Result<Option<u64>, AppError> {
+    match range {
+        "1d" => Ok(Some(now_ms().saturating_sub(86_400_000))),
+        "7d" => Ok(Some(now_ms().saturating_sub(7 * 86_400_000))),
+        "30d" => Ok(Some(now_ms().saturating_sub(30 * 86_400_000))),
+        "all" => Ok(None),
+        other => Err(AppError::BadRequest(format!(
+            "unknown errors range '{other}' (expected 1d, 7d, 30d, all)"
+        ))),
+    }
+}
+
+/// Most groups `/api/errors` returns.
+const MAX_ERROR_GROUPS: usize = 100;
+
 #[utoipa::path(get, path = "/api/errors", tag = "stats", summary = "Failed requests", params(ErrorsQuery), responses((status = 200, description = "Recent failed requests. Needs persistence.", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn errors(
     State(state): State<AppState>,
@@ -585,21 +657,12 @@ pub async fn errors(
         ));
     };
     let range = query.range.as_deref().unwrap_or("7d");
-    let since_ms = match range {
-        "1d" => Some(now_ms().saturating_sub(86_400_000)),
-        "7d" => Some(now_ms().saturating_sub(7 * 86_400_000)),
-        "30d" => Some(now_ms().saturating_sub(30 * 86_400_000)),
-        "all" => None,
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "unknown errors range '{other}' (expected 1d, 7d, 30d, all)"
-            )));
-        }
-    };
+    let since_ms = errors_since_ms(range)?;
     let (total_errors, mut recent) = store.errors(since_ms).map_err(AppError::Internal)?;
     let solved_errors = store
         .solved_error_count(since_ms)
         .map_err(AppError::Internal)?;
+    let tallies = store.error_tallies(since_ms).map_err(AppError::Internal)?;
     let mut priced = UsageReport {
         total_requests: total_errors,
         total_errors,
@@ -617,6 +680,7 @@ pub async fn errors(
         total_errors,
         open_errors: total_errors.saturating_sub(solved_errors),
         recent,
+        groups: group_errors(&tallies, MAX_ERROR_GROUPS),
     })
     .map_err(|e| AppError::Internal(format!("serialize errors report failed: {e}")))?;
     Ok(Json(body))
@@ -657,6 +721,51 @@ pub async fn resolve_errors(
 }
 
 const MAX_RESOLVE_IDS: usize = 500;
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResolveErrorGroupInput {
+    /// `groups[].signature` from `/api/errors`.
+    pub signature: String,
+    /// Window the group came from: `1d`, `7d` (default), `30d`, or `all`.
+    #[serde(default)]
+    pub range: Option<String>,
+    /// `true` (default) marks the group's open errors solved, `false` reopens its solved ones.
+    #[serde(default = "default_true")]
+    pub solved: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Marks every open failure whose signature matches solved (or reopens every solved one).
+#[utoipa::path(post, path = "/api/errors/resolve-group", tag = "stats", summary = "Mark a whole error group solved or reopen it", request_body(content = ResolveErrorGroupInput, description = "Group signature, window and the solved flag", content_type = "application/json"), responses((status = 200, description = "Updated count", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
+pub async fn resolve_error_group(
+    State(state): State<AppState>,
+    Json(input): Json<ResolveErrorGroupInput>,
+) -> Result<Json<Value>, AppError> {
+    let Some(store) = state.store() else {
+        return Err(AppError::BadRequest(
+            "persistence is off — set LLM_HUB_PERSISTENT=true to track solved errors".into(),
+        ));
+    };
+    if input.signature.trim().is_empty() {
+        return Err(AppError::BadRequest("signature must not be empty".into()));
+    }
+    let since_ms = errors_since_ms(input.range.as_deref().unwrap_or("7d"))?;
+    let ids: Vec<i64> = store
+        .error_reasons(since_ms, !input.solved)
+        .map_err(AppError::Internal)?
+        .into_iter()
+        .filter(|(_, error, status)| error_signature(error.as_deref(), *status) == input.signature)
+        .map(|(id, _, _)| id)
+        .collect();
+    let resolved_ms = input.solved.then(now_ms);
+    let updated = store
+        .set_errors_resolved(&ids, resolved_ms)
+        .map_err(AppError::Internal)?;
+    Ok(Json(json!({ "updated": updated, "solved": input.solved })))
+}
 
 // --- hub api keys ---
 
@@ -791,8 +900,15 @@ pub async fn insights_agent_report(
     State(state): State<AppState>,
     Query(query): Query<InsightsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let window = insights_window(&state, &query).await?;
-    let report = insights::build_agent_report_priced(
+    let report = agent_report(&state, &query).await?;
+    serde_json::to_value(report)
+        .map(Json)
+        .map_err(|e| AppError::Internal(format!("serialize agent report failed: {e}")))
+}
+
+async fn agent_report(state: &AppState, query: &InsightsQuery) -> Result<AgentReport, AppError> {
+    let window = insights_window(state, query).await?;
+    Ok(insights::build_agent_report_priced(
         &window.outcomes,
         &window.catalog,
         &window.range,
@@ -800,10 +916,93 @@ pub async fn insights_agent_report(
         window.min_requests,
         now_ms(),
         &window.evidence,
-    );
-    serde_json::to_value(report)
-        .map(Json)
-        .map_err(|e| AppError::Internal(format!("serialize agent report failed: {e}")))
+    ))
+}
+
+/// Models for a manual AI analysis of the insights, with the estimated cost of one run and
+/// the recommended one: the highest quality whose run costs no more than the fair limit.
+#[utoipa::path(get, path = "/api/insights/analysis/models", tag = "insights", summary = "Models for an AI analysis of the insights", params(InsightsQuery), responses((status = 200, description = "Candidates, recommended first", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
+pub async fn insights_analysis_models(
+    State(state): State<AppState>,
+    Query(query): Query<InsightsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let report = agent_report(&state, &query).await?;
+    let input_tokens =
+        insights_analysis::estimate_input_tokens(&insights_analysis::compact_report(&report));
+    let book = state.pricing_book();
+    let candidates = insights_analysis::candidates(&report.models, |model| {
+        book.estimate(
+            model,
+            input_tokens,
+            insights_analysis::ANALYSIS_EXPECTED_OUTPUT_TOKENS,
+            0,
+            0,
+        )
+    });
+    Ok(Json(json!({
+        "estimated_input_tokens": input_tokens,
+        "max_output_tokens": insights_analysis::ANALYSIS_MAX_OUTPUT_TOKENS,
+        "expected_output_tokens": insights_analysis::ANALYSIS_EXPECTED_OUTPUT_TOKENS,
+        "fair_run_usd": insights_analysis::FAIR_RUN_USD,
+        "candidates": candidates,
+    })))
+}
+
+/// Runs one AI analysis of the insights on the chosen model and returns its Markdown.
+/// The hub calls the model once, with no fallbacks, and records the call and its cost.
+#[utoipa::path(post, path = "/api/insights/analysis", tag = "insights", summary = "Run an AI analysis of the insights", params(InsightsQuery), request_body(content = InsightsAnalysisInput, description = "The model to run on", content_type = "application/json"), responses((status = 200, description = "Analysis Markdown and the run's cost", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 503, description = "The model call failed.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
+pub async fn insights_analyze(
+    State(state): State<AppState>,
+    Query(query): Query<InsightsQuery>,
+    Json(input): Json<InsightsAnalysisInput>,
+) -> Result<Json<Value>, AppError> {
+    let model_id = crate::schemas::model_id::ModelId::parse(input.model.trim())
+        .filter(|id| state.config().profile(&id.profile).is_some())
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "unknown model '{}': use <profile>/<model> from /v1/models",
+                input.model
+            ))
+        })?;
+    let report = agent_report(&state, &query).await?;
+    let compact = insights_analysis::compact_report(&report);
+    let body = insights_analysis::request_body(&model_id.model, &compact);
+    let started = std::time::Instant::now();
+    let reply = crate::routes::proxy::send_internal_chat(
+        &state,
+        &model_id,
+        bytes::Bytes::from(body.to_string()),
+        insights_analysis::ANALYSIS_CLIENT,
+    )
+    .await;
+    let text = reply
+        .ok
+        .then(|| insights_analysis::reply_text(&reply.body))
+        .flatten()
+        .ok_or_else(|| {
+            let detail = insights_analysis::empty_reply_reason(&reply.body)
+                .filter(|_| reply.ok)
+                .map_or_else(
+                    || {
+                        String::from_utf8_lossy(&reply.body)
+                            .chars()
+                            .take(300)
+                            .collect()
+                    },
+                    str::to_string,
+                );
+            AppError::UpstreamUnavailable(format!(
+                "{} failed the analysis: HTTP {}: {detail}",
+                model_id.qualified(),
+                reply.status,
+            ))
+        })?;
+    Ok(Json(json!({
+        "model": model_id.qualified(),
+        "markdown": text,
+        "cost_usd": reply.cost_usd,
+        "latency_ms": elapsed_ms(started),
+    })))
 }
 
 struct InsightsWindow {
@@ -1676,6 +1875,81 @@ mod tests {
     }
 
     #[test]
+    fn set_media_fallback_saves_the_switch_and_models_and_checks_them() {
+        let state = state_for(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_file(&dir, &[]);
+        let input = MediaFallbackInput {
+            enabled: true,
+            vision_model: " local/eye ".to_owned(),
+            stt_model: String::new(),
+        };
+
+        assert_saved(set_media_fallback_in(
+            &state,
+            &input,
+            &env,
+            reload_from(&env),
+        ));
+
+        let config = state.config();
+        assert!(config.media_fallback.enabled);
+        assert_eq!(
+            config
+                .media_fallback
+                .vision_model
+                .as_ref()
+                .map(ModelId::qualified),
+            Some("local/eye".to_owned())
+        );
+        assert!(config.media_fallback.stt_model.is_none());
+
+        let bad = MediaFallbackInput {
+            stt_model: "no-slash".to_owned(),
+            ..input.clone()
+        };
+        let result = set_media_fallback_in(&state, &bad, &env, reload_from(&env));
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+
+        let read_only = set_media_fallback_in(
+            &state_for(&[("LLM_HUB_CONFIG_READONLY", "true")]),
+            &input,
+            &env,
+            reload_from(&env),
+        );
+        assert!(matches!(read_only, Err(AppError::ReadOnly)));
+    }
+
+    #[tokio::test]
+    async fn set_media_fallback_route_refuses_a_read_only_hub() {
+        let result = set_media_fallback(
+            State(state_for(&[("LLM_HUB_CONFIG_READONLY", "true")])),
+            Json(MediaFallbackInput {
+                enabled: false,
+                vision_model: String::new(),
+                stt_model: String::new(),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::ReadOnly)));
+    }
+
+    #[tokio::test]
+    async fn profiles_list_reports_the_media_fallback_settings() {
+        let Json(body) = list_profiles(State(state_for(&[]))).await;
+        assert_eq!(body["media_fallback"]["enabled"], json!(false));
+        assert_eq!(
+            body["media_fallback"]["vision_model"],
+            json!("llama_swap/muse-glimmer-30b")
+        );
+        assert_eq!(body["media_fallback"]["stt_model"], Value::Null);
+        assert!(media_fallback_pinned_by(
+            |key| key == "LLM_HUB_MEDIA_FALLBACK_STT_MODEL"
+        ));
+        assert!(!media_fallback_pinned_by(|_| false));
+    }
+
+    #[test]
     fn set_keep_warm_saves_the_switch_and_idle_cap() {
         let state = state_for(&[]);
         let dir = tempfile::tempdir().unwrap();
@@ -1903,6 +2177,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn errors_group_by_signature_and_resolve_a_whole_group() {
+        let (_dir, state) = persistent_state("sqlite", &[]);
+        let mut first = outcome("a/m1", 400);
+        first.error = Some("prompt token count of 1150005 exceeds the limit of 922000".into());
+        let mut second = outcome("b/m2", 400);
+        second.error = Some("prompt token count of 2300066 exceeds the limit of 372000".into());
+        record(&state, &[first, second, outcome("a/m1", 502)]);
+        let all = || ErrorsQuery {
+            range: Some("all".into()),
+        };
+
+        let Json(report) = errors(State(state.clone()), Query(all())).await.unwrap();
+        let groups = report["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(report["recent"].as_array().unwrap().len(), 3);
+        let signature = "prompt token count of <n> exceeds the limit of <n>";
+        assert_eq!(groups[0]["signature"], signature);
+        assert_eq!(groups[0]["count"], 2);
+        assert_eq!(groups[0]["open"], 2);
+        assert_eq!(groups[0]["model_count"], 2);
+
+        let resolve = |solved| {
+            resolve_error_group(
+                State(state.clone()),
+                Json(ResolveErrorGroupInput {
+                    signature: signature.into(),
+                    range: Some("all".into()),
+                    solved,
+                }),
+            )
+        };
+        let Json(solved) = resolve(true).await.unwrap();
+        assert_eq!(solved, json!({"updated": 2, "solved": true}));
+        let Json(report) = errors(State(state.clone()), Query(all())).await.unwrap();
+        assert_eq!(report["open_errors"], 1);
+        assert_eq!(report["groups"][0]["resolved"], 2);
+
+        let Json(again) = resolve(true).await.unwrap();
+        assert_eq!(again["updated"], 0);
+        let Json(reopened) = resolve(false).await.unwrap();
+        assert_eq!(reopened, json!({"updated": 2, "solved": false}));
+    }
+
+    #[tokio::test]
+    async fn resolve_error_group_rejects_bad_input_and_stores_without_ids() {
+        let input = |signature: &str, range: Option<&str>| {
+            Json(ResolveErrorGroupInput {
+                signature: signature.into(),
+                range: range.map(str::to_string),
+                solved: true,
+            })
+        };
+        let off = resolve_error_group(State(state_for(&[])), input("x", None)).await;
+        let (_dir, state) = persistent_state("sqlite", &[]);
+        let blank = resolve_error_group(State(state.clone()), input(" ", None)).await;
+        let range = resolve_error_group(State(state), input("x", Some("90d"))).await;
+        let (_json_dir, json_state) = persistent_state("json", &[]);
+        let json = resolve_error_group(State(json_state), input("x", Some("1d"))).await;
+
+        for result in [off, blank, range] {
+            assert!(matches!(result, Err(AppError::BadRequest(_))));
+        }
+        assert!(matches!(json, Err(AppError::Internal(_))));
+        let parsed: ResolveErrorGroupInput =
+            serde_json::from_value(json!({"signature": "x"})).unwrap();
+        assert!(parsed.solved);
+    }
+
+    #[tokio::test]
     async fn resolve_errors_bounds_the_id_list() {
         let (_dir, state) = persistent_state("sqlite", &[]);
 
@@ -2081,6 +2424,128 @@ mod tests {
 
         assert_eq!(body["profile"], "b");
         assert_eq!(model_ids(&body["models"]), vec!["b/m2"]);
+    }
+
+    #[tokio::test]
+    async fn analysis_models_recommend_the_ranked_model_within_the_fair_limit() {
+        let (_dir, state) = insights_state();
+
+        let Json(body) =
+            insights_analysis_models(State(state), Query(insights_query(Some("all"), None)))
+                .await
+                .unwrap();
+
+        assert_eq!(body["candidates"][0]["model"], "a/m1");
+        assert_eq!(body["candidates"][0]["recommended"], true);
+        assert!(body["estimated_input_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(
+            body["max_output_tokens"],
+            insights_analysis::ANALYSIS_MAX_OUTPUT_TOKENS
+        );
+    }
+
+    async fn analysis_upstream(status: u16, reply: Value) -> (MockServer, TempDir, AppState) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(reply))
+            .mount(&server)
+            .await;
+        let base = server.uri();
+        let (dir, state) = persistent_state(
+            "sqlite",
+            &[("LLM_HUB_PROFILES", "w"), ("LLM_HUB_W_BASE_URL", &base)],
+        );
+        (server, dir, state)
+    }
+
+    #[tokio::test]
+    async fn analyze_returns_the_markdown_and_records_the_call() {
+        let reply = json!({
+            "choices": [{"message": {"role": "assistant", "content": "## At a glance\n- ok"}}],
+            "usage": {"prompt_tokens": 900, "completion_tokens": 40}
+        });
+        let (server, _dir, state) = analysis_upstream(200, reply).await;
+
+        let Json(body) = insights_analyze(
+            State(state.clone()),
+            Query(insights_query(Some("all"), None)),
+            Json(InsightsAnalysisInput {
+                model: "w/small".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(body["model"], "w/small");
+        assert_eq!(body["markdown"], "## At a glance\n- ok");
+        let chats: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/chat/completions")
+            .collect();
+        assert_eq!(chats.len(), 1);
+        let sent: Value = chats[0].body_json().unwrap();
+        assert_eq!(sent["model"], "small");
+        assert_eq!(sent["stream"], false);
+        let logged = state
+            .store()
+            .unwrap()
+            .filtered_outcomes(&StatsFilter {
+                range_label: "all".into(),
+                ..StatsFilter::default()
+            })
+            .unwrap();
+        assert_eq!(
+            logged[0].client.as_deref(),
+            Some(insights_analysis::ANALYSIS_CLIENT)
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_explains_a_reply_that_spent_its_budget_thinking() {
+        let reply = json!({"choices": [{"finish_reason": "length", "message": {"content": ""}}]});
+        let (_server, _dir, state) = analysis_upstream(200, reply).await;
+
+        let spent = insights_analyze(
+            State(state),
+            Query(insights_query(Some("all"), None)),
+            Json(InsightsAnalysisInput {
+                model: "w/small".into(),
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(spent, Err(AppError::UpstreamUnavailable(reason)) if reason.contains("token budget"))
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_reports_a_failed_call_and_an_unknown_model() {
+        let (_server, _dir, state) =
+            analysis_upstream(500, json!({"error": {"message": "boom"}})).await;
+        let run = |model: &str| {
+            insights_analyze(
+                State(state.clone()),
+                Query(insights_query(Some("all"), None)),
+                Json(InsightsAnalysisInput {
+                    model: model.into(),
+                }),
+            )
+        };
+
+        let failed = run("w/small").await;
+        let unknown = run("nope/small").await;
+        let bare = run("small").await;
+
+        assert!(
+            matches!(failed, Err(AppError::UpstreamUnavailable(reason)) if reason.contains("HTTP 500"))
+        );
+        assert!(matches!(unknown, Err(AppError::BadRequest(_))));
+        assert!(matches!(bare, Err(AppError::BadRequest(_))));
     }
 
     #[tokio::test]

@@ -51,6 +51,16 @@ export interface KeepWarmSettings {
   readonly overridden_by_env: boolean;
 }
 
+export interface MediaFallbackSettings {
+  readonly enabled: boolean;
+  /** The `<profile>/<model>` that captions images; `null` when captions are off. */
+  readonly vision_model: string | null;
+  /** The `<profile>/<model>` that transcribes audio; `null` when transcripts are off. */
+  readonly stt_model: string | null;
+  /** The service environment sets one of the variables, so a saved value does not take effect. */
+  readonly overridden_by_env: boolean;
+}
+
 /** Keep-warm pings and their estimated savings. Pings are counted in cost, not in requests. */
 export interface KeepWarmFigures {
   readonly keepwarm_pings: number;
@@ -71,6 +81,7 @@ export interface HubMeta {
   /** `LLM_HUB_COPILOT_PRICES_REFRESH_SECS`; 0 means the fetch is off. */
   readonly copilot_prices_refresh_secs: number;
   readonly keep_warm: KeepWarmSettings;
+  readonly media_fallback: MediaFallbackSettings;
   readonly persistent: boolean;
   readonly auth_enabled: boolean;
   readonly version: string;
@@ -193,6 +204,31 @@ export interface ErrorsReport {
   /** Failed calls in the window not yet marked solved. */
   readonly open_errors: number;
   readonly recent: readonly ErrorEntry[];
+  /** Every failure in the window grouped by normalized signature, largest first. */
+  readonly groups: readonly ErrorGroup[];
+}
+
+export interface NameCount {
+  readonly name: string;
+  readonly count: number;
+}
+
+export interface ErrorGroup {
+  /** Key for `POST /api/errors/resolve-group`. */
+  readonly signature: string;
+  readonly count: number;
+  readonly open: number;
+  readonly resolved: number;
+  readonly first_ts_ms: number;
+  readonly last_ts_ms: number;
+  /** Top few by failure count; `profile_count` and `model_count` give the full number. */
+  readonly profiles: readonly NameCount[];
+  readonly models: readonly NameCount[];
+  readonly profile_count: number;
+  readonly model_count: number;
+  /** Raw reason of the newest failure in the group. */
+  readonly sample: string | null;
+  readonly sample_status: number;
 }
 
 export type ErrorsRange = "1d" | "7d" | "30d" | "all";
@@ -524,9 +560,13 @@ export interface ModelHealthRow {
   readonly endpoint: string;
   /** Failures in a row; 0 after an answer. */
   readonly failures: number;
-  readonly last_failure: "timeout" | "transport" | { readonly status: number } | null;
+  readonly last_failure: "timeout" | "transport" | "broken_reply" | { readonly status: number } | null;
   /** Milliseconds left before Smart Auto picks the model again; 0 when it is not cooled. */
   readonly cooled_for_ms: number;
+  /** Unix milliseconds when the cooldown ends; null when it is not cooled. */
+  readonly cooled_until_ms: number | null;
+  /** Why the model is cooled when an upstream named the wait, such as a rate limit reset. */
+  readonly cooled_reason: string | null;
   /** Share of recent attempts that failed on the model's side, 0 to 1. */
   readonly error_rate: number;
   readonly outcomes: number;
@@ -536,8 +576,17 @@ export interface ModelHealthRow {
   readonly speed: number | null;
 }
 
+/** A profile Smart Auto skips as a whole, such as one out of credits. */
+export interface ProfileCooldownRow {
+  readonly profile: string;
+  readonly cooled_for_ms: number;
+  readonly cooled_until_ms: number;
+  readonly reason: string;
+}
+
 export interface ModelHealthSnapshot {
   readonly models: readonly ModelHealthRow[];
+  readonly profiles: readonly ProfileCooldownRow[];
   /** Cost score per priced model: 0 dearest, 10 free. */
   readonly costs: Record<string, number>;
 }

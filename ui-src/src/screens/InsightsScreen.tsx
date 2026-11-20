@@ -18,6 +18,7 @@ import type {
   SessionsInsight,
   UseCasePick,
 } from "../lib/types";
+import { InsightsAnalysis } from "./InsightsAnalysis";
 import { HealthPill, InsightsModelsTable } from "./InsightsModelsTable";
 import "../styles/screens/insights.css";
 
@@ -145,8 +146,8 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
         </div>
       </div>
       <p className="dim insights-intro">
-        Which model has been fastest, most reliable and best value, from real calls through the hub. These numbers
-        measure speed, failed calls and cost, not answer quality.
+        Which model has been best, most reliable and best value, from real calls through the hub. Scores combine the
+        model's capability tier, verified test and review outcomes, reliability and speed. No AI computes them.
       </p>
 
       {unavailable ? (
@@ -207,6 +208,8 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
           </div>
         </Panel>
       </div>
+
+      {report ? <InsightsAnalysis query={queryString(range, minCalls)} /> : null}
 
       {report ? <Leaders leaders={report.leaders} modelsById={modelsById} onCopy={onCopy} /> : null}
 

@@ -18,6 +18,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::consts::{ERROR_STATUS_MIN, KEEP_WARM_CLIENT};
+use crate::services::error_signature::ErrorTally;
 use crate::services::harness::is_keep_warm;
 use crate::services::model_limits::{LimitSource, ModelLimit};
 use crate::services::pricing::{PricingBook, apply_outcome_costs, outcome_cost_parts};
@@ -75,6 +76,9 @@ struct JsonState {
     /// Profile -> upstream models that refused image input. Absent from older files.
     #[serde(default)]
     vision_refusals: HashMap<String, Vec<String>>,
+    /// Media fallback key -> the text made from that media. Absent from older files.
+    #[serde(default)]
+    media_texts: HashMap<String, String>,
     /// Smart Auto selection events, oldest first. Absent from older files.
     #[serde(default)]
     selection_events: Vec<SelectionEvent>,
@@ -194,6 +198,12 @@ impl Store {
         format!("client IS NOT '{KEEP_WARM_CLIENT}'")
     }
 
+    /// When a failed `requests` row counts as solved: its own mark, or a later solve of the same reason.
+    fn resolved_ms_sql() -> &'static str {
+        "COALESCE(requests.resolved_ms, (SELECT e.resolved_ms FROM error_resolutions e
+            WHERE e.reason = COALESCE(requests.error, '') AND e.resolved_ms >= requests.ts_ms))"
+    }
+
     /// Runs `ddl` unless `existing` already has the column `name`.
     fn add_missing_column(
         conn: &Connection,
@@ -279,6 +289,14 @@ impl Store {
                 learned_at INTEGER NOT NULL,
                 PRIMARY KEY (profile, model),
                 CONSTRAINT ck_vision_refusals_source CHECK (source IN ('learned'))
+            );
+            CREATE TABLE IF NOT EXISTS media_texts (
+                key TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                model TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_ms INTEGER NOT NULL,
+                CONSTRAINT ck_media_texts_kind CHECK (kind IN ('image', 'audio', 'document'))
             );
             CREATE TABLE IF NOT EXISTS selection_events (
                 seq INTEGER PRIMARY KEY,
@@ -550,9 +568,9 @@ impl Store {
                 let mut list_sql = format!(
                     "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
                             ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker,
-                            id, COALESCE(resolved_ms, (SELECT e.resolved_ms FROM error_resolutions e
-                                WHERE e.reason = COALESCE(requests.error, '') AND e.resolved_ms >= requests.ts_ms))
+                            id, {}
                      FROM requests WHERE status >= {ERROR_STATUS_MIN} AND {}",
+                    Self::resolved_ms_sql(),
                     Self::not_keep_warm_sql()
                 );
                 if since_ms.is_some() {
@@ -616,9 +634,8 @@ impl Store {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
                 let mut sql = format!(
                     "SELECT COUNT(*) FROM requests WHERE status >= {ERROR_STATUS_MIN}
-                     AND (resolved_ms IS NOT NULL OR EXISTS (SELECT 1 FROM error_resolutions e
-                         WHERE e.reason = COALESCE(requests.error, '') AND e.resolved_ms >= requests.ts_ms))
-                     AND {}",
+                     AND {} IS NOT NULL AND {}",
+                    Self::resolved_ms_sql(),
                     Self::not_keep_warm_sql()
                 );
                 let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -636,6 +653,103 @@ impl Store {
         }
     }
 
+    /// Failed rows in the window counted per exact reason, status, model and profile.
+    /// The JSON store tallies its in-memory recent rows, all open.
+    pub fn error_tallies(&self, since_ms: Option<u64>) -> Result<Vec<ErrorTally>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut sql = format!(
+                    "SELECT error, status, model, profile, COUNT(*),
+                            SUM(CASE WHEN {} IS NULL THEN 1 ELSE 0 END), MIN(ts_ms), MAX(ts_ms)
+                     FROM requests WHERE status >= {ERROR_STATUS_MIN} AND {}",
+                    Self::resolved_ms_sql(),
+                    Self::not_keep_warm_sql()
+                );
+                let mut params: Vec<rusqlite::types::Value> = Vec::new();
+                if let Some(since) = since_ms {
+                    sql.push_str(" AND ts_ms >= ?");
+                    params.push(rusqlite::types::Value::Integer(db_i64(since)));
+                }
+                sql.push_str(" GROUP BY error, status, model, profile");
+                let mut stmt = guard.prepare(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                        Ok(ErrorTally {
+                            error: r.get(0)?,
+                            status: u16::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
+                            model: r.get(2)?,
+                            profile: r.get(3)?,
+                            count: db_u64(r.get(4)?),
+                            open: db_u64(r.get(5)?),
+                            first_ts_ms: db_u64(r.get(6)?),
+                            last_ts_ms: db_u64(r.get(7)?),
+                        })
+                    })
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                Ok(rows)
+            }
+            Store::Json(_) => {
+                let (_, recent) = self.errors(since_ms)?;
+                Ok(recent
+                    .into_iter()
+                    .map(|entry| ErrorTally {
+                        error: entry.row.error,
+                        status: entry.row.status,
+                        model: entry.row.model,
+                        profile: entry.row.profile,
+                        count: 1,
+                        open: 1,
+                        first_ts_ms: entry.row.ts_ms,
+                        last_ts_ms: entry.row.ts_ms,
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    /// Id, reason and status of failed rows in the window that are open (`solved == false`)
+    /// or solved (`solved == true`). Only the `SQLite` store keeps row ids.
+    pub fn error_reasons(
+        &self,
+        since_ms: Option<u64>,
+        solved: bool,
+    ) -> Result<Vec<(i64, Option<String>, u16)>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut sql = format!(
+                    "SELECT id, error, status FROM requests WHERE status >= {ERROR_STATUS_MIN}
+                     AND {} IS {} NULL AND {}",
+                    Self::resolved_ms_sql(),
+                    if solved { "NOT" } else { "" },
+                    Self::not_keep_warm_sql()
+                );
+                let mut params: Vec<rusqlite::types::Value> = Vec::new();
+                if let Some(since) = since_ms {
+                    sql.push_str(" AND ts_ms >= ?");
+                    params.push(rusqlite::types::Value::Integer(db_i64(since)));
+                }
+                let mut stmt = guard.prepare(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            u16::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                        ))
+                    })
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                Ok(rows)
+            }
+            Store::Json(_) => Err("error resolution needs the SQLite store".into()),
+        }
+    }
+
     /// Sets or clears `resolved_ms` on failed rows by id. Returns rows updated.
     /// Only the `SQLite` store keeps row ids, so the JSON store refuses.
     pub fn set_errors_resolved(
@@ -645,7 +759,11 @@ impl Store {
     ) -> Result<u64, String> {
         match self {
             Store::Sqlite(conn) => {
-                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let conn_guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                // One transaction, so solving a large group commits once.
+                let guard = conn_guard
+                    .unchecked_transaction()
+                    .map_err(|e| e.to_string())?;
                 let value = resolved_ms.map(|ms| rusqlite::types::Value::Integer(db_i64(ms)));
                 let mut updated = 0_u64;
                 let mut stmt = guard
@@ -682,6 +800,8 @@ impl Store {
                         }
                     }
                 }
+                drop(stmt);
+                guard.commit().map_err(|e| e.to_string())?;
                 Ok(updated)
             }
             Store::Json(_) => Err("error resolution needs the SQLite store".into()),
@@ -1422,6 +1542,78 @@ impl Store {
                     return Ok(());
                 }
                 models.push(model.to_string());
+                guard.flush()
+            }
+        }
+    }
+
+    /// The saved media fallback texts of `keys`, by key. Keys with no text are left out.
+    pub fn load_media_texts(&self, keys: &[String]) -> Result<HashMap<String, String>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut stmt = guard
+                    .prepare_cached("SELECT text FROM media_texts WHERE key = ?1")
+                    .map_err(|e| e.to_string())?;
+                let mut found = HashMap::new();
+                for key in keys {
+                    let text: Option<String> = stmt
+                        .query_row([key], |r| r.get(0))
+                        .optional()
+                        .map_err(|e| e.to_string())?;
+                    if let Some(text) = text {
+                        found.insert(key.clone(), text);
+                    }
+                }
+                Ok(found)
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                Ok(keys
+                    .iter()
+                    .filter_map(|key| {
+                        guard
+                            .state
+                            .media_texts
+                            .get(key)
+                            .map(|text| (key.clone(), text.clone()))
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    /// Saves the text made from one media item under its `key`. A saved key keeps its first text.
+    pub fn save_media_text(
+        &self,
+        key: &str,
+        kind: &str,
+        model: &str,
+        text: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                guard
+                    .execute(
+                        "INSERT INTO media_texts (key, kind, model, text, created_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(key) DO NOTHING",
+                        rusqlite::params![key, kind, model, text, db_i64(now_ms)],
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                if guard.state.media_texts.contains_key(key) {
+                    return Ok(());
+                }
+                guard
+                    .state
+                    .media_texts
+                    .insert(key.to_owned(), text.to_owned());
                 guard.flush()
             }
         }
@@ -2423,6 +2615,62 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_error_tallies_and_reasons_split_open_from_solved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        store.record(&sample_outcome()).unwrap();
+        let mut failed = sample_outcome();
+        failed.status = 413;
+        failed.error = Some("Request Entity Too Large".into());
+        store.record(&failed).unwrap();
+        store.record(&failed).unwrap();
+        failed.error = Some("other".into());
+        store.record(&failed).unwrap();
+        let (_, rows) = store.errors(None).unwrap();
+        let other = rows[0].id.unwrap();
+        store.set_errors_resolved(&[other], Some(now_ms())).unwrap();
+
+        let tallies = store.error_tallies(None).unwrap();
+        let too_large = tallies
+            .iter()
+            .find(|t| t.error.as_deref() == Some("Request Entity Too Large"))
+            .unwrap();
+        assert_eq!(
+            (too_large.count, too_large.open, too_large.status),
+            (2, 2, 413)
+        );
+        assert!(too_large.first_ts_ms <= too_large.last_ts_ms);
+        assert_eq!(tallies.len(), 2);
+        assert!(
+            store
+                .error_tallies(Some(now_ms() + 60_000))
+                .unwrap()
+                .is_empty()
+        );
+
+        let open = store.error_reasons(None, false).unwrap();
+        let solved = store.error_reasons(Some(0), true).unwrap();
+        assert_eq!(open.len(), 2);
+        assert_eq!(solved, vec![(other, Some("other".into()), 413)]);
+    }
+
+    #[test]
+    fn json_error_tallies_count_recent_rows_as_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.json");
+        let store = Store::open("json", Some(path.to_str().unwrap())).unwrap();
+        let mut failed = sample_outcome();
+        failed.status = 500;
+        store.record(&failed).unwrap();
+
+        let tallies = store.error_tallies(None).unwrap();
+        assert_eq!(tallies.len(), 1);
+        assert_eq!((tallies[0].count, tallies[0].open), (1, 1));
+        assert!(store.error_reasons(None, false).is_err());
+    }
+
+    #[test]
     fn sqlite_api_keys_crud() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
@@ -2590,6 +2838,45 @@ mod tests {
                 ("other".to_string(), "mini".to_string()),
             ]
         );
+    }
+
+    fn media_texts_round_trip(kind: &str, file: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        let path_str = path.to_str().unwrap();
+        {
+            let store = Store::open(kind, Some(path_str)).unwrap();
+            store
+                .save_media_text("k1", "image", "local/v", "a cat", 1)
+                .unwrap();
+            store
+                .save_media_text("k1", "image", "local/v", "a dog", 2)
+                .unwrap();
+            store
+                .save_media_text("k2", "audio", "local/s", "hello", 3)
+                .unwrap();
+        }
+        let store = Store::open(kind, Some(path_str)).unwrap();
+        let found = store
+            .load_media_texts(&["k1".to_owned(), "k3".to_owned(), "k2".to_owned()])
+            .unwrap();
+        assert_eq!(
+            found,
+            HashMap::from([
+                ("k1".to_owned(), "a cat".to_owned()),
+                ("k2".to_owned(), "hello".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn sqlite_media_texts_survive_reopen_and_keep_the_first_text() {
+        media_texts_round_trip("sqlite", "t.db");
+    }
+
+    #[test]
+    fn json_media_texts_survive_reopen_and_keep_the_first_text() {
+        media_texts_round_trip("json", "s.json");
     }
 
     #[test]

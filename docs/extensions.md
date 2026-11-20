@@ -58,8 +58,17 @@ A request carries typed state from `request` to `attempt`, `response` and `compl
 stood after the last `response` phase. A value must implement `Clone`.
 
 `config_change` runs for these admin calls: save or delete a profile, set the default fallbacks,
-the Copilot price refresh, keep-warm, create or delete an API key, and save the Smart Auto rules.
-It sees the kind of change and, for a profile or key, its name. It never sees a secret.
+the Copilot price refresh, keep-warm, media fallback, create or delete an API key, and save the
+Smart Auto rules. It sees the kind of change and, for a profile or key, its name. It never sees a secret.
+
+## Built-ins
+
+Most built-ins are sync extensions that change error replies. One built-in is async, because it
+can call a model, so the hub runs it itself instead of through the sync `Extension` trait:
+
+| Built-in | Phase | What it does |
+|---|---|---|
+| Media fallback | `attempt` | Off by default (`LLM_HUB_MEDIA_FALLBACK`). Before the other attempt extensions, it turns the images, audio and files of an attempt to a text-only model into text: captions from a vision model, transcripts from a speech model, PDF text. Extensions in the same phase see the text. See [Media fallback](media-fallback.md) |
 
 ## Rules
 
@@ -119,6 +128,13 @@ rules:
     actions:
       - retry_next: true
 
+  # A gateway that answers 400 while it warms a model up.
+  - name: warming
+    phase: response
+    match: { status: 400, error_message: "model is warming up" }
+    actions:
+      - retry_next: true
+
   # A local server that rejects OpenAI's `metadata` field.
   - name: no-metadata-local
     phase: attempt
@@ -144,6 +160,7 @@ in the same phase sees the changes of an earlier one, including a model that `se
 | `stream` | request, attempt | The body's `stream` flag |
 | `status` | response, http_response | A status (`400`) or class (`5xx`) |
 | `error_code` | response | `error.code` in the JSON error body |
+| `error_message` | response | Part of the error message (`error.message`, a string `error`, `message` or `detail`), in any case |
 
 `header` takes a map and `stream` takes `true` or `false`. Every other key takes one value or a
 list, and a list matches when any value matches. A key that a phase cannot

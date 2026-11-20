@@ -25,6 +25,7 @@ unwrap_used = "warn"
 
 [dependencies]
 arc-swap = "1.9.2"
+base64 = "0.22.1"
 axum = "0.8.9"
 bytes = "1.12.1"
 dashmap = "6.2.1"
@@ -32,6 +33,7 @@ dotenvy = "0.15.7"
 futures-util = "0.3.34"
 hdrhistogram = "7.6.0"
 keyring = "4.2.0"
+lopdf = { version = "0.47.0", default-features = false, optional = true }
 mime_guess = "2.0.5"
 rand = "0.10.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream"] }
@@ -63,6 +65,10 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+[features]
+# PDF text for media fallback. Adds a PDF parser to the binary.
+media-pdf = ["dep:lopdf"]
 
 [profile.release]
 lto = "fat"

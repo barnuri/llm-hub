@@ -25,6 +25,8 @@ Boolean flags accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off`.
 | `LLM_HUB_EXTENSIONS_FILE` | `extensions.yaml`, `extensions.yml` or `extensions.json` in the working directory | Rules file for [extensions](extensions.md#rules). Reloaded on change. `llm-hub extensions check` validates it. |
 | `LLM_HUB_STREAM_ROLE` | `true` | Add `role: "assistant"` to the first streamed delta when the upstream leaves it out. |
 | `LLM_HUB_SSE_KEEPALIVE_MS` | `15000` | Idle time before an SSE keepalive comment. `0` turns it off. |
+| `LLM_HUB_DEADLINE_MS` | none | Default time limit of a whole fallback chain. `X-LLM-Hub-Deadline-Ms` wins. See [Fallbacks](fallbacks-and-transforms.md#fallbacks). |
+| `LLM_HUB_QUOTA_COOLDOWN_SECS` | `3600` | How long a profile that is out of credits is skipped. `0` cools nothing, but the next fallback still runs. |
 | `LLM_HUB_FIRST_BYTE_TIMEOUT_MS` | `20000` | Longest wait for the first byte of a streamed Smart Auto attempt on a remote profile. A model that misses it is cooled and the next fallback is tried. `0` turns it off. See [Live signals](smart-auto.md#live-signals). |
 | `LLM_HUB_COPILOT_PRICES_REFRESH_SECS` | `86400` (24 hours) | How often the hub fetches Copilot model prices from GitHub Docs while a Copilot profile is enabled. The same interval governs Copilot model descriptions fetched from the GitHub Docs model comparison page. Fetches stay at least 1 hour apart. `0` turns the fetch off and the built-in prices apply. Editable on the Models page. |
 | `LLM_HUB_COPILOT_GUARD_MODELS` | `*` | Models (`<model>`, `<profile>/<model>` or `*`) whose Copilot CLI requests get the tool-loop guard. The guard adds a system-prompt note. It also withholds a tool that the history shows called the same way 3 times in a row. Empty turns it off. |
@@ -44,6 +46,24 @@ every remote profile, on chat completions, messages and responses calls. See
 
 The Models page writes both variables to `.env`. A value set in the process environment wins over
 `.env`, so the page shows its controls disabled when the service environment sets either variable.
+
+## Media fallback
+
+Media fallback turns images, audio and files into text before an attempt goes to a model that
+cannot read them. Off by default. See [Media fallback](media-fallback.md).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_HUB_MEDIA_FALLBACK` | `false` | Turns media fallback on. |
+| `LLM_HUB_MEDIA_FALLBACK_VISION_MODEL` | `llama_swap/muse-glimmer-30b` | The `<profile>/<model>` that captions images. Empty: images become placeholders. |
+| `LLM_HUB_MEDIA_FALLBACK_STT_MODEL` | unset | The `<profile>/<model>` that transcribes audio through `/v1/audio/transcriptions`. Unset: audio becomes a placeholder. |
+| `LLM_HUB_MEDIA_FALLBACK_TEXT_ONLY` | empty | Comma-separated model globs (`llama_swap/*`) that always get text, on top of the models the hub knows cannot read images. |
+| `LLM_HUB_MEDIA_FALLBACK_MAX_ITEM_BYTES` | `20971520` (20 MiB) | Largest encoded media item that is converted. A larger one becomes a placeholder. |
+| `LLM_HUB_MEDIA_FALLBACK_MAX_ITEMS` | `16` | Conversions per request that are not cached. Later items become placeholders. |
+| `LLM_HUB_MEDIA_FALLBACK_TIMEOUT_MS` | `120000` | Longest wait for one conversion. A local model may have to load first. |
+
+The Models page writes the first three variables to `.env`, and shows its controls disabled when
+the service environment sets one of them.
 
 ## Persistence
 

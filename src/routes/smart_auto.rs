@@ -42,7 +42,7 @@ use crate::schemas::smart_auto_rules::SmartAutoRules;
 use crate::schemas::smart_auto_tier::SmartAutoTier;
 use crate::schemas::turn_signals::TurnSignals;
 use crate::services::extension_phases;
-use crate::services::model_health::HealthRow;
+use crate::services::model_health::{HealthRow, ProfileCooldownRow};
 use crate::services::selection_log::SelectionLog;
 use crate::services::smart_auto_live::SmartAutoLive;
 use crate::services::smart_auto_pool::SmartAutoPool;
@@ -129,6 +129,8 @@ struct DecisionsBody {
 struct HealthBody {
     /// Each `(model, endpoint)` the hub attempted: failures, cooldown, error rate and speed.
     models: Vec<HealthRow>,
+    /// Profiles skipped as a whole now, such as one out of credits, with the reason and when it ends.
+    profiles: Vec<ProfileCooldownRow>,
     /// Cost score (0 dearest, 10 free) of each priced model, from the price book.
     costs: std::collections::BTreeMap<String, u8>,
 }
@@ -320,8 +322,10 @@ pub async fn decisions(
 /// `cooled_for_ms` above 0 is skipped until it elapses.
 #[utoipa::path(get, path = "/api/smart-auto/health", tag = "smart-auto", summary = "Per-model measurements", responses((status = 200, description = "Failures, cooldown, error rate, speed and cost scores", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn health(State(state): State<AppState>) -> Response {
+    let now = std::time::Instant::now();
     Json(HealthBody {
-        models: state.model_health().report(std::time::Instant::now()),
+        models: state.model_health().report(now),
+        profiles: state.model_health().profile_report(now),
         costs: state
             .model_costs()
             .iter()

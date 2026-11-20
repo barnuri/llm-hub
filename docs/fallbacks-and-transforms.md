@@ -4,7 +4,28 @@
 
 Send an ordered chain. The hub tries the next model only after a connect error, a timeout, 408,
 429 or 5xx. It never retries 400, 401, 403, 404 or 422, because those describe your request and
-fail the same way on every upstream.
+fail the same way on every upstream. Three cases are exceptions, because they describe the upstream:
+
+- **A broken success.** While a fallback remains, the hub holds back a 2xx reply until its first
+  meaningful event: SSE comments and pings are skipped, and only the bytes up to that event are
+  held. An empty body, a stream that ends or sends `[DONE]` before any content, or a first event
+  that is an error (`event: error`, `"type": "error"` or a top-level `error`) fails the attempt
+  with `empty reply: ...` or `error event: ...`, and the next model runs. A compressed or non-SSE
+  body passes at its first non-space byte. Without a time limit, the check waits at most 30
+  seconds and then lets the reply through. On the last model, the client gets the reply as it came.
+- **A model that is not ready.** A 400 whose message says a local server is still loading or
+  failed to start (llama.cpp `Failed to initialize samplers`, `Loading model`, LM Studio
+  `No models loaded`, and similar) moves on. Any other 400, such as a schema error or a prompt
+  over the context, still stops the chain.
+- **Out of credits.** A 402, or a 400, 403 or 429 whose body says the account has no credit
+  (`insufficient_quota`, "credit balance is too low", and similar), moves on and cools the whole
+  profile for `LLM_HUB_QUOTA_COOLDOWN_SECS` (1 hour by default).
+
+A rate limit cools the model until the reset the upstream names: `retry-after-ms`, `Retry-After`
+(seconds or an HTTP date), `x-ratelimit-reset-requests` and `-tokens` (`6m0s`),
+`anthropic-ratelimit-*-reset` (RFC 3339), Gemini's `retryDelay`, or "try again in 20s" in the
+error message. The longest wait is 6 hours. Without a hint, the 30-second doubling backoff
+applies. The request log records why each attempt failed.
 
 ```sh
 curl http://127.0.0.1:8888/v1/chat/completions \
@@ -20,8 +41,14 @@ X-LLM-Hub-Model: groq/llama-3.3-70b-versatile
 X-LLM-Hub-Attempts: openai/gpt-5=429, groq/llama-3.3-70b-versatile=200
 ```
 
-- `X-LLM-Hub-Timeout-Ms` sets a deadline per attempt. `X-LLM-Hub-Retry-On: 429,503` replaces the
-  set of statuses that trigger a retry.
+- `X-LLM-Hub-Timeout-Ms` sets the time limit of each attempt, to the upstream's response
+  headers. `X-LLM-Hub-Retry-On: 429,503` replaces the set of statuses that trigger a retry.
+- `X-LLM-Hub-Deadline-Ms` sets one time limit for the whole chain, from the moment the hub
+  receives the request. Each attempt waits at most the time left, for its headers and its first
+  event. Once the time is up, the hub skips the remaining models and answers 504 with
+  `timeout_error`, the attempts made and the models it skipped. `LLM_HUB_DEADLINE_MS` sets a
+  default (off unless set). The header wins, and `0` in it turns the limit off. The deadline does
+  not cut a reply that already reached the client.
 - A fallback replays the request body, so the hub buffers it. A body over
   `LLM_HUB_MAX_REPLAY_BYTES` streams through with fallbacks off.
 - The default chain applies when a request has no fallback header. The header always wins. Set
