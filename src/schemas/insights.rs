@@ -5,6 +5,7 @@ pub mod harness_insight;
 pub mod insight_leaders;
 pub mod insights_report;
 pub mod model_catalog_entry;
+pub mod model_cost;
 pub mod model_health;
 pub mod model_insight;
 pub mod model_pick;

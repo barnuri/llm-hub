@@ -21,6 +21,8 @@ pub struct AgentReport {
     pub picks: Vec<ModelPick>,
     pub leaders: InsightLeaders,
     pub best_for: Vec<UseCasePick>,
+    pub best_free: Vec<String>,
+    pub best_value: Vec<String>,
     pub harnesses: Vec<HarnessInsight>,
     pub failure_reasons: Vec<FailureReason>,
     pub models: Vec<ModelInsight>,

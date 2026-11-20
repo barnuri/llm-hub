@@ -22,6 +22,7 @@ use crate::schemas::errors_report::ErrorsReport;
 use crate::schemas::fallbacks_input::FallbacksInput;
 use crate::schemas::insights::insights_report::InsightsReport;
 use crate::schemas::insights::model_catalog_entry::ModelCatalogEntry;
+use crate::schemas::insights::model_cost::ModelCost;
 use crate::schemas::insights::pick_by::PickBy;
 use crate::schemas::keep_warm_input::KeepWarmInput;
 use crate::schemas::keep_warm_summary::KeepWarmSummary;
@@ -791,13 +792,14 @@ pub async fn insights_agent_report(
     Query(query): Query<InsightsQuery>,
 ) -> Result<Json<Value>, AppError> {
     let window = insights_window(&state, &query).await?;
-    let report = insights::build_agent_report(
+    let report = insights::build_agent_report_priced(
         &window.outcomes,
         &window.catalog,
         &window.range,
         window.profile,
         window.min_requests,
         now_ms(),
+        &window.costs,
     );
     serde_json::to_value(report)
         .map(Json)
@@ -807,6 +809,7 @@ pub async fn insights_agent_report(
 struct InsightsWindow {
     outcomes: Vec<RequestOutcome>,
     catalog: HashMap<String, ModelCatalogEntry>,
+    costs: insights::ModelCosts,
     range: String,
     profile: Option<String>,
     min_requests: u64,
@@ -817,12 +820,13 @@ async fn insights_report(
     query: &InsightsQuery,
 ) -> Result<InsightsReport, AppError> {
     let window = insights_window(state, query).await?;
-    Ok(insights::build_report(
+    Ok(insights::build_report_priced(
         &window.outcomes,
         &window.catalog,
         &window.range,
         window.min_requests,
         now_ms(),
+        &window.costs,
     ))
 }
 
@@ -863,9 +867,12 @@ async fn insights_window(
         })
         .map_err(AppError::Internal)?;
     let catalog = insights_catalog(state, profile.as_deref()).await;
+    let book = state.pricing_book();
+    let costs = model_costs(&outcomes, &book);
     Ok(InsightsWindow {
         outcomes,
         catalog,
+        costs,
         range: range.to_string(),
         profile,
         min_requests: query
@@ -873,6 +880,27 @@ async fn insights_window(
             .unwrap_or(DEFAULT_INSIGHTS_MIN_REQUESTS)
             .max(1),
     })
+}
+
+/// Spend and free flag per model over the window. Keep-warm pings cost nothing a user chose, so they are skipped.
+fn model_costs(
+    outcomes: &[RequestOutcome],
+    book: &crate::services::pricing::PricingBook,
+) -> insights::ModelCosts {
+    let mut costs = insights::ModelCosts::new();
+    for outcome in outcomes
+        .iter()
+        .filter(|outcome| !crate::services::harness::is_keep_warm(outcome.client.as_deref()))
+    {
+        let entry = costs
+            .entry(outcome.model_key.clone())
+            .or_insert_with(|| ModelCost {
+                usd: 0.0,
+                free: book.is_local_model(&outcome.model_key),
+            });
+        entry.usd += crate::services::pricing::outcome_cost_parts(book, outcome).total();
+    }
+    costs
 }
 
 /// Enabled models from the hub's model list (cached, refreshed when cold),
@@ -1004,6 +1032,35 @@ mod tests {
             attempt: None,
             role: None,
         }
+    }
+
+    #[test]
+    fn model_costs_price_calls_skip_keep_warm_and_mark_local_free() {
+        let mut book = PricingBook::default();
+        book.local_profiles.insert("llama".into());
+        let cloud = crate::configs::TokenRates {
+            input_per_1m: 1.0,
+            ..Default::default()
+        };
+        book.listed = Arc::new(HashMap::from([(
+            "cloud/a".to_string(),
+            crate::configs::PriceCard::flat(cloud),
+        )]));
+        let mut warm = outcome("cloud/a", 200);
+        warm.client = Some(crate::consts::KEEP_WARM_CLIENT.into());
+        let outcomes = [
+            outcome("cloud/a", 200),
+            outcome("cloud/a", 200),
+            warm,
+            outcome("llama/b", 200),
+        ];
+
+        let costs = model_costs(&outcomes, &book);
+
+        assert!((costs["cloud/a"].usd - 0.002).abs() < 1e-9);
+        assert!(!costs["cloud/a"].free);
+        assert!(costs["llama/b"].free);
+        assert!(costs["llama/b"].usd.abs() < f64::EPSILON);
     }
 
     fn record(state: &AppState, outcomes: &[RequestOutcome]) -> Vec<i64> {

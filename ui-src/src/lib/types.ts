@@ -250,6 +250,8 @@ export interface UseCasePick {
   readonly ranked: boolean;
   readonly reason: string;
   readonly candidates: readonly string[];
+  /** Up to three models for this use case, best first. */
+  readonly top: readonly string[];
 }
 
 export interface ModelInsight {
@@ -278,17 +280,25 @@ export interface ModelInsight {
   readonly stability_score: number | null;
   readonly speed_score: number | null;
   readonly overall_score: number | null;
+  /** Estimated spend in the window; null when the model had no priced calls. */
+  readonly cost_usd: number | null;
+  /** Spend per successful call, in US cents. */
+  readonly cost_per_call_cents: number | null;
+  /** Runs on a local profile, so it costs nothing. */
+  readonly free: boolean;
+  /** Overall score per US cent per successful call. */
+  readonly value_score: number | null;
   readonly by_harness: readonly HarnessInsight[];
   readonly best_harness: string | null;
 }
 
 export interface InsightLeaders {
-  readonly best_overall: string | null;
-  readonly most_stable: string | null;
-  readonly fastest_first_token: string | null;
-  readonly fastest_decode: string | null;
-  readonly fastest_prefill: string | null;
-  readonly most_used: string | null;
+  readonly best_overall: readonly string[];
+  readonly most_stable: readonly string[];
+  readonly fastest_first_token: readonly string[];
+  readonly fastest_decode: readonly string[];
+  readonly fastest_prefill: readonly string[];
+  readonly most_used: readonly string[];
 }
 
 export interface InsightsReport {
@@ -297,6 +307,8 @@ export interface InsightsReport {
   readonly generated_ms: number;
   readonly leaders: InsightLeaders;
   readonly best_for: readonly UseCasePick[];
+  readonly best_free: readonly string[];
+  readonly best_value: readonly string[];
   readonly harnesses: readonly HarnessInsight[];
   readonly models: readonly ModelInsight[];
 }

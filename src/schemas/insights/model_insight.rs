@@ -35,6 +35,14 @@ pub struct ModelInsight {
     pub stability_score: Option<f64>,
     pub speed_score: Option<f64>,
     pub overall_score: Option<f64>,
+    /// Estimated spend in the window; `None` when the model had no priced calls.
+    pub cost_usd: Option<f64>,
+    /// Spend per successful call, in US cents.
+    pub cost_per_call_cents: Option<f64>,
+    /// Runs on a local profile, so it costs nothing.
+    pub free: bool,
+    /// Overall score per US cent per successful call. Higher is better value.
+    pub value_score: Option<f64>,
     pub by_harness: Vec<HarnessInsight>,
     pub best_harness: Option<String>,
 }
