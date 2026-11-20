@@ -498,6 +498,7 @@ fn api_router(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(live::stream))
         .routes(routes!(admin::errors))
         .routes(routes!(admin::resolve_errors))
+        .routes(routes!(admin::resolve_error_group))
         .routes(routes!(sessions::list))
         .routes(routes!(sessions::detail))
         .routes(routes!(admin::insights))

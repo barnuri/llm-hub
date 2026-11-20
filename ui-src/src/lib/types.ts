@@ -193,6 +193,31 @@ export interface ErrorsReport {
   /** Failed calls in the window not yet marked solved. */
   readonly open_errors: number;
   readonly recent: readonly ErrorEntry[];
+  /** Every failure in the window grouped by normalized signature, largest first. */
+  readonly groups: readonly ErrorGroup[];
+}
+
+export interface NameCount {
+  readonly name: string;
+  readonly count: number;
+}
+
+export interface ErrorGroup {
+  /** Key for `POST /api/errors/resolve-group`. */
+  readonly signature: string;
+  readonly count: number;
+  readonly open: number;
+  readonly resolved: number;
+  readonly first_ts_ms: number;
+  readonly last_ts_ms: number;
+  /** Top few by failure count; `profile_count` and `model_count` give the full number. */
+  readonly profiles: readonly NameCount[];
+  readonly models: readonly NameCount[];
+  readonly profile_count: number;
+  readonly model_count: number;
+  /** Raw reason of the newest failure in the group. */
+  readonly sample: string | null;
+  readonly sample_status: number;
 }
 
 export type ErrorsRange = "1d" | "7d" | "30d" | "all";

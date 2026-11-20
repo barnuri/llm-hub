@@ -31,6 +31,7 @@ use crate::schemas::keep_warm_summary::KeepWarmSummary;
 use crate::schemas::profile_input::ProfileInput;
 use crate::schemas::usage_report::UsageReport;
 use crate::services::env_writer;
+use crate::services::error_signature::{error_signature, group_errors};
 use crate::services::extension_phases;
 use crate::services::insights;
 use crate::services::insights_analysis;
@@ -577,6 +578,22 @@ pub struct ErrorsQuery {
     pub range: Option<String>,
 }
 
+/// Start of an errors window: `1d`, `7d`, `30d`, or `all` (no start).
+fn errors_since_ms(range: &str) -> Result<Option<u64>, AppError> {
+    match range {
+        "1d" => Ok(Some(now_ms().saturating_sub(86_400_000))),
+        "7d" => Ok(Some(now_ms().saturating_sub(7 * 86_400_000))),
+        "30d" => Ok(Some(now_ms().saturating_sub(30 * 86_400_000))),
+        "all" => Ok(None),
+        other => Err(AppError::BadRequest(format!(
+            "unknown errors range '{other}' (expected 1d, 7d, 30d, all)"
+        ))),
+    }
+}
+
+/// Most groups `/api/errors` returns.
+const MAX_ERROR_GROUPS: usize = 100;
+
 #[utoipa::path(get, path = "/api/errors", tag = "stats", summary = "Failed requests", params(ErrorsQuery), responses((status = 200, description = "Recent failed requests. Needs persistence.", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn errors(
     State(state): State<AppState>,
@@ -588,21 +605,12 @@ pub async fn errors(
         ));
     };
     let range = query.range.as_deref().unwrap_or("7d");
-    let since_ms = match range {
-        "1d" => Some(now_ms().saturating_sub(86_400_000)),
-        "7d" => Some(now_ms().saturating_sub(7 * 86_400_000)),
-        "30d" => Some(now_ms().saturating_sub(30 * 86_400_000)),
-        "all" => None,
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "unknown errors range '{other}' (expected 1d, 7d, 30d, all)"
-            )));
-        }
-    };
+    let since_ms = errors_since_ms(range)?;
     let (total_errors, mut recent) = store.errors(since_ms).map_err(AppError::Internal)?;
     let solved_errors = store
         .solved_error_count(since_ms)
         .map_err(AppError::Internal)?;
+    let tallies = store.error_tallies(since_ms).map_err(AppError::Internal)?;
     let mut priced = UsageReport {
         total_requests: total_errors,
         total_errors,
@@ -620,6 +628,7 @@ pub async fn errors(
         total_errors,
         open_errors: total_errors.saturating_sub(solved_errors),
         recent,
+        groups: group_errors(&tallies, MAX_ERROR_GROUPS),
     })
     .map_err(|e| AppError::Internal(format!("serialize errors report failed: {e}")))?;
     Ok(Json(body))
@@ -660,6 +669,51 @@ pub async fn resolve_errors(
 }
 
 const MAX_RESOLVE_IDS: usize = 500;
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResolveErrorGroupInput {
+    /// `groups[].signature` from `/api/errors`.
+    pub signature: String,
+    /// Window the group came from: `1d`, `7d` (default), `30d`, or `all`.
+    #[serde(default)]
+    pub range: Option<String>,
+    /// `true` (default) marks the group's open errors solved, `false` reopens its solved ones.
+    #[serde(default = "default_true")]
+    pub solved: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Marks every open failure whose signature matches solved (or reopens every solved one).
+#[utoipa::path(post, path = "/api/errors/resolve-group", tag = "stats", summary = "Mark a whole error group solved or reopen it", request_body(content = ResolveErrorGroupInput, description = "Group signature, window and the solved flag", content_type = "application/json"), responses((status = 200, description = "Updated count", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
+pub async fn resolve_error_group(
+    State(state): State<AppState>,
+    Json(input): Json<ResolveErrorGroupInput>,
+) -> Result<Json<Value>, AppError> {
+    let Some(store) = state.store() else {
+        return Err(AppError::BadRequest(
+            "persistence is off — set LLM_HUB_PERSISTENT=true to track solved errors".into(),
+        ));
+    };
+    if input.signature.trim().is_empty() {
+        return Err(AppError::BadRequest("signature must not be empty".into()));
+    }
+    let since_ms = errors_since_ms(input.range.as_deref().unwrap_or("7d"))?;
+    let ids: Vec<i64> = store
+        .error_reasons(since_ms, !input.solved)
+        .map_err(AppError::Internal)?
+        .into_iter()
+        .filter(|(_, error, status)| error_signature(error.as_deref(), *status) == input.signature)
+        .map(|(id, _, _)| id)
+        .collect();
+    let resolved_ms = input.solved.then(now_ms);
+    let updated = store
+        .set_errors_resolved(&ids, resolved_ms)
+        .map_err(AppError::Internal)?;
+    Ok(Json(json!({ "updated": updated, "solved": input.solved })))
+}
 
 // --- hub api keys ---
 
@@ -1993,6 +2047,75 @@ mod tests {
         )
         .await;
         assert!(matches!(unknown, Err(AppError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn errors_group_by_signature_and_resolve_a_whole_group() {
+        let (_dir, state) = persistent_state("sqlite", &[]);
+        let mut first = outcome("a/m1", 400);
+        first.error = Some("prompt token count of 1150005 exceeds the limit of 922000".into());
+        let mut second = outcome("b/m2", 400);
+        second.error = Some("prompt token count of 2300066 exceeds the limit of 372000".into());
+        record(&state, &[first, second, outcome("a/m1", 502)]);
+        let all = || ErrorsQuery {
+            range: Some("all".into()),
+        };
+
+        let Json(report) = errors(State(state.clone()), Query(all())).await.unwrap();
+        let groups = report["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(report["recent"].as_array().unwrap().len(), 3);
+        let signature = "prompt token count of <n> exceeds the limit of <n>";
+        assert_eq!(groups[0]["signature"], signature);
+        assert_eq!(groups[0]["count"], 2);
+        assert_eq!(groups[0]["open"], 2);
+        assert_eq!(groups[0]["model_count"], 2);
+
+        let resolve = |solved| {
+            resolve_error_group(
+                State(state.clone()),
+                Json(ResolveErrorGroupInput {
+                    signature: signature.into(),
+                    range: Some("all".into()),
+                    solved,
+                }),
+            )
+        };
+        let Json(solved) = resolve(true).await.unwrap();
+        assert_eq!(solved, json!({"updated": 2, "solved": true}));
+        let Json(report) = errors(State(state.clone()), Query(all())).await.unwrap();
+        assert_eq!(report["open_errors"], 1);
+        assert_eq!(report["groups"][0]["resolved"], 2);
+
+        let Json(again) = resolve(true).await.unwrap();
+        assert_eq!(again["updated"], 0);
+        let Json(reopened) = resolve(false).await.unwrap();
+        assert_eq!(reopened, json!({"updated": 2, "solved": false}));
+    }
+
+    #[tokio::test]
+    async fn resolve_error_group_rejects_bad_input_and_stores_without_ids() {
+        let input = |signature: &str, range: Option<&str>| {
+            Json(ResolveErrorGroupInput {
+                signature: signature.into(),
+                range: range.map(str::to_string),
+                solved: true,
+            })
+        };
+        let off = resolve_error_group(State(state_for(&[])), input("x", None)).await;
+        let (_dir, state) = persistent_state("sqlite", &[]);
+        let blank = resolve_error_group(State(state.clone()), input(" ", None)).await;
+        let range = resolve_error_group(State(state), input("x", Some("90d"))).await;
+        let (_json_dir, json_state) = persistent_state("json", &[]);
+        let json = resolve_error_group(State(json_state), input("x", Some("1d"))).await;
+
+        for result in [off, blank, range] {
+            assert!(matches!(result, Err(AppError::BadRequest(_))));
+        }
+        assert!(matches!(json, Err(AppError::Internal(_))));
+        let parsed: ResolveErrorGroupInput =
+            serde_json::from_value(json!({"signature": "x"})).unwrap();
+        assert!(parsed.solved);
     }
 
     #[tokio::test]

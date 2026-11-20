@@ -17,6 +17,7 @@ pub mod copilot_prices;
 pub mod copilot_sessions;
 pub mod credential_store;
 pub mod env_writer;
+pub mod error_signature;
 pub mod extension_http;
 pub mod extension_loader;
 pub mod extension_phases;

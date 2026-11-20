@@ -6,10 +6,10 @@ import { Panel } from "../components/Panel";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
 import { ShareBar } from "../components/ShareBar";
 import { api } from "../lib/api";
-import { formatDateTime, formatMs, formatNumber, formatPct } from "../lib/format";
+import { formatCompact, formatDateTime, formatMs, formatNumber, formatPct } from "../lib/format";
 import { useLive } from "../lib/live";
 import { navigate, useRoute } from "../lib/router";
-import type { ErrorEntry, ErrorsRange, ErrorsReport, StatsSnapshot, UsageRow } from "../lib/types";
+import type { ErrorEntry, ErrorGroup, ErrorsRange, ErrorsReport, NameCount, StatsSnapshot, UsageRow } from "../lib/types";
 import "../styles/screens/errors.css";
 
 const PAGE_SIZE = 25;
@@ -18,6 +18,11 @@ const UNRECORDED_REASON = "Reason not recorded (before error capture)";
 const DAY_MS = 86_400_000;
 const SPARK_DAYS = 7;
 const PERCENT = 100;
+type ErrorsView = "groups" | "calls";
+const VIEWS: readonly SegmentedOption<ErrorsView>[] = [
+  { value: "groups", label: "Grouped" },
+  { value: "calls", label: "All calls" },
+];
 const RANGES: readonly SegmentedOption<ErrorsRange>[] = [
   { value: "1d", label: "Today" },
   { value: "7d", label: "7 days" },
@@ -70,6 +75,15 @@ function dailyModels(days: readonly number[], rows: readonly UsageRow[]): number
   return days.map((day) => new Set(rows.filter((row) => dayOf(row.ts_ms) === day).map((row) => row.model)).size);
 }
 
+function parseView(value: string | null): ErrorsView {
+  return value === "calls" ? "calls" : "groups";
+}
+
+function namesLabel(names: readonly NameCount[], total: number): string {
+  const shown = names.map((entry) => entry.name).join(", ");
+  return total > names.length ? `${shown} +${formatNumber(total - names.length)}` : shown;
+}
+
 function parseRange(value: string | null): ErrorsRange {
   if (value === "1d" || value === "7d" || value === "30d" || value === "all") {
     return value;
@@ -80,6 +94,9 @@ function parseRange(value: string | null): ErrorsRange {
 export function ErrorsScreen() {
   const route = useRoute();
   const range = parseRange(route.query.get("range"));
+  const view = parseView(route.query.get("view"));
+  const go = (nextRange: ErrorsRange, nextView: ErrorsView) =>
+    navigate(`/errors?range=${nextRange}${nextView === "calls" ? "&view=calls" : ""}`);
   const [report, setReport] = useState<ErrorsReport | null>(null);
   const [loadedAtMs, setLoadedAtMs] = useState(0);
   const [unavailable, setUnavailable] = useState(false);
@@ -157,14 +174,26 @@ export function ErrorsScreen() {
     setPage(0);
   };
 
-  const solve = (ids: readonly number[], solved: boolean) => {
+  const post = (path: string, body: object) => {
     setBusy(true);
     setSolveError(null);
-    api<{ updated: number }>("/api/errors/resolve", { method: "POST", body: JSON.stringify({ ids, solved }) })
+    api<{ updated: number }>(path, { method: "POST", body: JSON.stringify(body) })
       .then(() => setReloadKey((key) => key + 1))
       .catch((err: unknown) => setSolveError(err instanceof Error ? err.message : "Could not update the error"))
       .finally(() => setBusy(false));
   };
+  const solve = (ids: readonly number[], solved: boolean) => post("/api/errors/resolve", { ids, solved });
+  const solveGroup = (group: ErrorGroup, solved: boolean) =>
+    post("/api/errors/resolve-group", { signature: group.signature, range, solved });
+
+  const allGroups: readonly ErrorGroup[] = report?.groups ?? [];
+  // The server ranks by total count; with solved hidden, rank by the open count shown.
+  const groups = showSolved
+    ? allGroups
+    : allGroups.filter((group) => group.open > 0).toSorted((a, b) => b.open - a.open || b.last_ts_ms - a.last_ts_ms);
+  const groupTotal = groups.reduce((sum, group) => sum + (showSolved ? group.count : group.open), 0);
+  // The JSON store keeps no row ids, so it cannot mark errors solved.
+  const canSolve = allRows.some((row) => row.id !== null);
 
   const totalErrors = report ? (showSolved ? report.total_errors : report.open_errors) : 0;
   const modelsAffected = new Set(scopedRows.map((row) => row.model)).size;
@@ -192,8 +221,9 @@ export function ErrorsScreen() {
           label="Errors period"
           options={RANGES}
           value={range}
-          onChange={(value) => navigate(`/errors?range=${value}`)}
+          onChange={(value) => go(value, view)}
         />
+        <Segmented label="Errors view" options={VIEWS} value={view} onChange={(value) => go(range, value)} />
         <span className="dim">Failed calls (HTTP 400+) in the selected window</span>
         <button
           type="button"
@@ -217,7 +247,11 @@ export function ErrorsScreen() {
           series={sparkDays ? dailyErrors(sparkDays, scopedRows) : undefined}
           seriesLabel="Errors per day, last 7 days"
         />
-        <KpiCard label="Distinct reasons" value={report ? formatNumber(reasons.length) : "…"} sub="In recent failures" />
+        <KpiCard
+          label="Distinct reasons"
+          value={report ? formatNumber(view === "groups" ? groups.length : reasons.length) : "…"}
+          sub={view === "groups" ? "Error groups in this window" : "In recent failures"}
+        />
         <KpiCard
           label="Models affected"
           value={report ? formatNumber(modelsAffected) : "…"}
@@ -232,176 +266,269 @@ export function ErrorsScreen() {
         />
       </div>
 
-      <div className="stack errors-body">
-        {reasons.length > 0 ? (
+      {view === "groups" ? (
+        <div className="stack errors-body">
+          {solveError ? (
+            <p className="note" role="alert">
+              {solveError}
+            </p>
+          ) : null}
           <Panel
-            title="Top reasons"
-            sub={reasonsSub}
-            actions={
-              <>
-                {reasonFilter && openInReason.length > 0 ? (
-                  <button
-                    type="button"
-                    className="btn small"
-                    disabled={busy}
-                    onClick={() => solve(openInReason.map((row) => row.id as number), true)}
-                  >
-                    Mark {formatNumber(openInReason.length)} solved
-                  </button>
-                ) : null}
-                {reasonFilter ? (
-                  <button
-                    type="button"
-                    className="chip errors-filter-chip"
-                    title="Clear the reason filter"
-                    onClick={() => toggleReason(reasonFilter)}
-                  >
-                    Filter: <span className="errors-filter-text">{reasonFilter}</span>
-                    <span aria-hidden="true">×</span>
-                  </button>
-                ) : null}
-                {reasons.length > TOP_REASONS ? (
-                  <button type="button" className="btn small" onClick={() => setShowAllReasons((shown) => !shown)}>
-                    {showAllReasons ? `Show top ${TOP_REASONS}` : "Show all reasons"}
-                  </button>
-                ) : null}
-              </>
-            }
+            title="Error groups"
+            sub="Failures with the same reason once ids, numbers and timestamps are masked"
           >
             <div className="table-scroll">
-              <table className="table errors-reasons">
+              <table className="table errors-reasons errors-groups">
                 <thead>
                   <tr>
                     <th className="num">Count</th>
                     <th>Share</th>
-                    <th>Reason</th>
+                    <th>Signature</th>
                     <th>Models</th>
-                    <th>Last</th>
+                    <th>Last seen</th>
                     <th>
-                      <span className="sr-only">Filter</span>
+                      <span className="sr-only">Action</span>
                     </th>
                   </tr>
                 </thead>
                 <tbody>
-                  {shownReasons.map((group) => {
-                    const active = reasonFilter === group.reason;
-                    const share = scopedRows.length > 0 ? group.count / scopedRows.length : 0;
-                    return (
-                      <tr key={group.reason} className={active ? "errors-reason-active" : undefined}>
-                        <td className="num errors-reason-count">{formatNumber(group.count)}×</td>
-                        <td>
-                          <ShareBar fraction={share} label={`${formatPct(share * PERCENT)} of failures`} />
-                        </td>
-                        <td className="mono errors-reason-text" title={group.reason}>
-                          {group.reason}
-                        </td>
-                        <td className="mono errors-reason-models">{group.models.join(", ")}</td>
-                        <td className="nowrap errors-reason-last">{formatDateTime(group.lastTsMs)}</td>
-                        <td>
-                          <button
-                            type="button"
-                            className={active ? "chip active" : "chip"}
-                            aria-pressed={active}
-                            aria-label={active ? `Stop filtering by ${group.reason}` : `Filter by ${group.reason}`}
-                            onClick={() => toggleReason(group.reason)}
+                  {groups.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="dim errors-empty">
+                        {report === null ? "Loading…" : "No errors in this window."}
+                      </td>
+                    </tr>
+                  ) : (
+                    groups.map((group) => {
+                      const shown = showSolved ? group.count : group.open;
+                      const share = groupTotal > 0 ? shown / groupTotal : 0;
+                      return (
+                        <tr key={group.signature}>
+                          <td
+                            className="num errors-reason-count"
+                            title={`${formatNumber(group.open)} open, ${formatNumber(group.resolved)} solved`}
                           >
-                            {active ? "On" : "Filter"}
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                            {formatCompact(shown)}×
+                          </td>
+                          <td>
+                            <ShareBar fraction={share} label={`${formatPct(share * PERCENT)} of failures`} />
+                          </td>
+                          <td className="mono errors-reason-text" title={group.sample ?? group.signature}>
+                            {group.signature}
+                          </td>
+                          <td
+                            className="mono errors-reason-models"
+                            title={`Profiles: ${namesLabel(group.profiles, group.profile_count)}`}
+                          >
+                            {namesLabel(group.models, group.model_count)}
+                          </td>
+                          <td className="nowrap errors-reason-last">{formatDateTime(group.last_ts_ms)}</td>
+                          <td className="nowrap">
+                            {!canSolve ? (
+                              <span className="dim" title="Solved state needs the SQLite store">
+                                n/a
+                              </span>
+                            ) : group.open > 0 ? (
+                              <button
+                                type="button"
+                                className="btn small"
+                                disabled={busy}
+                                onClick={() => solveGroup(group, true)}
+                              >
+                                Resolve group
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className="btn small"
+                                disabled={busy}
+                                onClick={() => solveGroup(group, false)}
+                              >
+                                Reopen group
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
                 </tbody>
               </table>
             </div>
           </Panel>
-        ) : null}
+        </div>
+      ) : (
+        <div className="stack errors-body">
+          {reasons.length > 0 ? (
+            <Panel
+              title="Top reasons"
+              sub={reasonsSub}
+              actions={
+                <>
+                  {reasonFilter && openInReason.length > 0 ? (
+                    <button
+                      type="button"
+                      className="btn small"
+                      disabled={busy}
+                      onClick={() => solve(openInReason.map((row) => row.id as number), true)}
+                    >
+                      Mark {formatNumber(openInReason.length)} solved
+                    </button>
+                  ) : null}
+                  {reasonFilter ? (
+                    <button
+                      type="button"
+                      className="chip errors-filter-chip"
+                      title="Clear the reason filter"
+                      onClick={() => toggleReason(reasonFilter)}
+                    >
+                      Filter: <span className="errors-filter-text">{reasonFilter}</span>
+                      <span aria-hidden="true">×</span>
+                    </button>
+                  ) : null}
+                  {reasons.length > TOP_REASONS ? (
+                    <button type="button" className="btn small" onClick={() => setShowAllReasons((shown) => !shown)}>
+                      {showAllReasons ? `Show top ${TOP_REASONS}` : "Show all reasons"}
+                    </button>
+                  ) : null}
+                </>
+              }
+            >
+              <div className="table-scroll">
+                <table className="table errors-reasons">
+                  <thead>
+                    <tr>
+                      <th className="num">Count</th>
+                      <th>Share</th>
+                      <th>Reason</th>
+                      <th>Models</th>
+                      <th>Last</th>
+                      <th>
+                        <span className="sr-only">Filter</span>
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {shownReasons.map((group) => {
+                      const active = reasonFilter === group.reason;
+                      const share = scopedRows.length > 0 ? group.count / scopedRows.length : 0;
+                      return (
+                        <tr key={group.reason} className={active ? "errors-reason-active" : undefined}>
+                          <td className="num errors-reason-count">{formatNumber(group.count)}×</td>
+                          <td>
+                            <ShareBar fraction={share} label={`${formatPct(share * PERCENT)} of failures`} />
+                          </td>
+                          <td className="mono errors-reason-text" title={group.reason}>
+                            {group.reason}
+                          </td>
+                          <td className="mono errors-reason-models">{group.models.join(", ")}</td>
+                          <td className="nowrap errors-reason-last">{formatDateTime(group.lastTsMs)}</td>
+                          <td>
+                            <button
+                              type="button"
+                              className={active ? "chip active" : "chip"}
+                              aria-pressed={active}
+                              aria-label={active ? `Stop filtering by ${group.reason}` : `Filter by ${group.reason}`}
+                              onClick={() => toggleReason(group.reason)}
+                            >
+                              {active ? "On" : "Filter"}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Panel>
+          ) : null}
 
-        {solveError ? (
-          <p className="note" role="alert">
-            {solveError}
-          </p>
-        ) : null}
+          {solveError ? (
+            <p className="note" role="alert">
+              {solveError}
+            </p>
+          ) : null}
 
-        <Panel
-          title="Failed calls"
-          sub={`${formatNumber(rows.length)} shown${reasonFilter ? ", filtered by reason" : ""}`}
-          actions={
-            <div className="usage-pager">
-              <button
-                type="button"
-                className="btn small usage-page-btn"
-                disabled={safePage <= 0}
-                onClick={() => setPage(safePage - 1)}
-              >
-                Prev
-              </button>
-              <span className="dim">
-                Page {safePage + 1} of {pageCount}
-              </span>
-              <button
-                type="button"
-                className="btn small usage-page-btn"
-                disabled={safePage >= pageCount - 1}
-                onClick={() => setPage(safePage + 1)}
-              >
-                Next
-              </button>
-            </div>
-          }
-        >
-          <div className="table-scroll errors-table-scroll">
-            <table className="table errors-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Model</th>
-                  <th className="num">Status</th>
-                  <th className="num">Latency</th>
-                  <th>Reason</th>
-                  <th>Solved</th>
-                </tr>
-              </thead>
-              <tbody>
-                {pageRows.length === 0 ? (
+          <Panel
+            title="Failed calls"
+            sub={`${formatNumber(rows.length)} shown${reasonFilter ? ", filtered by reason" : ""}`}
+            actions={
+              <div className="usage-pager">
+                <button
+                  type="button"
+                  className="btn small usage-page-btn"
+                  disabled={safePage <= 0}
+                  onClick={() => setPage(safePage - 1)}
+                >
+                  Prev
+                </button>
+                <span className="dim">
+                  Page {safePage + 1} of {pageCount}
+                </span>
+                <button
+                  type="button"
+                  className="btn small usage-page-btn"
+                  disabled={safePage >= pageCount - 1}
+                  onClick={() => setPage(safePage + 1)}
+                >
+                  Next
+                </button>
+              </div>
+            }
+          >
+            <div className="table-scroll errors-table-scroll">
+              <table className="table errors-table">
+                <thead>
                   <tr>
-                    <td colSpan={6} className="dim errors-empty">
-                      {report === null ? "Loading…" : "No errors in this window."}
-                    </td>
+                    <th>Time</th>
+                    <th>Model</th>
+                    <th className="num">Status</th>
+                    <th className="num">Latency</th>
+                    <th>Reason</th>
+                    <th>Solved</th>
                   </tr>
-                ) : (
-                  pageRows.map((row) => (
-                    <tr key={`${row.ts_ms}-${row.model}-${row.status}-${row.latency_ms}`}>
-                      <td className="mono nowrap">{formatDateTime(row.ts_ms)}</td>
-                      <td className="mono nowrap"><ModelName id={row.model} profile={row.profile} /></td>
-                      <td className="num t-err">{row.status}</td>
-                      <td className="num nowrap">{formatMs(row.latency_ms)}</td>
-                      <td className="mono errors-call-reason" title={row.error ?? undefined}>
-                        {row.error ?? <span className="dim">not recorded</span>}
-                      </td>
-                      <td className="nowrap">
-                        {row.id === null ? (
-                          <span className="dim" title="Solved state needs the SQLite store">
-                            n/a
-                          </span>
-                        ) : row.resolved_ms !== null ? (
-                          <button type="button" className="btn small" disabled={busy} onClick={() => solve([row.id as number], false)}>
-                            Reopen
-                          </button>
-                        ) : (
-                          <button type="button" className="btn small" disabled={busy} onClick={() => solve([row.id as number], true)}>
-                            Mark solved
-                          </button>
-                        )}
+                </thead>
+                <tbody>
+                  {pageRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="dim errors-empty">
+                        {report === null ? "Loading…" : "No errors in this window."}
                       </td>
                     </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </Panel>
-      </div>
+                  ) : (
+                    pageRows.map((row) => (
+                      <tr key={`${row.ts_ms}-${row.model}-${row.status}-${row.latency_ms}`}>
+                        <td className="mono nowrap">{formatDateTime(row.ts_ms)}</td>
+                        <td className="mono nowrap"><ModelName id={row.model} profile={row.profile} /></td>
+                        <td className="num t-err">{row.status}</td>
+                        <td className="num nowrap">{formatMs(row.latency_ms)}</td>
+                        <td className="mono errors-call-reason" title={row.error ?? undefined}>
+                          {row.error ?? <span className="dim">not recorded</span>}
+                        </td>
+                        <td className="nowrap">
+                          {row.id === null ? (
+                            <span className="dim" title="Solved state needs the SQLite store">
+                              n/a
+                            </span>
+                          ) : row.resolved_ms !== null ? (
+                            <button type="button" className="btn small" disabled={busy} onClick={() => solve([row.id as number], false)}>
+                              Reopen
+                            </button>
+                          ) : (
+                            <button type="button" className="btn small" disabled={busy} onClick={() => solve([row.id as number], true)}>
+                              Mark solved
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </Panel>
+        </div>
+      )}
     </section>
   );
 }
