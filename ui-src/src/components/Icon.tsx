@@ -1,5 +1,6 @@
 const ICON_PATHS = {
   restart: "M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7",
+  copy: "M9 9h11a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2V11a2 2 0 0 1 2-2zM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1",
 } as const;
 
 type IconName = keyof typeof ICON_PATHS;

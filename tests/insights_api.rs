@@ -154,7 +154,7 @@ async fn insights_rank_the_stable_model_and_flag_the_failing_one() {
     assert_eq!(bad["health"], "failing");
     assert_eq!(bad["ranked"], false);
     assert_eq!(bad["top_errors"][0]["reason"], "upstream exploded");
-    assert_eq!(report["leaders"]["best_overall"], "local/good");
+    assert_eq!(report["leaders"]["best_overall"][0], "local/good");
     assert_eq!(report["models"][0]["model"], "local/good");
 
     let picked: Value = client

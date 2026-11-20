@@ -203,6 +203,14 @@ impl PricingBook {
             .any(|card| card.long_context.is_some())
     }
 
+    /// True when the model's profile runs on this machine, so the hub prices it at zero.
+    #[must_use]
+    pub fn is_local_model(&self, model_key: &str) -> bool {
+        split_model_key(model_key)
+            .0
+            .is_some_and(|profile| self.local_profiles.contains(profile))
+    }
+
     #[must_use]
     pub fn is_configured(&self) -> bool {
         if !self.global.is_zero() {

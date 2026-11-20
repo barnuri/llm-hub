@@ -70,17 +70,22 @@ impl SmartAutoSuitability {
     const VALIDATION: usize = 4;
     const CONVERSATION: usize = 5;
     const PATH_SEPARATOR: char = '/';
+    const QUALITY_COLUMNS: u32 = 6;
+    /// Seed quality runs 0-10, so ten points of percentage per step.
+    const QUALITY_TO_PCT: f64 = 10.0;
     // A family the table does not know is average at every role and earns no cost or speed credit.
     const UNKNOWN: FamilySeed = FamilySeed::contains(&[], [5, 5, 5, 5, 5, 5], 3, 3);
     // Quality columns: planning, investigation, implementation, plan-backed implementation,
     // validation, conversation. The first matching row wins, so size markers come first.
-    const SEEDS: [FamilySeed; 24] = [
+    const SEEDS: [FamilySeed; 27] = [
         FamilySeed::contains(&["nano"], [2, 3, 4, 6, 3, 6], 10, 10),
         FamilySeed::contains(&["-mini"], [4, 5, 6, 8, 5, 7], 9, 9),
         FamilySeed::contains(&["flash"], [4, 5, 6, 8, 5, 7], 9, 9),
         FamilySeed::contains(&["-luna"], [4, 6, 6, 8, 6, 7], 8, 8),
         FamilySeed::contains(&["haiku"], [4, 6, 6, 8, 6, 7], 8, 9),
         FamilySeed::contains(&["opus"], [10, 10, 10, 9, 10, 9], 1, 3),
+        FamilySeed::contains(&["fable"], [10, 10, 10, 9, 10, 9], 1, 3),
+        FamilySeed::contains(&["-astra"], [10, 10, 10, 9, 10, 9], 1, 2),
         FamilySeed::contains(&["-sol"], [10, 9, 9, 9, 9, 9], 2, 3),
         FamilySeed::contains(&["gemini", "pro"], [9, 8, 8, 8, 8, 8], 4, 5),
         FamilySeed::contains(&["sonnet"], [8, 9, 9, 9, 8, 8], 4, 5),
@@ -98,6 +103,7 @@ impl SmartAutoSuitability {
         FamilySeed::contains(&["gemma"], [3, 4, 5, 6, 4, 6], 10, 7),
         FamilySeed::contains(&["llama"], [3, 4, 4, 5, 3, 6], 10, 7),
         FamilySeed::prefix(&["phi"], [2, 3, 4, 5, 3, 5], 10, 8),
+        FamilySeed::contains(&["mai-code-2"], [8, 8, 9, 9, 8, 7], 6, 6),
         FamilySeed::contains(&["mai-", "code"], [6, 6, 7, 8, 6, 6], 6, 7),
     ];
 
@@ -183,6 +189,21 @@ impl SmartAutoSuitability {
         (errors + quota).round() as u32
     }
 
+    /// Seed quality of `model_id` on a 0-100 scale: one role column, or the mean of all six
+    /// columns when `role` is `None`. An unknown family scores 50.
+    #[must_use]
+    pub fn quality_pct(model_id: &str, role: Option<WorkRole>) -> f64 {
+        let quality = &Self::seed(model_id).quality;
+        let (points, columns) = match role {
+            Some(role) => (u32::from(quality[Self::column(role, false)]), 1),
+            None => (
+                quality.iter().map(|value| u32::from(*value)).sum(),
+                Self::QUALITY_COLUMNS,
+            ),
+        };
+        f64::from(points) * Self::QUALITY_TO_PCT / f64::from(columns)
+    }
+
     fn seed(model_id: &str) -> &'static FamilySeed {
         Self::family(model_id).unwrap_or(&Self::UNKNOWN)
     }
@@ -255,6 +276,34 @@ mod tests {
     fn quality(model_id: &str, role: WorkRole, plan_backed: bool) -> u8 {
         SmartAutoSuitability::seed(model_id).quality
             [SmartAutoSuitability::column(role, plan_backed)]
+    }
+
+    #[test]
+    fn quality_pct_reads_one_role_or_the_mean() {
+        let opus = "copilot/claude-opus-5-5";
+        let planning = SmartAutoSuitability::quality_pct(opus, Some(WorkRole::Planning));
+        assert!((planning - 100.0).abs() < 1e-9);
+        assert!((SmartAutoSuitability::quality_pct(opus, None) - 96.666).abs() < 0.01);
+        assert!((SmartAutoSuitability::quality_pct("x/unknown", None) - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn newer_top_tier_families_are_not_average() {
+        for id in [
+            "copilot/gpt-6-astra",
+            "copilot/gpt-6.2-astra",
+            "copilot/claude-fable-5-2",
+        ] {
+            assert_eq!(quality(id, WorkRole::Planning, false), 10, "{id}");
+        }
+        assert_eq!(
+            quality("copilot/mai-code-2", WorkRole::Implementation, false),
+            9
+        );
+        assert_eq!(
+            SmartAutoSuitability::seed("copilot/mai-code-2-flash").cheapness,
+            9
+        );
     }
 
     #[test]

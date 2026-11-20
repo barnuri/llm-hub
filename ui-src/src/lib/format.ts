@@ -34,21 +34,19 @@ export function formatNumber(value: number, digits = 0): string {
   });
 }
 
-const THOUSAND = 1_000;
-const MILLION = 1_000_000;
-
-/** Short count for tight cells: 950, 1.2k, 3.4m. */
+/** Rounds to a short unit: 950 → 950, 1000 → 1k, 1500000 → 1.5m. */
 export function formatCompact(value: number): string {
   if (!Number.isFinite(value)) {
     return "—";
   }
-  if (Math.abs(value) >= MILLION) {
-    return `${formatNumber(value / MILLION, value >= 10 * MILLION ? 0 : 1)}m`;
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000) {
+    return `${Number((value / 1_000_000).toFixed(1))}m`;
   }
-  if (Math.abs(value) >= THOUSAND) {
-    return `${formatNumber(value / THOUSAND, value >= 10 * THOUSAND ? 0 : 1)}k`;
+  if (abs >= 1_000) {
+    return `${Number((value / 1_000).toFixed(1))}k`;
   }
-  return formatNumber(value);
+  return formatNumber(value, 1);
 }
 
 export function formatMs(value: number): string {

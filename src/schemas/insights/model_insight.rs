@@ -32,9 +32,28 @@ pub struct ModelInsight {
     pub last_success_ms: Option<u64>,
     pub last_error_ms: Option<u64>,
     pub ranked: bool,
+    /// Seed capability tier of the model family, 0-100. Not measured from answers.
+    pub quality_score: Option<f64>,
+    /// 95% lower bound of the success rate, so few calls cannot score high.
     pub stability_score: Option<f64>,
     pub speed_score: Option<f64>,
     pub overall_score: Option<f64>,
+    /// Estimated spend in the window; `None` when the model had no priced calls.
+    pub cost_usd: Option<f64>,
+    /// Spend per successful call, in US cents.
+    pub cost_per_call_cents: Option<f64>,
+    /// Runs on a local profile, so it costs nothing.
+    pub free: bool,
+    /// Overall score per US cent per successful call. Higher is better value.
+    pub value_score: Option<f64>,
+    /// Smart Auto attempts this model solved that got a tests, review or user outcome.
+    pub verified_outcomes: u64,
+    pub verified_passed: u64,
+    /// Passing share of `verified_outcomes`; `None` with none.
+    pub verified_pass_pct: Option<f64>,
+    /// Verified sessions this model led, and how many of them it solved.
+    pub sessions_verified: u64,
+    pub sessions_solved: u64,
     pub by_harness: Vec<HarnessInsight>,
     pub best_harness: Option<String>,
 }
