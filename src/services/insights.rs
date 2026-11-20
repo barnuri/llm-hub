@@ -14,15 +14,20 @@ use crate::schemas::insights::harness_insight::HarnessInsight;
 use crate::schemas::insights::insight_leaders::InsightLeaders;
 use crate::schemas::insights::insights_report::InsightsReport;
 use crate::schemas::insights::model_catalog_entry::ModelCatalogEntry;
+use crate::schemas::insights::model_cost::ModelCost;
 use crate::schemas::insights::model_health::ModelHealth;
 use crate::schemas::insights::model_insight::ModelInsight;
 use crate::schemas::insights::model_pick::ModelPick;
 use crate::schemas::insights::pick_by::PickBy;
 use crate::schemas::insights::pick_candidate::PickCandidate;
+use crate::schemas::insights::sessions_insight::SessionsInsight;
+use crate::schemas::insights::solver_verdict::SolverVerdict;
 use crate::schemas::insights::use_case_pick::UseCasePick;
 use crate::schemas::model_context::{max_input_tokens_from_item, strip_1m_suffix};
+use crate::schemas::work_role::WorkRole;
 use crate::services::harness::{classify, is_keep_warm};
 use crate::services::pricing::split_cached_input;
+use crate::services::smart_auto_suitability::SmartAutoSuitability;
 use crate::services::stats::{RequestOutcome, tokens_per_sec};
 use crate::utils::time::utc_iso8601;
 
@@ -30,10 +35,15 @@ use crate::utils::time::utc_iso8601;
 const FAILING_STREAK: u64 = 3;
 /// Below this success rate a model is degraded.
 const DEGRADED_SUCCESS_PCT: f64 = 90.0;
-const STABILITY_WEIGHT: f64 = 0.6;
-const SPEED_WEIGHT: f64 = 0.4;
+const QUALITY_WEIGHT: f64 = 0.5;
+const STABILITY_WEIGHT: f64 = 0.3;
+const SPEED_WEIGHT: f64 = 0.2;
+/// z for a 95% Wilson lower bound: few calls cannot prove high reliability.
+const WILSON_Z: f64 = 1.96;
 const TOP_ERRORS: usize = 3;
 const PICK_ALTERNATIVES: usize = 4;
+/// Models listed per top list: best free, best value, and per use case.
+const TOP_PICKS: usize = 3;
 const PERCENT: f64 = 100.0;
 const MEDIAN: f64 = 0.5;
 const P95: f64 = 0.95;
@@ -43,27 +53,53 @@ const HARNESS_MIN_CALLS: u64 = 3;
 /// Probes and scripts, not agent harnesses: never offered as a model's best harness.
 const NON_AGENT_CLIENTS: [&str; 3] = ["curl", "python", "unknown"];
 const MS_PER_SECOND: f64 = 1000.0;
-const SCORING: &str = "overall = 0.6 x reliability (success %) + 0.4 x speed; speed = half output tok/s \
-relative to the fastest ranked model + half the fastest first-token p50 relative to this model's";
+/// Measured pass rate never outweighs the capability table more than this.
+const MEASURED_QUALITY_MAX_WEIGHT: f64 = 0.5;
+/// At this many verified outcomes the measured rate reaches half its maximum weight.
+const MEASURED_QUALITY_HALF_SAMPLES: f64 = 50.0;
+/// A model needs this many verified outcomes to lead the verified list.
+const VERIFIED_MIN_OUTCOMES: u64 = 5;
+/// A model needs to lead this many verified sessions to rank on sessions.
+const SESSION_MIN_VERIFIED: u64 = 3;
+const SCORING: &str = "overall = 0.5 x quality + 0.3 x reliability + 0.2 x speed; quality = public \
+capability tier of the model family (unknown families score 50), blended with the 95% lower bound of the \
+verified pass rate (tests, reviews, user verdicts) up to half weight as samples grow; reliability = 95% lower bound of the \
+success rate, so few calls score lower; speed = half output tok/s relative to the fastest ranked model + \
+half the fastest first-token p50 relative to this model's. Use cases mapped to a role score that role's \
+quality instead";
 const CAVEATS: [&str; 3] = [
-    "Scores measure latency, throughput and failed calls through the hub, not answer quality: a model \
-can be fast and healthy here and still fail agentic tasks.",
+    "Quality starts from a fixed table of public capability tiers per model family. Verified outcomes \
+exist only for Smart Auto attempts, and Smart Auto sends harder turns to stronger models, so a strong \
+model's pass rate is measured on harder work.",
     "First-token time includes cold model loads; a single-slot local router holds one model at a time, \
 so switching models costs a reload.",
     "Output speed of very short replies is dominated by overhead; compare models on similar workloads.",
 ];
 
+/// Estimated spend and free flag per model key.
+pub type ModelCosts = HashMap<String, ModelCost>;
+
+/// Spend and verified outcomes that add cost, value, measured quality and sessions to a report.
+#[derive(Debug, Default)]
+pub struct ModelEvidence {
+    pub costs: ModelCosts,
+    /// Verified attempt outcomes in the window, oldest first.
+    pub verdicts: Vec<SolverVerdict>,
+}
+
 /// Builds the insights report from outcomes in chronological order.
 ///
+/// `evidence` adds spend, cost per call, free models, value, measured quality and sessions;
 /// `catalog` adds context window and declared use cases, and lists models that
 /// had no calls in the window so readers still see them.
 #[must_use]
-pub fn build_report(
+pub fn build_report_priced(
     outcomes: &[RequestOutcome],
     catalog: &HashMap<String, ModelCatalogEntry>,
     range: &str,
     min_requests: u64,
     generated_ms: u64,
+    evidence: &ModelEvidence,
 ) -> InsightsReport {
     let calls: Vec<&RequestOutcome> = outcomes
         .iter()
@@ -86,13 +122,26 @@ pub fn build_report(
         }
     }
     for model in &mut models {
+        model.quality_score = Some(round_score(SmartAutoSuitability::quality_pct(
+            &model.model,
+            None,
+        )));
         if let Some(entry) = catalog.get(&model.model) {
             model.context_window = entry.context_window;
             model.use_cases.clone_from(&entry.use_cases);
             model.summary.clone_from(&entry.summary);
         }
     }
+    for model in &mut models {
+        if let Some(cost) = evidence.costs.get(&model.model) {
+            model.cost_usd = Some(cost.usd);
+            model.free = cost.free;
+        }
+    }
+    apply_verdicts(&mut models, &evidence.verdicts);
+    let sessions = sessions(&mut models, &calls, &evidence.verdicts);
     score_ranked(&mut models);
+    score_value(&mut models);
     models.sort_by(report_order);
     InsightsReport {
         range: range.to_string(),
@@ -100,6 +149,13 @@ pub fn build_report(
         generated_ms,
         leaders: leaders(&models),
         best_for: best_for(&models),
+        best_free: top_models(
+            &models,
+            |model| model.ranked && model.free,
+            |model| model.overall_score,
+        ),
+        best_value: top_models(&models, |model| model.ranked, |model| model.value_score),
+        sessions,
         harnesses: harness_insights(&calls),
         models,
     }
@@ -192,16 +248,25 @@ pub fn pick(report: &InsightsReport, by: PickBy) -> Option<ModelPick> {
 }
 
 /// Everything an agent needs to choose a model, in one document.
+/// `evidence` as in [`build_report_priced`].
 #[must_use]
-pub fn build_agent_report(
+pub fn build_agent_report_priced(
     outcomes: &[RequestOutcome],
     catalog: &HashMap<String, ModelCatalogEntry>,
     range: &str,
     profile: Option<String>,
     min_requests: u64,
     generated_ms: u64,
+    evidence: &ModelEvidence,
 ) -> AgentReport {
-    let report = build_report(outcomes, catalog, range, min_requests, generated_ms);
+    let report = build_report_priced(
+        outcomes,
+        catalog,
+        range,
+        min_requests,
+        generated_ms,
+        evidence,
+    );
     let picks: Vec<ModelPick> = PickBy::ALL
         .into_iter()
         .filter_map(|by| pick(&report, by))
@@ -217,6 +282,9 @@ pub fn build_agent_report(
         picks,
         leaders: report.leaders,
         best_for: report.best_for,
+        best_free: report.best_free,
+        best_value: report.best_value,
+        sessions: report.sessions,
         harnesses: report.harnesses,
         failure_reasons: failure_reasons(outcomes),
         models: report.models,
@@ -248,6 +316,12 @@ Lower min_requests or widen the range.",
     }
     for picked in picks.iter().filter(|picked| picked.by != PickBy::Overall) {
         lines.push(format!("{}: {}.", criterion_label(picked.by), picked.model));
+    }
+    if !report.best_free.is_empty() {
+        lines.push(format!("Best free: {}.", report.best_free.join(", ")));
+    }
+    if !report.best_value.is_empty() {
+        lines.push(format!("Best value: {}.", report.best_value.join(", ")));
     }
     for use_case_pick in &report.best_for {
         let basis = if use_case_pick.ranked {
@@ -455,10 +529,23 @@ fn model_insight(calls: &[&RequestOutcome], min_requests: u64) -> ModelInsight {
             .rev()
             .find(|call| !is_success(call))
             .map(|call| call.ts_ms),
-        ranked: requests >= min_requests && health != ModelHealth::Failing,
+        // Speech models return no output tokens, so they never compete with chat models.
+        ranked: requests >= min_requests
+            && health != ModelHealth::Failing
+            && successes.iter().any(|call| call.tokens_out > 0),
+        quality_score: None,
         stability_score: None,
         speed_score: None,
         overall_score: None,
+        cost_usd: None,
+        cost_per_call_cents: None,
+        free: false,
+        value_score: None,
+        verified_outcomes: 0,
+        verified_passed: 0,
+        verified_pass_pct: None,
+        sessions_verified: 0,
+        sessions_solved: 0,
         best_harness: best_harness(&by_harness),
         by_harness,
     }
@@ -489,9 +576,19 @@ fn unused_model(id: &str) -> ModelInsight {
         last_success_ms: None,
         last_error_ms: None,
         ranked: false,
+        quality_score: None,
         stability_score: None,
         speed_score: None,
         overall_score: None,
+        cost_usd: None,
+        cost_per_call_cents: None,
+        free: false,
+        value_score: None,
+        verified_outcomes: 0,
+        verified_passed: 0,
+        verified_pass_pct: None,
+        sessions_verified: 0,
+        sessions_solved: 0,
         by_harness: Vec::new(),
         best_harness: None,
     }
@@ -559,8 +656,54 @@ fn best_harness(by_harness: &[HarnessInsight]) -> Option<String> {
         .map(|entry| entry.harness.clone())
 }
 
-/// One pick per declared use case: the best ranked model tagged with it, or,
-/// when none is ranked yet, the tagged model with the most calls.
+/// How a declared use case ranks its candidates.
+#[derive(Clone, Copy)]
+enum UseCaseRank {
+    /// Overall score with this role's seed quality; every ranked model competes.
+    Role(WorkRole),
+    /// Speed score; every ranked model competes.
+    Speed,
+    /// Overall score among the tagged models only.
+    TaggedOnly,
+}
+
+impl UseCaseRank {
+    fn of(use_case: &str) -> Self {
+        match use_case {
+            "coding" => Self::Role(WorkRole::Implementation),
+            "planning" | "reasoning" => Self::Role(WorkRole::Planning),
+            "general" | "chat" => Self::Role(WorkRole::Conversation),
+            "review" => Self::Role(WorkRole::Validation),
+            "fast" => Self::Speed,
+            _ => Self::TaggedOnly,
+        }
+    }
+
+    fn score(self, model: &ModelInsight) -> Option<f64> {
+        match self {
+            Self::Role(role) => Some(round_score(weighted(
+                SmartAutoSuitability::quality_pct(&model.model, Some(role)),
+                model.stability_score?,
+                model.speed_score?,
+            ))),
+            Self::Speed => model.speed_score,
+            Self::TaggedOnly => model.overall_score,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Role(_) => "use-case score",
+            Self::Speed => "speed score",
+            Self::TaggedOnly => "overall score",
+        }
+    }
+}
+
+/// One pick per declared use case. Use cases that map to a role or to speed rank every
+/// ranked model, so a cloud model can win a use case only local models declare. Other
+/// use cases rank the tagged models. With nothing ranked, the tagged model with the most
+/// calls wins.
 fn best_for(models: &[ModelInsight]) -> Vec<UseCasePick> {
     let use_cases: BTreeSet<&str> = models
         .iter()
@@ -569,24 +712,31 @@ fn best_for(models: &[ModelInsight]) -> Vec<UseCasePick> {
     use_cases
         .into_iter()
         .filter_map(|use_case| {
+            let rank = UseCaseRank::of(use_case);
             let tagged: Vec<&ModelInsight> = models
                 .iter()
                 .filter(|model| model.use_cases.iter().any(|tag| tag == use_case))
                 .collect();
-            let best_ranked = tagged.iter().filter(|model| model.ranked).max_by(|a, b| {
-                compare_f64(
-                    a.overall_score.unwrap_or(0.0),
-                    b.overall_score.unwrap_or(0.0),
-                )
-            });
-            let (winner, ranked) = match best_ranked {
-                Some(model) => (*model, true),
-                None => (*tagged.iter().max_by_key(|model| model.requests)?, false),
-            };
+            let open = !matches!(rank, UseCaseRank::TaggedOnly);
+            let candidates: Vec<&ModelInsight> = models
+                .iter()
+                .filter(|model| {
+                    model.use_cases.iter().any(|tag| tag == use_case) || (open && model.ranked)
+                })
+                .collect();
+            let top = top_for(&candidates, &tagged, rank);
+            let winner = models.iter().find(|model| Some(&model.model) == top.first())?;
+            let ranked = winner.ranked;
             let reason = if ranked {
+                let scope = if open {
+                    "all ranked models"
+                } else {
+                    "models declared for this use case"
+                };
                 format!(
-                    "highest overall score ({:.1}) among models declared for {use_case}",
-                    winner.overall_score.unwrap_or(0.0)
+                    "highest {} ({:.1}) for {use_case} among {scope}",
+                    rank.label(),
+                    rank.score(winner).unwrap_or(0.0)
                 )
             } else {
                 format!(
@@ -598,7 +748,8 @@ fn best_for(models: &[ModelInsight]) -> Vec<UseCasePick> {
                 model: winner.model.clone(),
                 ranked,
                 reason,
-                candidates: tagged.iter().map(|model| model.model.clone()).collect(),
+                candidates: candidates.iter().map(|model| model.model.clone()).collect(),
+                top,
             })
         })
         .collect()
@@ -643,43 +794,247 @@ fn score_ranked(models: &mut [ModelInsight]) {
             _ => 0.0,
         };
         let speed = PERCENT * (decode_share + ttft_share) / 2.0;
-        let stability = model.success_rate_pct;
+        let stability = wilson_lower_pct(model.requests - model.errors, model.requests);
+        let quality = model.quality_score.unwrap_or(0.0);
         model.speed_score = Some(round_score(speed));
         model.stability_score = Some(round_score(stability));
-        model.overall_score = Some(round_score(
-            STABILITY_WEIGHT * stability + SPEED_WEIGHT * speed,
-        ));
+        model.overall_score = Some(round_score(weighted(quality, stability, speed)));
     }
+}
+
+/// Counts each model's verified outcomes and blends their pass-rate lower bound into quality.
+fn apply_verdicts(models: &mut [ModelInsight], verdicts: &[SolverVerdict]) {
+    let mut counts: HashMap<&str, (u64, u64)> = HashMap::new();
+    for verdict in verdicts {
+        let entry = counts.entry(verdict.model.as_str()).or_default();
+        entry.0 += u64::from(verdict.passed);
+        entry.1 += 1;
+    }
+    for model in models.iter_mut() {
+        let Some(&(passed, total)) = counts.get(model.model.as_str()) else {
+            continue;
+        };
+        model.verified_outcomes = total;
+        model.verified_passed = passed;
+        model.verified_pass_pct = Some(ratio_pct(passed, total));
+        let measured_weight = MEASURED_QUALITY_MAX_WEIGHT * to_f64(total)
+            / (to_f64(total) + MEASURED_QUALITY_HALF_SAMPLES);
+        if let Some(seed) = model.quality_score {
+            let measured = wilson_lower_pct(passed, total);
+            model.quality_score = Some(round_score(
+                seed * (1.0 - measured_weight) + measured * measured_weight,
+            ));
+        }
+    }
+}
+
+/// Rolls calls and verdicts up per session. The model with the most output tokens leads a
+/// session; a verified session is solved when its newest verdict passed.
+fn sessions(
+    models: &mut [ModelInsight],
+    calls: &[&RequestOutcome],
+    verdicts: &[SolverVerdict],
+) -> SessionsInsight {
+    let mut output: HashMap<&str, HashMap<&str, u64>> = HashMap::new();
+    for call in calls {
+        if let Some(worker) = call.worker.as_deref() {
+            *output
+                .entry(worker)
+                .or_default()
+                .entry(call.model_key.as_str())
+                .or_default() += call.tokens_out;
+        }
+    }
+    let mut last: HashMap<&str, &SolverVerdict> = HashMap::new();
+    for verdict in verdicts {
+        if let Some(worker) = verdict.worker.as_deref()
+            && output.contains_key(worker)
+        {
+            let newest = last.entry(worker).or_insert(verdict);
+            if verdict.ts_ms >= newest.ts_ms {
+                *newest = verdict;
+            }
+        }
+    }
+    let mut by_lead: HashMap<&str, (u64, u64)> = HashMap::new();
+    for (worker, verdict) in &last {
+        let lead = output.get(worker).and_then(|by_model| {
+            by_model
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                .map(|(model, _)| *model)
+        });
+        if let Some(lead) = lead {
+            let entry = by_lead.entry(lead).or_default();
+            entry.0 += 1;
+            entry.1 += u64::from(verdict.passed);
+        }
+    }
+    for model in models.iter_mut() {
+        if let Some(&(verified, solved)) = by_lead.get(model.model.as_str()) {
+            model.sessions_verified = verified;
+            model.sessions_solved = solved;
+        }
+    }
+    let solved = last.values().filter(|verdict| verdict.passed).count() as u64;
+    let verified = last.len() as u64;
+    SessionsInsight {
+        total: output.len() as u64,
+        verified,
+        solved,
+        solved_pct: (verified > 0).then(|| ratio_pct(solved, verified)),
+        best_models: top_models(
+            models,
+            |model| model.sessions_verified >= SESSION_MIN_VERIFIED,
+            |model| {
+                Some(wilson_lower_pct(
+                    model.sessions_solved,
+                    model.sessions_verified,
+                ))
+            },
+        ),
+    }
+}
+
+fn weighted(quality: f64, stability: f64, speed: f64) -> f64 {
+    QUALITY_WEIGHT * quality + STABILITY_WEIGHT * stability + SPEED_WEIGHT * speed
+}
+
+/// The 95% Wilson lower bound of `successes / requests`, as a percentage.
+fn wilson_lower_pct(successes: u64, requests: u64) -> f64 {
+    if requests == 0 {
+        return 0.0;
+    }
+    let n = to_f64(requests);
+    let p = to_f64(successes) / n;
+    let z2 = WILSON_Z * WILSON_Z;
+    let centre = p + z2 / (2.0 * n);
+    let spread = WILSON_Z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
+    PERCENT * ((centre - spread) / (1.0 + z2 / n)).max(0.0)
+}
+
+/// Value is the overall score per US cent per successful call, for paid ranked models.
+fn score_value(models: &mut [ModelInsight]) {
+    for model in models
+        .iter_mut()
+        .filter(|model| model.ranked && !model.free)
+    {
+        let successes = model.requests - model.errors;
+        let (Some(usd), Some(overall)) = (model.cost_usd, model.overall_score) else {
+            continue;
+        };
+        if usd <= 0.0 || successes == 0 {
+            continue;
+        }
+        let cents_per_call = PERCENT * usd / to_f64(successes);
+        model.cost_per_call_cents = Some(round_cost(cents_per_call));
+        model.value_score = Some(round_score(overall / cents_per_call));
+    }
+}
+
+/// The top `TOP_PICKS` models that pass `keep`, highest `value` first, ties by name.
+fn top_models(
+    models: &[ModelInsight],
+    keep: impl Fn(&ModelInsight) -> bool,
+    value: impl Fn(&ModelInsight) -> Option<f64>,
+) -> Vec<String> {
+    let mut candidates: Vec<(&str, f64)> = models
+        .iter()
+        .filter(|model| keep(model))
+        .filter_map(|model| value(model).map(|v| (model.model.as_str(), v)))
+        .collect();
+    candidates.sort_by(|a, b| compare_f64(b.1, a.1).then_with(|| a.0.cmp(b.0)));
+    candidates
+        .into_iter()
+        .take(TOP_PICKS)
+        .map(|(model, _)| model.to_string())
+        .collect()
+}
+
+/// Top models for one use case: the ranked candidates by `rank`, else the tagged models by calls.
+fn top_for(
+    candidates: &[&ModelInsight],
+    tagged: &[&ModelInsight],
+    rank: UseCaseRank,
+) -> Vec<String> {
+    let mut scored: Vec<(&ModelInsight, f64)> = candidates
+        .iter()
+        .filter(|model| model.ranked)
+        .filter_map(|model| rank.score(model).map(|score| (*model, score)))
+        .collect();
+    if scored.is_empty() {
+        let mut by_calls: Vec<&&ModelInsight> = tagged.iter().collect();
+        by_calls.sort_by(|a, b| {
+            b.requests
+                .cmp(&a.requests)
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        return by_calls
+            .into_iter()
+            .take(TOP_PICKS)
+            .map(|model| model.model.clone())
+            .collect();
+    }
+    scored.sort_by(|a, b| compare_f64(b.1, a.1).then_with(|| a.0.model.cmp(&b.0.model)));
+    scored
+        .into_iter()
+        .take(TOP_PICKS)
+        .map(|(model, _)| model.model.clone())
+        .collect()
 }
 
 fn leaders(models: &[ModelInsight]) -> InsightLeaders {
     let ranked: Vec<&ModelInsight> = models.iter().filter(|model| model.ranked).collect();
-    let best = |value: fn(&ModelInsight) -> Option<f64>| {
-        ranked
+    let top = |value: fn(&ModelInsight) -> Option<f64>| -> Vec<String> {
+        let mut candidates: Vec<(&ModelInsight, f64)> = ranked
             .iter()
             .filter_map(|model| value(model).map(|v| (*model, v)))
-            .max_by(|a, b| {
-                compare_f64(a.1, b.1)
-                    .then_with(|| {
-                        compare_f64(
-                            a.0.overall_score.unwrap_or(0.0),
-                            b.0.overall_score.unwrap_or(0.0),
-                        )
-                    })
-                    .then_with(|| a.0.requests.cmp(&b.0.requests))
-            })
+            .collect();
+        candidates.sort_by(|a, b| {
+            compare_f64(b.1, a.1)
+                .then_with(|| {
+                    compare_f64(
+                        b.0.overall_score.unwrap_or(0.0),
+                        a.0.overall_score.unwrap_or(0.0),
+                    )
+                })
+                .then_with(|| b.0.requests.cmp(&a.0.requests))
+                .then_with(|| a.0.model.cmp(&b.0.model))
+        });
+        candidates
+            .into_iter()
+            .take(TOP_PICKS)
             .map(|(model, _)| model.model.clone())
+            .collect()
     };
+    let mut by_calls: Vec<&ModelInsight> = models.iter().collect();
+    by_calls.sort_by(|a, b| {
+        b.requests
+            .cmp(&a.requests)
+            .then_with(|| a.model.cmp(&b.model))
+    });
     InsightLeaders {
-        best_overall: best(|model| model.overall_score),
-        most_stable: best(|model| Some(model.success_rate_pct)),
-        fastest_first_token: best(|model| model.ttft_p50_ms.map(|ttft| -to_f64(ttft))),
-        fastest_decode: best(|model| model.decode_tokens_per_sec_p50),
-        fastest_prefill: best(|model| model.prefill_tokens_per_sec_p50),
-        most_used: models
-            .iter()
-            .max_by_key(|model| model.requests)
-            .map(|model| model.model.clone()),
+        best_overall: top(|model| model.overall_score),
+        most_stable: top(|model| model.stability_score),
+        best_verified: top_models(
+            models,
+            |model| model.verified_outcomes >= VERIFIED_MIN_OUTCOMES,
+            |model| {
+                Some(wilson_lower_pct(
+                    model.verified_passed,
+                    model.verified_outcomes,
+                ))
+            },
+        ),
+        fastest_first_token: top(|model| model.ttft_p50_ms.map(|ttft| -to_f64(ttft))),
+        fastest_decode: top(|model| model.decode_tokens_per_sec_p50),
+        fastest_prefill: top(|model| model.prefill_tokens_per_sec_p50),
+        most_used: by_calls
+            .into_iter()
+            .take(TOP_PICKS)
+            .filter(|model| model.requests > 0)
+            .map(|model| model.model.clone())
+            .collect(),
     }
 }
 
@@ -800,6 +1155,11 @@ fn round_score(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
 }
 
+/// Four decimals: a cent per call can be a fraction of a cent.
+fn round_cost(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +1204,42 @@ mod tests {
 
     fn insight<'a>(report: &'a InsightsReport, model: &str) -> &'a ModelInsight {
         report.models.iter().find(|m| m.model == model).unwrap()
+    }
+
+    fn build_report(
+        outcomes: &[RequestOutcome],
+        catalog: &HashMap<String, ModelCatalogEntry>,
+        range: &str,
+        min_requests: u64,
+        generated_ms: u64,
+    ) -> InsightsReport {
+        build_report_priced(
+            outcomes,
+            catalog,
+            range,
+            min_requests,
+            generated_ms,
+            &ModelEvidence::default(),
+        )
+    }
+
+    fn build_agent_report(
+        outcomes: &[RequestOutcome],
+        catalog: &HashMap<String, ModelCatalogEntry>,
+        range: &str,
+        profile: Option<String>,
+        min_requests: u64,
+        generated_ms: u64,
+    ) -> AgentReport {
+        build_agent_report_priced(
+            outcomes,
+            catalog,
+            range,
+            profile,
+            min_requests,
+            generated_ms,
+            &ModelEvidence::default(),
+        )
     }
 
     #[test]
@@ -953,21 +1349,35 @@ mod tests {
         let report = build_report(&outcomes, &HashMap::new(), "7d", 2, NOW_MS);
 
         let fast = insight(&report, "p/fast");
+        // Unknown family quality 50, 2 of 2 calls -> reliability lower bound 34.2.
+        assert_eq!(fast.quality_score, Some(50.0));
+        assert_eq!(fast.stability_score, Some(34.2));
         assert_eq!(fast.speed_score, Some(100.0));
-        assert_eq!(fast.overall_score, Some(100.0));
+        assert_eq!(fast.overall_score, Some(55.3));
         let slow = insight(&report, "p/slow");
         // decode 25/100 and ttft 100/400 -> speed 25.
         assert_eq!(slow.speed_score, Some(25.0));
-        assert_eq!(slow.overall_score, Some(70.0));
+        assert_eq!(slow.overall_score, Some(40.3));
         let flaky = insight(&report, "p/flaky");
-        assert_eq!(flaky.overall_score, Some(70.0));
+        assert_eq!(flaky.stability_score, Some(9.5));
+        assert_eq!(flaky.overall_score, Some(47.8));
         assert_eq!(report.models[0].model, "p/fast");
-        assert_eq!(report.leaders.best_overall.as_deref(), Some("p/fast"));
         assert_eq!(
-            report.leaders.fastest_first_token.as_deref(),
+            report.leaders.best_overall.first().map(String::as_str),
             Some("p/fast")
         );
-        assert_eq!(report.leaders.most_stable.as_deref(), Some("p/fast"));
+        assert_eq!(
+            report
+                .leaders
+                .fastest_first_token
+                .first()
+                .map(String::as_str),
+            Some("p/fast")
+        );
+        assert_eq!(
+            report.leaders.most_stable.first().map(String::as_str),
+            Some("p/fast")
+        );
     }
 
     #[test]
@@ -1195,9 +1605,266 @@ mod tests {
 
         assert_eq!(by_use["coding"].model, "p/fast");
         assert!(by_use["coding"].ranked);
-        assert_eq!(by_use["planning"].model, "p/slow");
+        assert!(by_use["coding"].reason.contains("all ranked models"));
+        // Planning maps to a role, so the untagged faster model competes and wins.
+        assert_eq!(by_use["planning"].model, "p/fast");
         assert_eq!(by_use["vision"].model, "p/idle");
         assert!(!by_use["vision"].ranked);
+    }
+
+    #[test]
+    fn free_and_value_top_lists_from_priced_models() {
+        let outcomes = timed(vec![
+            ok("local/a", 100, 1000),
+            ok("local/a", 100, 1000),
+            ok("p/paid", 100, 1000),
+            ok("p/paid", 100, 1000),
+            ok("p/dear", 100, 1000),
+            ok("p/dear", 100, 1000),
+        ]);
+        let mut costs = ModelCosts::new();
+        costs.insert(
+            "local/a".into(),
+            ModelCost {
+                usd: 0.0,
+                free: true,
+            },
+        );
+        costs.insert(
+            "p/paid".into(),
+            ModelCost {
+                usd: 0.02,
+                free: false,
+            },
+        );
+        costs.insert(
+            "p/dear".into(),
+            ModelCost {
+                usd: 0.2,
+                free: false,
+            },
+        );
+
+        let evidence = ModelEvidence {
+            costs,
+            verdicts: Vec::new(),
+        };
+        let report = build_report_priced(&outcomes, &HashMap::new(), "7d", 1, NOW_MS, &evidence);
+
+        assert_eq!(report.best_free, vec!["local/a"]);
+        assert_eq!(report.best_value, vec!["p/paid", "p/dear"]);
+        let paid = insight(&report, "p/paid");
+        assert_eq!(paid.cost_per_call_cents, Some(1.0));
+        assert_eq!(paid.value_score, Some(55.3));
+        assert_eq!(insight(&report, "p/dear").value_score, Some(5.5));
+        assert!(insight(&report, "local/a").free);
+        assert_eq!(insight(&report, "local/a").value_score, None);
+    }
+
+    #[test]
+    fn top_lists_cap_at_three_and_use_case_top_lists_fall_back_to_calls() {
+        let outcomes = timed(vec![
+            ok("p/a", 100, 1000),
+            ok("p/b", 100, 1000),
+            ok("p/c", 100, 1000),
+            ok("p/d", 100, 1000),
+            ok("p/d", 100, 1000),
+        ]);
+        let known = catalog(&[
+            ("p/a", 1, &["coding"]),
+            ("p/b", 1, &["coding"]),
+            ("p/c", 1, &["coding"]),
+            ("p/d", 1, &["coding"]),
+        ]);
+
+        let report = build_report(&outcomes, &known, "7d", 1, NOW_MS);
+
+        assert_eq!(report.leaders.most_used.len(), 3);
+        assert_eq!(report.leaders.most_used[0], "p/d");
+        // p/d has two calls, so its reliability bound leads. Equal scores tie on name.
+        assert_eq!(report.best_for[0].top, vec!["p/d", "p/a", "p/b"]);
+        assert!(report.best_free.is_empty());
+        assert!(report.best_value.is_empty());
+    }
+
+    #[test]
+    fn quality_tier_beats_a_faster_weaker_model() {
+        let mut outcomes = Vec::new();
+        for _ in 0..20 {
+            outcomes.push(ok("local/tiny-model", 100, 1100));
+            outcomes.push(ok("cloud/claude-opus-9", 400, 4400));
+        }
+        let report = build_report(&timed(outcomes), &HashMap::new(), "7d", 2, NOW_MS);
+
+        assert_eq!(
+            insight(&report, "cloud/claude-opus-9").quality_score,
+            Some(96.7)
+        );
+        assert_eq!(report.leaders.best_overall[0], "cloud/claude-opus-9");
+        assert_eq!(report.leaders.fastest_first_token[0], "local/tiny-model");
+    }
+
+    #[test]
+    fn many_successful_calls_outrank_a_few() {
+        let mut outcomes = vec![ok("p/few", 100, 1100), ok("p/few", 100, 1100)];
+        outcomes.extend((0..200).map(|_| ok("p/many", 100, 1100)));
+        let report = build_report(&timed(outcomes), &HashMap::new(), "7d", 2, NOW_MS);
+
+        assert_eq!(report.leaders.most_stable[0], "p/many");
+        assert_eq!(report.leaders.best_overall[0], "p/many");
+    }
+
+    #[test]
+    fn speech_models_without_output_tokens_are_not_ranked() {
+        let mut speech = vec![ok("stt/whisper", 50, 500), ok("stt/whisper", 50, 500)];
+        for call in &mut speech {
+            call.tokens_out = 0;
+        }
+        speech.extend([ok("p/chat", 100, 1100), ok("p/chat", 100, 1100)]);
+        let report = build_report(&timed(speech), &HashMap::new(), "7d", 2, NOW_MS);
+
+        assert!(!insight(&report, "stt/whisper").ranked);
+        assert_eq!(report.leaders.best_overall, vec!["p/chat"]);
+    }
+
+    #[test]
+    fn untagged_strong_model_wins_a_role_use_case_but_not_a_tagged_only_one() {
+        let mut outcomes = Vec::new();
+        for _ in 0..10 {
+            outcomes.push(ok("local/tiny", 100, 1100));
+            outcomes.push(ok("cloud/claude-sonnet-9", 300, 3300));
+        }
+        let known = catalog(&[
+            ("local/tiny", 1, &["coding", "fast", "vision"]),
+            ("cloud/claude-sonnet-9", 1, &[]),
+        ]);
+        let report = build_report(&timed(outcomes), &known, "7d", 2, NOW_MS);
+        let by_use: HashMap<&str, &UseCasePick> = report
+            .best_for
+            .iter()
+            .map(|pick| (pick.use_case.as_str(), pick))
+            .collect();
+
+        assert_eq!(by_use["coding"].model, "cloud/claude-sonnet-9");
+        assert!(by_use["coding"].reason.contains("use-case score"));
+        assert_eq!(by_use["fast"].model, "local/tiny");
+        assert!(by_use["fast"].reason.contains("speed score"));
+        assert_eq!(by_use["vision"].top, vec!["local/tiny"]);
+        assert!(
+            by_use["vision"]
+                .reason
+                .contains("declared for this use case")
+        );
+    }
+
+    fn verdict(model: &str, worker: &str, passed: bool, ts_ms: u64) -> SolverVerdict {
+        SolverVerdict {
+            model: model.to_string(),
+            worker: Some(worker.to_string()),
+            passed,
+            ts_ms,
+        }
+    }
+
+    fn in_session(worker: &str, mut outcome: RequestOutcome) -> RequestOutcome {
+        outcome.worker = Some(worker.to_string());
+        outcome
+    }
+
+    #[test]
+    fn verified_outcomes_blend_into_quality_and_lead_the_verified_list() {
+        let outcomes = timed(vec![
+            ok("p/good", 100, 1100),
+            ok("p/good", 100, 1100),
+            ok("p/bad", 100, 1100),
+            ok("p/bad", 100, 1100),
+            ok("p/plain", 100, 1100),
+            ok("p/plain", 100, 1100),
+        ]);
+        let mut verdicts: Vec<SolverVerdict> =
+            (0..50).map(|i| verdict("p/good", "w", true, i)).collect();
+        verdicts.extend((0..50).map(|i| verdict("p/bad", "w", false, i)));
+        verdicts.push(verdict("p/unseen", "w", true, 99));
+        let evidence = ModelEvidence {
+            costs: ModelCosts::new(),
+            verdicts,
+        };
+
+        let report = build_report_priced(&outcomes, &HashMap::new(), "7d", 2, NOW_MS, &evidence);
+
+        let good = insight(&report, "p/good");
+        assert_eq!((good.verified_outcomes, good.verified_passed), (50, 50));
+        assert_eq!(good.verified_pass_pct, Some(100.0));
+        // Half samples -> a quarter weight: 0.75 x 50 + 0.25 x 92.9.
+        assert_eq!(good.quality_score, Some(60.7));
+        assert_eq!(insight(&report, "p/bad").quality_score, Some(37.5));
+        assert_eq!(insight(&report, "p/plain").quality_score, Some(50.0));
+        assert_eq!(insight(&report, "p/plain").verified_pass_pct, None);
+        assert_eq!(report.leaders.best_verified, vec!["p/good", "p/bad"]);
+        assert_eq!(report.leaders.best_overall[0], "p/good");
+    }
+
+    #[test]
+    fn sessions_credit_the_lead_model_with_the_newest_verdict() {
+        let mut heavy = in_session("s1", ok("p/big", 100, 1100));
+        heavy.tokens_out = 900;
+        let outcomes = timed(vec![
+            heavy,
+            in_session("s1", ok("p/small", 100, 1100)),
+            in_session("s2", ok("p/big", 100, 1100)),
+            in_session("s3", ok("p/big", 100, 1100)),
+            in_session("s4", ok("p/big", 100, 1100)),
+            in_session("s5", ok("p/small", 100, 1100)),
+            ok("p/small", 100, 1100),
+        ]);
+        let verdicts = vec![
+            verdict("p/small", "s1", false, 1),
+            verdict("p/big", "s1", true, 2),
+            verdict("p/big", "s2", true, 3),
+            verdict("p/big", "s3", true, 4),
+            verdict("p/big", "s4", true, 6),
+            verdict("p/big", "s4", false, 5),
+            verdict("p/big", "gone", true, 7),
+            SolverVerdict {
+                worker: None,
+                ..verdict("p/big", "", true, 8)
+            },
+        ];
+        let evidence = ModelEvidence {
+            costs: ModelCosts::new(),
+            verdicts,
+        };
+
+        let report = build_report_priced(&outcomes, &HashMap::new(), "7d", 1, NOW_MS, &evidence);
+
+        assert_eq!(report.sessions.total, 5);
+        assert_eq!(report.sessions.verified, 4);
+        assert_eq!(report.sessions.solved, 4);
+        assert_eq!(report.sessions.solved_pct, Some(100.0));
+        let big = insight(&report, "p/big");
+        assert_eq!((big.sessions_verified, big.sessions_solved), (4, 4));
+        assert_eq!(insight(&report, "p/small").sessions_verified, 0);
+        assert_eq!(report.sessions.best_models, vec!["p/big"]);
+    }
+
+    #[test]
+    fn no_sessions_means_no_solved_share() {
+        let report = build_report(
+            &timed(vec![ok("p/a", 1, 2)]),
+            &HashMap::new(),
+            "7d",
+            1,
+            NOW_MS,
+        );
+
+        assert_eq!(report.sessions, SessionsInsight::default());
+    }
+
+    #[test]
+    fn wilson_bound_handles_empty_and_full_samples() {
+        assert!(wilson_lower_pct(0, 0).abs() < 1e-9);
+        assert!(wilson_lower_pct(1000, 1000) > 99.0);
+        assert!(wilson_lower_pct(0, 5) < 1e-9);
     }
 
     #[test]

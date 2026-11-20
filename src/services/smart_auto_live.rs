@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use crate::configs::TokenRates;
 use crate::dependencies::state::AppState;
 use crate::schemas::live_signals::{LiveSignals, ModelSignal};
 use crate::schemas::model_context::strip_1m_suffix;
@@ -24,8 +25,11 @@ pub struct SmartAutoLive;
 impl SmartAutoLive {
     /// A quota snapshot older than this is not trusted.
     const QUOTA_TTL_MS: u64 = 3_600_000;
-    const TOKENS_PER_MILLION_INPUT_SHARE: f64 = 3.0;
-    const IO_SHARES: f64 = 4.0;
+    /// An agent turn re-reads its cached prompt, so the blend weighs cached input most: eight
+    /// parts cached input, one part fresh input and one part output.
+    const CACHED_INPUT_SHARE: f64 = 8.0;
+    const FRESH_INPUT_SHARE: f64 = 1.0;
+    const OUTPUT_SHARE: f64 = 1.0;
     /// Upper bound of each cost score, from 10 (cheapest) down to 1, in USD per million tokens.
     const COST_BOUNDS_USD: [f64; 10] = [0.10, 0.50, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0, 100.0];
     const COST_FREE: u8 = 10;
@@ -83,10 +87,7 @@ impl SmartAutoLive {
                     .contains(profile)
                     .then_some(Self::COST_FREE)
             } else {
-                let blended = (Self::TOKENS_PER_MILLION_INPUT_SHARE * rates.input_per_1m
-                    + rates.output_per_1m)
-                    / Self::IO_SHARES;
-                Some(Self::cost_score(blended))
+                Some(Self::cost_score(Self::blended_usd_per_1m(&rates)))
             };
             if let Some(score) = score {
                 scores.insert(id.to_owned(), score);
@@ -95,7 +96,21 @@ impl SmartAutoLive {
         scores
     }
 
-    /// The cost score of a blended price in USD per million tokens (three parts input, one output).
+    /// USD per million tokens of an agent turn. A model with no cache-read price reads cache at
+    /// its input price.
+    fn blended_usd_per_1m(rates: &TokenRates) -> f64 {
+        let cached = if rates.cache_read_per_1m > 0.0 {
+            rates.cache_read_per_1m
+        } else {
+            rates.input_per_1m
+        };
+        (Self::CACHED_INPUT_SHARE * cached
+            + Self::FRESH_INPUT_SHARE * rates.input_per_1m
+            + Self::OUTPUT_SHARE * rates.output_per_1m)
+            / (Self::CACHED_INPUT_SHARE + Self::FRESH_INPUT_SHARE + Self::OUTPUT_SHARE)
+    }
+
+    /// The cost score of a blended price in USD per million tokens (see `blended_usd_per_1m`).
     #[must_use]
     pub fn cost_score(blended_usd_per_1m: f64) -> u8 {
         Self::COST_BOUNDS_USD
@@ -317,6 +332,28 @@ mod tests {
             SmartAutoLive::cost_scores(&book(), ["home/qwen", "other/unknown"].into_iter());
         assert_eq!(scores["home/qwen"], 10);
         assert!(!scores.contains_key("other/unknown"));
+    }
+
+    #[test]
+    fn a_cheap_cache_read_price_raises_the_cost_score() {
+        let rates = |cache_read_per_1m| TokenRates {
+            input_per_1m: 5.0,
+            output_per_1m: 25.0,
+            cache_read_per_1m,
+            cache_write_per_1m: 0.0,
+        };
+        let mut priced = book();
+        priced.by_model.insert("acme/cached".to_owned(), rates(0.5));
+        priced
+            .by_model
+            .insert("acme/uncached".to_owned(), rates(0.0));
+
+        let scores =
+            SmartAutoLive::cost_scores(&priced, ["acme/cached", "acme/uncached"].into_iter());
+
+        // (8 x 0.5 + 5 + 25) / 10 = 3.4 against (8 x 5 + 5 + 25) / 10 = 7.0.
+        assert_eq!(scores["acme/cached"], 6);
+        assert_eq!(scores["acme/uncached"], 5);
     }
 
     #[test]
