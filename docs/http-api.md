@@ -39,7 +39,9 @@ Routes marked "key" need a key only when [hub auth](#hub-authentication) is on.
 | GET | `/api/stats` | Request stats. Query: `range` (`live` default, `1d`, `7d`, `30d`, `all`), `profile`, `model`. | key |
 | GET | `/api/usage` | Usage history with costs. Needs persistence. | key |
 | GET | `/api/live` | Server-sent events: one `data:` line per finished request, as a usage row, with a `: keep-alive` comment every 15 s. Keep-warm pings are skipped. | key |
-| GET | `/api/errors` | Failed requests. Query: `range` (default `7d`). Needs persistence. | key |
+| GET | `/api/errors` | Failed requests: `recent` rows and `groups` by normalized signature (ids, long numbers, timestamps and URL query strings masked). Query: `range` (default `7d`). Needs persistence. | key |
+| POST | `/api/errors/resolve` | Mark failed requests solved or reopen them. Body: `ids`, `solved`. Needs the SQLite store. | key |
+| POST | `/api/errors/resolve-group` | Mark every open failure with one signature solved (`solved: false` reopens). Body: `signature`, `range` (default `7d`), `solved` (default `true`). Needs the SQLite store. | key |
 | GET | `/api/insights` | Model rankings. See [Insights](usage-and-insights.md#insights). | key |
 | GET | `/api/insights/pick` | Best model. See [Insights](usage-and-insights.md#insights). | key |
 | GET | `/api/insights/report` | Insights as one document for agents. | key |

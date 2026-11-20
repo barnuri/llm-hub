@@ -420,6 +420,68 @@
         }
       }
     },
+    "/api/errors/resolve-group": {
+      "post": {
+        "tags": [
+          "stats"
+        ],
+        "summary": "Mark a whole error group solved or reopen it",
+        "operationId": "resolve_error_group",
+        "requestBody": {
+          "description": "Group signature, window and the solved flag",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveErrorGroupInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated count",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/fallbacks": {
       "post": {
         "tags": [
@@ -2978,6 +3040,29 @@
           }
         },
         "additionalProperties": false
+      },
+      "ResolveErrorGroupInput": {
+        "type": "object",
+        "required": [
+          "signature"
+        ],
+        "properties": {
+          "range": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Window the group came from: `1d`, `7d` (default), `30d`, or `all`."
+          },
+          "signature": {
+            "type": "string",
+            "description": "`groups[].signature` from `/api/errors`."
+          },
+          "solved": {
+            "type": "boolean",
+            "description": "`true` (default) marks the group's open errors solved, `false` reopens its solved ones."
+          }
+        }
       },
       "ResolveErrorsInput": {
         "type": "object",
