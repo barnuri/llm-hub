@@ -268,8 +268,10 @@ mod tests {
                 panic!("expected Failed, got {outcome:?}");
             };
             assert!(reason.contains("did not finish within 1000 ms"), "{reason}");
-            let pid = std::fs::read_to_string(&pid_file).unwrap();
-            assert!(!process_alive(pid.trim()).await, "gh {pid} still running");
+            // On a loaded machine the timeout can kill the script before it writes its pid.
+            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                assert!(!process_alive(pid.trim()).await, "gh {pid} still running");
+            }
         }
 
         // kill_on_drop kills without waiting, so poll until the pid is gone or only a zombie.

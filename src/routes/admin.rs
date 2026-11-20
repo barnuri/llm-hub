@@ -89,6 +89,7 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
         },
         "media_fallback": {
             "enabled": config.media_fallback.enabled,
+            "skip": config.media_fallback.skip,
             "vision_model": config.media_fallback.vision_model.as_ref().map(ModelId::qualified),
             "stt_model": config.media_fallback.stt_model.as_ref().map(ModelId::qualified),
             "overridden_by_env": media_fallback_pinned_by(|key| std::env::var_os(key).is_some()),
@@ -317,7 +318,7 @@ fn set_media_fallback_in(
                 )));
             }
         }
-        env_writer::set_media_fallback(env_file, input.enabled, vision, stt)
+        env_writer::set_media_fallback(env_file, input.enabled, input.skip, vision, stt)
             .map_err(AppError::Internal)?;
         reload(state)?;
         Ok(Json(json!({ "ok": true })))
@@ -328,6 +329,7 @@ fn set_media_fallback_in(
 fn media_fallback_pinned_by(is_set: impl Fn(&str) -> bool) -> bool {
     [
         "LLM_HUB_MEDIA_FALLBACK",
+        "LLM_HUB_MEDIA_SKIP",
         "LLM_HUB_MEDIA_FALLBACK_VISION_MODEL",
         "LLM_HUB_MEDIA_FALLBACK_STT_MODEL",
     ]
@@ -1881,6 +1883,7 @@ mod tests {
         let env = env_file(&dir, &[]);
         let input = MediaFallbackInput {
             enabled: true,
+            skip: true,
             vision_model: " local/eye ".to_owned(),
             stt_model: String::new(),
         };
@@ -1894,6 +1897,7 @@ mod tests {
 
         let config = state.config();
         assert!(config.media_fallback.enabled);
+        assert!(config.media_fallback.skip);
         assert_eq!(
             config
                 .media_fallback
@@ -1926,6 +1930,7 @@ mod tests {
             State(state_for(&[("LLM_HUB_CONFIG_READONLY", "true")])),
             Json(MediaFallbackInput {
                 enabled: false,
+                skip: false,
                 vision_model: String::new(),
                 stt_model: String::new(),
             }),
@@ -1938,6 +1943,7 @@ mod tests {
     async fn profiles_list_reports_the_media_fallback_settings() {
         let Json(body) = list_profiles(State(state_for(&[]))).await;
         assert_eq!(body["media_fallback"]["enabled"], json!(false));
+        assert_eq!(body["media_fallback"]["skip"], json!(false));
         assert_eq!(
             body["media_fallback"]["vision_model"],
             json!("llama_swap/muse-glimmer-30b")

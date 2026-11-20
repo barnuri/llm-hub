@@ -53,6 +53,7 @@ export interface KeepWarmSettings {
 
 export interface MediaFallbackSettings {
   readonly enabled: boolean;
+  readonly skip: boolean;
   /** The `<profile>/<model>` that captions images; `null` when captions are off. */
   readonly vision_model: string | null;
   /** The `<profile>/<model>` that transcribes audio; `null` when transcripts are off. */
