@@ -34,6 +34,7 @@ pub mod launch;
 pub mod listed_prices;
 pub mod live_feed;
 pub mod managed_process;
+pub mod media_fallback;
 #[cfg(test)]
 pub mod memory_credential_store;
 pub mod model_descriptors;

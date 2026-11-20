@@ -492,6 +492,7 @@ fn api_router(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(admin::set_default_fallbacks))
         .routes(routes!(admin::set_copilot_prices))
         .routes(routes!(admin::set_keep_warm))
+        .routes(routes!(admin::set_media_fallback))
         .routes(routes!(admin::restart_server))
         .routes(routes!(admin::stats))
         .routes(routes!(admin::usage))

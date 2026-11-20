@@ -136,6 +136,7 @@ mod tests {
             first_byte_timeout: None,
             copilot_prices_refresh: None,
             keep_warm: KeepWarmConfig::default(),
+            media_fallback: crate::configs::MediaFallbackConfig::default(),
             pricing: TokenRates::default(),
         }
     }

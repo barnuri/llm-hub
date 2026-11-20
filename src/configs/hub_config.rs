@@ -4,6 +4,7 @@ use std::time::Duration;
 use super::copilot_auth::CopilotAuth;
 use super::keep_warm_config::KeepWarmConfig;
 use super::managed_command::ManagedCommand;
+use super::media_fallback_config::MediaFallbackConfig;
 use super::profile_config::ProfileConfig;
 use super::usage_source::{BIFROST_KEY_PREFIX, UsageSource};
 use crate::consts::{
@@ -74,6 +75,8 @@ pub struct HubConfig {
     pub copilot_prices_refresh: Option<Duration>,
     /// Cache keep-warm for idle Copilot Claude streams.
     pub keep_warm: KeepWarmConfig,
+    /// Media parts converted to text for text-only models. Off by default.
+    pub media_fallback: MediaFallbackConfig,
     /// Global USD/1M token defaults when a profile/model has no rates.
     pub pricing: crate::configs::TokenRates,
 }
@@ -171,6 +174,7 @@ impl HubConfig {
         };
 
         let keep_warm = keep_warm_from_map(&get)?;
+        let media_fallback = MediaFallbackConfig::from_get(&get, is_truthy)?;
 
         let pricing = crate::configs::TokenRates {
             input_per_1m: crate::configs::token_rates::parse_optional_f64(
@@ -226,6 +230,7 @@ impl HubConfig {
             copilot_prices_refresh: (copilot_prices_refresh_secs > 0)
                 .then(|| Duration::from_secs(copilot_prices_refresh_secs)),
             keep_warm,
+            media_fallback,
             pricing,
         })
     }

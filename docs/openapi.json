@@ -1015,6 +1015,78 @@
         }
       }
     },
+    "/api/media-fallback": {
+      "post": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Configure media fallback",
+        "operationId": "set_media_fallback",
+        "requestBody": {
+          "description": "Media fallback switch and its models",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MediaFallbackInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Config is read-only (LLM_HUB_CONFIG_READONLY=true).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/profiles": {
       "get": {
         "tags": [
@@ -2760,6 +2832,26 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "MediaFallbackInput": {
+        "type": "object",
+        "description": "The media fallback settings the UI saves. An empty model turns that conversion off.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "stt_model": {
+            "type": "string",
+            "description": "The `<profile>/<model>` that transcribes audio."
+          },
+          "vision_model": {
+            "type": "string",
+            "description": "The `<profile>/<model>` that captions images."
           }
         }
       },

@@ -5,7 +5,7 @@ use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
 
 use crate::configs::HubConfig;
-use crate::consts::LOGS_DIR;
+use crate::consts::{LOGS_DIR, MEDIA_FALLBACK_CACHE_ENTRIES};
 use crate::ext::builtin::builtins;
 use crate::ext::{CompleteCtx, ExtensionSet};
 use crate::schemas::model_descriptor::ModelDescriptor;
@@ -24,6 +24,7 @@ use crate::services::keyring_credential_store::KeyringCredentialStore;
 use crate::services::listed_prices::ListedPrices;
 use crate::services::live_feed::LiveFeed;
 use crate::services::managed_process::ProcessManager;
+use crate::services::media_fallback::MediaCache;
 use crate::services::model_health::ModelHealth;
 use crate::services::model_limits::{ModelLimit, ModelLimits};
 use crate::services::pricing::PricingBook;
@@ -82,6 +83,8 @@ struct Inner {
     unsupported_body_fields: UnsupportedBodyFields,
     /// `<profile>/<upstream model>` keys that refused image input, learned from upstream rejections.
     vision_unsupported: DashSet<String>,
+    /// The texts media fallback made from media, most recently used first.
+    media_cache: MediaCache,
     /// `<profile>/<upstream model>` -> the prompt limit an upstream 400 named in its message.
     rejected_prompt_limits: DashMap<String, u64>,
     smart_auto_affinity: SmartAutoAffinity,
@@ -176,6 +179,7 @@ impl AppState {
             model_limits,
             unsupported_body_fields,
             vision_unsupported,
+            media_cache: MediaCache::new(MEDIA_FALLBACK_CACHE_ENTRIES),
             rejected_prompt_limits: DashMap::new(),
             smart_auto_affinity: SmartAutoAffinity::new(),
             smart_auto_decisions: SmartAutoDecisionLog::default(),
@@ -446,6 +450,11 @@ impl AppState {
         self.0
             .vision_unsupported
             .contains(&format!("{profile}/{model}"))
+    }
+
+    /// The texts media fallback made from media, held in memory.
+    pub(crate) fn media_cache(&self) -> &MediaCache {
+        &self.0.media_cache
     }
 
     /// Records that `model` on `profile` refused image input, so later image requests skip it.

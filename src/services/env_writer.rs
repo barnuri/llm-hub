@@ -101,6 +101,25 @@ pub fn set_keep_warm(path: &Path, enabled: bool, idle_cap_minutes: u64) -> Resul
     write_atomic(path, &lines)
 }
 
+/// Persists `LLM_HUB_MEDIA_FALLBACK` and its vision and speech models. An empty model is saved
+/// empty, which turns that conversion off.
+pub fn set_media_fallback(
+    path: &Path,
+    enabled: bool,
+    vision_model: &str,
+    stt_model: &str,
+) -> Result<(), String> {
+    let mut lines = read_lines(path)?;
+    set_var(
+        &mut lines,
+        "MEDIA_FALLBACK",
+        if enabled { "true" } else { "false" },
+    );
+    set_var(&mut lines, "MEDIA_FALLBACK_VISION_MODEL", vision_model);
+    set_var(&mut lines, "MEDIA_FALLBACK_STT_MODEL", stt_model);
+    write_atomic(path, &lines)
+}
+
 /// Persists `LLM_HUB_COPILOT_PRICES_REFRESH_SECS`. `0` turns the price fetch off.
 pub fn set_copilot_prices_refresh(path: &Path, secs: u64) -> Result<(), String> {
     let mut lines = read_lines(path)?;
@@ -194,6 +213,20 @@ mod tests {
             keep_warm: true,
             first_byte_timeout_ms: None,
         }
+    }
+
+    #[test]
+    fn set_media_fallback_writes_the_switch_and_both_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+
+        set_media_fallback(&path, true, "local/eye", "").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content,
+            "LLM_HUB_MEDIA_FALLBACK=true\nLLM_HUB_MEDIA_FALLBACK_VISION_MODEL=local/eye\nLLM_HUB_MEDIA_FALLBACK_STT_MODEL=\n"
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { CopilotPricesPanel } from "../components/CopilotPricesPanel";
 import { KeepWarmPanel } from "../components/KeepWarmPanel";
+import { MediaFallbackPanel } from "../components/MediaFallbackPanel";
 import { MixTable, type MixRow } from "../components/MixTable";
 import { Panel } from "../components/Panel";
 import { PriceHeader } from "../components/PriceHeader";
@@ -257,6 +258,16 @@ export function ModelsScreen({ models, profiles, meta, onCopy, onSaved, onToast 
                 onToast={onToast}
               />
             </>
+          ) : null}
+          {meta !== null ? (
+            <MediaFallbackPanel
+              key={`${meta.media_fallback.enabled}-${meta.media_fallback.vision_model}-${meta.media_fallback.stt_model}-${meta.media_fallback.overridden_by_env}`}
+              settings={meta.media_fallback}
+              modelIds={models.map((model) => model.id)}
+              readonly={meta.readonly}
+              onSaved={onSaved}
+              onToast={onToast}
+            />
           ) : null}
           {byProfile.length > 0 ? (
             <Panel title="By profile" sub="models listed">

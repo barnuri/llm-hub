@@ -28,6 +28,7 @@ pub mod keep_warm_summary;
 pub mod launch;
 pub mod limit_evidence;
 pub mod live_signals;
+pub mod media_fallback_input;
 pub mod model_context;
 pub mod model_descriptor;
 pub mod model_descriptor_snapshot;
