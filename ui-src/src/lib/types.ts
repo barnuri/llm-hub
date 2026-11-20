@@ -560,9 +560,13 @@ export interface ModelHealthRow {
   readonly endpoint: string;
   /** Failures in a row; 0 after an answer. */
   readonly failures: number;
-  readonly last_failure: "timeout" | "transport" | { readonly status: number } | null;
+  readonly last_failure: "timeout" | "transport" | "broken_reply" | { readonly status: number } | null;
   /** Milliseconds left before Smart Auto picks the model again; 0 when it is not cooled. */
   readonly cooled_for_ms: number;
+  /** Unix milliseconds when the cooldown ends; null when it is not cooled. */
+  readonly cooled_until_ms: number | null;
+  /** Why the model is cooled when an upstream named the wait, such as a rate limit reset. */
+  readonly cooled_reason: string | null;
   /** Share of recent attempts that failed on the model's side, 0 to 1. */
   readonly error_rate: number;
   readonly outcomes: number;
@@ -572,8 +576,17 @@ export interface ModelHealthRow {
   readonly speed: number | null;
 }
 
+/** A profile Smart Auto skips as a whole, such as one out of credits. */
+export interface ProfileCooldownRow {
+  readonly profile: string;
+  readonly cooled_for_ms: number;
+  readonly cooled_until_ms: number;
+  readonly reason: string;
+}
+
 export interface ModelHealthSnapshot {
   readonly models: readonly ModelHealthRow[];
+  readonly profiles: readonly ProfileCooldownRow[];
   /** Cost score per priced model: 0 dearest, 10 free. */
   readonly costs: Record<string, number>;
 }

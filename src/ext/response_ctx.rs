@@ -138,6 +138,12 @@ impl<'a> ResponseCtx<'a> {
         self.error_body()?.pointer("/error/code")?.as_str()
     }
 
+    /// The message of the error body: `error.message`, a string `error`, `message` or `detail`.
+    #[must_use]
+    pub fn error_message(&self) -> Option<&str> {
+        error_message_of(self.error_body()?)
+    }
+
     /// Typed data for this request, shared with the other phases.
     #[must_use]
     pub fn state(&self) -> &Extensions {
@@ -148,6 +154,13 @@ impl<'a> ResponseCtx<'a> {
     pub fn state_mut(&mut self) -> &mut Extensions {
         self.state
     }
+}
+
+/// The message of a JSON error body in the `OpenAI`, Anthropic, llama.cpp or `FastAPI` shape.
+pub(crate) fn error_message_of(body: &Value) -> Option<&str> {
+    ["/error/message", "/error", "/message", "/detail"]
+        .iter()
+        .find_map(|pointer| body.pointer(pointer).and_then(Value::as_str))
 }
 
 #[cfg(test)]
@@ -196,8 +209,22 @@ mod tests {
 
         ctx.set_error_body(Some(json!({"error": {"code": "x"}})));
         assert_eq!(ctx.error_code(), Some("x"));
+        assert_eq!(ctx.error_message(), None);
 
         assert_eq!(ctx.into_parts(), (StatusCode::BAD_REQUEST, None));
+    }
+
+    #[test]
+    fn the_error_message_is_read_from_each_known_shape() {
+        for body in [
+            json!({"error": {"message": "m"}}),
+            json!({"error": "m"}),
+            json!({"message": "m"}),
+            json!({"detail": "m"}),
+        ] {
+            assert_eq!(error_message_of(&body), Some("m"), "{body}");
+        }
+        assert_eq!(error_message_of(&json!({"error": {"code": 1}})), None);
     }
 
     #[test]

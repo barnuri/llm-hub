@@ -2,7 +2,12 @@ use std::collections::HashSet;
 
 use axum::http::HeaderMap;
 
-use crate::consts::{HEADER_FALLBACKS, HEADER_FALLBACKS_ALIAS, HEADER_RETRY_ON, HEADER_TIMEOUT_MS};
+use std::time::Duration;
+
+use crate::consts::{
+    HEADER_DEADLINE_MS, HEADER_FALLBACKS, HEADER_FALLBACKS_ALIAS, HEADER_RETRY_ON,
+    HEADER_TIMEOUT_MS,
+};
 use crate::schemas::model_context::strip_1m_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 
@@ -113,6 +118,25 @@ pub fn validate_chain(chain: &[String]) -> Result<Vec<String>, String> {
 
 pub fn per_attempt_timeout_ms(headers: &HeaderMap) -> Option<u64> {
     header_str(headers, HEADER_TIMEOUT_MS)?.trim().parse().ok()
+}
+
+/// The time limit of the whole fallback chain. A valid `x-llm-hub-deadline-ms` wins over the
+/// configured default, and `0` in it turns the limit off for the request.
+pub fn chain_deadline(headers: &HeaderMap, default: Option<Duration>) -> Option<Duration> {
+    match header_str(headers, HEADER_DEADLINE_MS).and_then(|raw| raw.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(ms)),
+        None => default,
+    }
+}
+
+/// The shorter of two optional time limits. `None` is no limit.
+#[must_use]
+pub fn shorter(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (one, None) | (None, one) => one,
+    }
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -248,6 +272,34 @@ mod tests {
         let fallbacks = fallback_chain(&HeaderMap::new(), &default_chain);
 
         assert_eq!(retain_eligible(fallbacks, None), default_chain);
+    }
+
+    #[test]
+    fn the_deadline_header_wins_and_zero_turns_it_off() {
+        let default = Some(Duration::from_secs(30));
+        assert_eq!(chain_deadline(&HeaderMap::new(), default), default);
+        let header = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(HEADER_DEADLINE_MS, HeaderValue::from_static(value));
+            headers
+        };
+        assert_eq!(
+            chain_deadline(&header(" 1500 "), default),
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(chain_deadline(&header("0"), default), None);
+        assert_eq!(chain_deadline(&header("soon"), default), default);
+        assert_eq!(chain_deadline(&header("soon"), None), None);
+    }
+
+    #[test]
+    fn shorter_picks_the_smaller_limit() {
+        let (one, two) = (Some(Duration::from_secs(1)), Some(Duration::from_secs(2)));
+        assert_eq!(shorter(one, two), one);
+        assert_eq!(shorter(two, one), one);
+        assert_eq!(shorter(None, two), two);
+        assert_eq!(shorter(one, None), one);
+        assert_eq!(shorter(None, None), None);
     }
 
     #[test]

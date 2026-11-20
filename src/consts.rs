@@ -51,6 +51,8 @@ pub const DEFAULT_SSE_KEEPALIVE_MS: u64 = 15_000;
 /// How long a Smart Auto streamed attempt on a remote profile may wait for its first byte
 /// before the hub marks the model and tries the next one.
 pub const DEFAULT_FIRST_BYTE_TIMEOUT_MS: u64 = 20_000;
+/// How long the hub skips a profile whose upstream says it is out of credits.
+pub const DEFAULT_QUOTA_COOLDOWN_SECS: u64 = 3_600;
 /// The keepalive itself. A line starting with `:` is a comment in the SSE
 /// grammar, so every conformant parser drops it before it reaches the message
 /// stream — it is inert in both the `OpenAI` and Anthropic dialects.
@@ -59,6 +61,8 @@ pub const SSE_KEEPALIVE_FRAME: &str = ": llm-hub keepalive\n\n";
 pub const HEADER_FALLBACKS: &str = "x-llm-hub-fallbacks";
 pub const HEADER_FALLBACKS_ALIAS: &str = "x-fallbacks";
 pub const HEADER_TIMEOUT_MS: &str = "x-llm-hub-timeout-ms";
+/// One time limit for the whole fallback chain, in milliseconds from the hub receiving the request.
+pub const HEADER_DEADLINE_MS: &str = "x-llm-hub-deadline-ms";
 pub const HEADER_RETRY_ON: &str = "x-llm-hub-retry-on";
 pub const HEADER_SERVED_MODEL: &str = "x-llm-hub-model";
 pub const HEADER_ATTEMPTS: &str = "x-llm-hub-attempts";

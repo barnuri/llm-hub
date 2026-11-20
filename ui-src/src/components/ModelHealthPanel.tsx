@@ -20,11 +20,16 @@ function failureText(row: ModelHealthRow): string {
   return typeof failure === "string" ? failure : `HTTP ${failure.status}`;
 }
 
+function untilText(untilMs: number | null): string {
+  return untilMs === null ? "" : ` until ${new Date(untilMs).toLocaleTimeString()}`;
+}
+
 function StatusPill({ row }: { readonly row: ModelHealthRow }) {
   if (row.cooled_for_ms > 0) {
     const seconds = Math.ceil(row.cooled_for_ms / MS_PER_SECOND);
+    const why = row.cooled_reason ?? "Smart Auto skips this model until the wait ends";
     return (
-      <Pill tone="danger" title="Smart Auto skips this model until the wait ends">
+      <Pill tone="danger" title={`${why}${untilText(row.cooled_until_ms)}`}>
         Skipped {seconds} s
       </Pill>
     );
@@ -58,6 +63,7 @@ export function ModelHealthPanel() {
   }, [tick]);
 
   const rows = snapshot?.models ?? [];
+  const profiles = snapshot?.profiles ?? [];
   const skipped = rows.filter((row) => row.cooled_for_ms > 0).length;
 
   let body;
@@ -131,9 +137,16 @@ export function ModelHealthPanel() {
       sub={`${formatNumber(rows.length)} tracked, ${formatNumber(skipped)} skipped`}
       className="smart-auto-panel"
     >
+      {profiles.map((cooled) => (
+        <p key={cooled.profile} className="note" role="status">
+          Profile <strong>{cooled.profile}</strong> skipped
+          {untilText(cooled.cooled_until_ms)}: {cooled.reason}
+        </p>
+      ))}
       {body}
       <p className="dim models-side-note">
-        A failed attempt skips the model for 30 s, doubling to 10 min; an answer clears it. Speed and cost (10 is best)
+        A failed attempt skips the model for 30 s, doubling to 10 min, or until the reset a rate limit names; an
+        answer clears it. Speed and cost (10 is best)
         and the error rate feed the ranking.
       </p>
     </Panel>

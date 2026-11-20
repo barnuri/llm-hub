@@ -24,6 +24,7 @@ pub mod extension_phases;
 #[cfg(test)]
 pub mod fake_gh_cli;
 pub mod fallback;
+pub mod first_event;
 pub mod gh_cli;
 pub mod github_token_resolver;
 pub mod harness;
@@ -49,6 +50,7 @@ pub mod process_gh_cli;
 pub mod profile_usage;
 pub mod prompt_shape_reader;
 pub mod quota_snapshots;
+pub mod rate_limit;
 pub mod request_images;
 pub mod responses_chat;
 pub mod responses_item_ids;
