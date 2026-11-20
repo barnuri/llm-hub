@@ -11,4 +11,6 @@ pub struct UseCasePick {
     pub ranked: bool,
     pub reason: String,
     pub candidates: Vec<String>,
+    /// Up to three models for this use case, best first.
+    pub top: Vec<String>,
 }

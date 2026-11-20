@@ -7,6 +7,7 @@ use crate::schemas::api_key_record::ApiKeyRecord;
 use crate::schemas::attempt_outcome::{AttemptOutcome, OutcomeCode, OutcomeSource};
 use crate::schemas::cost_parts::CostParts;
 use crate::schemas::errors_report::ErrorEntry;
+use crate::schemas::insights::solver_verdict::SolverVerdict;
 use crate::schemas::prompt_shape::PromptShape;
 use crate::schemas::selection_event::SelectionEvent;
 use crate::schemas::usage_report::UsageReport;
@@ -860,6 +861,66 @@ impl Store {
             }
         }
         Ok(found)
+    }
+
+    /// Verified attempt outcomes since `since_ms`, oldest first, each credited to the last solver
+    /// model that completed its attempt. Attempts with no completed solver are skipped. The json
+    /// store keeps no attempts, so it returns none.
+    pub fn solver_verdicts(&self, since_ms: Option<u64>) -> Result<Vec<SolverVerdict>, String> {
+        let Store::Sqlite(conn) = self else {
+            return Ok(Vec::new());
+        };
+        let since_ms = db_i64(since_ms.unwrap_or(0));
+        let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+        let mut solvers: HashMap<String, String> = HashMap::new();
+        {
+            let mut stmt = guard
+                .prepare(
+                    "SELECT json_extract(event, '$.attempt'), json_extract(event, '$.model')
+                     FROM selection_events
+                     WHERE ts_ms >= ?1
+                       AND json_extract(event, '$.stage') = 'solver'
+                       AND json_extract(event, '$.state') = 'completed'
+                       AND json_extract(event, '$.attempt') IS NOT NULL
+                       AND json_extract(event, '$.model') IS NOT NULL
+                     ORDER BY seq",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([since_ms], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            solvers.extend(rows.filter_map(Result::ok));
+        }
+        let mut stmt = guard
+            .prepare(
+                "SELECT attempt, worker, code, ts_ms FROM attempt_outcomes
+                 WHERE ts_ms >= ?1 ORDER BY ts_ms, attempt",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([since_ms], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .filter_map(Result::ok)
+            .filter_map(|(attempt, worker, code, ts_ms)| {
+                let model = solvers.get(&attempt)?.clone();
+                Some(SolverVerdict {
+                    model,
+                    worker,
+                    passed: OutcomeCode::parse(&code)?.is_pass(),
+                    ts_ms: db_u64(ts_ms),
+                })
+            })
+            .collect())
     }
 
     /// Request outcomes matching `filter`, oldest first.
@@ -2999,6 +3060,107 @@ mod tier_role_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn solver_verdicts_credit_the_last_completed_solver() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verdicts.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let outcome = |code| AttemptOutcome {
+            code,
+            source: OutcomeSource::Review,
+        };
+        store
+            .save_attempt_outcome("a1", Some("w1"), &outcome(OutcomeCode::ReviewPassed), 10)
+            .unwrap();
+        store
+            .save_attempt_outcome("a2", None, &outcome(OutcomeCode::ReviewRejected), 20)
+            .unwrap();
+        store
+            .save_attempt_outcome("a3", None, &outcome(OutcomeCode::ReviewPassed), 30)
+            .unwrap();
+        store
+            .save_attempt_outcome("old", None, &outcome(OutcomeCode::ReviewPassed), 1)
+            .unwrap();
+        let event = |seq: u64, attempt: &str, model: &str, stage, state| SelectionEvent {
+            seq,
+            ts_ms: 5,
+            attempt: Some(attempt.into()),
+            ..SelectionEvent::new(stage, state, model)
+        };
+        store
+            .save_selection_events(
+                &[
+                    event(
+                        1,
+                        "a1",
+                        "acme/first",
+                        SelectionStage::Solver,
+                        SelectionState::Completed,
+                    ),
+                    event(
+                        2,
+                        "a1",
+                        "acme/last",
+                        SelectionStage::Solver,
+                        SelectionState::Completed,
+                    ),
+                    event(
+                        3,
+                        "a1",
+                        "acme/judge",
+                        SelectionStage::Judge,
+                        SelectionState::Completed,
+                    ),
+                    event(
+                        4,
+                        "a2",
+                        "acme/first",
+                        SelectionStage::Solver,
+                        SelectionState::Completed,
+                    ),
+                    event(
+                        5,
+                        "a3",
+                        "acme/first",
+                        SelectionStage::Solver,
+                        SelectionState::Selected,
+                    ),
+                    event(
+                        6,
+                        "old",
+                        "acme/first",
+                        SelectionStage::Solver,
+                        SelectionState::Completed,
+                    ),
+                ],
+                5,
+                -1,
+            )
+            .unwrap();
+
+        let verdicts = store.solver_verdicts(Some(5)).unwrap();
+
+        assert_eq!(
+            verdicts,
+            vec![
+                SolverVerdict {
+                    model: "acme/last".into(),
+                    worker: Some("w1".into()),
+                    passed: true,
+                    ts_ms: 10,
+                },
+                SolverVerdict {
+                    model: "acme/first".into(),
+                    worker: None,
+                    passed: false,
+                    ts_ms: 20,
+                },
+            ]
+        );
+        let json = Store::open("json", Some(dir.path().join("s.json").to_str().unwrap())).unwrap();
+        assert!(json.solver_verdicts(None).unwrap().is_empty());
     }
 
     #[test]
