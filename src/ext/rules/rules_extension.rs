@@ -131,7 +131,11 @@ impl RulesExtension {
             .chain(&self.http_response)
     }
 
-    fn response_facts<'c>(ctx: &'c ResponseCtx<'_>, error_code: Option<&'c str>) -> Facts<'c> {
+    fn response_facts<'c>(
+        ctx: &'c ResponseCtx<'_>,
+        error_code: Option<&'c str>,
+        error_message: Option<&'c str>,
+    ) -> Facts<'c> {
         Facts {
             path: Some(ctx.client_path()),
             api: Some(ctx.api()),
@@ -140,6 +144,7 @@ impl RulesExtension {
             headers: Some(ctx.headers()),
             status: Some(ctx.status().as_u16()),
             error_code,
+            error_message,
             ..Facts::default()
         }
     }
@@ -247,7 +252,7 @@ impl Extension for RulesExtension {
     }
 
     fn wants_error_body(&self, ctx: &ResponseCtx<'_>) -> bool {
-        let facts = Self::response_facts(ctx, None);
+        let facts = Self::response_facts(ctx, None, None);
         self.response.iter().any(|rule| {
             (rule.matcher.needs_error_body()
                 || (!rule.shadow && rule.actions.iter().any(Action::changes_body)))
@@ -259,7 +264,8 @@ impl Extension for RulesExtension {
         let mut flow = ResponseFlow::Continue;
         for rule in &self.response {
             let error_code = ctx.error_code().map(str::to_owned);
-            let facts = Self::response_facts(ctx, error_code.as_deref());
+            let error_message = ctx.error_message().map(str::to_owned);
+            let facts = Self::response_facts(ctx, error_code.as_deref(), error_message.as_deref());
             if !rule.matcher.matches(&facts, false) || !rule.acts() {
                 continue;
             }
@@ -537,6 +543,24 @@ mod tests {
         let ok = response(&rules, 200, json!({}));
         assert!(!ok.wants);
         assert_eq!(ok.flow, ResponseFlow::Continue);
+    }
+
+    #[test]
+    fn a_response_rule_can_match_the_error_message() {
+        let rules = rules(
+            "rules:\n  - name: warming\n    phase: response\n    match: {status: 400, error_message: 'model is warming up'}\n    actions:\n      - retry_next: true\n",
+        );
+
+        let warming = response(
+            &rules,
+            400,
+            json!({"error": {"message": "The model is WARMING UP, retry"}}),
+        );
+        assert!(warming.wants);
+        assert_eq!(warming.flow, ResponseFlow::RetryNext);
+
+        let schema = response(&rules, 400, json!({"error": {"message": "bad schema"}}));
+        assert_eq!(schema.flow, ResponseFlow::Continue);
     }
 
     #[test]

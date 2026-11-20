@@ -42,9 +42,12 @@ impl SmartAutoLive {
         let costs = state.model_costs();
         let mut quotas: HashMap<&str, Option<f64>> = HashMap::new();
         let mut by_model = HashMap::with_capacity(pool.len());
-        let unavailable = health.cooled;
+        let mut unavailable = health.cooled;
         for descriptor in pool {
             let id = strip_1m_suffix(&descriptor.qualified_id);
+            if health.cooled_profiles.contains(&descriptor.profile) {
+                unavailable.insert(id.to_owned());
+            }
             let quota = *quotas
                 .entry(descriptor.profile.as_str())
                 .or_insert_with(|| Self::quota_left(state, &descriptor.profile));
@@ -222,6 +225,27 @@ mod tests {
         assert_eq!(
             collected.signals.get("llmgw/m").quota_remaining_pct,
             Some(20.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cooled_profile_makes_every_model_of_it_unavailable() {
+        let state = state("http://127.0.0.1:9/v1");
+        let pool = descriptors(&["home/a", "home/b[1m]", "remote/m"]);
+        let now = Instant::now();
+        state.model_health().cool_profile(
+            "home",
+            std::time::Duration::from_hours(1),
+            "out of credits".into(),
+            now,
+        );
+        let pool_refs: Vec<&ModelDescriptor> = pool.iter().collect();
+
+        let collected = SmartAutoLive::collect(&state, ENDPOINT, &pool_refs, now);
+
+        assert_eq!(
+            collected.unavailable,
+            HashSet::from(["home/a".to_owned(), "home/b".to_owned()])
         );
     }
 

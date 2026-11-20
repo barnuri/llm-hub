@@ -134,6 +134,8 @@ mod tests {
             copilot_strip_sampling_models: vec![],
             sse_keepalive: None,
             first_byte_timeout: None,
+            quota_cooldown: None,
+            deadline: None,
             copilot_prices_refresh: None,
             keep_warm: KeepWarmConfig::default(),
             pricing: TokenRates::default(),

@@ -187,7 +187,7 @@ The seed table cannot know that a model is down, slow today, dear on this accoun
 
 One further rule keeps a broken model out of the pool, not just lower in the ranking:
 
-- **Cooldown.** A failed attempt cools the model on that route for 30 seconds. Each failure in a row doubles the wait, up to 10 minutes. An answer clears it. The model rejoins the pool when the wait ends, so the next request tests it.
+- **Cooldown.** A failed attempt cools the model on that route for 30 seconds. Each failure in a row doubles the wait, up to 10 minutes. A rate limit that names its reset cools the model until then instead, up to 6 hours. An out-of-credits reply cools every model of the profile for `LLM_HUB_QUOTA_COOLDOWN_SECS`. An answer clears it. The model rejoins the pool when the wait ends, so the next request tests it. See [Fallbacks](fallbacks-and-transforms.md#fallbacks).
 
 A quota only costs points. It applies to every model of the profile, because the hub cannot tell which models a quota meters. A metered model that the upstream refuses is cooled by its own error.
 
@@ -254,7 +254,7 @@ If a check runs out of budget, times out or returns a bad verdict, the draft is 
   - `GET /api/smart-auto/current?worker=<id>` or `?session=<id>`: the worker's main model, its active stages, `age_ms`, and `stale` (true after 10 minutes). `selection` is `null` before the first event. Returns 400 without either parameter.
   - `GET /api/smart-auto/history?workflow=&worker=&since_seq=&limit=`: events after `since_seq`, oldest first. `limit` defaults to 200 and is capped at 1,000.
   - `GET /api/smart-auto/decisions?limit=N`: the newest routes first, from memory, each with its `why`. `limit` defaults to 50 and is capped at 200.
-  - `GET /api/smart-auto/health`: each `(model, route)` the hub attempted, with `failures` in a row, `last_failure`, `cooled_for_ms` (above 0 means skipped), `error_rate`, `outcomes`, `ttft_ms`, `samples` and `speed`. `costs` holds the cost score of each priced model.
+  - `GET /api/smart-auto/health`: each `(model, route)` the hub attempted, with `failures` in a row, `last_failure`, `cooled_for_ms` (above 0 means skipped), `cooled_until_ms` and `cooled_reason` (set when an upstream named the wait), `error_rate`, `outcomes`, `ttft_ms`, `samples` and `speed`. `profiles` lists the profiles skipped as a whole, with `cooled_for_ms`, `cooled_until_ms` and `reason`. `costs` holds the cost score of each priced model.
   - `GET /api/smart-auto/rules`: the active rules, their source (`file`, `env` or `none`), and whether they are read-only.
   - `PUT /api/smart-auto/rules`: checks the JSON, saves it atomically and makes it active. Refused when env rules own the rules.
   - `GET /api/smart-auto/rules/effect`: each known model's outcome under the current rules, with the reason and the glob that decided it.

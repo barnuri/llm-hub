@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
 use crate::schemas::model_context::strip_1m_suffix;
+use crate::services::rate_limit::HINT_CAP;
 
 /// Why an attempt counts against a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -16,14 +17,22 @@ pub enum FailureKind {
     Transport,
     /// The upstream answered with a status that describes the model, not the request.
     Status(u16),
+    /// A success status with an empty body or an error event before any content.
+    BrokenReply,
 }
 
 impl FailureKind {
-    /// The attempt sender reports a timeout as text that starts with `timeout`.
+    /// The attempt sender reports a timeout as text that starts with `timeout`, and the first
+    /// event check a broken reply as [`BROKEN_REPLY_PREFIXES`].
     #[must_use]
     pub fn from_reason(reason: &str) -> FailureKind {
         if reason.starts_with("timeout") {
             FailureKind::Timeout
+        } else if BROKEN_REPLY_PREFIXES
+            .iter()
+            .any(|prefix| reason.starts_with(prefix))
+        {
+            FailureKind::BrokenReply
         } else {
             FailureKind::Transport
         }
@@ -38,10 +47,15 @@ impl FailureKind {
     }
 }
 
+/// The reason prefixes of a 2xx reply that carried no answer.
+pub const BROKEN_REPLY_PREFIXES: [&str; 2] = ["empty reply", "error event"];
+
 #[derive(Debug, Default)]
 struct Entry {
     failures: u32,
     cooled_until: Option<Instant>,
+    /// Why the model is cooled, when an upstream hint set the wait. `None` for the doubling backoff.
+    cooled_reason: Option<String>,
     last_failure: Option<FailureKind>,
     error_rate: f64,
     outcomes: u32,
@@ -61,6 +75,10 @@ pub struct HealthRow {
     pub last_failure: Option<FailureKind>,
     /// Milliseconds left before Smart Auto picks the model again. 0 when it is not cooled.
     pub cooled_for_ms: u64,
+    /// Unix milliseconds when the cooldown ends. `None` when it is not cooled.
+    pub cooled_until_ms: Option<u64>,
+    /// Why the model is cooled, when an upstream said how long: a rate limit reset. `None` for the doubling backoff.
+    pub cooled_reason: Option<String>,
     /// Share of recent attempts that failed on the model's side, 0 to 1.
     pub error_rate: f64,
     pub outcomes: u32,
@@ -71,11 +89,28 @@ pub struct HealthRow {
     pub speed: Option<u8>,
 }
 
+/// A profile the hub skips as a whole, such as one out of credits.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileCooldownRow {
+    pub profile: String,
+    pub cooled_for_ms: u64,
+    pub cooled_until_ms: u64,
+    pub reason: String,
+}
+
+#[derive(Debug)]
+struct ProfileCooldown {
+    until: Instant,
+    reason: String,
+}
+
 /// What the router reads for one endpoint.
 #[derive(Debug, Default)]
 pub struct HealthView {
     /// Models Smart Auto skips now.
     pub cooled: HashSet<String>,
+    /// Profiles Smart Auto skips now, with every model.
+    pub cooled_profiles: HashSet<String>,
     /// Measured speed scores, 0 to 10.
     pub speeds: HashMap<String, u8>,
     /// Recent failure share, 0 to 1.
@@ -89,6 +124,7 @@ pub struct HealthView {
 #[derive(Debug, Default)]
 pub struct ModelHealth {
     entries: Mutex<HashMap<(String, String), Entry>>,
+    profiles: Mutex<HashMap<String, ProfileCooldown>>,
 }
 
 #[allow(
@@ -131,16 +167,71 @@ impl ModelHealth {
         let doublings = (entry.failures - 1).min(Self::MAX_DOUBLINGS);
         let wait = (Self::COOLDOWN_BASE * 2u32.pow(doublings)).min(Self::COOLDOWN_CAP);
         entry.cooled_until = Some(now + wait);
+        entry.cooled_reason = None;
         Self::count_outcome(entry, 1.0, now);
     }
 
-    /// An answer arrived: the model is healthy again.
+    /// Counts a failure like [`ModelHealth::record_failure`], but cools `model` for the `wait`
+    /// the upstream named, at most six hours, instead of the doubling backoff.
+    pub fn record_failure_until(
+        &self,
+        model: &str,
+        endpoint: &str,
+        kind: FailureKind,
+        wait: Duration,
+        reason: String,
+        now: Instant,
+    ) {
+        let mut entries = self.lock();
+        let entry = entries.entry(Self::key(model, endpoint)).or_default();
+        entry.failures = entry.failures.saturating_add(1);
+        entry.last_failure = Some(kind);
+        entry.cooled_until = Some(now + wait.min(HINT_CAP));
+        entry.cooled_reason = Some(reason);
+        Self::count_outcome(entry, 1.0, now);
+    }
+
+    /// Sets the cooldown of a failure already counted to the `wait` an error body named.
+    pub fn set_cooldown(
+        &self,
+        model: &str,
+        endpoint: &str,
+        wait: Duration,
+        reason: String,
+        now: Instant,
+    ) {
+        let mut entries = self.lock();
+        let entry = entries.entry(Self::key(model, endpoint)).or_default();
+        entry.cooled_until = Some(now + wait.min(HINT_CAP));
+        entry.cooled_reason = Some(reason);
+    }
+
+    /// Cools every model of `profile` for `wait`, at most six hours.
+    pub fn cool_profile(&self, profile: &str, wait: Duration, reason: String, now: Instant) {
+        self.lock_profiles().insert(
+            profile.to_owned(),
+            ProfileCooldown {
+                until: now + wait.min(HINT_CAP),
+                reason,
+            },
+        );
+    }
+
+    /// An answer arrived: the model, and its profile, are healthy again.
     pub fn record_success(&self, model: &str, endpoint: &str, now: Instant) {
         let mut entries = self.lock();
         let entry = entries.entry(Self::key(model, endpoint)).or_default();
         entry.failures = 0;
         entry.cooled_until = None;
+        entry.cooled_reason = None;
         Self::count_outcome(entry, 0.0, now);
+        drop(entries);
+        if let Some((profile, _)) = model.split_once('/') {
+            let mut profiles = self.lock_profiles();
+            if !profiles.is_empty() {
+                profiles.remove(profile);
+            }
+        }
     }
 
     /// Adds one time-to-first-byte sample of a streamed answer.
@@ -180,34 +271,71 @@ impl ModelHealth {
                 view.error_rates.insert(model.clone(), rate);
             }
         }
+        drop(entries);
+        view.cooled_profiles = self
+            .lock_profiles()
+            .iter()
+            .filter(|(_, cooldown)| cooldown.until > now)
+            .map(|(profile, _)| profile.clone())
+            .collect();
         view
+    }
+
+    /// The profiles cooled now, the longest wait first.
+    #[must_use]
+    pub fn profile_report(&self, now: Instant) -> Vec<ProfileCooldownRow> {
+        let now_ms = unix_ms_now();
+        let mut rows: Vec<ProfileCooldownRow> = self
+            .lock_profiles()
+            .iter()
+            .filter_map(|(profile, cooldown)| {
+                let left = millis(cooldown.until.checked_duration_since(now)?);
+                (left > 0).then(|| ProfileCooldownRow {
+                    profile: profile.clone(),
+                    cooled_for_ms: left,
+                    cooled_until_ms: now_ms.saturating_add(left),
+                    reason: cooldown.reason.clone(),
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.cooled_for_ms
+                .cmp(&a.cooled_for_ms)
+                .then(a.profile.cmp(&b.profile))
+        });
+        rows
     }
 
     /// Every record, cooled models first, then the slowest.
     #[must_use]
     pub fn report(&self, now: Instant) -> Vec<HealthRow> {
+        let now_ms = unix_ms_now();
         let entries = self.lock();
         let mut rows: Vec<HealthRow> = entries
             .iter()
-            .map(|((model, endpoint), entry)| HealthRow {
-                model: model.clone(),
-                endpoint: endpoint.clone(),
-                failures: entry.failures,
-                last_failure: entry.last_failure,
-                cooled_for_ms: entry
+            .map(|((model, endpoint), entry)| {
+                let cooled_for_ms = entry
                     .cooled_until
                     .and_then(|until| until.checked_duration_since(now))
-                    .map_or(0, |left| {
-                        u64::try_from(left.as_millis()).unwrap_or(u64::MAX)
-                    }),
-                error_rate: Self::error_rate(entry, now).unwrap_or(0.0),
-                outcomes: entry.outcomes,
-                ttft_ms: entry
-                    .ttft_ewma_ms
-                    .filter(|_| Self::fresh(entry.last_sample, now))
-                    .map(|average| average as u64),
-                samples: entry.samples,
-                speed: Self::speed(entry, now),
+                    .map_or(0, millis);
+                let cooled = cooled_for_ms > 0;
+                HealthRow {
+                    model: model.clone(),
+                    endpoint: endpoint.clone(),
+                    failures: entry.failures,
+                    last_failure: entry.last_failure,
+                    cooled_for_ms,
+                    cooled_until_ms: cooled.then(|| now_ms.saturating_add(cooled_for_ms)),
+                    cooled_reason: entry.cooled_reason.clone().filter(|_| cooled),
+                    error_rate: Self::error_rate(entry, now).unwrap_or(0.0),
+                    outcomes: entry.outcomes,
+                    ttft_ms: entry
+                        .ttft_ewma_ms
+                        .filter(|_| Self::fresh(entry.last_sample, now))
+                        .map(|average| average as u64),
+                    samples: entry.samples,
+                    speed: Self::speed(entry, now),
+                }
             })
             .collect();
         rows.sort_by(|a, b| {
@@ -259,6 +387,22 @@ impl ModelHealth {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    fn lock_profiles(&self) -> std::sync::MutexGuard<'_, HashMap<String, ProfileCooldown>> {
+        self.profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, millis)
 }
 
 #[cfg(test)]
@@ -332,6 +476,103 @@ mod tests {
     }
 
     #[test]
+    fn a_hinted_wait_replaces_the_backoff_and_shows_its_reason() {
+        let health = ModelHealth::default();
+        let now = Instant::now();
+        health.record_failure_until(
+            MODEL,
+            MESSAGES,
+            FailureKind::Status(429),
+            Duration::from_secs(90),
+            "rate limited: retry-after".into(),
+            now,
+        );
+        let row = &health.report(now)[0];
+        assert_eq!(row.cooled_for_ms, 90_000);
+        assert_eq!(
+            row.cooled_reason.as_deref(),
+            Some("rate limited: retry-after")
+        );
+        assert!(row.cooled_until_ms.unwrap() > 90_000);
+        assert!(
+            health
+                .view(MESSAGES, now + Duration::from_secs(89))
+                .cooled
+                .contains(MODEL)
+        );
+        assert!(
+            health
+                .view(MESSAGES, now + Duration::from_secs(91))
+                .cooled
+                .is_empty()
+        );
+
+        health.set_cooldown(
+            MODEL,
+            MESSAGES,
+            Duration::from_hours(100),
+            "long".into(),
+            now,
+        );
+        assert_eq!(
+            cooled_ms(&health, now),
+            6 * 3_600_000,
+            "capped at six hours"
+        );
+
+        health.record_failure(MODEL, MESSAGES, FailureKind::Status(429), now);
+        let row = &health.report(now)[0];
+        assert_eq!(row.cooled_reason, None, "the backoff has no reason");
+        assert_eq!(row.failures, 2);
+        let later = now + Duration::from_hours(1);
+        let row = &health.report(later)[0];
+        assert_eq!(
+            (row.cooled_until_ms, row.cooled_reason.as_ref()),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn a_cooled_profile_is_skipped_until_it_answers_again() {
+        let health = ModelHealth::default();
+        let now = Instant::now();
+        health.cool_profile(
+            "llmgw",
+            Duration::from_hours(1),
+            "out of credits".into(),
+            now,
+        );
+
+        assert!(health.view(MESSAGES, now).cooled_profiles.contains("llmgw"));
+        let rows = health.profile_report(now);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (
+                rows[0].profile.as_str(),
+                rows[0].cooled_for_ms,
+                rows[0].reason.as_str()
+            ),
+            ("llmgw", 3_600_000, "out of credits")
+        );
+        assert!(
+            health
+                .profile_report(now + Duration::from_hours(2))
+                .is_empty()
+        );
+        assert!(
+            health
+                .view(MESSAGES, now + Duration::from_hours(2))
+                .cooled_profiles
+                .is_empty()
+        );
+
+        health.record_success("other/m", MESSAGES, now);
+        assert_eq!(health.profile_report(now).len(), 1);
+        health.record_success(MODEL, MESSAGES, now);
+        assert!(health.profile_report(now).is_empty());
+    }
+
+    #[test]
     fn only_model_side_statuses_count_as_failures() {
         for status in [404, 408, 429, 500, 502, 503, 529] {
             assert!(FailureKind::from_status(status).is_some(), "{status}");
@@ -343,6 +584,14 @@ mod tests {
         assert_eq!(
             FailureKind::from_reason("connect error: refused"),
             FailureKind::Transport
+        );
+        assert_eq!(
+            FailureKind::from_reason("empty reply: no content"),
+            FailureKind::BrokenReply
+        );
+        assert_eq!(
+            FailureKind::from_reason("error event: overloaded"),
+            FailureKind::BrokenReply
         );
     }
 

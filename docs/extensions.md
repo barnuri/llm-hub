@@ -119,6 +119,13 @@ rules:
     actions:
       - retry_next: true
 
+  # A gateway that answers 400 while it warms a model up.
+  - name: warming
+    phase: response
+    match: { status: 400, error_message: "model is warming up" }
+    actions:
+      - retry_next: true
+
   # A local server that rejects OpenAI's `metadata` field.
   - name: no-metadata-local
     phase: attempt
@@ -144,6 +151,7 @@ in the same phase sees the changes of an earlier one, including a model that `se
 | `stream` | request, attempt | The body's `stream` flag |
 | `status` | response, http_response | A status (`400`) or class (`5xx`) |
 | `error_code` | response | `error.code` in the JSON error body |
+| `error_message` | response | Part of the error message (`error.message`, a string `error`, `message` or `detail`), in any case |
 
 `header` takes a map and `stream` takes `true` or `false`. Every other key takes one value or a
 list, and a list matches when any value matches. A key that a phase cannot

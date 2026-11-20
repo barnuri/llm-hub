@@ -59,7 +59,8 @@ Routes marked "key" need a key only when [hub auth](#hub-authentication) is on.
 | Header | Direction | Purpose |
 |---|---|---|
 | `X-LLM-Hub-Fallbacks` (alias `X-Fallbacks`) | request | Comma-separated fallback chain. See [Fallbacks](fallbacks-and-transforms.md#fallbacks). |
-| `X-LLM-Hub-Timeout-Ms` | request | Deadline per attempt. |
+| `X-LLM-Hub-Timeout-Ms` | request | Time limit of each attempt, to the upstream's response headers. |
+| `X-LLM-Hub-Deadline-Ms` | request | One time limit for the whole fallback chain. Past it, the hub skips the rest and answers 504. `0` turns `LLM_HUB_DEADLINE_MS` off. See [Fallbacks](fallbacks-and-transforms.md#fallbacks). |
 | `X-LLM-Hub-Retry-On` | request | Statuses that trigger a retry, for example `429,503`. |
 | `X-LLM-Hub-System-Prompt-Mode` | request | See [Request transforms](fallbacks-and-transforms.md#request-transforms). |
 | `X-LLM-Hub-Reasoning-Strip` | request | See [Request transforms](fallbacks-and-transforms.md#request-transforms). |

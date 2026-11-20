@@ -261,7 +261,13 @@ mod tests {
         assert!(sources.load_rules(&HashMap::new()).unwrap().is_none());
         assert_eq!(
             sources.compose(None).names(),
-            ["copilot-context-code", "payload-too-large", "library"]
+            [
+                "copilot-context-code",
+                "payload-too-large",
+                "local-not-ready",
+                "upstream-limits",
+                "library"
+            ]
         );
     }
 
@@ -283,6 +289,8 @@ mod tests {
             [
                 "copilot-context-code",
                 "payload-too-large",
+                "local-not-ready",
+                "upstream-limits",
                 "library",
                 "rules"
             ]
@@ -328,7 +336,13 @@ mod tests {
         assert!(reload(&state, &sources, &vars).unwrap().contains("cleared"));
         assert_eq!(
             state.extensions().names(),
-            ["copilot-context-code", "payload-too-large", "library"]
+            [
+                "copilot-context-code",
+                "payload-too-large",
+                "local-not-ready",
+                "upstream-limits",
+                "library"
+            ]
         );
     }
 

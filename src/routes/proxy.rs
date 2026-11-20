@@ -18,6 +18,7 @@ use crate::consts::{
     PROMPT_REFUSAL_MARGIN_PERCENT, SSE_KEEPALIVE_FRAME, USAGE_SCRAPE_TAIL_BYTES,
 };
 use crate::dependencies::state::AppState;
+use crate::ext::builtin::AttemptNote;
 use crate::ext::{Api, AttemptTarget, ResponseFlow, ResponseTarget};
 use crate::routes::models::{COPILOT_AUTO_MODEL, advertised_bare_id};
 use crate::schemas::affinity_key::AffinityKey;
@@ -65,12 +66,14 @@ use crate::services::copilot_body_fields::BodyField;
 use crate::services::copilot_headers::{HEADER_X_INITIATOR, INITIATOR_AGENT};
 use crate::services::extension_phases;
 use crate::services::fallback::{
-    RetryPolicy, fallback_chain, per_attempt_timeout_ms, retain_eligible,
+    RetryPolicy, chain_deadline, fallback_chain, per_attempt_timeout_ms, retain_eligible, shorter,
 };
+use crate::services::first_event::{FirstEventCheck, first_event};
 use crate::services::harness::client_signature;
 use crate::services::keep_warm::{ApiShape, KeepWarm, KeepWarmLease, PingPlan, PingTarget};
 use crate::services::model_health::FailureKind;
 use crate::services::multipart_model;
+use crate::services::rate_limit::{CooldownHint, CooldownScope, reset_after};
 use crate::services::request_images::request_has_image;
 use crate::services::responses_chat::{self, ChatStream};
 use crate::services::responses_item_ids::ResponsesItemIds;
@@ -240,6 +243,7 @@ pub(crate) async fn attempt_loop(
     body: Bytes,
     route: RouteKind,
 ) -> Result<Response, AppError> {
+    let received = Instant::now();
     let extensions = state.extensions();
     let mut ext_state = Extensions::new();
     let (changed_headers, body) = extension_phases::request_phase(
@@ -294,6 +298,8 @@ pub(crate) async fn attempt_loop(
     // The raw client body, kept only for the Anthropic route's prompt shape row.
     let shape_body = (bodies.route == RouteKind::Anthropic).then(|| body.clone());
     let attempt_timeout = per_attempt_timeout_ms(headers).map(Duration::from_millis);
+    let deadline_limit = chain_deadline(headers, config.deadline);
+    let deadline = deadline_limit.map(|limit| received + limit);
     let client_body = bodies
         .native
         .as_ref()
@@ -310,6 +316,11 @@ pub(crate) async fn attempt_loop(
     let mut routed = smart.as_ref().map(|plan| plan.template.clone());
 
     for (index, requested) in chain.iter().enumerate() {
+        if let (Some(limit), Some(ends)) = (deadline_limit, deadline)
+            && Instant::now() >= ends
+        {
+            return Err(deadline_exceeded(limit, &attempts_trail, &chain[index..]));
+        }
         let auto = resolve_auto(state, &bodies, requested).await;
         if let Some(pick) = &auto {
             routed = Some(pick.template.clone());
@@ -392,7 +403,8 @@ pub(crate) async fn attempt_loop(
             model_id,
             attempt_timeout.or(first_byte),
             session_token,
-        );
+        )
+        .with_deadline(deadline);
         let mut keep_warm = keep_warm_lease(state, &attempt, model_id, worker.as_deref());
         let (result, retried_body) = match sender.send(attempt.body.clone()).await {
             Ok(response) if attempt.native_messages => {
@@ -417,13 +429,25 @@ pub(crate) async fn attempt_loop(
             Ok(response) => (Ok(attempt.reply_rewrite.apply(response).await), None),
             other => (other, None),
         };
-        let result = match (result, first_byte) {
-            (Ok(response), Some(limit))
-                if SUCCESS_STATUS_RANGE.contains(&response.status().as_u16()) =>
+        // A fallback that remains needs the first event before the client gets anything, so an
+        // empty or broken success can still move on. Without one, only a time limit applies.
+        let has_next = index < last_index;
+        let result = match result {
+            Ok(response)
+                if SUCCESS_STATUS_RANGE.contains(&response.status().as_u16())
+                    && (has_next || first_byte.is_some() || deadline.is_some()) =>
             {
-                await_first_chunk(response, limit.saturating_sub(started.elapsed())).await
+                let limit = shorter(
+                    first_byte.map(|limit| limit.saturating_sub(started.elapsed())),
+                    deadline.map(|ends| ends.saturating_duration_since(Instant::now())),
+                );
+                let check = FirstEventCheck {
+                    limit,
+                    judge: has_next,
+                };
+                first_event(response, check).await
             }
-            (other, _) => other,
+            other => other,
         };
         note_attempt_health(state, model_id, client_path, &result);
 
@@ -440,6 +464,10 @@ pub(crate) async fn attempt_loop(
                 let (response, flow, client_changes) =
                     extension_phases::response_phase(&extensions, target, response, &mut ext_state)
                         .await;
+                let note = ext_state.remove::<AttemptNote>();
+                if let Some(hint) = ext_state.remove::<CooldownHint>() {
+                    apply_cooldown_hint(state, &config, model_id, client_path, hint);
+                }
                 let client_changes = if attempt.route == RouteKind::Anthropic {
                     client_changes.without_body()
                 } else {
@@ -556,7 +584,12 @@ pub(crate) async fn attempt_loop(
                     model_id,
                     status,
                     started,
-                    format!("HTTP {status}; retried on the next fallback"),
+                    note.map_or_else(
+                        || format!("HTTP {status}; retried on the next fallback"),
+                        |AttemptNote(why)| {
+                            format!("HTTP {status} ({why}); retried on the next fallback")
+                        },
+                    ),
                     client.clone(),
                     worker.clone(),
                     routed_by.clone(),
@@ -592,6 +625,11 @@ pub(crate) async fn attempt_loop(
                         .as_ref(),
                 );
                 if index == last_index {
+                    if let (Some(limit), Some(ends)) = (deadline_limit, deadline)
+                        && Instant::now() >= ends
+                    {
+                        return Err(deadline_exceeded(limit, &attempts_trail, &[]));
+                    }
                     return Err(AppError::UpstreamUnavailable(format!(
                         "all attempts failed: {}",
                         attempts_trail.join(", ")
@@ -603,28 +641,48 @@ pub(crate) async fn attempt_loop(
     unreachable!("attempt loop always returns on the last attempt");
 }
 
-/// Waits up to `limit` for the first body chunk of a streamed 2xx reply, then hands back a reply
-/// that still carries that chunk. A silent upstream becomes the `timeout` error, so the loop
-/// marks the model and tries the next one. Nothing is buffered beyond the one chunk.
-async fn await_first_chunk(
-    response: reqwest::Response,
-    limit: Duration,
-) -> Result<reqwest::Response, String> {
-    let (status, version, headers) = (
-        response.status(),
-        response.version(),
-        response.headers().clone(),
-    );
-    let mut chunks = response.bytes_stream();
-    let first = match tokio::time::timeout(limit, chunks.next()).await {
-        Err(_elapsed) => return Err("timeout: no first byte".to_owned()),
-        Ok(None) => None,
-        Ok(Some(Err(error))) => return Err(format!("read error: {error}")),
-        Ok(Some(Ok(chunk))) => Some(chunk),
+/// The 504 of a chain whose deadline passed: the attempts made and the models it skipped.
+fn deadline_exceeded(limit: Duration, tried: &[String], skipped: &[ModelId]) -> AppError {
+    let tried = if tried.is_empty() {
+        "none".to_owned()
+    } else {
+        tried.join(", ")
     };
-    let head = futures_util::stream::iter(first.map(Ok::<Bytes, reqwest::Error>));
-    let body = reqwest::Body::wrap_stream(head.chain(chunks));
-    Ok(rebuilt_response(status, version, headers, body))
+    let mut message = format!(
+        "the fallback deadline of {} ms passed; attempts: {tried}",
+        limit.as_millis()
+    );
+    if !skipped.is_empty() {
+        let skipped: Vec<String> = skipped.iter().map(ModelId::qualified).collect();
+        message.push_str("; skipped: ");
+        message.push_str(&skipped.join(", "));
+    }
+    AppError::DeadlineExceeded(message)
+}
+
+/// Applies a cooldown a built-in read from an error body. A profile-wide one without its own
+/// wait uses `LLM_HUB_QUOTA_COOLDOWN_SECS`.
+fn apply_cooldown_hint(
+    state: &AppState,
+    config: &HubConfig,
+    model_id: &ModelId,
+    endpoint: &str,
+    hint: CooldownHint,
+) {
+    let (health, now) = (state.model_health(), Instant::now());
+    match hint.scope {
+        CooldownScope::Profile => {
+            if let Some(wait) = hint.wait.or(config.quota_cooldown) {
+                tracing::warn!(profile = %model_id.profile, wait_s = wait.as_secs(), reason = %hint.reason, "profile cooled");
+                health.cool_profile(&model_id.profile, wait, hint.reason, now);
+            }
+        }
+        CooldownScope::Model => {
+            if let Some(wait) = hint.wait {
+                health.set_cooldown(&model_id.qualified(), endpoint, wait, hint.reason, now);
+            }
+        }
+    }
 }
 
 /// Feeds one attempt's result into the model health record: an answer clears the model, a
@@ -643,13 +701,30 @@ fn note_attempt_health(
             if SUCCESS_STATUS_RANGE.contains(&status) {
                 health.record_success(&model, endpoint, now);
             } else if let Some(kind) = FailureKind::from_status(status) {
-                health.record_failure(&model, endpoint, kind, now);
+                let hinted = matches!(status, 429 | 503)
+                    .then(|| reset_after(response.headers(), unix_ms_now()))
+                    .flatten();
+                match hinted {
+                    Some((wait, source)) => {
+                        let reason = format!("HTTP {status}: {source} {} s", wait.as_secs());
+                        health.record_failure_until(&model, endpoint, kind, wait, reason, now);
+                    }
+                    None => health.record_failure(&model, endpoint, kind, now),
+                }
             }
         }
         Err(reason) => {
             health.record_failure(&model, endpoint, FailureKind::from_reason(reason), now);
         }
     }
+}
+
+fn unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// How many next-best pool models a Smart Auto request may try after its explicit fallbacks.
@@ -2047,6 +2122,7 @@ async fn attempt_single(
         attempt_timeout,
         force_identity_encoding: false,
         session_token: None,
+        deadline: None,
     };
     let response = sender
         .send(body)
@@ -2094,6 +2170,7 @@ pub(crate) async fn send_stage(
         attempt_timeout: None,
         force_identity_encoding: true,
         session_token: None,
+        deadline: None,
     };
     let response = sender.send(body).await?;
     Ok(if may_reply_natively(state, STAGE_CHAT_PATH, sent_id) {
@@ -2196,9 +2273,15 @@ struct AttemptSender<'a> {
     /// caller's `accept-encoding` is replaced (not appended to) with `identity`.
     force_identity_encoding: bool,
     session_token: Option<&'a str>,
+    /// When the fallback chain runs out of time. Each send waits at most until then.
+    deadline: Option<Instant>,
 }
 
 impl<'a> AttemptSender<'a> {
+    fn with_deadline(self, deadline: Option<Instant>) -> Self {
+        AttemptSender { deadline, ..self }
+    }
+
     fn for_attempt(
         state: &'a AppState,
         method: &'a Method,
@@ -2216,6 +2299,7 @@ impl<'a> AttemptSender<'a> {
             attempt_timeout,
             force_identity_encoding: attempt.force_identity_encoding,
             session_token,
+            deadline: None,
         }
     }
 
@@ -2239,9 +2323,12 @@ impl<'a> AttemptSender<'a> {
             upstream_path: self.path.as_str(),
             headers: self.headers,
             force_identity_encoding: self.force_identity_encoding,
-            timeout: self
-                .attempt_timeout
-                .or(profile.timeout_ms.map(Duration::from_millis)),
+            timeout: shorter(
+                self.attempt_timeout
+                    .or(profile.timeout_ms.map(Duration::from_millis)),
+                self.deadline
+                    .map(|ends| ends.saturating_duration_since(Instant::now())),
+            ),
             session_token: self.session_token,
         };
         let (response, copilot_bearer) = upstream.send(body.clone()).await?;
@@ -2433,6 +2520,7 @@ pub(crate) async fn send_keep_warm_ping(state: &AppState, ping: PingPlan) {
         attempt_timeout: None,
         force_identity_encoding: true,
         session_token: None,
+        deadline: None,
     };
     let started = Instant::now();
     let (status, raw, upstream_end) = match sender.send(body).await {
@@ -4262,51 +4350,6 @@ mod tests {
         // separate them.
         let first = chunks.iter().position(|c| c == "data: one\n\n").unwrap();
         assert_eq!(chunks[first + 1], "data: two\n\n", "{chunks:?}");
-    }
-
-    fn streamed_reply(
-        body: impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync + 'static,
-    ) -> reqwest::Response {
-        rebuilt_response(
-            StatusCode::OK,
-            reqwest::Version::HTTP_11,
-            HeaderMap::new(),
-            reqwest::Body::wrap_stream(body),
-        )
-    }
-
-    #[tokio::test]
-    async fn a_silent_stream_hits_the_first_byte_limit() {
-        let reply = streamed_reply(stream::pending());
-
-        let result = await_first_chunk(reply, Duration::from_millis(50)).await;
-
-        assert_eq!(result.unwrap_err(), "timeout: no first byte");
-    }
-
-    #[tokio::test]
-    async fn the_first_chunk_is_kept_in_the_reply() {
-        let chunks = stream::iter([
-            Ok(Bytes::from_static(b"data: one\n\n")),
-            Ok(Bytes::from_static(b"data: two\n\n")),
-        ]);
-
-        let reply = await_first_chunk(streamed_reply(chunks), Duration::from_secs(5))
-            .await
-            .unwrap();
-
-        assert_eq!(reply.status(), StatusCode::OK);
-        let body = reply.bytes().await.unwrap();
-        assert_eq!(&body[..], b"data: one\n\ndata: two\n\n");
-    }
-
-    #[tokio::test]
-    async fn an_empty_stream_is_not_a_timeout() {
-        let reply = await_first_chunk(streamed_reply(stream::empty()), Duration::from_secs(5))
-            .await
-            .unwrap();
-
-        assert!(reply.bytes().await.unwrap().is_empty());
     }
 
     #[tokio::test]
