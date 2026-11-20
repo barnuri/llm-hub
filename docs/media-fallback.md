@@ -29,6 +29,26 @@ with `[truncated]`.
 The caption prompt is: "Describe this image factually and concisely for a reader who cannot see
 it. Include any visible text verbatim." A caption has at most 300 tokens.
 
+The vision and speech models get only the media item: one image with the caption prompt, or one
+audio file. They never see the chat, the system prompt or the other parts.
+
+## Skip instead of convert
+
+`LLM_HUB_MEDIA_SKIP=true` (off by default) drops a media part that a text-only model cannot read,
+with no model call, and leaves a `<system-reminder>` text part in its place that says the image,
+audio or document was removed and asks the model to tell the user if it matters. The Models page
+panel has a checkbox for it.
+
+| `LLM_HUB_MEDIA_FALLBACK` | `LLM_HUB_MEDIA_SKIP` | A media part for a text-only model becomes |
+|---|---|---|
+| `false` | `false` | Unchanged. A model known to refuse images is skipped for an image request |
+| `true` | `false` | Its text, or `[<kind> omitted: <reason>]` when no model is set for its kind |
+| `false` | `true` | A skip reminder. No model call |
+| `true` | `true` | Its text, or a skip reminder when no model is set for its kind |
+
+A conversion that fails (timeout, error, size limit) stays an `[<kind> omitted: <reason>]` part in
+both modes.
+
 ## Which models get text
 
 A model gets text when one of these holds:

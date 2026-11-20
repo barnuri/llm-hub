@@ -55,6 +55,7 @@ cannot read them. Off by default. See [Media fallback](media-fallback.md).
 | Variable | Default | Purpose |
 |---|---|---|
 | `LLM_HUB_MEDIA_FALLBACK` | `false` | Turns media fallback on. |
+| `LLM_HUB_MEDIA_SKIP` | `false` | Drops media a text-only model cannot read, with no model call, and leaves a system reminder in its place. With `LLM_HUB_MEDIA_FALLBACK` on, only the media no model is set to convert. |
 | `LLM_HUB_MEDIA_FALLBACK_VISION_MODEL` | `llama_swap/muse-glimmer-30b` | The `<profile>/<model>` that captions images. Empty: images become placeholders. |
 | `LLM_HUB_MEDIA_FALLBACK_STT_MODEL` | unset | The `<profile>/<model>` that transcribes audio through `/v1/audio/transcriptions`. Unset: audio becomes a placeholder. |
 | `LLM_HUB_MEDIA_FALLBACK_TEXT_ONLY` | empty | Comma-separated model globs (`llama_swap/*`) that always get text, on top of the models the hub knows cannot read images. |
