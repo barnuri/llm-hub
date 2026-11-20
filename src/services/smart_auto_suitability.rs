@@ -70,6 +70,9 @@ impl SmartAutoSuitability {
     const VALIDATION: usize = 4;
     const CONVERSATION: usize = 5;
     const PATH_SEPARATOR: char = '/';
+    const QUALITY_COLUMNS: u32 = 6;
+    /// Seed quality runs 0-10, so ten points of percentage per step.
+    const QUALITY_TO_PCT: f64 = 10.0;
     // A family the table does not know is average at every role and earns no cost or speed credit.
     const UNKNOWN: FamilySeed = FamilySeed::contains(&[], [5, 5, 5, 5, 5, 5], 3, 3);
     // Quality columns: planning, investigation, implementation, plan-backed implementation,
@@ -183,6 +186,21 @@ impl SmartAutoSuitability {
         (errors + quota).round() as u32
     }
 
+    /// Seed quality of `model_id` on a 0-100 scale: one role column, or the mean of all six
+    /// columns when `role` is `None`. An unknown family scores 50.
+    #[must_use]
+    pub fn quality_pct(model_id: &str, role: Option<WorkRole>) -> f64 {
+        let quality = &Self::seed(model_id).quality;
+        let (points, columns) = match role {
+            Some(role) => (u32::from(quality[Self::column(role, false)]), 1),
+            None => (
+                quality.iter().map(|value| u32::from(*value)).sum(),
+                Self::QUALITY_COLUMNS,
+            ),
+        };
+        f64::from(points) * Self::QUALITY_TO_PCT / f64::from(columns)
+    }
+
     fn seed(model_id: &str) -> &'static FamilySeed {
         Self::family(model_id).unwrap_or(&Self::UNKNOWN)
     }
@@ -255,6 +273,15 @@ mod tests {
     fn quality(model_id: &str, role: WorkRole, plan_backed: bool) -> u8 {
         SmartAutoSuitability::seed(model_id).quality
             [SmartAutoSuitability::column(role, plan_backed)]
+    }
+
+    #[test]
+    fn quality_pct_reads_one_role_or_the_mean() {
+        let opus = "copilot/claude-opus-5-5";
+        let planning = SmartAutoSuitability::quality_pct(opus, Some(WorkRole::Planning));
+        assert!((planning - 100.0).abs() < 1e-9);
+        assert!((SmartAutoSuitability::quality_pct(opus, None) - 96.666).abs() < 0.01);
+        assert!((SmartAutoSuitability::quality_pct("x/unknown", None) - 50.0).abs() < 1e-9);
     }
 
     #[test]

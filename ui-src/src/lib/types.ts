@@ -277,6 +277,7 @@ export interface ModelInsight {
   readonly last_success_ms: number | null;
   readonly last_error_ms: number | null;
   readonly ranked: boolean;
+  readonly quality_score: number | null;
   readonly stability_score: number | null;
   readonly speed_score: number | null;
   readonly overall_score: number | null;

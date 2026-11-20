@@ -32,6 +32,9 @@ pub struct ModelInsight {
     pub last_success_ms: Option<u64>,
     pub last_error_ms: Option<u64>,
     pub ranked: bool,
+    /// Seed capability tier of the model family, 0-100. Not measured from answers.
+    pub quality_score: Option<f64>,
+    /// 95% lower bound of the success rate, so few calls cannot score high.
     pub stability_score: Option<f64>,
     pub speed_score: Option<f64>,
     pub overall_score: Option<f64>,

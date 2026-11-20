@@ -141,6 +141,11 @@
   height: 100%;
 }
 
+.insights-bar-part.quality,
+.insights-swatch.quality {
+  background: var(--text);
+}
+
 .insights-bar-part.reliability,
 .insights-swatch.reliability {
   background: var(--accent);

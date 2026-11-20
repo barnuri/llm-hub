@@ -2,23 +2,22 @@ import { useEffect, useState } from "react";
 
 import { ModelName } from "../components/ModelName";
 import { Panel } from "../components/Panel";
-import { Pill, type PillTone } from "../components/Pill";
 import { Segmented, type SegmentedOption } from "../components/Segmented";
 import { ShareBar } from "../components/ShareBar";
 import { TopList, type TopListItem } from "../components/TopList";
 import { api } from "../lib/api";
-import { formatMs, formatNumber, formatPct, formatTps, formatUsd } from "../lib/format";
+import { formatCompact, formatMs, formatNumber, formatPct, formatTps, formatUsd } from "../lib/format";
 import { navigate, useRoute } from "../lib/router";
 import type {
   HarnessInsight,
   InsightLeaders,
   InsightsRange,
   InsightsReport,
-  ModelHealth,
   ModelInsight,
   ModelPick,
   UseCasePick,
 } from "../lib/types";
+import { HealthPill, InsightsModelsTable } from "./InsightsModelsTable";
 import "../styles/screens/insights.css";
 
 interface InsightsScreenProps {
@@ -39,22 +38,9 @@ const MIN_CALL_SEGMENTS: readonly SegmentedOption<string>[] = MIN_CALL_OPTIONS.m
 }));
 const DEFAULT_MIN_CALLS = 5;
 const TOP_COUNT = 3;
-const STABILITY_WEIGHT = 0.6;
-const SPEED_WEIGHT = 0.4;
-
-const HEALTH_LABEL: Readonly<Record<ModelHealth, string>> = {
-  healthy: "Healthy",
-  degraded: "Degraded",
-  failing: "Failing now",
-  insufficient_data: "Too few calls",
-};
-
-const HEALTH_TONE: Readonly<Record<ModelHealth, PillTone>> = {
-  healthy: "ok",
-  degraded: "warn",
-  failing: "danger",
-  insufficient_data: "neutral",
-};
+const QUALITY_WEIGHT = 0.5;
+const STABILITY_WEIGHT = 0.3;
+const SPEED_WEIGHT = 0.2;
 
 function parseRange(value: string | null): InsightsRange {
   if (value === "1d" || value === "7d" || value === "30d" || value === "all") {
@@ -70,24 +56,6 @@ function parseMinCalls(value: string | null): number {
 
 function fullName(model: string | null): string {
   return model || "—";
-}
-
-function formatContext(tokens: number | null): string {
-  if (!tokens) {
-    return "—";
-  }
-  if (tokens >= 1_000_000) {
-    return `${formatNumber(tokens / 1_000_000, 1)}M`;
-  }
-  const unit = tokens % 1024 === 0 ? 1024 : 1000;
-  return `${formatNumber(Math.round(tokens / unit))}k`;
-}
-
-function formatRate(tokensPerSec: number | null): string {
-  if (!tokensPerSec) {
-    return "—";
-  }
-  return formatNumber(tokensPerSec, tokensPerSec >= 100 ? 0 : 1);
 }
 
 function formatCostPerCall(cents: number | null): string {
@@ -155,7 +123,6 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
   const models = report?.models ?? [];
   const modelsById = new Map(models.map((model) => [model.model, model] as const));
   const ranked = models.filter((model) => model.ranked);
-  const unranked = models.filter((model) => !model.ranked);
   const pickUrl = `${window.location.origin}/api/insights/pick?${queryString(range, minCalls)}`;
   const agentReportPath = `/api/insights/report?${queryString(range, minCalls)}`;
   const agentReportUrl = `${window.location.origin}${agentReportPath}`;
@@ -240,25 +207,27 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
         </Panel>
       </div>
 
-      {report ? <Leaders leaders={report.leaders} modelsById={modelsById} /> : null}
+      {report ? <Leaders leaders={report.leaders} modelsById={modelsById} onCopy={onCopy} /> : null}
 
-      {report ? <ValuePicks report={report} modelsById={modelsById} /> : null}
+      {report ? <ValuePicks report={report} modelsById={modelsById} onCopy={onCopy} /> : null}
 
-      {report && report.best_for.length > 0 ? <BestFor picks={report.best_for} modelsById={modelsById} /> : null}
+      {report && report.best_for.length > 0 ? <BestFor picks={report.best_for} modelsById={modelsById} onCopy={onCopy} /> : null}
 
       {ranked.length > 0 ? (
         <Panel
           title="Ranking"
-          sub={`top ${TOP_COUNT} of ${formatNumber(ranked.length)} ranked · overall = 60% reliability + 40% speed`}
+          sub={`top ${TOP_COUNT} of ${formatNumber(ranked.length)} ranked · overall = 50% quality + 30% reliability + 20% speed`}
           actions={
             <div className="insights-legend dim" aria-hidden="true">
+              <span className="insights-swatch quality" /> Quality
               <span className="insights-swatch reliability" /> Reliability
               <span className="insights-swatch speed" /> Speed
             </div>
           }
         >
           <p className="dim insights-panel-note">
-            Speed compares first-token time and output speed with the best ranked model. The full list is under All
+            Quality is the public capability tier of the model family. Reliability is the 95% lower bound of the
+            success rate, so a model with few calls scores lower. Speed compares first-token time and output speed with the best ranked model. The full list is under All
             models.
           </p>
           <div className="table-scroll">
@@ -287,57 +256,14 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
       {models.length > 0 ? (
         <Panel
           title="All models"
-          sub={`${formatNumber(models.length)} models, ranked first`}
+          sub={`${formatNumber(models.length)} models, ranked first · click a column to sort`}
           actions={
             <span className="insights-abbr">
               TTFT = first token · Out = output speed · Prefill = prompt reading · Value = score per US cent per call
             </span>
           }
         >
-          <div className="table-scroll insights-table-scroll">
-            <table className="table insights-models">
-              <thead>
-                <tr>
-                  <th>Model</th>
-                  <th>Good for</th>
-                  <th>Health</th>
-                  <th className="num" title="Context window">
-                    Ctx
-                  </th>
-                  <th className="num">Calls</th>
-                  <th className="num">Success</th>
-                  <th className="num" title="Time to first token, median">
-                    TTFT p50
-                  </th>
-                  <th className="num" title="Time to first token, slow tail">
-                    TTFT p95
-                  </th>
-                  <th className="num" title="Output speed, median">
-                    Out tok/s
-                  </th>
-                  <th className="num" title="Prompt reading speed, median">
-                    Prefill tok/s
-                  </th>
-                  <th className="num" title="Prompt share served from cache">
-                    Cache
-                  </th>
-                  <th className="num" title="Estimated spend in the window">
-                    Cost
-                  </th>
-                  <th className="num" title="Score per US cent per successful call">
-                    Value
-                  </th>
-                  <th>Best harness</th>
-                  <th>Most common error</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[...ranked, ...unranked].map((model) => (
-                  <DetailRow key={model.model} model={model} />
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <InsightsModelsTable models={models} onCopy={onCopy} />
         </Panel>
       ) : report && !unavailable ? (
         <Panel title="All models">
@@ -353,9 +279,11 @@ export function InsightsScreen({ onCopy }: InsightsScreenProps) {
 function ValuePicks({
   report,
   modelsById,
+  onCopy,
 }: {
   readonly report: InsightsReport;
   readonly modelsById: ReadonlyMap<string, ModelInsight>;
+  readonly onCopy: (text: string) => void;
 }) {
   const freeItems: TopListItem[] = byIds(modelsById, report.best_free).map((model) => ({
     model: model.model,
@@ -364,7 +292,7 @@ function ValuePicks({
   }));
   const valueItems: TopListItem[] = byIds(modelsById, report.best_value).map((model) => ({
     model: model.model,
-    value: formatNumber(model.value_score ?? 0, 1),
+    value: formatCompact(model.value_score ?? 0),
     sub: `${formatCostPerCall(model.cost_per_call_cents)} per call · overall ${formatNumber(model.overall_score ?? 0, 1)}`,
   }));
   return (
@@ -372,6 +300,7 @@ function ValuePicks({
       <Panel title="Best free models" sub="run on a local profile, cost $0" className="insights-free">
         <TopList
           items={freeItems}
+          onCopy={onCopy}
           empty="No free model is ranked yet. Local models appear here after enough calls."
           limit={TOP_COUNT}
         />
@@ -379,6 +308,7 @@ function ValuePicks({
       <Panel title="Best value" sub="overall score per US cent per call" className="insights-value">
         <TopList
           items={valueItems}
+          onCopy={onCopy}
           empty="No paid model is ranked yet, or none has a priced call in this window."
           limit={TOP_COUNT}
         />
@@ -390,9 +320,11 @@ function ValuePicks({
 function BestFor({
   picks,
   modelsById,
+  onCopy,
 }: {
   readonly picks: readonly UseCasePick[];
   readonly modelsById: ReadonlyMap<string, ModelInsight>;
+  readonly onCopy: (text: string) => void;
 }) {
   return (
     <Panel title="Best model for each job" sub="top three per use case, from the model registry tags">
@@ -408,6 +340,7 @@ function BestFor({
               <span className="kpi-label">Best for {pick.use_case}</span>
               <TopList
                 items={items}
+                onCopy={onCopy}
                 empty="No model is tagged for this job yet."
                 limit={TOP_COUNT}
               />
@@ -473,9 +406,11 @@ interface LeaderSpec {
 function Leaders({
   leaders,
   modelsById,
+  onCopy,
 }: {
   readonly leaders: InsightLeaders;
   readonly modelsById: ReadonlyMap<string, ModelInsight>;
+  readonly onCopy: (text: string) => void;
 }) {
   const specs: readonly LeaderSpec[] = [
     {
@@ -525,7 +460,7 @@ function Leaders({
         }));
         return (
           <Panel key={spec.label} title={spec.label} className="insights-leader">
-            <TopList items={items} empty="No ranked model yet." limit={TOP_COUNT} />
+            <TopList items={items} onCopy={onCopy} empty="No ranked model yet." limit={TOP_COUNT} />
           </Panel>
         );
       })}
@@ -534,6 +469,7 @@ function Leaders({
 }
 
 function RankingRow({ model, position }: { readonly model: ModelInsight; readonly position: number }) {
+  const quality = QUALITY_WEIGHT * (model.quality_score ?? 0);
   const reliability = STABILITY_WEIGHT * (model.stability_score ?? 0);
   const speed = SPEED_WEIGHT * (model.speed_score ?? 0);
   return (
@@ -551,8 +487,9 @@ function RankingRow({ model, position }: { readonly model: ModelInsight; readonl
         <span
           className="insights-bar"
           role="img"
-          aria-label={`Overall ${formatNumber(model.overall_score ?? 0, 1)}: reliability ${formatNumber(reliability, 1)}, speed ${formatNumber(speed, 1)}`}
+          aria-label={`Overall ${formatNumber(model.overall_score ?? 0, 1)}: quality ${formatNumber(quality, 1)}, reliability ${formatNumber(reliability, 1)}, speed ${formatNumber(speed, 1)}`}
         >
+          <span className="insights-bar-part quality" style={{ width: `${quality}%` }} />
           <span className="insights-bar-part reliability" style={{ width: `${reliability}%` }} />
           <span className="insights-bar-part speed" style={{ width: `${speed}%` }} />
         </span>
@@ -560,52 +497,4 @@ function RankingRow({ model, position }: { readonly model: ModelInsight; readonl
       <td className="num insights-score">{formatNumber(model.overall_score ?? 0, 1)}</td>
     </tr>
   );
-}
-
-function DetailRow({ model }: { readonly model: ModelInsight }) {
-  const topError = model.top_errors[0];
-  return (
-    <tr>
-      <td className={model.ranked ? "mono nowrap" : "mono nowrap insights-unranked"} title={model.summary ?? model.model}>
-        {fullName(model.model)}
-        {model.free ? (
-          <span className="insights-free-tag">
-            <Pill tone="ok">Free</Pill>
-          </span>
-        ) : null}
-      </td>
-      <td className="nowrap">
-        {model.use_cases.length > 0 ? (
-          model.use_cases.map((useCase) => (
-            <span key={useCase} className="insights-use">
-              <Pill>{useCase}</Pill>
-            </span>
-          ))
-        ) : (
-          <span className="dim">—</span>
-        )}
-      </td>
-      <td>
-        <HealthPill health={model.health} />
-      </td>
-      <td className="num">{formatContext(model.context_window)}</td>
-      <td className="num">{formatNumber(model.requests)}</td>
-      <td className="num">{formatPct(model.success_rate_pct)}</td>
-      <td className="num nowrap">{formatMs(model.ttft_p50_ms ?? 0)}</td>
-      <td className="num nowrap">{formatMs(model.ttft_p95_ms ?? 0)}</td>
-      <td className="num nowrap">{formatRate(model.decode_tokens_per_sec_p50)}</td>
-      <td className="num nowrap">{formatRate(model.prefill_tokens_per_sec_p50)}</td>
-      <td className="num">{formatPct(model.cache_hit_rate_pct)}</td>
-      <td className="num nowrap">{model.free ? "$0.00" : model.cost_usd === null ? "—" : formatUsd(model.cost_usd)}</td>
-      <td className="num nowrap">{model.value_score === null ? "—" : formatNumber(model.value_score, 1)}</td>
-      <td className="mono nowrap">{model.best_harness ?? <span className="dim">—</span>}</td>
-      <td className={topError ? "mono insights-top-error" : undefined} title={topError?.reason}>
-        {topError ? `${topError.reason} (×${topError.count})` : <span className="dim">None</span>}
-      </td>
-    </tr>
-  );
-}
-
-function HealthPill({ health }: { readonly health: ModelHealth }) {
-  return <Pill tone={HEALTH_TONE[health]}>{HEALTH_LABEL[health]}</Pill>;
 }

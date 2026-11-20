@@ -12,10 +12,12 @@ interface TopListProps {
   readonly empty: string;
   /** Rows shown, best first. */
   readonly limit?: number;
+  /** Adds a copy button to each model name. */
+  readonly onCopy?: (text: string) => void;
 }
 
 /** Up to `limit` ranked models, each with its rank, name and one value. */
-export function TopList({ items, empty, limit = 3 }: TopListProps) {
+export function TopList({ items, empty, limit = 3, onCopy }: TopListProps) {
   if (items.length === 0) {
     return <p className="note top-list-empty">{empty}</p>;
   }
@@ -25,7 +27,7 @@ export function TopList({ items, empty, limit = 3 }: TopListProps) {
         <li key={item.model} className="top-list-row">
           <span className={index === 0 ? "top-list-rank first" : "top-list-rank"}>{index + 1}</span>
           <span className="top-list-name">
-            <ModelName id={item.model} />
+            <ModelName id={item.model} onCopy={onCopy} />
             {item.sub ? <span className="top-list-sub">{item.sub}</span> : null}
           </span>
           <span className="top-list-value">{item.value}</span>

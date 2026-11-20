@@ -34,6 +34,21 @@ export function formatNumber(value: number, digits = 0): string {
   });
 }
 
+/** Rounds to a short unit: 950 → 950, 1000 → 1k, 1500000 → 1.5m. */
+export function formatCompact(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "—";
+  }
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000) {
+    return `${Number((value / 1_000_000).toFixed(1))}m`;
+  }
+  if (abs >= 1_000) {
+    return `${Number((value / 1_000).toFixed(1))}k`;
+  }
+  return formatNumber(value, 1);
+}
+
 export function formatMs(value: number): string {
   if (!value) {
     return "—";
