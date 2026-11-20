@@ -1,0 +1,27 @@
+.markdown-text {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  line-height: 1.5;
+}
+
+.markdown-text h4 {
+  margin: 8px 0 0;
+  font-size: 14px;
+}
+
+.markdown-text ul,
+.markdown-text ol,
+.markdown-text p {
+  margin: 0;
+}
+
+.markdown-text ul,
+.markdown-text ol {
+  padding-left: 20px;
+}
+
+.markdown-text code {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12px;
+}

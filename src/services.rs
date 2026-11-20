@@ -28,6 +28,7 @@ pub mod github_token_resolver;
 pub mod harness;
 pub mod history_exporter;
 pub mod insights;
+pub mod insights_analysis;
 pub mod keep_warm;
 pub mod keyring_credential_store;
 pub mod launch;

@@ -1,4 +1,5 @@
 pub mod agent_report;
+pub mod analysis_candidate;
 pub mod error_count;
 pub mod failure_reason;
 pub mod harness_insight;

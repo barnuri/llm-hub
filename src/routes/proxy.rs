@@ -2417,19 +2417,81 @@ pub(crate) async fn send_keep_warm_ping(state: &AppState, ping: PingPlan) {
         body,
         target,
     } = ping;
-    let body = without_unsupported_fields(state, &model_id, body);
     let headers = keep_warm_headers(
         target.shape,
         target.beta,
         is_copilot_profile(state, &model_id),
     );
+    let reply = send_internal(
+        state,
+        &model_id,
+        UpstreamPath::Verbatim(&target.path),
+        &headers,
+        body,
+        KEEP_WARM_CLIENT,
+        Some(worker.clone()),
+    )
+    .await;
+    state
+        .keep_warm()
+        .ping_finished(&worker, &stream_key, reply.ok, reply.cost_usd);
+}
+
+/// What one hub-initiated call returned.
+#[derive(Debug)]
+pub(crate) struct InternalReply {
+    pub status: u16,
+    pub body: Vec<u8>,
+    /// A 2xx status and an upstream that ended cleanly.
+    pub ok: bool,
+    pub cost_usd: f64,
+}
+
+/// Sends `body` as a chat completion the hub itself starts, such as an insights analysis.
+/// The request log records it under `client`, so its cost shows in usage and insights.
+pub(crate) async fn send_internal_chat(
+    state: &AppState,
+    model_id: &ModelId,
+    body: Bytes,
+    client: &str,
+) -> InternalReply {
+    let headers = keep_warm_headers(
+        ApiShape::ChatCompletions,
+        None,
+        is_copilot_profile(state, model_id),
+    );
+    send_internal(
+        state,
+        model_id,
+        UpstreamPath::Strip(STAGE_CHAT_PATH),
+        &headers,
+        body,
+        client,
+        None,
+    )
+    .await
+}
+
+/// Sends one hub-initiated request without fallbacks and records it as a pinned request.
+async fn send_internal(
+    state: &AppState,
+    model_id: &ModelId,
+    path: UpstreamPath<'_>,
+    headers: &HeaderMap,
+    body: Bytes,
+    client: &str,
+    worker: Option<String>,
+) -> InternalReply {
+    let body = without_unsupported_fields(state, model_id, body);
+    let repair_native = matches!(path, UpstreamPath::Strip(client_path) if client_path == STAGE_CHAT_PATH)
+        && may_reply_natively(state, STAGE_CHAT_PATH, model_id);
     let method = Method::POST;
     let sender = AttemptSender {
         state,
         method: &method,
-        path: UpstreamPath::Verbatim(&target.path),
-        headers: &headers,
-        model_id: &model_id,
+        path,
+        headers,
+        model_id,
         attempt_timeout: None,
         force_identity_encoding: true,
         session_token: None,
@@ -2437,6 +2499,11 @@ pub(crate) async fn send_keep_warm_ping(state: &AppState, ping: PingPlan) {
     let started = Instant::now();
     let (status, raw, upstream_end) = match sender.send(body).await {
         Ok(response) => {
+            let response = if repair_native {
+                repair_native_reply(response)
+            } else {
+                response
+            };
             let status = response.status().as_u16();
             let (raw, upstream_end) =
                 read_upstream_capped(response, MAX_TRANSFORM_BUFFER_BYTES).await;
@@ -2470,8 +2537,8 @@ pub(crate) async fn send_keep_warm_ping(state: &AppState, ping: PingPlan) {
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
         error: (!ok).then(|| error_reason(status, &raw)),
-        client: Some(KEEP_WARM_CLIENT.to_string()),
-        worker: Some(worker.clone()),
+        client: Some(client.to_string()),
+        worker,
         routed_by: Some(ROUTED_BY_PINNED.to_owned()),
         attempt: None,
         role: None,
@@ -2479,9 +2546,12 @@ pub(crate) async fn send_keep_warm_ping(state: &AppState, ping: PingPlan) {
     state.record_outcome(&outcome, None);
     state.publish_live(&outcome);
     record_request(state, &outcome, None).await;
-    state
-        .keep_warm()
-        .ping_finished(&worker, &stream_key, ok, cost_usd);
+    InternalReply {
+        status,
+        body: raw,
+        ok,
+        cost_usd,
+    }
 }
 
 /// True for a Copilot Claude model sent to `/chat/completions`. Newer ones can

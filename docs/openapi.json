@@ -571,6 +571,205 @@
         }
       }
     },
+    "/api/insights/analysis": {
+      "post": {
+        "tags": [
+          "insights"
+        ],
+        "summary": "Run an AI analysis of the insights",
+        "operationId": "insights_analyze",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "`1d`, `7d` (default), `30d`, or `all`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "min_requests",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "by",
+            "in": "query",
+            "description": "Criterion for `/api/insights/pick`; `overall` when omitted.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PickBy"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The model to run on",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InsightsAnalysisInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Analysis Markdown and the run's cost",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The model call failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/insights/analysis/models": {
+      "get": {
+        "tags": [
+          "insights"
+        ],
+        "summary": "Models for an AI analysis of the insights",
+        "operationId": "insights_analysis_models",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "`1d`, `7d` (default), `30d`, or `all`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "profile",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "min_requests",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "by",
+            "in": "query",
+            "description": "Criterion for `/api/insights/pick`; `overall` when omitted.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PickBy"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Candidates, recommended first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/insights/pick": {
       "get": {
         "tags": [
@@ -2743,6 +2942,18 @@
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "InsightsAnalysisInput": {
+        "type": "object",
+        "description": "The model a manual insights analysis runs on, as `<profile>/<model>`.",
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
           }
         }
       },

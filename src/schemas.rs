@@ -23,6 +23,7 @@ pub mod fallbacks_input;
 pub mod history_query;
 pub mod hub_selector;
 pub mod insights;
+pub mod insights_analysis_input;
 pub mod keep_warm_input;
 pub mod keep_warm_summary;
 pub mod launch;

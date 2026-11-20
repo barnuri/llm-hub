@@ -503,6 +503,8 @@ fn api_router(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(admin::insights))
         .routes(routes!(admin::insights_pick))
         .routes(routes!(admin::insights_agent_report))
+        .routes(routes!(admin::insights_analysis_models))
+        .routes(routes!(admin::insights_analyze))
         .routes(routes!(admin::list_api_keys, admin::create_api_key))
         .routes(routes!(admin::delete_api_key))
 }

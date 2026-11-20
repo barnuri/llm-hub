@@ -20,10 +20,12 @@ use crate::schemas::copilot_prices_input::CopilotPricesInput;
 use crate::schemas::error_body::ErrorBody;
 use crate::schemas::errors_report::ErrorsReport;
 use crate::schemas::fallbacks_input::FallbacksInput;
+use crate::schemas::insights::agent_report::AgentReport;
 use crate::schemas::insights::insights_report::InsightsReport;
 use crate::schemas::insights::model_catalog_entry::ModelCatalogEntry;
 use crate::schemas::insights::model_cost::ModelCost;
 use crate::schemas::insights::pick_by::PickBy;
+use crate::schemas::insights_analysis_input::InsightsAnalysisInput;
 use crate::schemas::keep_warm_input::KeepWarmInput;
 use crate::schemas::keep_warm_summary::KeepWarmSummary;
 use crate::schemas::profile_input::ProfileInput;
@@ -31,6 +33,7 @@ use crate::schemas::usage_report::UsageReport;
 use crate::services::env_writer;
 use crate::services::extension_phases;
 use crate::services::insights;
+use crate::services::insights_analysis;
 use crate::services::pricing::PricingBook;
 use crate::services::session_insights;
 use crate::services::stats::RequestOutcome;
@@ -791,8 +794,15 @@ pub async fn insights_agent_report(
     State(state): State<AppState>,
     Query(query): Query<InsightsQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let window = insights_window(&state, &query).await?;
-    let report = insights::build_agent_report_priced(
+    let report = agent_report(&state, &query).await?;
+    serde_json::to_value(report)
+        .map(Json)
+        .map_err(|e| AppError::Internal(format!("serialize agent report failed: {e}")))
+}
+
+async fn agent_report(state: &AppState, query: &InsightsQuery) -> Result<AgentReport, AppError> {
+    let window = insights_window(state, query).await?;
+    Ok(insights::build_agent_report_priced(
         &window.outcomes,
         &window.catalog,
         &window.range,
@@ -800,10 +810,85 @@ pub async fn insights_agent_report(
         window.min_requests,
         now_ms(),
         &window.evidence,
-    );
-    serde_json::to_value(report)
-        .map(Json)
-        .map_err(|e| AppError::Internal(format!("serialize agent report failed: {e}")))
+    ))
+}
+
+/// Models for a manual AI analysis of the insights, with the estimated cost of one run and
+/// the recommended one: the highest quality whose run costs no more than the fair limit.
+#[utoipa::path(get, path = "/api/insights/analysis/models", tag = "insights", summary = "Models for an AI analysis of the insights", params(InsightsQuery), responses((status = 200, description = "Candidates, recommended first", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
+pub async fn insights_analysis_models(
+    State(state): State<AppState>,
+    Query(query): Query<InsightsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let report = agent_report(&state, &query).await?;
+    let input_tokens =
+        insights_analysis::estimate_input_tokens(&insights_analysis::compact_report(&report));
+    let book = state.pricing_book();
+    let candidates = insights_analysis::candidates(&report.models, |model| {
+        book.estimate(
+            model,
+            input_tokens,
+            insights_analysis::ANALYSIS_MAX_OUTPUT_TOKENS,
+            0,
+            0,
+        )
+    });
+    Ok(Json(json!({
+        "estimated_input_tokens": input_tokens,
+        "max_output_tokens": insights_analysis::ANALYSIS_MAX_OUTPUT_TOKENS,
+        "fair_run_usd": insights_analysis::FAIR_RUN_USD,
+        "candidates": candidates,
+    })))
+}
+
+/// Runs one AI analysis of the insights on the chosen model and returns its Markdown.
+/// The hub calls the model once, with no fallbacks, and records the call and its cost.
+#[utoipa::path(post, path = "/api/insights/analysis", tag = "insights", summary = "Run an AI analysis of the insights", params(InsightsQuery), request_body(content = InsightsAnalysisInput, description = "The model to run on", content_type = "application/json"), responses((status = 200, description = "Analysis Markdown and the run's cost", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 503, description = "The model call failed.", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
+pub async fn insights_analyze(
+    State(state): State<AppState>,
+    Query(query): Query<InsightsQuery>,
+    Json(input): Json<InsightsAnalysisInput>,
+) -> Result<Json<Value>, AppError> {
+    let model_id = crate::schemas::model_id::ModelId::parse(input.model.trim())
+        .filter(|id| state.config().profile(&id.profile).is_some())
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "unknown model '{}': use <profile>/<model> from /v1/models",
+                input.model
+            ))
+        })?;
+    let report = agent_report(&state, &query).await?;
+    let compact = insights_analysis::compact_report(&report);
+    let body = insights_analysis::request_body(&model_id.model, &compact);
+    let started = std::time::Instant::now();
+    let reply = crate::routes::proxy::send_internal_chat(
+        &state,
+        &model_id,
+        bytes::Bytes::from(body.to_string()),
+        insights_analysis::ANALYSIS_CLIENT,
+    )
+    .await;
+    let text = reply
+        .ok
+        .then(|| insights_analysis::reply_text(&reply.body))
+        .flatten()
+        .ok_or_else(|| {
+            AppError::UpstreamUnavailable(format!(
+                "{} failed the analysis: HTTP {}: {}",
+                model_id.qualified(),
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            ))
+        })?;
+    Ok(Json(json!({
+        "model": model_id.qualified(),
+        "markdown": text,
+        "cost_usd": reply.cost_usd,
+        "latency_ms": elapsed_ms(started),
+    })))
 }
 
 struct InsightsWindow {
@@ -2081,6 +2166,109 @@ mod tests {
 
         assert_eq!(body["profile"], "b");
         assert_eq!(model_ids(&body["models"]), vec!["b/m2"]);
+    }
+
+    #[tokio::test]
+    async fn analysis_models_recommend_the_ranked_model_within_the_fair_limit() {
+        let (_dir, state) = insights_state();
+
+        let Json(body) =
+            insights_analysis_models(State(state), Query(insights_query(Some("all"), None)))
+                .await
+                .unwrap();
+
+        assert_eq!(body["candidates"][0]["model"], "a/m1");
+        assert_eq!(body["candidates"][0]["recommended"], true);
+        assert!(body["estimated_input_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(
+            body["max_output_tokens"],
+            insights_analysis::ANALYSIS_MAX_OUTPUT_TOKENS
+        );
+    }
+
+    async fn analysis_upstream(status: u16, reply: Value) -> (MockServer, TempDir, AppState) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(reply))
+            .mount(&server)
+            .await;
+        let base = server.uri();
+        let (dir, state) = persistent_state(
+            "sqlite",
+            &[("LLM_HUB_PROFILES", "w"), ("LLM_HUB_W_BASE_URL", &base)],
+        );
+        (server, dir, state)
+    }
+
+    #[tokio::test]
+    async fn analyze_returns_the_markdown_and_records_the_call() {
+        let reply = json!({
+            "choices": [{"message": {"role": "assistant", "content": "## At a glance\n- ok"}}],
+            "usage": {"prompt_tokens": 900, "completion_tokens": 40}
+        });
+        let (server, _dir, state) = analysis_upstream(200, reply).await;
+
+        let Json(body) = insights_analyze(
+            State(state.clone()),
+            Query(insights_query(Some("all"), None)),
+            Json(InsightsAnalysisInput {
+                model: "w/small".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(body["model"], "w/small");
+        assert_eq!(body["markdown"], "## At a glance\n- ok");
+        let chats: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/chat/completions")
+            .collect();
+        assert_eq!(chats.len(), 1);
+        let sent: Value = chats[0].body_json().unwrap();
+        assert_eq!(sent["model"], "small");
+        assert_eq!(sent["stream"], false);
+        let logged = state
+            .store()
+            .unwrap()
+            .filtered_outcomes(&StatsFilter {
+                range_label: "all".into(),
+                ..StatsFilter::default()
+            })
+            .unwrap();
+        assert_eq!(
+            logged[0].client.as_deref(),
+            Some(insights_analysis::ANALYSIS_CLIENT)
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_reports_a_failed_call_and_an_unknown_model() {
+        let (_server, _dir, state) =
+            analysis_upstream(500, json!({"error": {"message": "boom"}})).await;
+        let run = |model: &str| {
+            insights_analyze(
+                State(state.clone()),
+                Query(insights_query(Some("all"), None)),
+                Json(InsightsAnalysisInput {
+                    model: model.into(),
+                }),
+            )
+        };
+
+        let failed = run("w/small").await;
+        let unknown = run("nope/small").await;
+        let bare = run("small").await;
+
+        assert!(
+            matches!(failed, Err(AppError::UpstreamUnavailable(reason)) if reason.contains("HTTP 500"))
+        );
+        assert!(matches!(unknown, Err(AppError::BadRequest(_))));
+        assert!(matches!(bare, Err(AppError::BadRequest(_))));
     }
 
     #[tokio::test]
