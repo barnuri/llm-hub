@@ -32,6 +32,13 @@ curl 'http://127.0.0.1:8888/api/insights/pick?by=overall&profile=llama_swap'
   `summary`, every `pick`, `best_for` per use case, stats per harness, failure reasons and
   caveats.
 
+Every list on the page shows its top three: the leaders, best free, best value, each use case and
+the ranking. The full list is under All models.
+
+- **Best free** ranks ranked models that run on a local profile. The hub prices them at zero.
+- **Best value** ranks paid, ranked models by overall score per US cent per successful call.
+  Cost comes from the price settings in [Pricing](configuration.md#pricing).
+
 ## Model details
 
 Each model also carries:

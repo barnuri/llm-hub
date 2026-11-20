@@ -47,6 +47,14 @@ impl OutcomeCode {
             .into_iter()
             .find(|code| code.as_str() == raw)
     }
+
+    /// True for passing tests, a passing review and a user acceptance.
+    pub fn is_pass(self) -> bool {
+        matches!(
+            self,
+            OutcomeCode::TestsPassed | OutcomeCode::ReviewPassed | OutcomeCode::UserAccepted
+        )
+    }
 }
 
 impl OutcomeSource {
@@ -95,5 +103,21 @@ mod tests {
             assert_eq!(OutcomeSource::parse(source.as_str()), Some(source));
         }
         assert_eq!(OutcomeCode::parse("nope"), None);
+    }
+
+    #[test]
+    fn passes_are_tests_passed_review_passed_and_user_accepted() {
+        let passes: Vec<OutcomeCode> = OutcomeCode::ALL
+            .into_iter()
+            .filter(|code| code.is_pass())
+            .collect();
+        assert_eq!(
+            passes,
+            vec![
+                OutcomeCode::TestsPassed,
+                OutcomeCode::ReviewPassed,
+                OutcomeCode::UserAccepted
+            ]
+        );
     }
 }

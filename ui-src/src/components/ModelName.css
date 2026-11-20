@@ -6,3 +6,46 @@
 .model-name-profile {
   color: var(--muted);
 }
+
+.model-name-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  min-width: 0;
+}
+
+/* The hit area is 36px tall, but the negative margin keeps the row height unchanged. */
+.model-copy {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 36px;
+  margin: -10px -4px -10px 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: none;
+  color: var(--faint, var(--muted));
+  cursor: pointer;
+  transition: color var(--ease), background var(--ease);
+}
+
+.model-copy:hover,
+.model-copy:focus-visible {
+  color: var(--accent-text);
+  background: var(--panel-2);
+}
+
+.model-copy:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .model-copy {
+    transition: none;
+  }
+}
