@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -12,6 +11,7 @@ use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
 use crate::schemas::smart_auto_rules::{SmartAutoRules, SmartAutoRulesMode};
 use crate::services::smart_auto_pool::{RuleDecision, SmartAutoPool};
+use crate::utils::atomic_write::write_atomically;
 
 /// The rules file, kept in the same directory as the store.
 pub const RULES_FILE: &str = "smart-auto-rules.json";
@@ -218,22 +218,6 @@ impl SmartAutoRulesStore {
         self.active.store(Arc::clone(&loaded));
         Ok(loaded)
     }
-}
-
-/// Writes a temp file beside `path`, then renames it over `path`, so readers see old or new, never half.
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    let temp = dir.join(format!(".{RULES_FILE}.{}.tmp", std::process::id()));
-    let mut file = File::create(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&temp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&temp);
-    })
 }
 
 #[cfg(test)]

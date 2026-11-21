@@ -172,6 +172,8 @@ fn upsert_profile_apply(
             .or_else(|| existing.map(|p| p.keep_warm))
             .unwrap_or(true),
         first_byte_timeout_ms: existing.and_then(|p| p.first_byte_timeout_ms),
+        tuner: existing.map(|p| p.tuner.clone()).unwrap_or_default(),
+        budget_monthly_usd: existing.and_then(|p| p.budget_monthly_usd),
     };
     if !profile.base_url.starts_with("http://") && !profile.base_url.starts_with("https://") {
         return Err(AppError::BadRequest(
@@ -402,7 +404,7 @@ pub async fn test_profile(
     let started = std::time::Instant::now();
     // A managed profile's server starts on demand; the probe must not run against a stopped one.
     if let Err(e) = state.managed().ensure_running(profile).await {
-        state.set_upstream_health(&name, false);
+        state.set_upstream_health(&name, false, &format!("The server did not start: {e}"));
         return Ok(Json(json!({ "ok": false, "error": e })));
     }
     let probe = send_models_request(&state, &client, profile);
@@ -412,7 +414,11 @@ pub async fn test_profile(
             let no_models_route = response.status() == reqwest::StatusCode::NOT_FOUND
                 && !profile.static_models.is_empty();
             let healthy = response.status().is_success() || no_models_route;
-            state.set_upstream_health(&name, healthy);
+            state.set_upstream_health(
+                &name,
+                healthy,
+                &format!("The test probe answered {}.", response.status()),
+            );
             Ok(Json(json!({
                 "ok": healthy,
                 "status": response.status().as_u16(),
@@ -420,11 +426,11 @@ pub async fn test_profile(
             })))
         }
         Ok(Err(e)) => {
-            state.set_upstream_health(&name, false);
+            state.set_upstream_health(&name, false, &format!("The test probe failed: {e}"));
             Ok(Json(json!({ "ok": false, "error": e })))
         }
         Err(_) => {
-            state.set_upstream_health(&name, false);
+            state.set_upstream_health(&name, false, "The test probe timed out.");
             Ok(Json(json!({ "ok": false, "error": "timeout" })))
         }
     }
@@ -1504,6 +1510,19 @@ mod tests {
         assert_eq!(body["ok"], false, "{body}");
         assert!(body["error"].is_string(), "{body}");
         assert_eq!(state.upstream_health().get("dead").copied(), Some(false));
+        let flips: Vec<_> = state
+            .notifier()
+            .list()
+            .into_iter()
+            .filter(|n| n.source == "health")
+            .collect();
+        assert_eq!(flips.len(), 1);
+        assert!(flips[0].id.starts_with("health:dead:unhealthy:"));
+        assert!(
+            flips[0].body.starts_with("The test probe"),
+            "{}",
+            flips[0].body
+        );
     }
 
     #[tokio::test]

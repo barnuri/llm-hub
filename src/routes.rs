@@ -5,6 +5,7 @@ pub mod claude_code;
 pub mod copilot;
 pub mod live;
 pub mod models;
+pub mod notifications;
 pub mod profile_usage;
 pub mod proxy;
 pub mod sessions;

@@ -42,6 +42,17 @@ Routes marked "key" need a key only when [hub auth](#hub-authentication) is on.
 | GET | `/api/errors` | Failed requests: `recent` rows and `groups` by normalized signature (ids, long numbers, timestamps and URL query strings masked). Query: `range` (default `7d`). Needs persistence. | key |
 | POST | `/api/errors/resolve` | Mark failed requests solved or reopen them. Body: `ids`, `solved`. Needs the SQLite store. | key |
 | POST | `/api/errors/resolve-group` | Mark every open failure with one signature solved (`solved: false` reopens). Body: `signature`, `range` (default `7d`), `solved` (default `true`). Needs the SQLite store. | key |
+| GET | `/api/notifications` | The notification inbox, newest first, and the pending count. Query: `include_muted=1` also lists muted ones. See [Notifications](notifications.md#http-api). | key |
+| POST | `/api/notifications` | Post a notification. Body: `source`, `severity`, `title`, `body`, optional `kind`, `profile`, `model`. 60 per minute per source. A valid post within the limit answers 202 `{"disabled": true}` while notifications are off. | key |
+| POST | `/api/notifications/{id}/approve` | Approve a pending tuner proposal: edit the model registry and run the apply command. See [Approval](local-tuner.md#approval). | key |
+| POST | `/api/notifications/{id}/dismiss` | Dismiss a pending notification. | key |
+| GET | `/api/notifications/mutes` | Mute rules, env rules first. | key |
+| POST | `/api/notifications/mutes` | Add a mute rule. Body: `matcher`, `scope` (`all` or `sinks`), optional `until_ms`, `note`. | key |
+| DELETE | `/api/notifications/mutes/{id}` | Delete a mute rule added in the UI or the API. An env rule answers 409. | key |
+| GET | `/api/notifications/desktop` | Desktop popup status and the fix steps for this OS. | key |
+| POST | `/api/notifications/desktop/test` | Send a test popup. | key |
+| POST | `/api/notifications/desktop/confirm` | Record that the test popup showed. | key |
+| POST | `/api/notifications/desktop/fix/{step_id}` | Run a runnable fix step, such as opening the OS notification settings. | key |
 | GET | `/api/insights` | Model rankings. See [Insights](usage-and-insights.md#insights). | key |
 | GET | `/api/insights/pick` | Best model. See [Insights](usage-and-insights.md#insights). | key |
 | GET | `/api/insights/report` | Insights as one document for agents. | key |

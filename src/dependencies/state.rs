@@ -23,10 +23,12 @@ use crate::services::keep_warm::KeepWarm;
 use crate::services::keyring_credential_store::KeyringCredentialStore;
 use crate::services::listed_prices::ListedPrices;
 use crate::services::live_feed::LiveFeed;
+use crate::services::local_tuner::LocalTuner;
 use crate::services::managed_process::ProcessManager;
 use crate::services::media_fallback::MediaCache;
 use crate::services::model_health::ModelHealth;
 use crate::services::model_limits::{ModelLimit, ModelLimits};
+use crate::services::notifications::dispatch::Notifier;
 use crate::services::pricing::PricingBook;
 use crate::services::process_gh_cli::ProcessGhCli;
 use crate::services::profile_usage::ProfileUsageCache;
@@ -100,6 +102,10 @@ struct Inner {
     keep_warm: Arc<KeepWarm>,
     /// Built-in, library and rule extensions. Swapped whole when a rules file reloads.
     extensions: ArcSwap<ExtensionSet>,
+    /// Prefill fits and apply locks of the local model tuner.
+    local_tuner: Arc<LocalTuner>,
+    /// The notifications inbox, mutes and sink delivery every source writes through.
+    notifier: Arc<Notifier>,
 }
 
 #[derive(Clone)]
@@ -149,6 +155,7 @@ impl AppState {
             }
         }
         let selection_log = SelectionLog::open(store.clone());
+        let notifier = Notifier::new(&config.notify, store.as_ref().map(Arc::clone));
         let smart_auto_rules = SmartAutoRulesStore::open(
             &store_dir(config.store_path.as_deref()),
             config.smart_auto_rules_env.as_deref(),
@@ -189,7 +196,11 @@ impl AppState {
             selection_log,
             smart_auto_rules,
             keep_warm: Arc::new(KeepWarm::default()),
-            extensions: ArcSwap::from_pointee(ExtensionSet::new(builtins())),
+            extensions: ArcSwap::from_pointee(
+                ExtensionSet::new(builtins()).with_notifier(Arc::clone(&notifier)),
+            ),
+            local_tuner: Arc::new(LocalTuner::default()),
+            notifier,
         }));
         state.refresh_api_key_hashes();
         Ok(state)
@@ -207,6 +218,7 @@ impl AppState {
         self.0.managed.reconcile(&config);
         self.0.copilot_sessions.reconcile(&config);
         self.0.profile_usage.reconcile(&config);
+        self.0.notifier.reconfigure(&config.notify);
         let is_copilot = |name: &String| {
             config
                 .profiles
@@ -243,6 +255,7 @@ impl AppState {
         request_state: Option<&Arc<axum::http::Extensions>>,
     ) {
         self.0.stats.record(outcome);
+        self.0.notifier.note_error(outcome);
         self.extensions()
             .complete(&CompleteCtx::new(outcome, request_state));
     }
@@ -252,6 +265,7 @@ impl AppState {
     }
 
     pub fn set_extensions(&self, extensions: ExtensionSet) {
+        let extensions = extensions.with_notifier(Arc::clone(&self.0.notifier));
         self.0.extensions.store(Arc::new(extensions));
     }
 
@@ -261,6 +275,16 @@ impl AppState {
 
     pub fn publish_live(&self, outcome: &RequestOutcome) {
         self.0.live_feed.publish(outcome, || self.pricing_book());
+    }
+
+    /// The local model tuner's prefill fits and apply locks.
+    pub fn local_tuner(&self) -> &Arc<LocalTuner> {
+        &self.0.local_tuner
+    }
+
+    /// The notifications inbox and dispatcher.
+    pub fn notifier(&self) -> &Arc<Notifier> {
+        &self.0.notifier
     }
 
     pub fn store(&self) -> Option<&Store> {
@@ -595,9 +619,11 @@ impl AppState {
         Arc::clone(&self.0.restart_notify)
     }
 
-    pub fn set_upstream_health(&self, profile: &str, healthy: bool) {
+    /// Sets the health flag of `profile`. A flip to unhealthy, or back to healthy, notifies with `reason`.
+    pub fn set_upstream_health(&self, profile: &str, healthy: bool, reason: &str) {
         self.0.idle_upstreams.remove(profile);
         self.0.upstream_health.insert(profile.to_string(), healthy);
+        self.0.notifier.note_health(profile, healthy, reason);
     }
 
     /// Marks a managed profile as stopped on purpose: neither healthy nor unhealthy.
@@ -655,6 +681,58 @@ mod tests {
             Some("llmgw/bedrock/claude-opus-5")
         );
         assert_eq!(snapshot.for_model("copilot", "bedrock/claude-opus-5"), None);
+    }
+
+    #[test]
+    fn notifier_and_tuner_follow_the_config() {
+        use crate::schemas::notification::{
+            Notification, NotificationKind, NotificationSeverity, NotificationStatus,
+        };
+        use crate::services::fake_gh_cli::FakeGhCli;
+        use crate::services::gh_cli::GhOutcome;
+        use crate::services::memory_credential_store::MemoryCredentialStore;
+
+        let vars = |notifications: &str| {
+            [
+                ("LLM_HUB_PROFILES", "local"),
+                ("LLM_HUB_LOCAL_BASE_URL", "http://127.0.0.1:9"),
+                ("LLM_HUB_NOTIFICATIONS", notifications),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect::<HashMap<String, String>>()
+        };
+        let state = AppState::with_seams(
+            HubConfig::from_map(&vars("true")).unwrap(),
+            None,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
+        )
+        .unwrap();
+        let notification = Notification {
+            id: "n".into(),
+            kind: NotificationKind::Custom,
+            source: "api".into(),
+            severity: NotificationSeverity::Warning,
+            title: "t".into(),
+            body: "b".into(),
+            profile: None,
+            model: None,
+            rule: None,
+            diff: None,
+            actions: Notification::default_actions(NotificationKind::Custom),
+            status: NotificationStatus::Pending,
+            created_ms: 1,
+            updated_ms: 1,
+            result: None,
+            muted: false,
+        };
+        assert!(state.notifier().notify(notification.clone()).is_some());
+        assert_eq!(state.local_tuner().prefill_refusal("local/m", 1, 1), None);
+        state
+            .swap_config(HubConfig::from_map(&vars("false")).unwrap())
+            .unwrap();
+        assert!(state.notifier().notify(notification).is_none());
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use crate::ext::{ExtNotification, Outbox};
+
 /// A setting that an admin call saves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigKind {
@@ -26,11 +28,16 @@ pub enum ConfigKind {
 pub struct ConfigChangeCtx<'a> {
     kind: ConfigKind,
     subject: Option<&'a str>,
+    outbox: Outbox,
 }
 
 impl<'a> ConfigChangeCtx<'a> {
     pub(crate) fn new(kind: ConfigKind, subject: Option<&'a str>) -> ConfigChangeCtx<'a> {
-        ConfigChangeCtx { kind, subject }
+        ConfigChangeCtx {
+            kind,
+            subject,
+            outbox: Outbox::default(),
+        }
     }
 
     /// Which setting changes.
@@ -43,6 +50,16 @@ impl<'a> ConfigChangeCtx<'a> {
     #[must_use]
     pub fn subject(&self) -> Option<&str> {
         self.subject
+    }
+
+    /// Sends `notification` to the Notifications inbox, from `ext:<extension name>`. The hub
+    /// delivers it when this phase method returns, and drops it when notifications are off.
+    pub fn notify(&self, notification: ExtNotification) {
+        self.outbox.push(notification);
+    }
+
+    pub(crate) fn outbox(&self) -> &Outbox {
+        &self.outbox
     }
 }
 

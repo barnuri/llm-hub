@@ -291,7 +291,7 @@ mod tests {
 
     use super::*;
     use crate::ext::rules::parse;
-    use crate::ext::{Api, AttemptTarget, ResponseTarget};
+    use crate::ext::{Api, AttemptTarget, ExtNotification, ExtSeverity, ResponseTarget};
     use crate::utils::log_capture::LogCapture;
 
     fn rules(yaml: &str) -> RulesExtension {
@@ -632,6 +632,95 @@ mod tests {
             (
                 "rules: [{name: a, phase: http_response, match: {stream: true}, actions: [{set_status: 400}]}]",
                 "match key `stream`",
+            ),
+        ] {
+            let error = parse(yaml, false, &env).unwrap_err();
+            assert!(error.contains(expected), "{yaml}: {error}");
+        }
+    }
+
+    #[test]
+    fn notify_rules_send_from_every_phase_with_the_known_model_and_profile() {
+        let rules = rules(
+            "rules:\n  - name: n-http\n    phase: http_request\n    actions: [{notify: {title: 'http ${TEAM}', severity: info}}]\n  - name: n-request\n    phase: request\n    actions: [{notify: {title: request, body: b}}]\n  - name: n-attempt\n    phase: attempt\n    actions: [{notify: {title: attempt, severity: critical}}]\n  - name: n-response\n    phase: response\n    actions: [{notify: {title: response}}]\n  - name: n-out\n    phase: http_response\n    actions: [{notify: {title: out}}]\n  - name: n-shadow\n    phase: request\n    mode: shadow\n    actions: [{notify: {title: shadow}}]\n",
+        );
+        let mut headers = HeaderMap::new();
+        let mut http = HttpRequestCtx::new(&Method::GET, "/v1/models", &mut headers);
+        rules.on_http_request(&mut http);
+        let sent = http.outbox().take();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0],
+            ExtNotification::new(ExtSeverity::Info, "http blue", "")
+        );
+        let mut out =
+            HttpResponseCtx::new(&Method::GET, "/v1/models", StatusCode::OK, &mut headers);
+        rules.on_http_response(&mut out);
+        assert_eq!(out.outbox().take()[0].title, "out");
+
+        let mut state = Extensions::new();
+        let empty = HeaderMap::new();
+        let mut request = RequestCtx::new(
+            &Method::POST,
+            "/v1/chat/completions",
+            &empty,
+            Bytes::from_static(br#"{"model":"a/b"}"#),
+            &mut state,
+        );
+        rules.on_request(&mut request);
+        assert_eq!(
+            request.outbox().take(),
+            [ExtNotification::new(ExtSeverity::Warning, "request", "b").with_model("a/b")]
+        );
+
+        let target = AttemptTarget {
+            profile: "p",
+            model: "p/m",
+            api: Api::Chat,
+            client_path: "/v1/chat/completions",
+            upstream_path: "/chat/completions",
+        };
+        let mut attempt = AttemptCtx::new(target, &empty, Bytes::new(), &mut state);
+        rules.on_attempt(&mut attempt);
+        assert_eq!(
+            attempt.outbox().take(),
+            [ExtNotification::new(ExtSeverity::Critical, "attempt", "")
+                .with_model("p/m")
+                .with_profile("p")]
+        );
+
+        let target = ResponseTarget {
+            profile: "copilot",
+            model: "copilot/gpt-5",
+            api: Api::Responses,
+            client_path: "/v1/responses",
+            copilot: true,
+            last_attempt: false,
+        };
+        let mut reply_headers = HeaderMap::new();
+        let mut reply = ResponseCtx::new(target, StatusCode::OK, &mut reply_headers, &mut state);
+        assert!(!rules.wants_error_body(&reply));
+        rules.on_response(&mut reply);
+        let sent = reply.outbox().take();
+        assert_eq!(sent[0].model.as_deref(), Some("copilot/gpt-5"));
+        assert_eq!(sent[0].profile.as_deref(), Some("copilot"));
+    }
+
+    #[test]
+    fn a_notify_action_needs_a_title_and_a_known_severity() {
+        let env = |_: &str| None;
+        for (yaml, expected) in [
+            (
+                "rules: [{name: a, phase: request, actions: [{notify: {title: ' '}}]}]",
+                "notify needs a title",
+            ),
+            (
+                "rules: [{name: a, phase: request, actions: [{notify: {title: t, severity: loud}}]}]",
+                "loud",
+            ),
+            (
+                "rules: [{name: a, phase: request, actions: [{notify: {title: t, extra: 1}}]}]",
+                "extra",
             ),
         ] {
             let error = parse(yaml, false, &env).unwrap_err();

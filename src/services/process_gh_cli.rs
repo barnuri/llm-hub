@@ -91,7 +91,9 @@ async fn run_gh(gh_path: &str, host: &str, user: Option<&str>, limit: Duration) 
 
 /// Linux refuses to run a file another process still holds open for writing (ETXTBSY),
 /// e.g. while `gh` is being replaced. That clears within milliseconds, so retry briefly.
-async fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<tokio::process::Child> {
+pub(crate) async fn spawn_retrying_busy(
+    command: &mut Command,
+) -> std::io::Result<tokio::process::Child> {
     let mut attempt = 1;
     loop {
         match command.spawn() {
@@ -117,7 +119,7 @@ fn first_stderr_line(stderr: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn lookup_from(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -182,7 +184,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    mod unix {
+    pub(crate) mod unix {
         use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
 
@@ -275,7 +277,7 @@ mod tests {
         }
 
         // kill_on_drop kills without waiting, so poll until the pid is gone or only a zombie.
-        async fn process_alive(pid: &str) -> bool {
+        pub(crate) async fn process_alive(pid: &str) -> bool {
             for _ in 0..50 {
                 let probe = std::process::Command::new("ps")
                     .args(["-o", "stat=", "-p", pid])

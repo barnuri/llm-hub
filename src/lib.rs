@@ -99,6 +99,8 @@ async fn serve(hub: Hub) {
     services::copilot_prices::CopilotPrices::spawn_refresh_loop(state.clone());
     services::keep_warm::KeepWarm::spawn_refresh_loop(state.clone());
     services::quota_snapshots::QuotaSnapshots::spawn_poll_loop(state.clone());
+    spawn_notifications(&state);
+    services::local_tuner::probe::spawn_probe_loop(state.clone());
     state.managed().spawn_idle_reaper();
     let managed = std::sync::Arc::clone(state.managed());
     let restart_notify = state.restart_notify();
@@ -142,6 +144,54 @@ async fn serve(hub: Hub) {
         Ok(false) => {}
         Err(e) => eprintln!("restart respawn failed: {e}"),
     }
+}
+
+/// The install setting that remembers the user saw the desktop test popup.
+const DESKTOP_CONFIRMED_KEY: &str = "desktop_notify_confirmed";
+
+/// Starts notification delivery to the configured sinks, the snooze prune loop and the budget loop.
+fn spawn_notifications(state: &AppState) {
+    let config = state.config();
+    let notify = &config.notify;
+    let confirmed = state
+        .store()
+        .and_then(|store| store.install_setting(DESKTOP_CONFIRMED_KEY).ok().flatten())
+        .is_some_and(|value| value == "1");
+    let hook_state = state.clone();
+    let hook = services::notifications::desktop::ConfirmHook::new(move || {
+        let Some(store) = hook_state.store() else {
+            return;
+        };
+        if let Err(e) = store.set_install_setting(DESKTOP_CONFIRMED_KEY, "1") {
+            tracing::warn!("cannot save the desktop popup confirmation: {e}");
+        }
+    });
+    let desktop = std::sync::Arc::new(
+        services::notifications::desktop::DesktopSink::new(notify.desktop, notify.timeout)
+            .with_confirmation(confirmed, Some(hook)),
+    );
+    state
+        .notifier()
+        .set_desktop(std::sync::Arc::clone(&desktop));
+    let mut sinks: Vec<Box<dyn services::notifications::dispatch::Sink>> = vec![Box::new(desktop)];
+    if let Some(url) = notify.webhook_url.clone() {
+        match reqwest::Client::builder().build() {
+            Ok(client) => sinks.push(Box::new(
+                services::notifications::webhook::WebhookSink::new(client, url, notify.timeout),
+            )),
+            Err(e) => tracing::warn!("notification webhook disabled: {e}"),
+        }
+    }
+    if let Some(argv) = notify.command.clone() {
+        sinks.push(Box::new(
+            services::notifications::command_sink::CommandSink::new(argv, notify.timeout),
+        ));
+    }
+    state.notifier().spawn_delivery(sinks);
+    state
+        .notifier()
+        .spawn_prune_loop(std::time::Duration::from_mins(1));
+    services::notifications::budget_loop::spawn_budget_loop(state.clone());
 }
 
 /// Loads the rules file, sets the running extensions and starts the rules watcher. An invalid
@@ -509,6 +559,21 @@ fn api_router(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(admin::insights_analyze))
         .routes(routes!(admin::list_api_keys, admin::create_api_key))
         .routes(routes!(admin::delete_api_key))
+        .routes(routes!(
+            routes::notifications::list,
+            routes::notifications::ingest
+        ))
+        .routes(routes!(routes::notifications::approve))
+        .routes(routes!(routes::notifications::dismiss))
+        .routes(routes!(
+            routes::notifications::list_mutes,
+            routes::notifications::add_mute
+        ))
+        .routes(routes!(routes::notifications::delete_mute))
+        .routes(routes!(routes::notifications::desktop_status))
+        .routes(routes!(routes::notifications::desktop_test))
+        .routes(routes!(routes::notifications::desktop_confirm))
+        .routes(routes!(routes::notifications::desktop_fix))
 }
 
 #[cfg(test)]

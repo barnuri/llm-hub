@@ -117,6 +117,8 @@ mod tests {
                 copilot: None,
                 keep_warm: true,
                 first_byte_timeout_ms: None,
+                tuner: crate::configs::LocalTunerConfig::default(),
+                budget_monthly_usd: None,
             }],
             master_key: None,
             smart_auto_presets: std::collections::BTreeMap::new(),
@@ -140,6 +142,9 @@ mod tests {
             keep_warm: KeepWarmConfig::default(),
             media_fallback: crate::configs::MediaFallbackConfig::default(),
             pricing: TokenRates::default(),
+            local_tuner_enabled: false,
+            notify: crate::configs::NotifyConfig::default(),
+            budget_monthly_usd: None,
         }
     }
 

@@ -1,7 +1,8 @@
 //! Extension points of llm-hub. An [`Extension`] runs in fixed phases: `http_request` and
 //! `http_response` on every route, `request` once per `/v1/*` request, `attempt` once per upstream
 //! attempt, `response` once per upstream reply, `complete` once the outcome is recorded, and
-//! `config_change` when a setting is saved. Every phase method has a no-op default.
+//! `config_change` when a setting is saved. Every phase method has a no-op default. Every phase
+//! context has `notify`, which sends an [`ExtNotification`] to the hub's Notifications inbox.
 
 mod api;
 mod attempt_ctx;
@@ -14,6 +15,7 @@ mod flow;
 pub(crate) mod hooks;
 mod http_ctx;
 mod json_body;
+mod notify;
 mod request_ctx;
 mod response_ctx;
 mod response_flow;
@@ -29,6 +31,8 @@ pub(crate) use extension_set::ExtensionSet;
 pub use flow::Flow;
 pub use http_ctx::{HttpRequestCtx, HttpResponseCtx};
 pub(crate) use json_body::JsonBody;
+pub use notify::{ExtNotification, ExtSeverity};
+pub(crate) use notify::{Outbox, deliver};
 pub use request_ctx::RequestCtx;
 pub use response_ctx::ResponseCtx;
 pub(crate) use response_ctx::ResponseTarget;

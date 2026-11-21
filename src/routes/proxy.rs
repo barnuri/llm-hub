@@ -32,6 +32,9 @@ use crate::schemas::launch::profile_filter::ProfileFilter;
 use crate::schemas::model_context::strip_1m_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_id::ModelId;
+use crate::schemas::notification::{
+    Notification, NotificationKind, NotificationSeverity, NotificationStatus,
+};
 use crate::schemas::prompt_shape::PromptShape;
 use crate::schemas::reply_protocol::ReplyProtocol;
 use crate::schemas::review_evidence::ReviewEvidence;
@@ -118,6 +121,8 @@ const CAPTURE_TEXT_BYTES: usize = 256 * 1024;
 const STAGE_CHAT_PATH: &str = "/v1/chat/completions";
 /// The text an upstream 500 carries when the model refuses image input.
 const IMAGE_INPUT_REJECTION: &str = "image input is not supported";
+/// The rule name a prefill guard event carries, so mutes and the inbox dedupe can match it.
+const PREFILL_GUARD_RULE: &str = "prefill_guard";
 static NO_BODY: Value = Value::Null;
 /// The status codes that count as a success for Smart Auto affinity.
 const SUCCESS_STATUS_RANGE: std::ops::Range<u16> = 200..300;
@@ -300,8 +305,8 @@ pub(crate) async fn attempt_loop(
         .and_then(|plan| plan.template.worker.clone())
         .or_else(|| worker_key(state, headers));
     let retry_policy = RetryPolicy::from_headers(headers);
-    // The raw client body, kept only for the Anthropic route's prompt shape row.
-    let shape_body = (bodies.route == RouteKind::Anthropic).then(|| body.clone());
+    // The raw client body, kept only for the prompt shape row of a Messages or chat-completions request.
+    let shape_body = records_prompt_shape(bodies.route, client_path).then(|| body.clone());
     let attempt_timeout = per_attempt_timeout_ms(headers).map(Duration::from_millis);
     let deadline_limit = chain_deadline(headers, config.deadline);
     let deadline = deadline_limit.map(|limit| received + limit);
@@ -505,6 +510,9 @@ pub(crate) async fn attempt_loop(
                     record_transition(state, event, next, Some(status))
                 });
                 if final_attempt {
+                    if succeeded {
+                        observe_warm_prefix(state, &config, model_id, &needs);
+                    }
                     let commit = smart
                         .as_ref()
                         .and_then(|plan| plan.commit(status, model_id));
@@ -1171,6 +1179,8 @@ enum Refusal {
     Certain(String),
     /// The size estimate is over the model's known `limit` by more than the margin.
     Estimated { reason: String, limit: u64 },
+    /// The profile's prefill guard expects the prompt to prefill slower than its budget.
+    Guarded(String),
 }
 
 /// The chain models that may serve the request, or the 400 naming every refusal. On a Responses
@@ -1183,29 +1193,52 @@ fn servable_chain(
 ) -> Result<Vec<ModelId>, AppError> {
     let mut servable = Vec::new();
     let mut refusals = Vec::new();
-    let mut roomiest: Option<(ModelId, u64)> = None;
-    for model in chain {
+    let mut roomiest: Option<(ModelId, u64, usize)> = None;
+    // Only a guard skip ahead of the model that serves changes who serves, so only it notifies.
+    let mut guarded = Vec::new();
+    let mut first_servable = None;
+    for (index, model) in chain.into_iter().enumerate() {
         match refusal(state, config, &model, needs) {
-            None => servable.push(model),
+            None => {
+                first_servable.get_or_insert(index);
+                servable.push(model);
+            }
             Some(Refusal::Certain(reason)) => refusals.push(reason),
+            Some(Refusal::Guarded(reason)) => {
+                guarded.push((index, prefill_guard_notification(&model, &reason)));
+                refusals.push(reason);
+            }
             Some(Refusal::Estimated { reason, limit }) => {
                 refusals.push(reason);
-                if roomiest.as_ref().is_none_or(|(_, best)| limit > *best) {
-                    roomiest = Some((model, limit));
+                if roomiest.as_ref().is_none_or(|(_, best, _)| limit > *best) {
+                    roomiest = Some((model, limit, index));
                 }
             }
         }
     }
     if servable.is_empty()
         && is_responses_endpoint(bare_path(needs.path))
-        && let Some((model, _)) = roomiest
+        && let Some((model, _, index)) = roomiest
     {
+        first_servable = Some(index);
         servable.push(model);
+    }
+    for notification in skipped_ahead(guarded, first_servable) {
+        state.notifier().notify_guard(notification);
     }
     if servable.is_empty() {
         return Err(AppError::BadRequest(refusals.join("; ")));
     }
     Ok(servable)
+}
+
+/// The guard events of chain positions before `serving`, or all of them when nothing serves.
+fn skipped_ahead<T>(guarded: Vec<(usize, T)>, serving: Option<usize>) -> Vec<T> {
+    guarded
+        .into_iter()
+        .filter(|(index, _)| serving.is_none_or(|serving| *index < serving))
+        .map(|(_, event)| event)
+        .collect()
 }
 
 /// Why `model_id` cannot serve the request, or `None` when it may be tried. Reads memory only.
@@ -1241,6 +1274,9 @@ fn refusal(
             "{qualified}: image input is not supported"
         )));
     }
+    if let Some(reason) = prefill_guard_refusal(state, config, model_id, &qualified, needs) {
+        return Some(Refusal::Guarded(reason));
+    }
     let limit = known_prompt_limit(state, model_id, is_copilot, &upstream, descriptor)?;
     (needs.prompt_tokens.saturating_mul(100) > limit.saturating_mul(PROMPT_REFUSAL_MARGIN_PERCENT)).then(|| {
         Refusal::Estimated {
@@ -1251,6 +1287,68 @@ fn refusal(
             limit,
         }
     })
+}
+
+/// Why the profile's prefill guard skips `model_id`: its measured prefill time for the prompt is
+/// over the guard budget. Reads memory only. A `count_tokens` call never prefills, so it passes.
+fn prefill_guard_refusal(
+    state: &AppState,
+    config: &HubConfig,
+    model_id: &ModelId,
+    qualified: &str,
+    needs: &RequestNeeds<'_>,
+) -> Option<String> {
+    let budget = guard_budget(config, model_id, needs)?;
+    state
+        .local_tuner()
+        .prefill_refusal(qualified, needs.prompt_tokens, budget)
+}
+
+/// The prefill guard budget of `model_id`'s profile, when the guard is on and the request generates.
+fn guard_budget(config: &HubConfig, model_id: &ModelId, needs: &RequestNeeds<'_>) -> Option<u64> {
+    if bare_path(needs.path) == NATIVE_COUNT_TOKENS_PATH {
+        return None;
+    }
+    config.profile(&model_id.profile)?.tuner.prefill_guard
+}
+
+/// Tells the tuner that a guarded `model_id` served the prompt, so the guard counts only the next
+/// turn's new tokens. Both sides use the hub's byte estimate, never the upstream's count.
+fn observe_warm_prefix(
+    state: &AppState,
+    config: &HubConfig,
+    model_id: &ModelId,
+    needs: &RequestNeeds<'_>,
+) {
+    if guard_budget(config, model_id, needs).is_some() {
+        state
+            .local_tuner()
+            .observe(&model_id.qualified(), needs.prompt_tokens, now_ms());
+    }
+}
+
+/// The guard event for a request the prefill guard kept from `model_id`.
+fn prefill_guard_notification(model_id: &ModelId, reason: &str) -> Notification {
+    let qualified = model_id.qualified();
+    let now = now_ms();
+    Notification {
+        id: format!("tuner:{PREFILL_GUARD_RULE}:{qualified}:{now}"),
+        kind: NotificationKind::Guard,
+        source: crate::services::local_tuner::rules::SOURCE.to_owned(),
+        severity: NotificationSeverity::Warning,
+        title: format!("Prefill guard skipped {qualified}"),
+        body: reason.to_owned(),
+        profile: Some(model_id.profile.clone()),
+        model: Some(model_id.model.clone()),
+        rule: Some(PREFILL_GUARD_RULE.to_owned()),
+        diff: None,
+        actions: Notification::default_actions(NotificationKind::Guard),
+        status: NotificationStatus::Pending,
+        created_ms: now,
+        updated_ms: now,
+        result: None,
+        muted: false,
+    }
 }
 
 /// The smallest prompt size `model_id` is known to accept: a Copilot model's seeded or learned limit,
@@ -1929,6 +2027,12 @@ async fn deliver(
 /// True when the attempt is a chat-completions call whose answer review can read.
 fn review_applies(attempt: &Attempt<'_>) -> bool {
     !attempt.native_messages && attempt.path.as_str().ends_with(CHAT_ENDPOINT)
+}
+
+/// True when the request's prompt shape is recorded: an Anthropic Messages or a chat-completions
+/// body, the two shapes `PromptShape::from_body` reads.
+fn records_prompt_shape(route: RouteKind, client_path: &str) -> bool {
+    route == RouteKind::Anthropic || client_path.ends_with(CHAT_ENDPOINT)
 }
 
 /// True for a Responses call; the `OpenAI` route keeps the client's `/v1` prefix in its endpoint.
@@ -3749,7 +3853,7 @@ struct StreamSummary {
 
 /// How an upstream body ended, as the cancel and failure log lines name it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum UpstreamEnd {
+pub(crate) enum UpstreamEnd {
     /// The hub stopped reading before the upstream body ended.
     #[default]
     Open,
@@ -4012,7 +4116,10 @@ fn teaches_stored_limit(upstream_path: &str, upstream_id: &str) -> bool {
 
 /// Reads an upstream body into memory, stopping once `cap` is exceeded.
 /// A read error ends the read with whatever arrived, which the translator then renders as an error.
-async fn read_upstream_capped(upstream: reqwest::Response, cap: usize) -> (Vec<u8>, UpstreamEnd) {
+pub(crate) async fn read_upstream_capped(
+    upstream: reqwest::Response,
+    cap: usize,
+) -> (Vec<u8>, UpstreamEnd) {
     let mut stream = upstream.bytes_stream();
     let mut buffered: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -4027,8 +4134,8 @@ async fn read_upstream_capped(upstream: reqwest::Response, cap: usize) -> (Vec<u
     (buffered, UpstreamEnd::Complete)
 }
 
-/// Writes the request row, then the prompt shape of an Anthropic request beside it. The json store
-/// returns no row id, so it writes no shape.
+/// Writes the request row, then the prompt shape of a Messages or chat-completions request beside it.
+/// The json store returns no row id, so it writes no shape.
 async fn record_request(state: &AppState, outcome: &RequestOutcome, prompt_body: Option<Bytes>) {
     let Some(store) = state.store() else {
         return;
@@ -5483,7 +5590,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn openai_route_request_writes_no_shape_row() {
+        async fn chat_completion_request_writes_one_shape_row() {
             let dir = tempfile::tempdir().unwrap();
             let db = dir.path().join("hub.db");
             let copilot = copilot_with_store(Some(
@@ -5497,20 +5604,34 @@ mod tests {
                 .await;
             let body = json!({
                 "model": format!("{PROFILE}/{PLAIN_ID}"),
-                "messages": [{"role": "user", "content": "hi"}],
+                "messages": [
+                    {"role": "system", "content": "abcd"},
+                    {"role": "user", "content": "hi"},
+                ],
+                "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
             });
 
             let (status, _) = send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
 
             assert_eq!(status, 200);
             assert_eq!(
-                count_until(&db, "SELECT COUNT(*) FROM requests", 1).await,
+                count_until(
+                    &db,
+                    "SELECT COUNT(*) FROM request_shapes s JOIN requests r ON r.id = s.request_id",
+                    1,
+                )
+                .await,
                 1
             );
-            assert_eq!(
-                count_until(&db, "SELECT COUNT(*) FROM request_shapes", 0).await,
-                0
-            );
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let row: (i64, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT messages, turn_start, system_chars, tool_count FROM request_shapes",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(row, (1, 1, 4, 1));
         }
 
         #[tokio::test]
@@ -8399,6 +8520,261 @@ mod tests {
                     .is_empty()
             );
         }
+
+        /// Sets the profile's prefill guard budget, and gives `PLAIN_ID` a confident fit of
+        /// 3.5 ms per token, so a 2,000-token prompt takes about 7.2 s to prefill.
+        fn guard_plain_model(copilot: &Copilot, budget_ms: Option<u64>) {
+            let mut config = (*copilot.state.config()).clone();
+            for profile in &mut config.profiles {
+                profile.tuner.prefill_guard = budget_ms;
+            }
+            copilot.state.swap_config(config).unwrap();
+            copilot.state.local_tuner().set_fits(HashMap::from([(
+                format!("{PROFILE}/{PLAIN_ID}"),
+                crate::services::local_tuner::prefill::PrefillFit {
+                    a: 3.5,
+                    b: 0.0,
+                    low_confidence: false,
+                    max_tokens_seen: 100_000,
+                },
+            )]));
+        }
+
+        fn guard_events(copilot: &Copilot) -> Vec<Notification> {
+            copilot
+                .state
+                .notifier()
+                .list()
+                .into_iter()
+                .filter(|n| n.kind == NotificationKind::Guard)
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn prefill_guard_skips_a_slow_model_and_reaches_the_fallback() {
+            let copilot = copilot().await;
+            guard_plain_model(&copilot, Some(1_000));
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, _) = send(
+                &copilot,
+                &fallback_to(TRANSLATED_ID),
+                &long_anthropic_body(PLAIN_ID, 2_000),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert_eq!(chat_models(&copilot).await, [TRANSLATED_UPSTREAM_ID]);
+            let events = guard_events(&copilot);
+            assert_eq!(events.len(), 1);
+            let event = &events[0];
+            assert_eq!(event.source, crate::services::local_tuner::rules::SOURCE);
+            assert_eq!(event.rule.as_deref(), Some(PREFILL_GUARD_RULE));
+            assert_eq!(event.severity, NotificationSeverity::Warning);
+            assert_eq!(event.title, "Prefill guard skipped copilot/gpt-4.1");
+            assert_eq!(event.profile.as_deref(), Some(PROFILE));
+            assert_eq!(event.model.as_deref(), Some(PLAIN_ID));
+            assert!(event.body.starts_with("copilot/gpt-4.1: prompt ~2k tokens"));
+        }
+
+        #[tokio::test]
+        async fn prefill_guard_never_notifies_for_a_fallback_the_chain_does_not_reach() {
+            let copilot = copilot().await;
+            guard_plain_model(&copilot, Some(1_000));
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, _) = send(
+                &copilot,
+                &fallback_to(PLAIN_ID),
+                &long_anthropic_body(TRANSLATED_ID, 2_000),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert_eq!(chat_models(&copilot).await, [TRANSLATED_UPSTREAM_ID]);
+            assert!(guard_events(&copilot).is_empty());
+        }
+
+        #[test]
+        fn guard_events_count_only_positions_ahead_of_the_serving_model() {
+            let guarded = vec![(0, "a"), (2, "c")];
+            assert_eq!(skipped_ahead(guarded.clone(), Some(1)), ["a"]);
+            assert_eq!(skipped_ahead(guarded.clone(), Some(0)), Vec::<&str>::new());
+            assert_eq!(skipped_ahead(guarded, None), ["a", "c"]);
+        }
+
+        #[tokio::test]
+        async fn prefill_guard_lets_count_tokens_through_to_the_local_estimate() {
+            let copilot = copilot().await;
+            guard_plain_model(&copilot, Some(1_000));
+            let body = long_anthropic_body(PLAIN_ID, 2_000).to_string();
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                NATIVE_COUNT_TOKENS_PATH,
+                &client_headers(),
+                Bytes::from(body.clone()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), 200);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(reply["input_tokens"], estimated_prompt_tokens(body.len()));
+            assert!(guard_events(&copilot).is_empty());
+            assert!(
+                copilot
+                    .upstream
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn prefill_guard_on_the_only_model_answers_400_without_an_upstream_call() {
+            let copilot = copilot().await;
+            guard_plain_model(&copilot, Some(1_000));
+
+            let message = refused_message(
+                &copilot,
+                MESSAGES_ENDPOINT,
+                RouteKind::Anthropic,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 2_000),
+            )
+            .await;
+
+            assert!(
+                message.starts_with("copilot/gpt-4.1: prompt ~2k tokens, expected ~"),
+                "{message}"
+            );
+            assert!(
+                message.ends_with("budget 1 s. Use a smaller prompt or another model"),
+                "{message}"
+            );
+            assert!(
+                copilot
+                    .upstream
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            // A second refusal within the dedupe window adds no second guard event.
+            refused_message(
+                &copilot,
+                MESSAGES_ENDPOINT,
+                RouteKind::Anthropic,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 2_000),
+            )
+            .await;
+            assert_eq!(guard_events(&copilot).len(), 1);
+        }
+
+        #[tokio::test]
+        async fn prefill_guard_passes_the_request_when_off_under_budget_or_unmeasured() {
+            // Off, a budget the estimate fits in, and a model without a fit.
+            let cases = [
+                (None, PLAIN_ID),
+                (Some(60_000), PLAIN_ID),
+                (Some(1_000), TRANSLATED_ID),
+            ];
+            for (budget, model) in cases {
+                let copilot = copilot().await;
+                guard_plain_model(&copilot, budget);
+                Mock::given(method("POST"))
+                    .and(path(UPSTREAM_CHAT_PATH))
+                    .respond_with(chat_completion())
+                    .mount(&copilot.upstream)
+                    .await;
+
+                let (status, _) = send(
+                    &copilot,
+                    &client_headers(),
+                    &long_anthropic_body(model, 2_000),
+                    RouteKind::Anthropic,
+                )
+                .await;
+
+                assert_eq!(status, 200, "{budget:?} {model}");
+                assert_eq!(chat_models(&copilot).await.len(), 1, "{budget:?} {model}");
+                assert!(guard_events(&copilot).is_empty(), "{budget:?} {model}");
+            }
+        }
+
+        #[tokio::test]
+        async fn prefill_guard_counts_only_the_new_tokens_after_a_warm_prefix() {
+            let warm = copilot().await;
+            let cold = copilot().await;
+            for copilot in [&warm, &cold] {
+                // 1.5 s at 3.5 ms per token admits about 430 cold tokens. The upstream's count of 5
+                // differs from the hub's estimate, so the warm prefix must use the estimate.
+                guard_plain_model(copilot, Some(1_500));
+                Mock::given(method("POST"))
+                    .and(path(UPSTREAM_CHAT_PATH))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "chatcmpl-1",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+                    })))
+                    .mount(&copilot.upstream)
+                    .await;
+            }
+
+            let (first, _) = send(
+                &warm,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 300),
+                RouteKind::Anthropic,
+            )
+            .await;
+            let (follow_up, _) = send(
+                &warm,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 600),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!((first, follow_up), (200, 200));
+            assert_eq!(chat_models(&warm).await.len(), 2);
+            assert!(guard_events(&warm).is_empty());
+            let message = refused_message(
+                &cold,
+                MESSAGES_ENDPOINT,
+                RouteKind::Anthropic,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 600),
+            )
+            .await;
+            assert!(
+                message.starts_with("copilot/gpt-4.1: prompt ~"),
+                "{message}"
+            );
+            assert!(!message.contains("warm prefix"), "{message}");
+        }
     }
 
     #[tokio::test]
@@ -8499,6 +8875,18 @@ mod review_body_tests {
             completed_solver_attempt(&event, SelectionState::Completed),
             None
         );
+    }
+
+    #[test]
+    fn prompt_shape_recorded_for_messages_and_chat_completions_only() {
+        assert!(records_prompt_shape(RouteKind::Anthropic, "/v1/messages"));
+        assert!(records_prompt_shape(
+            RouteKind::OpenAi,
+            "/v1/chat/completions"
+        ));
+        assert!(records_prompt_shape(RouteKind::OpenAi, "/chat/completions"));
+        assert!(!records_prompt_shape(RouteKind::OpenAi, "/v1/responses"));
+        assert!(!records_prompt_shape(RouteKind::OpenAi, "/v1/embeddings"));
     }
 
     #[test]

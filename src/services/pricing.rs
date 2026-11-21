@@ -644,6 +644,8 @@ mod tests {
             copilot: None,
             keep_warm: true,
             first_byte_timeout_ms: None,
+            tuner: crate::configs::LocalTunerConfig::default(),
+            budget_monthly_usd: None,
         };
         let shared = TokenRates {
             input_per_1m: 5.0,
