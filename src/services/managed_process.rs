@@ -84,6 +84,18 @@ impl ProcessManager {
         }
     }
 
+    /// Starts the profile's process when it never idles (`IDLE_SECS=0`), so a
+    /// models refresh, including the first one at boot, lists its models.
+    ///
+    /// # Errors
+    /// The `ensure_running` message when the process cannot start.
+    pub async fn ensure_resident(&self, profile: &ProfileConfig) -> Result<(), String> {
+        match &profile.managed {
+            Some(command) if command.idle_timeout.is_none() => self.ensure_running(profile).await,
+            _ => Ok(()),
+        }
+    }
+
     /// Records a use so the idle timer restarts, e.g. when a long response arrives.
     pub fn touch(&self, profile: &str) {
         if let Some(entry) = self.entries.get(profile) {

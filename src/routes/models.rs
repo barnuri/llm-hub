@@ -198,6 +198,7 @@ async fn fetch_profile_models(
     state: &AppState,
     profile: &ProfileConfig,
 ) -> Result<ProfileListing, String> {
+    state.managed().ensure_resident(profile).await?;
     let client = state.client(&profile.name).ok_or("no client for profile")?;
     let body = tokio::time::timeout(
         MODELS_FANOUT_TIMEOUT,

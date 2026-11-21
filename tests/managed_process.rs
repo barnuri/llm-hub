@@ -232,6 +232,32 @@ async fn concurrent_first_requests_share_one_start_and_shutdown_stops_it() {
 }
 
 #[tokio::test]
+async fn never_idle_process_is_started_at_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_port = free_port();
+    let (command, spawn_log) = test_server_command(dir.path(), server_port);
+    let vars = managed_profile(server_port, &command, &[("IDLE_SECS", "0")]);
+    let (_hub, base) = start_hub(dir.path(), vars).await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !is_listening(server_port) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        is_listening(server_port),
+        "resident process not started at boot"
+    );
+    assert_eq!(spawn_count(&spawn_log), 1);
+    // The start holds its lock until its next readiness poll, so wait for it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while profile_status(&base).await["running"] != true && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(profile_status(&base).await["running"], true);
+}
+
+#[tokio::test]
 async fn idle_process_is_stopped_and_restarted_on_next_request() {
     let dir = tempfile::tempdir().unwrap();
     let server_port = free_port();

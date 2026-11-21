@@ -39,7 +39,8 @@ The abuse-detection warning in [GitHub Copilot](github-copilot.md) applies to bo
 A profile can carry a `COMMAND` that the hub runs itself. A local OpenAI-compatible server
 (whisper.cpp `whisper-server`, mlx-audio, a local vLLM) then runs only while you use it.
 
-1. The first request to the profile starts the process. The hub waits until the host and port
+1. The first request to the profile starts the process. With `IDLE_SECS=0`, the hub starts it
+   at boot instead, before the first models refresh. The hub waits until the host and port
    in `BASE_URL` accept connections. Concurrent requests share that start.
 2. If something already listens on that port, the hub uses it and starts nothing.
 3. If the process exits, the next request starts it again.
