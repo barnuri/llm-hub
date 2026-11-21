@@ -75,13 +75,7 @@ pub async fn run_once(state: &AppState, now_ms: u64) -> Vec<Notification> {
     let no_rows = ProfileRows::default();
     let mut raised = Vec::new();
     for profile in profiles {
-        if profile.managed.is_some() && !state.managed().is_running(&profile.name) {
-            tracing::debug!(
-                "tuner probe skips {}: its process is not running",
-                profile.name
-            );
-            continue;
-        }
+        // HTTP reads never start a managed command, so a server another tool runs is probed too.
         let Some(client) = state.client(&profile.name) else {
             continue;
         };
@@ -338,8 +332,14 @@ fn client_stats<'a>(rows: impl Iterator<Item = &'a RequestOutcome>) -> Vec<Clien
             ClientStats {
                 client: client.to_owned(),
                 requests: rows.len() as u64,
-                median_prompt_tokens: median(rows.iter().map(|r| r.tokens_in).collect())
-                    .unwrap_or(0),
+                // A failed call reports no prompt tokens, so only counted prompts form the median.
+                median_prompt_tokens: median(
+                    rows.iter()
+                        .map(|r| r.tokens_in)
+                        .filter(|t| *t > 0)
+                        .collect(),
+                )
+                .unwrap_or(0),
                 median_ttft_ms: median(rows.iter().filter_map(|r| r.ttft_ms).collect()),
                 failed_or_timeout_share,
             }
@@ -596,7 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stopped_managed_profile_keeps_its_fit_but_is_not_probed() {
+    async fn managed_profile_the_hub_did_not_start_is_still_probed() {
         let server = MockServer::start().await;
         let (_dir, store) = sqlite();
         seed_slow_gemma(&store);
@@ -611,9 +611,10 @@ mod tests {
             Some(store),
         );
 
-        assert!(run_once(&state, now_ms()).await.is_empty());
+        run_once(&state, now_ms()).await;
         assert!(state.local_tuner().fit("local/gemma").is_some());
-        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(!server.received_requests().await.unwrap().is_empty());
+        assert!(!state.managed().is_running("local"));
     }
 
     #[tokio::test]
@@ -696,6 +697,18 @@ mod tests {
         assert!((stats[0].failed_or_timeout_share - 0.75).abs() < 1e-9);
         assert_eq!(stats[1].client, "pi/1.0");
         assert!(stats[1].failed_or_timeout_share.abs() < 1e-9);
+    }
+
+    #[test]
+    fn client_stats_median_skips_failed_calls_without_prompt_tokens() {
+        let rows = [
+            row("gemma", 0, None, 502),
+            row("gemma", 0, None, 502),
+            row("gemma", 4_000, Some(900), 200),
+        ];
+        assert_eq!(client_stats(rows.iter())[0].median_prompt_tokens, 4_000);
+        let failed_only = [row("gemma", 0, None, 502)];
+        assert_eq!(client_stats(failed_only.iter())[0].median_prompt_tokens, 0);
     }
 
     #[test]

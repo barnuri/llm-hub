@@ -33,6 +33,8 @@ const CTX_STEP: u64 = 4_096;
 const CTX_FLOOR: u64 = 8_192;
 const TOOL_SHARE_LIMIT: f64 = 0.5;
 const FAILURE_SHARE_LIMIT: f64 = 0.3;
+/// Fewer calls than this from one client are not enough for harness advice.
+const MIN_CLIENT_REQUESTS: u64 = 5;
 /// A bare agent harness prompt: a model that cannot prefill this within budget is chat-only.
 const AGENT_PROMPT_TOKENS: u64 = 20_000;
 
@@ -230,6 +232,10 @@ fn does_not_fit(input: &RuleInput) -> Option<Notification> {
 
 fn harness_advice(input: &RuleInput, client: &ClientStats) -> Option<Notification> {
     let tokens = client.median_prompt_tokens;
+    // Prompt advice needs a measured prompt and enough calls to tell a pattern from one failure.
+    if tokens == 0 || client.requests < MIN_CLIENT_REQUESTS {
+        return None;
+    }
     let fit = confident_fit(input.fit.as_ref()).filter(|_| input.budget_ms > 0);
     let expected_ms = fit.map(|f| f.estimate_ms(tokens));
     let too_slow = expected_ms.is_some_and(|ms| ms > input.budget_ms);
@@ -711,6 +717,18 @@ mod tests {
              of opencode/2.3.0); or use bare-cli/1.0, which sends this model a median of 22,500 \
              tokens; or switch to small-model, which prefills 94,000 tokens in ~3.1 min."
         );
+    }
+
+    #[test]
+    fn harness_advice_needs_a_measured_prompt_and_enough_calls() {
+        let mut few = client("curl/8.7.1", 4_000, 1.0);
+        few.requests = MIN_CLIENT_REQUESTS - 1;
+        let input = RuleInput {
+            fit: None,
+            clients: vec![client("bun/1.4", 0, 0.4), few],
+            ..quiet()
+        };
+        assert!(by_rule(&evaluate(&input, NOW), RULE_HARNESS_ADVICE).is_empty());
     }
 
     #[test]
