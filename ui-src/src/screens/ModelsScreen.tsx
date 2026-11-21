@@ -40,6 +40,9 @@ function upstreamState(profile: ProfileRow): UpstreamState {
   if (profile.healthy === true) {
     return { tone: "ok", label: "up" };
   }
+  if (profile.idle) {
+    return { tone: "neutral", label: "idle" };
+  }
   return profile.healthy === false ? { tone: "danger", label: "down" } : { tone: "neutral", label: "unknown" };
 }
 

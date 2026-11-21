@@ -39,6 +39,9 @@ function healthPill(profile: ProfileRow) {
   if (profile.healthy === false) {
     return <Pill tone="danger">Unreachable</Pill>;
   }
+  if (profile.idle) {
+    return <Pill>Idle</Pill>;
+  }
   return <Pill tone="ok">Enabled</Pill>;
 }
 
@@ -86,7 +89,7 @@ interface ProfileKpisProps {
 
 function ProfileKpis({ profiles, models, counts }: ProfileKpisProps) {
   const enabled = profiles.filter((profile) => profile.enabled);
-  const reachable = enabled.filter((profile) => profile.healthy === true);
+  const reachable = enabled.filter((profile) => profile.healthy === true || profile.idle);
   const unreachable = enabled.filter((profile) => profile.healthy === false);
   const disabledCount = profiles.length - enabled.length;
 

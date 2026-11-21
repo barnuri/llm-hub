@@ -45,7 +45,8 @@ A profile can carry a `COMMAND` that the hub runs itself. A local OpenAI-compati
 2. If something already listens on that port, the hub uses it and starts nothing.
 3. If the process exits, the next request starts it again.
 4. The hub stops the process after `IDLE_SECS` without requests, when `COMMAND` changes or
-   leaves `.env`, and when the hub shuts down.
+   leaves `.env`, and when the hub shuts down. While it is stopped, the models list uses the
+   profile's static `MODELS`, and the UI and `/api/profiles` (`"idle": true`) show it as idle.
 5. A start that fails or times out fails that attempt like an unreachable upstream, so
    [fallbacks](fallbacks-and-transforms.md#fallbacks) still apply.
 

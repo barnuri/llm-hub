@@ -96,6 +96,26 @@ impl ProcessManager {
         }
     }
 
+    /// True when the profile's on-demand process is stopped on purpose: it has an
+    /// idle timeout, no start failed recently, and nothing serves its port.
+    pub async fn is_stopped(&self, profile: &ProfileConfig) -> bool {
+        let Some(command) = profile
+            .managed
+            .as_ref()
+            .filter(|c| c.idle_timeout.is_some())
+        else {
+            return false;
+        };
+        if self.is_running(&profile.name) {
+            return false;
+        }
+        let failed = self
+            .entries
+            .get(&profile.name)
+            .is_some_and(|entry| entry.backoff_reason().is_some());
+        !failed && !accepts_connections(&command.address).await
+    }
+
     /// Records a use so the idle timer restarts, e.g. when a long response arrives.
     pub fn touch(&self, profile: &str) {
         if let Some(entry) = self.entries.get(profile) {

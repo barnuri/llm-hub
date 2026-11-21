@@ -39,6 +39,8 @@ export interface ProfileRow {
   readonly keep_warm: boolean;
   readonly models: readonly string[];
   readonly healthy: boolean | null;
+  /** True for a managed profile whose local server is stopped on purpose and starts on the next request. */
+  readonly idle?: boolean;
   /** True for a native GitHub Copilot profile. */
   readonly copilot: boolean;
 }
