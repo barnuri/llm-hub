@@ -71,6 +71,7 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
                 "keep_warm": p.keep_warm,
                 "models": p.static_models,
                 "healthy": health.get(&p.name).copied(),
+                "idle": state.is_upstream_idle(&p.name),
                 "managed": p.managed.is_some(),
                 "copilot": p.copilot.is_some(),
                 "running": state.managed().is_running(&p.name),

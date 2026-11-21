@@ -247,14 +247,15 @@ export function App() {
               Upstreams
               {meta ? (
                 <span className="side-count">
-                  {enabledProfiles.filter((profile) => profile.healthy === true).length} of {enabledProfiles.length} up
+                  {enabledProfiles.filter((profile) => profile.healthy === true || profile.idle).length} of {enabledProfiles.length} up
                 </span>
               ) : null}
             </div>
             <ul className="upstream-list">
               {enabledProfiles.map((profile) => {
                 const led = profile.healthy === true ? "up" : profile.healthy === false ? "down" : "off";
-                const health = led === "up" ? "healthy" : led === "down" ? "unhealthy" : "unknown";
+                const health =
+                  led === "up" ? "healthy" : led === "down" ? "unhealthy" : profile.idle ? "idle, starts on request" : "unknown";
                 return (
                   <li key={profile.name}>
                     <button

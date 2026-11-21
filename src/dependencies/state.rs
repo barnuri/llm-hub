@@ -61,6 +61,8 @@ struct Inner {
     model_costs: ArcSwap<HashMap<String, u8>>,
     /// profile name -> reachable, updated on every models fan-out.
     upstream_health: DashMap<String, bool>,
+    /// Managed profiles stopped on purpose at the last models fan-out.
+    idle_upstreams: dashmap::DashSet<String>,
     /// Copilot profile name -> advertised bare model id -> upstream entry.
     upstream_models: DashMap<String, Arc<HashMap<String, UpstreamModel>>>,
     /// Copilot profile name -> its usable raw `/models` entries, for Auto routing.
@@ -164,6 +166,7 @@ impl AppState {
             model_health: ModelHealth::default(),
             model_costs: ArcSwap::from_pointee(HashMap::new()),
             upstream_health: DashMap::new(),
+            idle_upstreams: dashmap::DashSet::new(),
             upstream_models: DashMap::new(),
             copilot_catalogs: DashMap::new(),
             first_refresh: tokio::sync::OnceCell::new(),
@@ -593,7 +596,18 @@ impl AppState {
     }
 
     pub fn set_upstream_health(&self, profile: &str, healthy: bool) {
+        self.0.idle_upstreams.remove(profile);
         self.0.upstream_health.insert(profile.to_string(), healthy);
+    }
+
+    /// Marks a managed profile as stopped on purpose: neither healthy nor unhealthy.
+    pub fn set_upstream_idle(&self, profile: &str) {
+        self.0.upstream_health.remove(profile);
+        self.0.idle_upstreams.insert(profile.to_string());
+    }
+
+    pub fn is_upstream_idle(&self, profile: &str) -> bool {
+        self.0.idle_upstreams.contains(profile)
     }
 
     pub fn upstream_health(&self) -> HashMap<String, bool> {
