@@ -198,6 +198,7 @@ async fn fetch_profile_models(
     state: &AppState,
     profile: &ProfileConfig,
 ) -> Result<ProfileListing, String> {
+    state.managed().ensure_resident(profile).await?;
     let client = state.client(&profile.name).ok_or("no client for profile")?;
     let body = tokio::time::timeout(
         MODELS_FANOUT_TIMEOUT,
@@ -682,7 +683,6 @@ fn smart_auto_label(selector: &HubSelector) -> String {
 pub fn spawn_background_refresh(state: AppState) {
     tokio::spawn(async move {
         crate::services::model_picker::refresh_usage(&state).await;
-        state.managed().start_resident(&state.config()).await;
         first_refresh(&state).await;
         loop {
             tokio::time::sleep(MODELS_CACHE_TTL).await;
