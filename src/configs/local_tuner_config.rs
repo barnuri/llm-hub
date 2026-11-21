@@ -141,7 +141,7 @@ mod tests {
             &[
                 ("PREFILL_GUARD", "240000"),
                 ("TUNER_REGISTRY", "~/models/registry.txt"),
-                ("TUNER_APPLY_COMMAND", "~/bin/sync --restart 'two words'"),
+                ("TUNER_APPLY_COMMAND", r#"~/bin/sync --restart "two words""#),
                 ("TUNER_APPLY_TIMEOUT_MS", "5000"),
             ],
             None,
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn unbalanced_apply_command_is_rejected() {
-        let err = parse(&[("TUNER_APPLY_COMMAND", "sync 'open")], None, None).unwrap_err();
+        let err = parse(&[("TUNER_APPLY_COMMAND", r#"sync "open"#)], None, None).unwrap_err();
         assert!(err.contains("LLM_HUB_LOCAL_TUNER_APPLY_COMMAND"), "{err}");
     }
 
