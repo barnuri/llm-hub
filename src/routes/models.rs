@@ -682,6 +682,7 @@ fn smart_auto_label(selector: &HubSelector) -> String {
 pub fn spawn_background_refresh(state: AppState) {
     tokio::spawn(async move {
         crate::services::model_picker::refresh_usage(&state).await;
+        state.managed().start_resident(&state.config()).await;
         first_refresh(&state).await;
         loop {
             tokio::time::sleep(MODELS_CACHE_TTL).await;

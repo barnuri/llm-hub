@@ -104,7 +104,7 @@ the service environment sets one of them.
 | `LLM_HUB_<NAME>_CACHE_WRITE_USD_PER_1M` | the input price | Cache-write price. |
 | `LLM_HUB_<NAME>_MODEL_PRICES` | none | Prices per model: `model:in/out[,cache_read[/cache_write]]`. |
 | `LLM_HUB_<NAME>_COMMAND` | none | Local server the hub starts on demand. See [Local servers on demand](providers.md#local-servers-on-demand). |
-| `LLM_HUB_<NAME>_IDLE_SECS` | `900` | Stop the managed process after this many idle seconds. `0` means never. |
+| `LLM_HUB_<NAME>_IDLE_SECS` | `900` | Stop the managed process after this many idle seconds. `0` means never, and the hub starts the process at boot. |
 | `LLM_HUB_<NAME>_START_TIMEOUT_SECS` | `120` | Time the managed process gets to accept connections. |
 
 ## Per profile, native Copilot

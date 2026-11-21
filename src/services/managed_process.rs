@@ -84,6 +84,21 @@ impl ProcessManager {
         }
     }
 
+    /// Starts every enabled profile whose process never idles (`IDLE_SECS=0`),
+    /// so its models are listed before the first request. Logs each failed start.
+    pub async fn start_resident(&self, config: &HubConfig) {
+        let starts = config
+            .profiles
+            .iter()
+            .filter(|p| p.enabled && p.managed.as_ref().is_some_and(|c| c.idle_timeout.is_none()))
+            .map(|profile| async move {
+                if let Err(reason) = self.ensure_running(profile).await {
+                    tracing::warn!(profile = %profile.name, "resident process did not start: {reason}");
+                }
+            });
+        futures_util::future::join_all(starts).await;
+    }
+
     /// Records a use so the idle timer restarts, e.g. when a long response arrives.
     pub fn touch(&self, profile: &str) {
         if let Some(entry) = self.entries.get(profile) {
