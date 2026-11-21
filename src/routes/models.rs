@@ -115,20 +115,27 @@ pub async fn refresh_models(state: &AppState) -> Value {
     let config = state.config();
     let enabled: Vec<&ProfileConfig> = config.profiles.iter().filter(|p| p.enabled).collect();
 
-    let fetches = enabled
-        .iter()
-        .map(|profile| fetch_profile_models(state, profile));
+    let fetches = enabled.iter().map(|profile| async move {
+        if state.managed().is_stopped(profile).await {
+            return None;
+        }
+        Some(fetch_profile_models(state, profile).await)
+    });
     let per_profile = join_all(fetches).await;
 
     let mut merged = Vec::new();
     let mut descriptors = Vec::new();
     for (profile, result) in enabled.iter().zip(per_profile) {
         let listing = match result {
-            Ok(listing) => {
+            None => {
+                state.set_upstream_idle(&profile.name);
+                fallback_models(state, profile)
+            }
+            Some(Ok(listing)) => {
                 state.set_upstream_health(&profile.name, true);
                 listing
             }
-            Err(reason) => {
+            Some(Err(reason)) => {
                 state.set_upstream_health(&profile.name, false);
                 tracing::warn!(profile = %profile.name, "models fetch failed: {reason}");
                 fallback_models(state, profile)
@@ -820,6 +827,30 @@ mod tests {
         let base = format!("http://{}/probe", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, router).await });
         base
+    }
+
+    #[tokio::test]
+    async fn stopped_managed_profile_is_idle_with_its_static_models() {
+        let state = state_from(&[
+            ("LLM_HUB_PROFILES", "whisper"),
+            ("LLM_HUB_WHISPER_BASE_URL", "http://127.0.0.1:9/v1"),
+            ("LLM_HUB_WHISPER_COMMAND", "never-run-server"),
+            ("LLM_HUB_WHISPER_MODELS", "whisper-large-v3"),
+        ]);
+
+        let payload = refresh_models(&state).await;
+
+        assert!(state.is_upstream_idle("whisper"));
+        assert_eq!(state.upstream_health().get("whisper"), None);
+        assert!(
+            payload["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "whisper/whisper-large-v3")
+        );
+        state.set_upstream_health("whisper", true);
+        assert!(!state.is_upstream_idle("whisper"));
     }
 
     #[tokio::test]

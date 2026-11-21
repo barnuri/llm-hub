@@ -211,6 +211,12 @@ async fn concurrent_first_requests_share_one_start_and_shutdown_stops_it() {
         0,
         "/v1/models must not start the process"
     );
+    let status = profile_status(&base).await;
+    assert_eq!(status["idle"], true, "stopped profile shows idle: {status}");
+    assert!(
+        status["healthy"].is_null(),
+        "idle is not unhealthy: {status}"
+    );
 
     let (first, second) = tokio::join!(transcribe(&base), transcribe(&base));
 
