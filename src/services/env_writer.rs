@@ -23,8 +23,9 @@ const OPERATOR_ONLY_KEYS: [&str; 15] = [
     "TUNER_APPLY_TIMEOUT_MS",
     "BUDGET_MONTHLY_USD",
 ];
-/// Global keys a profile named `local`, `notify` or `budget` would otherwise claim as its own lines.
-const GLOBAL_KEYS: [&str; 10] = [
+/// Global keys a profile named `extensions`, `local`, `notify` or `budget` would otherwise claim as its own lines.
+const GLOBAL_KEYS: [&str; 11] = [
+    "EXTENSIONS_DISABLED",
     "LOCAL_TUNER",
     "NOTIFICATIONS",
     "NOTIFY_DESKTOP",
@@ -502,17 +503,23 @@ mod tests {
         std::fs::write(
             &path,
             "LLM_HUB_LOCAL_BASE_URL=http://127.0.0.1:1\nLLM_HUB_LOCAL_TUNER=true\n\
-             LLM_HUB_NOTIFY_BASE_URL=http://127.0.0.1:2\nLLM_HUB_NOTIFY_MUTE=source=errors\n",
+             LLM_HUB_NOTIFY_BASE_URL=http://127.0.0.1:2\nLLM_HUB_NOTIFY_MUTE=source=errors\n\
+             LLM_HUB_EXTENSIONS_BASE_URL=http://127.0.0.1:3\nLLM_HUB_EXTENSIONS_DISABLED=rules:*\n",
         )
         .unwrap();
 
         remove_profile(&path, "local", &[]).unwrap();
         remove_profile(&path, "notify", &[]).unwrap();
+        remove_profile(&path, "extensions", &[]).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("LLM_HUB_LOCAL_TUNER=true\n"), "{content}");
         assert!(
             content.contains("LLM_HUB_NOTIFY_MUTE=source=errors\n"),
+            "{content}"
+        );
+        assert!(
+            content.contains("LLM_HUB_EXTENSIONS_DISABLED=rules:*\n"),
             "{content}"
         );
         assert!(!content.contains("BASE_URL"), "{content}");

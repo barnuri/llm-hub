@@ -271,6 +271,31 @@ export interface KeysResponse {
   readonly keys: readonly ApiKeyRow[];
 }
 
+export type ExtensionKind = "builtin" | "rules" | "library" | "hook";
+
+export type ExtensionDisabledBy = "env" | "ui" | null;
+
+export interface ExtensionRuleStatus {
+  readonly name: string;
+  readonly phase: string;
+  readonly mode: "enforce" | "shadow";
+  readonly enabled: boolean;
+  readonly disabled_by: ExtensionDisabledBy;
+}
+
+export interface ExtensionStatus {
+  readonly name: string;
+  readonly kind: ExtensionKind;
+  readonly phases: readonly string[];
+  readonly enabled: boolean;
+  readonly disabled_by: ExtensionDisabledBy;
+  readonly rules?: readonly ExtensionRuleStatus[];
+}
+
+export interface ExtensionsResponse {
+  readonly extensions: readonly ExtensionStatus[];
+}
+
 export type ModelHealth = "healthy" | "degraded" | "failing" | "insufficient_data";
 
 export type InsightsRange = "1d" | "7d" | "30d" | "all";

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
@@ -8,6 +8,7 @@ use crate::configs::HubConfig;
 use crate::consts::{LOGS_DIR, MEDIA_FALLBACK_CACHE_ENTRIES};
 use crate::ext::builtin::builtins;
 use crate::ext::{CompleteCtx, ExtensionSet};
+use crate::schemas::extension_status::ExtensionStatus;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
 use crate::schemas::upstream_model::UpstreamModel;
@@ -18,6 +19,7 @@ use crate::services::copilot_descriptions::CopilotDescriptions;
 use crate::services::copilot_prices::CopilotPrices;
 use crate::services::copilot_sessions::CopilotSessionCache;
 use crate::services::credential_store::CredentialStore;
+use crate::services::extension_toggles::{self, ExtensionToggles, ToggleError, ToggleTarget};
 use crate::services::gh_cli::GhCli;
 use crate::services::keep_warm::KeepWarm;
 use crate::services::keyring_credential_store::KeyringCredentialStore;
@@ -100,8 +102,14 @@ struct Inner {
     smart_auto_rules: SmartAutoRulesStore,
     /// Idle Copilot Claude streams kept warm with pings.
     keep_warm: Arc<KeepWarm>,
-    /// Built-in, library and rule extensions. Swapped whole when a rules file reloads.
+    /// The running extensions: `all_extensions` without what `extension_toggles` turns off.
     extensions: ArcSwap<ExtensionSet>,
+    /// Built-in, library and rule extensions before toggles. Swapped whole when a rules file reloads.
+    all_extensions: ArcSwap<ExtensionSet>,
+    /// The extensions and rules turned off by the env or the UI.
+    extension_toggles: ArcSwap<ExtensionToggles>,
+    /// Serializes rebuilds of `extensions`, so a toggle and a rules reload never lose each other.
+    extensions_lock: Mutex<()>,
     /// Prefill fits and apply locks of the local model tuner.
     local_tuner: Arc<LocalTuner>,
     /// The notifications inbox, mutes and sink delivery every source writes through.
@@ -160,6 +168,12 @@ impl AppState {
             &store_dir(config.store_path.as_deref()),
             config.smart_auto_rules_env.as_deref(),
         )?;
+        let extension_toggles =
+            ExtensionToggles::load(&config.extensions_disabled, store.as_deref());
+        let all_extensions = ExtensionSet::new(builtins());
+        let extensions = all_extensions
+            .filtered(&extension_toggles)
+            .with_notifier(Arc::clone(&notifier));
         let state = AppState(Arc::new(Inner {
             config: ArcSwap::from_pointee(config),
             clients: ArcSwap::from_pointee(clients),
@@ -196,9 +210,10 @@ impl AppState {
             selection_log,
             smart_auto_rules,
             keep_warm: Arc::new(KeepWarm::default()),
-            extensions: ArcSwap::from_pointee(
-                ExtensionSet::new(builtins()).with_notifier(Arc::clone(&notifier)),
-            ),
+            extensions: ArcSwap::from_pointee(extensions),
+            all_extensions: ArcSwap::from_pointee(all_extensions),
+            extension_toggles: ArcSwap::from_pointee(extension_toggles),
+            extensions_lock: Mutex::new(()),
             local_tuner: Arc::new(LocalTuner::default()),
             notifier,
         }));
@@ -227,6 +242,16 @@ impl AppState {
         };
         self.0.upstream_models.retain(|name, _| is_copilot(name));
         self.0.copilot_catalogs.retain(|name, _| is_copilot(name));
+        if self.config().extensions_disabled != config.extensions_disabled {
+            let _guard = self.lock_extensions();
+            let toggles = self
+                .0
+                .extension_toggles
+                .load()
+                .with_env(&config.extensions_disabled);
+            self.0.extension_toggles.store(Arc::new(toggles));
+            self.rebuild_extensions();
+        }
         self.0.config.store(Arc::new(config));
         Ok(())
     }
@@ -264,9 +289,62 @@ impl AppState {
         self.0.extensions.load_full()
     }
 
+    /// Runs `extensions` without what the toggles turn off. Every rebuild passes through here.
     pub fn set_extensions(&self, extensions: ExtensionSet) {
-        let extensions = extensions.with_notifier(Arc::clone(&self.0.notifier));
-        self.0.extensions.store(Arc::new(extensions));
+        let _guard = self.lock_extensions();
+        self.0.all_extensions.store(Arc::new(extensions));
+        self.rebuild_extensions();
+    }
+
+    /// Every extension and rule, with whether it runs and what turned it off.
+    pub(crate) fn extension_statuses(&self) -> Vec<ExtensionStatus> {
+        extension_toggles::statuses(
+            &self.0.all_extensions.load(),
+            &self.0.extension_toggles.load(),
+        )
+    }
+
+    /// Turns an extension or a rule on or off from the UI, saves the choice and rebuilds the set.
+    ///
+    /// # Errors
+    /// [`ToggleError::Unknown`] for a name the set lacks, [`ToggleError::SetByEnv`] for a name
+    /// the env turns off, and [`ToggleError::Store`] when the save fails.
+    pub(crate) fn toggle_extension(
+        &self,
+        target: ToggleTarget,
+        name: &str,
+        enabled: bool,
+    ) -> Result<(), ToggleError> {
+        let _guard = self.lock_extensions();
+        if !extension_toggles::knows(&self.0.all_extensions.load(), target, name) {
+            return Err(ToggleError::Unknown(name.to_owned()));
+        }
+        let toggles =
+            self.0
+                .extension_toggles
+                .load()
+                .toggled(target, name, enabled, self.store())?;
+        self.0.extension_toggles.store(Arc::new(toggles));
+        self.rebuild_extensions();
+        Ok(())
+    }
+
+    fn lock_extensions(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.0
+            .extensions_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Filters the full set by the toggles into the running set. The caller holds the lock.
+    fn rebuild_extensions(&self) {
+        let running = self
+            .0
+            .all_extensions
+            .load()
+            .filtered(&self.0.extension_toggles.load())
+            .with_notifier(Arc::clone(&self.0.notifier));
+        self.0.extensions.store(Arc::new(running));
     }
 
     pub fn live_feed(&self) -> &LiveFeed {
@@ -742,5 +820,102 @@ mod tests {
         let snapshot = ModelDescriptorSnapshot::new(vec![descriptor("copilot/gpt-9"), replacement]);
         assert_eq!(snapshot.iter().count(), 1);
         assert!(!snapshot.get("copilot/gpt-9").unwrap().chat);
+    }
+
+    fn toggle_state(env: &[(&str, &str)], store: Option<Store>) -> AppState {
+        use crate::services::fake_gh_cli::FakeGhCli;
+        use crate::services::gh_cli::GhOutcome;
+        use crate::services::memory_credential_store::MemoryCredentialStore;
+
+        let vars: HashMap<String, String> = env
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            store,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_env_filters_the_set_at_startup_and_on_every_rebuild() {
+        let state = toggle_state(
+            &[("LLM_HUB_EXTENSIONS_DISABLED", "upstream-*,rules:tag")],
+            None,
+        );
+        assert!(!state.extensions().names().contains(&"upstream-limits"));
+
+        state.set_extensions(crate::services::extension_toggles::sample_set());
+
+        let running = state.extensions();
+        assert_eq!(running.names().len(), 5);
+        assert_eq!(state.extension_statuses().len(), 7);
+        let statuses = state.extension_statuses();
+        let rules = statuses[5].rules.as_ref().unwrap();
+        assert!(rules.iter().any(|rule| rule.name == "tag" && !rule.enabled));
+    }
+
+    #[test]
+    fn a_toggle_rebuilds_the_set_and_re_enabling_restores_it() {
+        let state = toggle_state(&[("LLM_HUB_EXTENSIONS_DISABLED", "rules:trial")], None);
+        state.set_extensions(crate::services::extension_toggles::sample_set());
+
+        state
+            .toggle_extension(ToggleTarget::Extension, "team-gate", false)
+            .unwrap();
+        assert!(!state.extensions().names().contains(&"team-gate"));
+        state
+            .toggle_extension(ToggleTarget::Extension, "team-gate", true)
+            .unwrap();
+        assert!(state.extensions().names().contains(&"team-gate"));
+
+        assert_eq!(
+            state.toggle_extension(ToggleTarget::Rule, "nope", false),
+            Err(ToggleError::Unknown("nope".into()))
+        );
+        assert_eq!(
+            state.toggle_extension(ToggleTarget::Rule, "trial", true),
+            Err(ToggleError::SetByEnv("trial".into()))
+        );
+    }
+
+    #[test]
+    fn ui_toggles_survive_a_rebuilt_state_on_the_same_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.json");
+        let open = || Store::open("json", path.to_str()).unwrap();
+        let first = toggle_state(&[], Some(open()));
+        first
+            .toggle_extension(ToggleTarget::Extension, "upstream-limits", false)
+            .unwrap();
+        drop(first);
+
+        let second = toggle_state(&[], Some(open()));
+
+        assert!(!second.extensions().names().contains(&"upstream-limits"));
+        assert_eq!(second.extensions().names().len(), 3);
+    }
+
+    #[test]
+    fn a_changed_env_list_refilters_the_running_set() {
+        let state = toggle_state(&[], None);
+        assert_eq!(state.extensions().names().len(), 4);
+
+        state
+            .swap_config(
+                HubConfig::from_map(
+                    &[("LLM_HUB_EXTENSIONS_DISABLED".to_owned(), "*".to_owned())]
+                        .into_iter()
+                        .collect(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert!(state.extensions().names().is_empty());
+        assert_eq!(state.extension_statuses().len(), 4);
     }
 }

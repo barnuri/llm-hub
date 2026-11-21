@@ -39,11 +39,11 @@ impl Rule {
 #[derive(Debug, Default)]
 pub(crate) struct RulesExtension {
     hooks: Option<Arc<HookSet>>,
-    http_request: Vec<Rule>,
-    request: Vec<Rule>,
-    attempt: Vec<Rule>,
-    response: Vec<Rule>,
-    http_response: Vec<Rule>,
+    http_request: Vec<Arc<Rule>>,
+    request: Vec<Arc<Rule>>,
+    attempt: Vec<Arc<Rule>>,
+    response: Vec<Arc<Rule>>,
+    http_response: Vec<Arc<Rule>>,
 }
 
 impl RulesExtension {
@@ -75,7 +75,7 @@ impl RulesExtension {
                     "rule `{name}`: the complete phase runs hooks only, because a rule has nothing to change there"
                 ));
             }
-            let rule = Rule {
+            let rule = Arc::new(Rule {
                 name: name.clone(),
                 phase,
                 shadow: spec.mode == RuleMode::Shadow,
@@ -87,7 +87,7 @@ impl RulesExtension {
                     .map(|action| Action::compile(action, phase, env))
                     .collect::<Result<_, _>>()
                     .map_err(|e| format!("rule `{name}`: {e}"))?,
-            };
+            });
             match phase {
                 PhaseName::HttpRequest => rules.http_request.push(rule),
                 PhaseName::Request => rules.request.push(rule),
@@ -122,7 +122,50 @@ impl RulesExtension {
         self.hooks.take()
     }
 
-    fn all(&self) -> impl Iterator<Item = &Rule> {
+    /// The name, phase and shadow flag of every rule, grouped by phase.
+    pub fn rule_list(&self) -> impl Iterator<Item = (&str, PhaseName, bool)> {
+        self.all()
+            .map(|rule| (rule.name.as_str(), rule.phase, rule.shadow))
+    }
+
+    /// The phases that hold at least one rule.
+    pub fn phases(&self) -> Vec<PhaseName> {
+        [
+            (PhaseName::HttpRequest, &self.http_request),
+            (PhaseName::Request, &self.request),
+            (PhaseName::Attempt, &self.attempt),
+            (PhaseName::Response, &self.response),
+            (PhaseName::HttpResponse, &self.http_response),
+        ]
+        .into_iter()
+        .filter(|(_, rules)| !rules.is_empty())
+        .map(|(phase, _)| phase)
+        .collect()
+    }
+
+    /// A copy without the rules `off` names and without the hooks. `None` when `off` names none.
+    pub fn without(&self, off: impl Fn(&str) -> bool) -> Option<RulesExtension> {
+        if !self.all().any(|rule| off(&rule.name)) {
+            return None;
+        }
+        let kept = |rules: &[Arc<Rule>]| -> Vec<Arc<Rule>> {
+            rules
+                .iter()
+                .filter(|rule| !off(&rule.name))
+                .map(Arc::clone)
+                .collect()
+        };
+        Some(RulesExtension {
+            hooks: None,
+            http_request: kept(&self.http_request),
+            request: kept(&self.request),
+            attempt: kept(&self.attempt),
+            response: kept(&self.response),
+            http_response: kept(&self.http_response),
+        })
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Arc<Rule>> {
         self.http_request
             .iter()
             .chain(&self.request)

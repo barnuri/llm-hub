@@ -23,6 +23,7 @@ Boolean flags accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off`.
 | `LLM_HUB_DEFAULT_FALLBACKS` | empty | Fallback chain for requests without the fallback header. |
 | `LLM_HUB_MAX_REPLAY_BYTES` | `268435456` (256 MB) | Largest request body the hub buffers for fallback replay and Anthropic translation. |
 | `LLM_HUB_EXTENSIONS_FILE` | `extensions.yaml`, `extensions.yml` or `extensions.json` in the working directory | Rules file for [extensions](extensions.md#rules). Reloaded on change. `llm-hub extensions check` validates it. |
+| `LLM_HUB_EXTENSIONS_DISABLED` | empty | Comma-separated extension names or globs to turn off, such as `upstream-limits` or `local-*`. `hooks` turns off the hooks of the rules file, and `rules:<name or glob>` turns off single rules. The UI cannot turn these back on. Applied when `.env` changes. See [Turn extensions on and off](extensions.md#turn-extensions-on-and-off). |
 | `LLM_HUB_STREAM_ROLE` | `true` | Add `role: "assistant"` to the first streamed delta when the upstream leaves it out. |
 | `LLM_HUB_SSE_KEEPALIVE_MS` | `15000` | Idle time before an SSE keepalive comment. `0` turns it off. |
 | `LLM_HUB_DEADLINE_MS` | none | Default time limit of a whole fallback chain. `X-LLM-Hub-Deadline-Ms` wins. See [Fallbacks](fallbacks-and-transforms.md#fallbacks). |

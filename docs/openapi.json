@@ -482,6 +482,204 @@
         }
       }
     },
+    "/api/extensions": {
+      "get": {
+        "tags": [
+          "extensions"
+        ],
+        "summary": "List extensions and rules",
+        "description": "Every extension in run order, then the hooks, with the rules of the rules file. `disabled_by` says whether the env or the UI turned one off.",
+        "operationId": "list_extensions",
+        "responses": {
+          "200": {
+            "description": "Extensions and rules",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/extensions/rules/{rule}": {
+      "put": {
+        "tags": [
+          "extensions"
+        ],
+        "summary": "Turn one rule on or off",
+        "description": "Turns one rule of the rules file on or off, and saves the choice in the store.",
+        "operationId": "set_extension_rule",
+        "parameters": [
+          {
+            "name": "rule",
+            "in": "path",
+            "description": "Rule name from the rules file.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtensionToggleInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Extensions and rules after the change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No rule has that name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`LLM_HUB_EXTENSIONS_DISABLED` turns it off with `rules:<name>`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The store could not save the choice.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/extensions/{name}": {
+      "put": {
+        "tags": [
+          "extensions"
+        ],
+        "summary": "Turn an extension on or off",
+        "description": "Saves the choice in the store, so it survives a restart. The hooks of the rules file go by the name `hooks`.",
+        "operationId": "set_extension",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Extension name, for example `upstream-limits`, `rules` or `hooks`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtensionToggleInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Extensions and rules after the change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No extension has that name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`LLM_HUB_EXTENSIONS_DISABLED` turns it off.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The store could not save the choice.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/fallbacks": {
       "post": {
         "tags": [
@@ -3671,6 +3869,14 @@
           }
         }
       },
+      "DisabledBy": {
+        "type": "string",
+        "description": "What turned an extension or a rule off.",
+        "enum": [
+          "env",
+          "ui"
+        ]
+      },
       "ErrorBody": {
         "type": "object",
         "description": "Error envelope the hub returns on a failed `/api/*` or `/v1/*` call.",
@@ -3697,6 +3903,91 @@
           "type": {
             "type": "string",
             "description": "Error kind, for example `invalid_request_error` or `authentication_error`."
+          }
+        }
+      },
+      "ExtensionKind": {
+        "type": "string",
+        "description": "Where an extension comes from.",
+        "enum": [
+          "builtin",
+          "rules",
+          "library",
+          "hook"
+        ]
+      },
+      "ExtensionList": {
+        "type": "object",
+        "description": "Every extension, in the order request phases run them, then the hooks.",
+        "required": [
+          "extensions"
+        ],
+        "properties": {
+          "extensions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExtensionStatus"
+            }
+          }
+        }
+      },
+      "ExtensionStatus": {
+        "type": "object",
+        "description": "One extension of the running hub.",
+        "required": [
+          "name",
+          "kind",
+          "phases",
+          "enabled"
+        ],
+        "properties": {
+          "disabled_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DisabledBy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ExtensionKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "phases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The phases it runs in. Empty for a library extension, whose phases the hub cannot see."
+          },
+          "rules": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/RuleStatus"
+            },
+            "description": "The rules of the rules extension. Absent for every other kind."
+          }
+        }
+      },
+      "ExtensionToggleInput": {
+        "type": "object",
+        "description": "Turns an extension or a rule on or off.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
           }
         }
       },
@@ -4453,6 +4744,42 @@
             "description": "`true` marks the errors solved, `false` reopens them."
           }
         }
+      },
+      "RuleStatus": {
+        "type": "object",
+        "description": "One rule of the rules file.",
+        "required": [
+          "name",
+          "phase",
+          "mode",
+          "enabled"
+        ],
+        "properties": {
+          "disabled_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DisabledBy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "mode": {
+            "type": "string",
+            "description": "`enforce` or `shadow`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "phase": {
+            "type": "string",
+            "description": "`http_request`, `request`, `attempt`, `response` or `http_response`."
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -4517,6 +4844,10 @@
     {
       "name": "notifications",
       "description": "Notifications inbox, tuner approvals, mute rules and desktop popup setup."
+    },
+    {
+      "name": "extensions",
+      "description": "Turn built-in, library and rule extensions on and off."
     },
     {
       "name": "system",

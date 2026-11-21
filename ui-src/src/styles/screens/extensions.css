@@ -1,0 +1,21 @@
+.tab.active.extensions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.extensions > .panel {
+  margin-top: 0;
+}
+
+.extensions-note {
+  margin-bottom: 8px;
+}
+
+.extensions-rule td:first-child {
+  padding-left: 32px;
+}
+
+.extensions-skeleton {
+  height: 160px;
+}

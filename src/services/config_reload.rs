@@ -123,6 +123,7 @@ mod tests {
             master_key: None,
             smart_auto_presets: std::collections::BTreeMap::new(),
             smart_auto_rules_env: None,
+            extensions_disabled: vec![],
             default_fallbacks: vec![],
             max_replay_bytes: 1,
             max_request_body_bytes: crate::consts::DEFAULT_MAX_REQUEST_BODY_BYTES,
