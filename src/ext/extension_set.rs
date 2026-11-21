@@ -19,7 +19,7 @@ pub(crate) struct ExtensionSet {
     hooks: Option<Arc<HookSet>>,
     /// Receives what extensions send with `ctx.notify(..)`. Without it those notifications drop.
     notifier: Option<Arc<Notifier>>,
-    /// The rules file's extension, also last in `extensions`. Toggles remove single rules from it.
+    /// The rules file's extension, also last in `extensions`. `None` in a filtered set.
     rules: Option<Arc<RulesExtension>>,
 }
 
@@ -61,7 +61,7 @@ impl ExtensionSet {
         self.hooks.as_ref()
     }
 
-    /// The rules file's extension, with every rule. `None` without a rules file.
+    /// The rules file's extension, with every rule. `None` without a rules file and in a filtered set.
     pub(crate) fn rules(&self) -> Option<&RulesExtension> {
         self.rules.as_deref()
     }

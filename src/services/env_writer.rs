@@ -24,8 +24,9 @@ const OPERATOR_ONLY_KEYS: [&str; 15] = [
     "BUDGET_MONTHLY_USD",
 ];
 /// Global keys a profile named `extensions`, `local`, `notify` or `budget` would otherwise claim as its own lines.
-const GLOBAL_KEYS: [&str; 11] = [
+const GLOBAL_KEYS: [&str; 12] = [
     "EXTENSIONS_DISABLED",
+    "EXTENSIONS_FILE",
     "LOCAL_TUNER",
     "NOTIFICATIONS",
     "NOTIFY_DESKTOP",
@@ -504,7 +505,8 @@ mod tests {
             &path,
             "LLM_HUB_LOCAL_BASE_URL=http://127.0.0.1:1\nLLM_HUB_LOCAL_TUNER=true\n\
              LLM_HUB_NOTIFY_BASE_URL=http://127.0.0.1:2\nLLM_HUB_NOTIFY_MUTE=source=errors\n\
-             LLM_HUB_EXTENSIONS_BASE_URL=http://127.0.0.1:3\nLLM_HUB_EXTENSIONS_DISABLED=rules:*\n",
+             LLM_HUB_EXTENSIONS_BASE_URL=http://127.0.0.1:3\nLLM_HUB_EXTENSIONS_DISABLED=rules:*\n\
+             LLM_HUB_EXTENSIONS_FILE=/etc/hub/rules.yaml\n",
         )
         .unwrap();
 
@@ -520,6 +522,10 @@ mod tests {
         );
         assert!(
             content.contains("LLM_HUB_EXTENSIONS_DISABLED=rules:*\n"),
+            "{content}"
+        );
+        assert!(
+            content.contains("LLM_HUB_EXTENSIONS_FILE=/etc/hub/rules.yaml\n"),
             "{content}"
         );
         assert!(!content.contains("BASE_URL"), "{content}");

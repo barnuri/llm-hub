@@ -449,7 +449,7 @@ list: `LLM_HUB_MEDIA_FALLBACK` turns it on and off.
 | Per-team metrics or billing from a library build | Rust: keep the team in request state in `on_request`, read it in `on_complete` |
 | Custom auth on the inference routes | Rust: `on_request` with `Flow::reject`. It also runs, headers only, for unbuffered bodies and `GET /v1/models/{id}` |
 | Freeze or audit settings | Rust: `on_config_change` and `on_config_changed` |
-| Rule out a built-in or a rule that misbehaves | Settings > Extensions, or `LLM_HUB_EXTENSIONS_DISABLED` |
+| Turn off a built-in or a rule that misbehaves | Settings > Extensions, or `LLM_HUB_EXTENSIONS_DISABLED` |
 | An extra endpoint | Rust: `Hub::routes` |
 | Access log, panic recovery or CORS on every route | Rust: `Hub::router` with a `tower` layer |
 

@@ -289,7 +289,7 @@ impl AppState {
         self.0.extensions.load_full()
     }
 
-    /// Runs `extensions` without what the toggles turn off. Every rebuild passes through here.
+    /// Stores `extensions` as the full set and runs it without what the toggles turn off.
     pub fn set_extensions(&self, extensions: ExtensionSet) {
         let _guard = self.lock_extensions();
         self.0.all_extensions.store(Arc::new(extensions));
