@@ -126,7 +126,8 @@ impl ManagedCommand {
         Some(words)
     }
 
-    fn expand_home(word: String, home: Option<&str>) -> String {
+    /// Replaces a leading `~/` in `word` with `home`. Other words come back unchanged.
+    pub(crate) fn expand_home(word: String, home: Option<&str>) -> String {
         match (word.strip_prefix("~/"), home) {
             (Some(rest), Some(home)) => {
                 format!("{}/{rest}", home.trim_end_matches(['/', '\\']))

@@ -3,8 +3,11 @@ use serde_json::{Map, Value};
 
 use crate::consts::HEADER_FALLBACKS;
 use crate::ext::rules::matcher::{header_name, header_value};
-use crate::ext::rules::rule_spec::{ActionSpec, PhaseName};
-use crate::ext::{AttemptCtx, Flow, HttpRequestCtx, HttpResponseCtx, RequestCtx, ResponseCtx};
+use crate::ext::rules::rule_spec::{ActionSpec, NotifySeverity, NotifySpec, PhaseName};
+use crate::ext::{
+    AttemptCtx, ExtNotification, ExtSeverity, Flow, HttpRequestCtx, HttpResponseCtx, RequestCtx,
+    ResponseCtx,
+};
 
 /// One compiled rule action.
 #[derive(Debug)]
@@ -17,6 +20,7 @@ pub(crate) enum Action {
     Reject(StatusCode, String),
     RetryNext,
     SetStatus(StatusCode),
+    Notify(ExtNotification),
 }
 
 impl Action {
@@ -27,36 +31,7 @@ impl Action {
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Action, String> {
         let name = spec.name();
-        let allowed: &[&str] = match phase {
-            PhaseName::HttpRequest => &["set_header", "remove_header", "reject"],
-            PhaseName::HttpResponse => &["set_header", "remove_header", "set_status"],
-            PhaseName::Complete => &[],
-            PhaseName::Request => &[
-                "set_header",
-                "remove_header",
-                "set_field",
-                "remove_field",
-                "set_model",
-                "set_fallbacks",
-                "reject",
-            ],
-            PhaseName::Attempt => &[
-                "set_header",
-                "remove_header",
-                "set_field",
-                "remove_field",
-                "set_model",
-                "reject",
-            ],
-            PhaseName::Response => &[
-                "set_header",
-                "remove_header",
-                "set_field",
-                "remove_field",
-                "retry_next",
-                "set_status",
-            ],
-        };
+        let allowed = allowed_actions(phase);
         if !allowed.contains(&name) {
             return Err(format!(
                 "action `{name}` is not available in the {} phase",
@@ -122,6 +97,7 @@ impl Action {
                     .filter(|s| s.as_u16() >= 200)
                     .ok_or_else(|| format!("set_status {status} is not an HTTP status"))?,
             ),
+            ActionSpec::Notify(notify) => Action::Notify(compile_notify(&notify, env)?),
         })
     }
 
@@ -136,6 +112,7 @@ impl Action {
             Action::Reject(status, _) => format!("reject({})", status.as_u16()),
             Action::RetryNext => "retry_next".to_owned(),
             Action::SetStatus(status) => format!("set_status({})", status.as_u16()),
+            Action::Notify(_) => "notify".to_owned(),
         }
     }
 
@@ -150,6 +127,10 @@ impl Action {
     /// Applies a header, body or reject action to `target`. Returns the rejection when the action
     /// rejects. The response-only actions are left to the caller.
     pub fn apply_to(&self, target: &mut impl ActionTarget) -> Option<Flow> {
+        if let Action::Notify(note) = self {
+            target.target_notify(note.clone());
+            return None;
+        }
         if let Action::Reject(status, message) = self {
             return Some(Flow::reject(status.as_u16(), message.clone()));
         }
@@ -163,10 +144,71 @@ impl Action {
     }
 }
 
-/// What a rule action changes: the headers and the JSON body of one phase.
+/// The actions a rule in `phase` may run.
+fn allowed_actions(phase: PhaseName) -> &'static [&'static str] {
+    match phase {
+        PhaseName::HttpRequest => &["set_header", "remove_header", "reject", "notify"],
+        PhaseName::HttpResponse => &["set_header", "remove_header", "set_status", "notify"],
+        PhaseName::Complete => &[],
+        PhaseName::Request => &[
+            "set_header",
+            "remove_header",
+            "set_field",
+            "remove_field",
+            "set_model",
+            "set_fallbacks",
+            "reject",
+            "notify",
+        ],
+        PhaseName::Attempt => &[
+            "set_header",
+            "remove_header",
+            "set_field",
+            "remove_field",
+            "set_model",
+            "reject",
+            "notify",
+        ],
+        PhaseName::Response => &[
+            "set_header",
+            "remove_header",
+            "set_field",
+            "remove_field",
+            "retry_next",
+            "set_status",
+            "notify",
+        ],
+    }
+}
+
+/// The notification of a `notify` action, with `${NAME}` expanded in its title and body.
+fn compile_notify(
+    notify: &NotifySpec,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<ExtNotification, String> {
+    let title = expand(notify.title.trim(), env)?;
+    if title.is_empty() {
+        return Err("notify needs a title".to_owned());
+    }
+    let severity = match notify.severity {
+        NotifySeverity::Info => ExtSeverity::Info,
+        NotifySeverity::Warning => ExtSeverity::Warning,
+        NotifySeverity::Critical => ExtSeverity::Critical,
+    };
+    Ok(ExtNotification::new(
+        severity,
+        title,
+        expand(&notify.body, env)?,
+    ))
+}
+
+/// What a rule action changes: the headers and the JSON body of one phase, and where its
+/// notifications go.
 pub(crate) trait ActionTarget {
     fn target_headers(&mut self) -> &mut HeaderMap;
     fn target_body(&mut self) -> Option<&mut Value>;
+    /// Sends `note`, with the model and profile this phase knows when the note names none.
+    fn target_notify(&mut self, note: ExtNotification);
 }
 
 impl ActionTarget for RequestCtx<'_> {
@@ -176,6 +218,13 @@ impl ActionTarget for RequestCtx<'_> {
 
     fn target_body(&mut self) -> Option<&mut Value> {
         self.body_mut()
+    }
+
+    fn target_notify(&mut self, mut note: ExtNotification) {
+        if note.model.is_none() {
+            note.model = self.model().map(str::to_owned);
+        }
+        self.notify(note);
     }
 }
 
@@ -187,6 +236,11 @@ impl ActionTarget for AttemptCtx<'_> {
     fn target_body(&mut self) -> Option<&mut Value> {
         self.body_mut()
     }
+
+    fn target_notify(&mut self, note: ExtNotification) {
+        let note = with_target(note, self.profile(), self.model());
+        self.notify(note);
+    }
 }
 
 impl ActionTarget for HttpRequestCtx<'_> {
@@ -196,6 +250,10 @@ impl ActionTarget for HttpRequestCtx<'_> {
 
     fn target_body(&mut self) -> Option<&mut Value> {
         None
+    }
+
+    fn target_notify(&mut self, note: ExtNotification) {
+        self.notify(note);
     }
 }
 
@@ -207,6 +265,10 @@ impl ActionTarget for HttpResponseCtx<'_> {
     fn target_body(&mut self) -> Option<&mut Value> {
         None
     }
+
+    fn target_notify(&mut self, note: ExtNotification) {
+        self.notify(note);
+    }
 }
 
 impl ActionTarget for ResponseCtx<'_> {
@@ -217,6 +279,18 @@ impl ActionTarget for ResponseCtx<'_> {
     fn target_body(&mut self) -> Option<&mut Value> {
         self.error_body_mut()
     }
+
+    fn target_notify(&mut self, note: ExtNotification) {
+        let note = with_target(note, self.profile(), self.model());
+        self.notify(note);
+    }
+}
+
+/// `note` with `profile` and `model` where it names none.
+fn with_target(mut note: ExtNotification, profile: &str, model: &str) -> ExtNotification {
+    note.profile.get_or_insert_with(|| profile.to_owned());
+    note.model.get_or_insert_with(|| model.to_owned());
+    note
 }
 
 /// Applies the header actions to `headers`.

@@ -3,10 +3,12 @@ use std::time::Duration;
 
 use super::copilot_auth::CopilotAuth;
 use super::keep_warm_config::KeepWarmConfig;
+use super::local_tuner_config::LocalTunerConfig;
 use super::managed_command::ManagedCommand;
 use super::media_fallback_config::MediaFallbackConfig;
 use super::profile_config::ProfileConfig;
 use super::usage_source::{BIFROST_KEY_PREFIX, UsageSource};
+use crate::configs::NotifyConfig;
 use crate::consts::{
     DEFAULT_BIND, DEFAULT_COPILOT_PRICES_REFRESH_SECS, DEFAULT_FIRST_BYTE_TIMEOUT_MS,
     DEFAULT_KEEP_WARM_ENABLED, DEFAULT_KEEP_WARM_IDLE_CAP_MINUTES, DEFAULT_MAX_REPLAY_BYTES,
@@ -86,6 +88,12 @@ pub struct HubConfig {
     pub media_fallback: MediaFallbackConfig,
     /// Global USD/1M token defaults when a profile/model has no rates.
     pub pricing: crate::configs::TokenRates,
+    /// `LLM_HUB_LOCAL_TUNER`, off by default: run the local model probe and its proposals.
+    pub local_tuner_enabled: bool,
+    /// The notification inbox, its sinks and the operator's mute rules.
+    pub notify: NotifyConfig,
+    /// `LLM_HUB_BUDGET_MONTHLY_USD`: the hub-wide monthly spend budget in USD. `None` sets none.
+    pub budget_monthly_usd: Option<f64>,
 }
 
 impl HubConfig {
@@ -195,6 +203,7 @@ impl HubConfig {
 
         let keep_warm = keep_warm_from_map(&get)?;
         let media_fallback = MediaFallbackConfig::from_get(&get, is_truthy)?;
+        let notify = NotifyConfig::from_get(&get, home_dir(vars), is_falsy)?;
 
         let pricing = crate::configs::TokenRates {
             input_per_1m: crate::configs::token_rates::parse_optional_f64(
@@ -255,6 +264,9 @@ impl HubConfig {
             keep_warm,
             media_fallback,
             pricing,
+            local_tuner_enabled: get("LOCAL_TUNER").is_some_and(|v| is_truthy(&v)),
+            notify,
+            budget_monthly_usd: parse_budget_usd(get("BUDGET_MONTHLY_USD"), "BUDGET_MONTHLY_USD")?,
         })
     }
 
@@ -298,14 +310,16 @@ impl HubConfig {
         };
 
         let display_name = get("DISPLAY_NAME").filter(|v| !v.is_empty());
-        let managed = ManagedCommand::from_env(
-            &upper,
-            &base_url,
-            vars.get("HOME")
-                .or_else(|| vars.get("USERPROFILE"))
-                .map(String::as_str),
-            &get,
-        )?;
+        let home = home_dir(vars);
+        let managed = ManagedCommand::from_env(&upper, &base_url, home, &get)?;
+        let first_byte_timeout_ms = match get("FIRST_BYTE_TIMEOUT_MS").filter(|v| !v.is_empty()) {
+            None => None,
+            Some(v) => Some(v.parse().map_err(|_| {
+                format!("LLM_HUB_{upper}_FIRST_BYTE_TIMEOUT_MS is not a number: {v}")
+            })?),
+        };
+        let tuner =
+            LocalTunerConfig::from_env(&upper, home, &get, timeout_ms, first_byte_timeout_ms)?;
         let (pricing, model_prices) =
             crate::configs::token_rates::profile_rates_from_env(name, &get)?;
         let api_key = get("API_KEY").unwrap_or_default();
@@ -335,13 +349,26 @@ impl HubConfig {
             managed,
             copilot,
             keep_warm: get("KEEP_WARM").is_none_or(|v| !is_falsy(&v)),
-            first_byte_timeout_ms: match get("FIRST_BYTE_TIMEOUT_MS").filter(|v| !v.is_empty()) {
-                None => None,
-                Some(v) => Some(v.parse().map_err(|_| {
-                    format!("LLM_HUB_{upper}_FIRST_BYTE_TIMEOUT_MS is not a number: {v}")
-                })?),
-            },
+            first_byte_timeout_ms,
+            tuner,
+            budget_monthly_usd: parse_budget_usd(
+                get("BUDGET_MONTHLY_USD"),
+                &format!("{upper}_BUDGET_MONTHLY_USD"),
+            )?,
         })
+    }
+}
+
+/// A monthly budget in USD from `LLM_HUB_<key>`: a finite number above 0. Unset or empty sets none.
+fn parse_budget_usd(raw: Option<String>, key: &str) -> Result<Option<f64>, String> {
+    let Some(raw) = raw.filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    match raw.parse::<f64>() {
+        Ok(usd) if usd.is_finite() && usd > 0.0 => Ok(Some(usd)),
+        _ => Err(format!(
+            "{PREFIX}{key} must be a number of USD above 0: {raw}"
+        )),
     }
 }
 
@@ -430,6 +457,13 @@ fn discover_profile_names(vars: &HashMap<String, String>) -> Vec<String> {
         .collect();
     names.sort_unstable();
     names
+}
+
+/// The user's home directory from `HOME`, or `USERPROFILE` on Windows.
+fn home_dir(vars: &HashMap<String, String>) -> Option<&str> {
+    vars.get("HOME")
+        .or_else(|| vars.get("USERPROFILE"))
+        .map(String::as_str)
 }
 
 /// Env-var segment for a profile name: uppercased, `-` mapped to `_`.
@@ -911,6 +945,123 @@ mod tests {
         vars.insert("LLM_HUB_GROQ_FIRST_BYTE_TIMEOUT_MS".into(), "soon".into());
         let err = HubConfig::from_map(&vars).unwrap_err();
         assert!(err.contains("GROQ_FIRST_BYTE_TIMEOUT_MS"), "{err}");
+    }
+
+    #[test]
+    fn a_profile_tuner_parses_its_keys_and_resolves_the_guard_budget() {
+        let mut vars = base_vars();
+        vars.insert("HOME".into(), "/home/op".into());
+        vars.insert("LLM_HUB_GROQ_TIMEOUT_MS".into(), "600000".into());
+        vars.insert("LLM_HUB_GROQ_FIRST_BYTE_TIMEOUT_MS".into(), "300000".into());
+        vars.insert("LLM_HUB_GROQ_PREFILL_GUARD".into(), "on".into());
+        vars.insert("LLM_HUB_GROQ_TUNER_REGISTRY".into(), "~/reg.txt".into());
+        vars.insert("LLM_HUB_GROQ_TUNER_APPLY_COMMAND".into(), "sync now".into());
+        vars.insert("LLM_HUB_GROQ_TUNER_APPLY_TIMEOUT_MS".into(), "9000".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        let tuner = &cfg.profile("groq").unwrap().tuner;
+        assert_eq!(tuner.prefill_guard, Some(300_000));
+        assert_eq!(
+            tuner.registry,
+            Some(std::path::PathBuf::from("/home/op/reg.txt"))
+        );
+        assert_eq!(
+            tuner.apply_command,
+            Some(vec!["sync".to_owned(), "now".to_owned()])
+        );
+        assert_eq!(tuner.apply_timeout, Duration::from_secs(9));
+        assert_eq!(
+            cfg.profile("openai").unwrap().tuner,
+            LocalTunerConfig::default()
+        );
+    }
+
+    #[test]
+    fn a_profile_prefill_guard_on_without_a_timeout_fails_the_load() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_GROQ_PREFILL_GUARD".into(), "on".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_GROQ_PREFILL_GUARD"), "{err}");
+    }
+
+    #[test]
+    fn local_tuner_is_opt_in() {
+        assert!(
+            !HubConfig::from_map(&base_vars())
+                .unwrap()
+                .local_tuner_enabled
+        );
+        for (value, expected) in [("true", true), ("on", true), ("false", false)] {
+            let mut vars = base_vars();
+            vars.insert("LLM_HUB_LOCAL_TUNER".into(), value.into());
+            let cfg = HubConfig::from_map(&vars).unwrap();
+            assert_eq!(cfg.local_tuner_enabled, expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn notify_defaults_on_and_reads_its_keys() {
+        let cfg = HubConfig::from_map(&base_vars()).unwrap();
+        assert_eq!(cfg.notify, NotifyConfig::default());
+        assert!(cfg.notify.enabled);
+        assert!(cfg.notify.desktop);
+
+        let mut vars = base_vars();
+        vars.insert("HOME".into(), "/home/op".into());
+        vars.insert("LLM_HUB_NOTIFICATIONS".into(), "off".into());
+        vars.insert("LLM_HUB_NOTIFY_DESKTOP".into(), "false".into());
+        vars.insert("LLM_HUB_NOTIFY_COMMAND".into(), "~/bin/notify".into());
+        vars.insert("LLM_HUB_NOTIFY_MUTE".into(), "source=errors".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert!(!cfg.notify.enabled);
+        assert!(!cfg.notify.desktop);
+        assert_eq!(
+            cfg.notify.command,
+            Some(vec!["/home/op/bin/notify".to_owned()])
+        );
+        assert_eq!(cfg.notify.mutes.len(), 1);
+
+        vars.insert("LLM_HUB_NOTIFY_MIN_SEVERITY".into(), "loud".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_NOTIFY_MIN_SEVERITY"), "{err}");
+    }
+
+    #[test]
+    fn budgets_are_unset_by_default_and_read_the_global_and_profile_keys() {
+        let cfg = HubConfig::from_map(&base_vars()).unwrap();
+        assert_eq!(cfg.budget_monthly_usd, None);
+        assert!(cfg.profiles.iter().all(|p| p.budget_monthly_usd.is_none()));
+        assert_eq!(cfg.notify.budget_steps, vec![25, 50, 75, 80, 85, 95, 100]);
+
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_BUDGET_MONTHLY_USD".into(), " 200 ".into());
+        vars.insert("LLM_HUB_GROQ_BUDGET_MONTHLY_USD".into(), "12.5".into());
+        vars.insert("LLM_HUB_OPENAI_BUDGET_MONTHLY_USD".into(), String::new());
+        vars.insert("LLM_HUB_NOTIFY_BUDGET_STEPS".into(), "100,50".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert_eq!(cfg.budget_monthly_usd, Some(200.0));
+        assert_eq!(cfg.profile("groq").unwrap().budget_monthly_usd, Some(12.5));
+        assert_eq!(cfg.profile("openai").unwrap().budget_monthly_usd, None);
+        assert_eq!(cfg.notify.budget_steps, vec![50, 100]);
+    }
+
+    #[test]
+    fn budgets_must_be_positive_finite_numbers() {
+        for (key, value) in [
+            ("LLM_HUB_BUDGET_MONTHLY_USD", "0"),
+            ("LLM_HUB_BUDGET_MONTHLY_USD", "-3"),
+            ("LLM_HUB_BUDGET_MONTHLY_USD", "lots"),
+            ("LLM_HUB_BUDGET_MONTHLY_USD", "inf"),
+            ("LLM_HUB_GROQ_BUDGET_MONTHLY_USD", "NaN"),
+            ("LLM_HUB_GROQ_BUDGET_MONTHLY_USD", "0.0"),
+        ] {
+            let mut vars = base_vars();
+            vars.insert(key.into(), value.into());
+            let err = HubConfig::from_map(&vars).unwrap_err();
+            assert!(
+                err.contains(key) && err.contains("above 0"),
+                "{key}={value}: {err}"
+            );
+        }
     }
 
     #[test]

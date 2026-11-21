@@ -4,13 +4,13 @@ use std::collections::BTreeMap;
 /// directory basename and the stream key, a hex hash of the system prompt and tool set.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PromptShape {
-    /// Characters of every text block in `system`.
+    /// Characters of every text block in `system`, or in the chat `system` and `developer` messages.
     pub system_chars: u64,
-    /// Entries in `messages`.
+    /// Entries in `messages`, not counting chat `system` and `developer` messages.
     pub messages: u64,
     /// The last message is a user message with a text block (not only tool results).
     pub turn_start: bool,
-    /// Tool definitions in the request.
+    /// Tool definitions in the request, Anthropic tools or chat `function` tools.
     pub tool_count: u64,
     /// Serialized bytes of every tool definition.
     pub tool_bytes: u64,
@@ -24,14 +24,14 @@ pub struct PromptShape {
     pub skills_listing_chars: Option<u64>,
     /// Summed characters of the blocks that inject a CLAUDE.md file, when present.
     pub claude_md_chars: Option<u64>,
-    /// Image blocks in messages, including those inside tool results.
+    /// Image blocks (chat `image_url` parts) in messages, including those inside tool results.
     pub image_count: u64,
     /// The basename of the working directory the body states, never the full path.
     pub project: Option<String>,
     /// Hex hash of the system text and the sorted tool names. Requests with the same key come from
     /// the same conversation or subagent type.
     pub stream_key: Option<String>,
-    /// Text bytes of the tool results by tool family: `mcp__<server>`, `Read`, `Bash`, `Agent`, `Skill`, or `other`.
+    /// Text bytes of the tool results (chat `tool` messages) by tool family: `mcp__<server>`, `Read`, `Bash`, `Agent`, `Skill`, or `other`.
     /// At most 12 named families; the rest are summed into `other`.
     pub tool_result_bytes: BTreeMap<String, u64>,
     /// Characters of each skill body in the user messages, by the skill's directory name.

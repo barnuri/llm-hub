@@ -20,44 +20,63 @@ impl PromptShape {
     const HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-    /// Reads the counts and sizes of one raw Anthropic `/v1/messages` body in one pass. Text is only
-    /// measured, hashed and searched, never copied. `None` when the body is not a JSON object.
+    /// Reads the counts and sizes of one raw Anthropic `/v1/messages` or `OpenAI` chat-completions
+    /// body in one pass. Text is only measured, hashed and searched, never copied. `None` when the
+    /// body is not a JSON object.
+    ///
+    /// A chat body maps onto the same fields: `system` and `developer` messages count as the system
+    /// prompt, not as messages; `tools[].function.name` names a tool; an assistant's `tool_calls`
+    /// name the `tool` messages that answer them; `image_url` parts count as images.
     #[must_use]
     pub fn from_body(raw: &[u8]) -> Option<PromptShape> {
         let body: Value = serde_json::from_slice(raw).ok()?;
         let fields = body.as_object()?;
+        let messages = fields
+            .get("messages")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        let (instructions, conversation): (Vec<&Value>, Vec<&Value>) = messages
+            .iter()
+            .partition(|message| Self::is_instruction(message));
         let mut shape = PromptShape::default();
         let mut stream_hash = Self::HASH_OFFSET;
-        for text in fields.get("system").into_iter().flat_map(Self::text_parts) {
+        let system_texts = fields
+            .get("system")
+            .into_iter()
+            .chain(
+                instructions
+                    .iter()
+                    .filter_map(|message| message.get("content")),
+            )
+            .flat_map(Self::text_parts);
+        for text in system_texts {
             shape.system_chars += Self::char_count(text);
             shape.note_text(text);
             Self::feed_hash(&mut stream_hash, text.as_bytes());
         }
         Self::feed_hash(&mut stream_hash, &[0]);
-        if let Some(messages) = fields.get("messages").and_then(Value::as_array) {
-            shape.messages = Self::to_u64(messages.len());
-            for message in messages {
-                let Some(content) = message.get("content") else {
-                    continue;
-                };
-                for text in Self::text_parts(content) {
-                    shape.note_text(text);
-                }
-                shape.image_count += Self::image_count(content);
+        shape.messages = Self::to_u64(conversation.len());
+        for message in &conversation {
+            let Some(content) = message.get("content") else {
+                continue;
+            };
+            for text in Self::text_parts(content) {
+                shape.note_text(text);
             }
-            shape.turn_start = messages.last().is_some_and(|message| {
-                message.get("role").and_then(Value::as_str) == Some("user")
-                    && message
-                        .get("content")
-                        .is_some_and(|content| Self::text_parts(content).next().is_some())
-            });
-            (shape.tool_result_bytes, shape.skill_body_chars) = Self::message_usage(messages);
+            shape.image_count += Self::image_count(content);
         }
+        shape.turn_start = conversation.last().is_some_and(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message
+                    .get("content")
+                    .is_some_and(|content| Self::text_parts(content).next().is_some())
+        });
+        (shape.tool_result_bytes, shape.skill_body_chars) = Self::message_usage(&conversation);
         let mut tool_names: Vec<&str> = Vec::new();
         if let Some(tools) = fields.get("tools").and_then(Value::as_array) {
             shape.tool_count = Self::to_u64(tools.len());
             for tool in tools {
-                let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+                let name = Self::tool_name(tool);
                 tool_names.push(name);
                 let bytes = Self::serialized_len(tool);
                 shape.tool_bytes += bytes;
@@ -150,6 +169,25 @@ impl PromptShape {
         block.get("text").and_then(Value::as_str)
     }
 
+    /// True for a chat `system` or `developer` message, which carries the system prompt.
+    fn is_instruction(message: &Value) -> bool {
+        matches!(
+            message.get("role").and_then(Value::as_str),
+            Some("system" | "developer")
+        )
+    }
+
+    /// The name of an Anthropic tool, or of a chat tool's `function`. Empty when it has none.
+    fn tool_name(tool: &Value) -> &str {
+        tool.get("name")
+            .or_else(|| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+            })
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    }
+
     /// Image blocks in one message `content`, counting the ones nested in tool results.
     fn image_count(content: &Value) -> u64 {
         let Some(blocks) = content.as_array() else {
@@ -158,7 +196,7 @@ impl PromptShape {
         blocks
             .iter()
             .map(|block| match block.get("type").and_then(Value::as_str) {
-                Some("image") => 1,
+                Some("image" | "image_url") => 1,
                 Some("tool_result") => block.get("content").map_or(0, Self::image_count),
                 _ => 0,
             })
@@ -183,16 +221,15 @@ impl PromptShape {
     }
 
     /// Tool-result text bytes by tool family and skill-body characters by skill name, over every message.
-    fn message_usage(messages: &[Value]) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
+    /// Anthropic `tool_result` blocks and chat `tool` messages both count, named through their call ids.
+    fn message_usage(messages: &[&Value]) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
         let mut tool_names: HashMap<&str, &str> = HashMap::new();
         for block in messages
             .iter()
             .filter_map(|message| message.get("content"))
             .flat_map(Self::blocks)
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
         {
-            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
-                continue;
-            }
             if let (Some(id), Some(name)) = (
                 block.get("id").and_then(Value::as_str),
                 block.get("name").and_then(Value::as_str),
@@ -200,13 +237,36 @@ impl PromptShape {
                 tool_names.insert(id, name);
             }
         }
+        for call in messages
+            .iter()
+            .filter_map(|message| message.get("tool_calls"))
+            .flat_map(Self::blocks)
+        {
+            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                tool_names.insert(id, Self::tool_name(call));
+            }
+        }
+        let name_of = |id: Option<&Value>| -> &str {
+            id.and_then(Value::as_str)
+                .and_then(|id| tool_names.get(id))
+                .copied()
+                .unwrap_or_default()
+        };
         let mut families: BTreeMap<String, u64> = BTreeMap::new();
         let mut skills: BTreeMap<String, u64> = BTreeMap::new();
         for message in messages {
+            let role = message.get("role").and_then(Value::as_str);
+            if role == Some("tool") {
+                let bytes = Self::result_text_bytes(message.get("content"));
+                *families
+                    .entry(Self::tool_family(name_of(message.get("tool_call_id"))))
+                    .or_default() += bytes;
+                continue;
+            }
             let Some(content) = message.get("content") else {
                 continue;
             };
-            if message.get("role").and_then(Value::as_str) == Some("user") {
+            if role == Some("user") {
                 for text in Self::text_parts(content) {
                     if let Some(name) = Self::skill_name(text) {
                         *skills.entry(name).or_default() += Self::char_count(text);
@@ -217,14 +277,10 @@ impl PromptShape {
                 if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                     continue;
                 }
-                let name = block
-                    .get("tool_use_id")
-                    .and_then(Value::as_str)
-                    .and_then(|id| tool_names.get(id))
-                    .copied()
-                    .unwrap_or_default();
                 let bytes = Self::result_text_bytes(block.get("content"));
-                *families.entry(Self::tool_family(name)).or_default() += bytes;
+                *families
+                    .entry(Self::tool_family(name_of(block.get("tool_use_id"))))
+                    .or_default() += bytes;
             }
         }
         (Self::top_families(families), skills)
@@ -666,5 +722,102 @@ mod tests {
         let shape = shape_of(&json!({"messages": [{"role": "user", "content": "hi"}]}));
         assert!(shape.tool_result_bytes.is_empty());
         assert!(shape.skill_body_chars.is_empty());
+    }
+
+    #[test]
+    fn chat_body_maps_system_tools_and_tool_messages() {
+        let read = json!({"type": "function", "function": {
+            "name": "Read", "description": "reads", "parameters": {"type": "object"},
+        }});
+        let mcp =
+            json!({"type": "function", "function": {"name": "mcp__files__list", "parameters": {}}});
+        let shape = shape_of(&json!({
+            "model": "local/gemma",
+            "messages": [
+                {"role": "system", "content": "abcd"},
+                {"role": "developer", "content": [{"type": "text", "text": "éf"}]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ]},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "Read", "arguments": "{}"}},
+                    {"id": "c2", "type": "function", "function": {"name": "mcp__files__list", "arguments": "{}"}},
+                    {"id": "c3", "type": "function", "function": {"name": "grep", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "12345"},
+                {"role": "tool", "tool_call_id": "c2", "content": [{"type": "text", "text": "xyz"}]},
+                {"role": "tool", "tool_call_id": "c3", "content": "é"},
+                {"role": "tool", "tool_call_id": "unknown", "content": "q"},
+            ],
+            "tools": [read.clone(), mcp.clone()],
+        }));
+        assert_eq!(shape.system_chars, 6);
+        assert_eq!(shape.messages, 6);
+        assert!(!shape.turn_start);
+        assert_eq!(shape.image_count, 1);
+        assert_eq!(shape.tool_count, 2);
+        assert_eq!(
+            shape.tool_bytes,
+            PromptShape::serialized_len(&read) + PromptShape::serialized_len(&mcp)
+        );
+        assert_eq!(shape.mcp_tool_count, 1);
+        assert_eq!(shape.mcp_tool_bytes, PromptShape::serialized_len(&mcp));
+        assert_eq!(
+            shape.tool_result_bytes,
+            BTreeMap::from([
+                ("Read".to_owned(), 5),
+                ("mcp__files".to_owned(), 3),
+                ("other".to_owned(), 3),
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_user_text_last_is_a_turn_start() {
+        let shape = shape_of(&json!({"messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "hello"},
+        ]}));
+        assert_eq!(shape.messages, 1);
+        assert!(shape.turn_start);
+    }
+
+    #[test]
+    fn chat_stream_key_follows_system_messages_and_function_names() {
+        let body = |system: &str, tool: &str, user: &str| {
+            json!({
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                "tools": [{"type": "function", "function": {"name": tool}}],
+            })
+        };
+        let key = |value: &Value| shape_of(value).stream_key;
+        assert_eq!(
+            key(&body("agent", "bash", "first")),
+            key(&body("agent", "bash", "later"))
+        );
+        assert_ne!(
+            key(&body("agent", "bash", "first")),
+            key(&body("planner", "bash", "first"))
+        );
+        assert_ne!(
+            key(&body("agent", "bash", "first")),
+            key(&body("agent", "read", "first"))
+        );
+    }
+
+    #[test]
+    fn malformed_chat_body_none_and_odd_fields_ignored() {
+        assert_eq!(
+            PromptShape::from_body(br#"{"messages": [{"role": "user""#),
+            None
+        );
+        let shape = shape_of(&json!({
+            "messages": "not a list",
+            "tools": [{"type": "function"}],
+        }));
+        assert_eq!(shape.messages, 0);
+        assert_eq!(shape.tool_count, 1);
+        assert!(shape.tool_result_bytes.is_empty());
     }
 }

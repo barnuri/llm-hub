@@ -1,7 +1,7 @@
 use axum::http::{Extensions, HeaderMap, StatusCode};
 use serde_json::Value;
 
-use crate::ext::Api;
+use crate::ext::{Api, ExtNotification, Outbox};
 
 /// The `response` phase view of one upstream reply, before the hub delivers it or tries the next
 /// fallback.
@@ -13,6 +13,7 @@ pub struct ResponseCtx<'a> {
     error_body: Option<Value>,
     error_body_changed: bool,
     state: &'a mut Extensions,
+    outbox: Outbox,
 }
 
 /// Where a reply came from, for [`ResponseCtx::new`].
@@ -40,6 +41,7 @@ impl<'a> ResponseCtx<'a> {
             error_body: None,
             error_body_changed: false,
             state,
+            outbox: Outbox::default(),
         }
     }
 
@@ -153,6 +155,16 @@ impl<'a> ResponseCtx<'a> {
     /// Typed data for this request, for a change.
     pub fn state_mut(&mut self) -> &mut Extensions {
         self.state
+    }
+
+    /// Sends `notification` to the Notifications inbox, from `ext:<extension name>`. The hub
+    /// delivers it when this phase method returns, and drops it when notifications are off.
+    pub fn notify(&self, notification: ExtNotification) {
+        self.outbox.push(notification);
+    }
+
+    pub(crate) fn outbox(&self) -> &Outbox {
+        &self.outbox
     }
 }
 

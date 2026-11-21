@@ -35,6 +35,7 @@ pub mod model_descriptor;
 pub mod model_descriptor_snapshot;
 pub mod model_directive;
 pub mod model_id;
+pub mod notification;
 pub mod pin_miss;
 pub mod pool_limits;
 pub mod profile_input;

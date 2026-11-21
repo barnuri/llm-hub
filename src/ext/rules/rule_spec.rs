@@ -114,6 +114,7 @@ pub(crate) enum ActionSpec {
     Reject(RejectSpec),
     RetryNext(bool),
     SetStatus(u16),
+    Notify(NotifySpec),
 }
 
 impl ActionSpec {
@@ -128,6 +129,7 @@ impl ActionSpec {
             ActionSpec::Reject(_) => "reject",
             ActionSpec::RetryNext(_) => "retry_next",
             ActionSpec::SetStatus(_) => "set_status",
+            ActionSpec::Notify(_) => "notify",
         }
     }
 }
@@ -137,4 +139,24 @@ impl ActionSpec {
 pub(crate) struct RejectSpec {
     pub status: u16,
     pub message: String,
+}
+
+/// A notification a matching rule sends to the inbox, from `ext:rules`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NotifySpec {
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub severity: NotifySeverity,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NotifySeverity {
+    Info,
+    #[default]
+    Warning,
+    Critical,
 }

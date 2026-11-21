@@ -177,6 +177,7 @@ check is a load error.
 | `reject` | http_request, request, attempt | Answer with `status` (4xx or 5xx) and `message`, in the client's API format |
 | `retry_next` | response | Try the next model in the chain. On the last model, deliver the reply |
 | `set_status` | response, http_response | The status the client gets |
+| `notify` | all | Send a notification to the Notifications inbox. See [Notifications](#notifications) |
 
 On the Anthropic Messages route, when llm-hub translates the reply, a `response` body change is not
 applied, because the error body is in the upstream's format.
@@ -202,6 +203,30 @@ INFO llm_hub::ext::rules::rules_extension: A shadow rule matched. The hub took n
 ```
 
 `llm-hub extensions check` prints how many rules and hooks are in shadow mode.
+
+### Notifications
+
+A `notify` action sends a notification to the Notifications inbox each time its rule matches, from
+source `ext:rules`. It takes a `title`, an optional `body` and an optional `severity` (`info`,
+`warning` or `critical`, default `warning`). `${NAME}` takes a value from the environment, as in the
+other actions. In `request` the notification names the body's model, and in `attempt` and
+`response` the attempt's profile and model. A shadow rule logs `notify` and sends nothing.
+
+```yaml
+rules:
+  - name: overloaded-alert
+    phase: response
+    match: { status: 5xx, error_code: overloaded }
+    actions:
+      - notify: { title: "Upstream overloaded", body: "Retrying on the next model", severity: warning }
+      - retry_next: true
+```
+
+The rule sends one notification per matching request. All rules share the source `ext:rules`
+and its limit of 60 a minute, and the hub drops the rest, so match narrowly. The inbox, the mute rules, the severity filter and the sinks treat it like any
+other notification. In `attempt` and `response` its `model` field is `<profile>/<model>`, so a
+mute glob on the bare name needs a leading `*`. See [Notifications](notifications.md). With
+`LLM_HUB_NOTIFICATIONS=false` the hub drops it.
 
 ## HTTP hooks
 
@@ -319,6 +344,42 @@ async fn main() {
 
 `examples/custom_hub.rs` is a complete example: `cargo run --example custom_hub`.
 
+An extension sends a notification from any phase with `ctx.notify(..)`:
+
+```rust
+use llm_hub::ext::{CompleteCtx, Extension, ExtNotification, ExtSeverity};
+
+struct SlowAlert;
+
+impl Extension for SlowAlert {
+    fn name(&self) -> &str {
+        "slow-alert"
+    }
+
+    fn on_complete(&self, ctx: &CompleteCtx<'_>) {
+        if ctx.latency_ms() > 60_000 {
+            ctx.notify(
+                ExtNotification::new(
+                    ExtSeverity::Warning,
+                    "Slow reply",
+                    format!("{} took {} ms", ctx.model(), ctx.latency_ms()),
+                )
+                .with_model(ctx.model())
+                .with_profile(ctx.profile()),
+            );
+        }
+    }
+}
+```
+
+The hub stores it in the inbox with source `ext:slow-alert`, kind `custom` and a Dismiss button,
+after the phase method returns. The mute rules, the severity filter
+(`LLM_HUB_NOTIFY_MIN_SEVERITY`) and the sinks apply as for any notification. With
+`LLM_HUB_NOTIFICATIONS=false` the hub drops it. The call never waits on a sink: the hub stores the
+notification in memory, saves it on a blocking thread and queues it for the sinks. Each call adds
+one inbox entry. Each extension gets 60 a minute as source `ext:<name>`, and the hub drops the
+rest, so do not call it on every request.
+
 | API | Use |
 |---|---|
 | `Extension` | A trait. Only `name` is required. Every phase method has a no-op default, so you override only what you need, and a new phase in a later release does not break you |
@@ -327,6 +388,7 @@ async fn main() {
 | `wants_error_body`, `on_response` | Ask for the error body, then return `ResponseFlow::Continue` or `ResponseFlow::RetryNext` |
 | `on_complete` | Profile, model, upstream status, latency, tokens, error and the request state of each recorded outcome |
 | `on_config_change`, `on_config_changed` | Before and after an admin call saves a setting. A rejection stops the save |
+| `ctx.notify(ExtNotification)` | Every phase context. Sends a notification to the Notifications inbox from source `ext:<name>`, where `<name>` is the extension's `name()` |
 | `Hub::routes` | Your routes under `/ext`, behind the master key like `/api` |
 | `Hub::router` | Any change to the finished router, such as a `tower` layer around every route |
 
@@ -348,6 +410,7 @@ and can change between minor versions. Pin a tag.
 | Try a new `reject` rule without risk | Rule or hook: `mode: shadow` |
 | Prompt guardrail in Python | Hook in `request`, `fail: closed`, `send: [body]` |
 | Audit log or billing export | Hook in `complete`, or Rust `on_complete` |
+| Alert someone about an upstream error or a slow model | Rule: `notify`, or Rust `ctx.notify(..)` |
 | Per-team metrics or billing from a library build | Rust: keep the team in request state in `on_request`, read it in `on_complete` |
 | Custom auth on the inference routes | Rust: `on_request` with `Flow::reject`. It also runs, headers only, for unbuffered bodies and `GET /v1/models/{id}` |
 | Freeze or audit settings | Rust: `on_config_change` and `on_config_changed` |

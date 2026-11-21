@@ -25,6 +25,10 @@ pub struct ProfileConfig {
     /// `LLM_HUB_<NAME>_FIRST_BYTE_TIMEOUT_MS`, env-only. It beats the global limit and applies to
     /// a local server too; `0` turns the limit off for this profile. `None` uses the global rule.
     pub first_byte_timeout_ms: Option<u64>,
+    /// Local model tuner and prefill guard settings; env-only, never set through the admin API.
+    pub tuner: crate::configs::LocalTunerConfig,
+    /// `LLM_HUB_<NAME>_BUDGET_MONTHLY_USD`, env-only: this profile's monthly spend budget in USD.
+    pub budget_monthly_usd: Option<f64>,
 }
 
 impl ProfileConfig {
@@ -76,6 +80,8 @@ mod tests {
             copilot: None,
             keep_warm: true,
             first_byte_timeout_ms: None,
+            tuner: crate::configs::LocalTunerConfig::default(),
+            budget_monthly_usd: None,
         }
     }
 

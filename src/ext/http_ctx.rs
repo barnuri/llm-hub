@@ -1,6 +1,6 @@
 use axum::http::{HeaderMap, Method, StatusCode};
 
-use crate::ext::Api;
+use crate::ext::{Api, ExtNotification, Outbox};
 
 /// The `http_request` phase view of any request, before the hub checks the master key. It runs
 /// on every route: `/v1/*`, `/api/*`, the UI and the health check.
@@ -9,6 +9,7 @@ pub struct HttpRequestCtx<'a> {
     method: &'a Method,
     path: &'a str,
     headers: &'a mut HeaderMap,
+    outbox: Outbox,
 }
 
 impl<'a> HttpRequestCtx<'a> {
@@ -21,6 +22,7 @@ impl<'a> HttpRequestCtx<'a> {
             method,
             path,
             headers,
+            outbox: Outbox::default(),
         }
     }
 
@@ -53,6 +55,16 @@ impl<'a> HttpRequestCtx<'a> {
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         self.headers
     }
+
+    /// Sends `notification` to the Notifications inbox, from `ext:<extension name>`. The hub
+    /// delivers it when this phase method returns, and drops it when notifications are off.
+    pub fn notify(&self, notification: ExtNotification) {
+        self.outbox.push(notification);
+    }
+
+    pub(crate) fn outbox(&self) -> &Outbox {
+        &self.outbox
+    }
 }
 
 /// The `http_response` phase view of any response, as it leaves the hub. It runs on every route,
@@ -63,6 +75,7 @@ pub struct HttpResponseCtx<'a> {
     path: &'a str,
     status: StatusCode,
     headers: &'a mut HeaderMap,
+    outbox: Outbox,
 }
 
 impl<'a> HttpResponseCtx<'a> {
@@ -77,6 +90,7 @@ impl<'a> HttpResponseCtx<'a> {
             path,
             status,
             headers,
+            outbox: Outbox::default(),
         }
     }
 
@@ -123,6 +137,16 @@ impl<'a> HttpResponseCtx<'a> {
     /// The response headers, for a change.
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         self.headers
+    }
+
+    /// Sends `notification` to the Notifications inbox, from `ext:<extension name>`. The hub
+    /// delivers it when this phase method returns, and drops it when notifications are off.
+    pub fn notify(&self, notification: ExtNotification) {
+        self.outbox.push(notification);
+    }
+
+    pub(crate) fn outbox(&self) -> &Outbox {
+        &self.outbox
     }
 }
 

@@ -4,14 +4,17 @@ use std::sync::Arc;
 use crate::ext::hooks::HookSet;
 use crate::ext::{
     AttemptCtx, CompleteCtx, ConfigChangeCtx, Extension, Flow, HttpRequestCtx, HttpResponseCtx,
-    RequestCtx, ResponseCtx, ResponseFlow,
+    Outbox, RequestCtx, ResponseCtx, ResponseFlow, deliver,
 };
+use crate::services::notifications::dispatch::Notifier;
 
 /// The extensions of a running hub, in the order request phases run them.
 #[derive(Clone, Default)]
 pub(crate) struct ExtensionSet {
     extensions: Vec<Arc<dyn Extension>>,
     hooks: Option<Arc<HookSet>>,
+    /// Receives what extensions send with `ctx.notify(..)`. Without it those notifications drop.
+    notifier: Option<Arc<Notifier>>,
 }
 
 impl ExtensionSet {
@@ -19,6 +22,7 @@ impl ExtensionSet {
         ExtensionSet {
             extensions,
             hooks: None,
+            notifier: None,
         }
     }
 
@@ -26,6 +30,12 @@ impl ExtensionSet {
     /// phases, and as `complete` hooks.
     pub(crate) fn with_hooks(mut self, hooks: Option<Arc<HookSet>>) -> ExtensionSet {
         self.hooks = hooks;
+        self
+    }
+
+    /// The set with the notifier that stores what extensions send with `ctx.notify(..)`.
+    pub(crate) fn with_notifier(mut self, notifier: Arc<Notifier>) -> ExtensionSet {
+        self.notifier = Some(notifier);
         self
     }
 
@@ -44,6 +54,7 @@ impl ExtensionSet {
             let flow = guarded(ext.as_ref(), "http_request", Flow::Continue, || {
                 ext.on_http_request(ctx)
             });
+            self.flush(ext.as_ref(), ctx.outbox());
             if flow != Flow::Continue {
                 return flow;
             }
@@ -57,6 +68,7 @@ impl ExtensionSet {
             guarded(ext.as_ref(), "http_response", (), || {
                 ext.on_http_response(ctx);
             });
+            self.flush(ext.as_ref(), ctx.outbox());
         }
     }
 
@@ -66,6 +78,7 @@ impl ExtensionSet {
             let flow = guarded(ext.as_ref(), "request", Flow::Continue, || {
                 ext.on_request(ctx)
             });
+            self.flush(ext.as_ref(), ctx.outbox());
             if flow != Flow::Continue {
                 return flow;
             }
@@ -79,6 +92,7 @@ impl ExtensionSet {
             let flow = guarded(ext.as_ref(), "attempt", Flow::Continue, || {
                 ext.on_attempt(ctx)
             });
+            self.flush(ext.as_ref(), ctx.outbox());
             if flow != Flow::Continue {
                 return flow;
             }
@@ -89,9 +103,11 @@ impl ExtensionSet {
     /// True when any extension wants the error body of this reply.
     pub(crate) fn wants_error_body(&self, ctx: &ResponseCtx<'_>) -> bool {
         self.extensions.iter().any(|ext| {
-            guarded(ext.as_ref(), "wants_error_body", false, || {
+            let wants = guarded(ext.as_ref(), "wants_error_body", false, || {
                 ext.wants_error_body(ctx)
-            })
+            });
+            self.flush(ext.as_ref(), ctx.outbox());
+            wants
         })
     }
 
@@ -102,6 +118,7 @@ impl ExtensionSet {
             let flow = guarded(ext.as_ref(), "response", ResponseFlow::Continue, || {
                 ext.on_response(ctx)
             });
+            self.flush(ext.as_ref(), ctx.outbox());
             if flow == ResponseFlow::RetryNext {
                 decided = ResponseFlow::RetryNext;
             }
@@ -115,6 +132,7 @@ impl ExtensionSet {
             let flow = guarded(ext.as_ref(), "config_change", Flow::Continue, || {
                 ext.on_config_change(ctx)
             });
+            self.flush(ext.as_ref(), ctx.outbox());
             if flow != Flow::Continue {
                 return flow;
             }
@@ -128,6 +146,7 @@ impl ExtensionSet {
             guarded(ext.as_ref(), "config_changed", (), || {
                 ext.on_config_changed(ctx);
             });
+            self.flush(ext.as_ref(), ctx.outbox());
         }
     }
 
@@ -135,10 +154,16 @@ impl ExtensionSet {
     pub(crate) fn complete(&self, ctx: &CompleteCtx<'_>) {
         for ext in &self.extensions {
             guarded(ext.as_ref(), "complete", (), || ext.on_complete(ctx));
+            self.flush(ext.as_ref(), ctx.outbox());
         }
         if let Some(hooks) = &self.hooks {
             hooks.complete(ctx);
         }
+    }
+
+    /// Hands what `ext` sent with `ctx.notify(..)` in its last call to the notifier.
+    fn flush(&self, ext: &dyn Extension, outbox: &Outbox) {
+        deliver(self.notifier.as_deref(), ext.name(), outbox);
     }
 }
 
@@ -158,9 +183,13 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
+    use crate::configs::NotifyConfig;
     use crate::ext::attempt_ctx::AttemptTarget;
     use crate::ext::response_ctx::ResponseTarget;
-    use crate::ext::{Api, ConfigKind};
+    use crate::ext::{Api, ConfigKind, ExtNotification, ExtSeverity};
+    use crate::schemas::notification::{
+        NotificationKind, NotificationSeverity, NotificationStatus,
+    };
     use crate::services::stats::RequestOutcome;
 
     /// Records every call into a shared log, and answers with fixed flows.
@@ -453,5 +482,136 @@ mod tests {
         assert_eq!(run_response(&set), (false, ResponseFlow::Continue));
         set.complete(&CompleteCtx::new(&RequestOutcome::default(), None));
         assert!(ExtensionSet::default().names().is_empty());
+    }
+
+    /// Sends one notification titled after the phase from every phase method.
+    struct Notifying;
+
+    impl Extension for Notifying {
+        fn name(&self) -> &'static str {
+            "notifying"
+        }
+
+        fn on_http_request(&self, ctx: &mut HttpRequestCtx<'_>) -> Flow {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "http_request", ""));
+            Flow::Continue
+        }
+
+        fn on_http_response(&self, ctx: &mut HttpResponseCtx<'_>) {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "http_response", ""));
+        }
+
+        fn on_request(&self, ctx: &mut RequestCtx<'_>) -> Flow {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "request", ""));
+            Flow::Continue
+        }
+
+        fn on_attempt(&self, ctx: &mut AttemptCtx<'_>) -> Flow {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "attempt", ""));
+            Flow::Continue
+        }
+
+        fn wants_error_body(&self, ctx: &ResponseCtx<'_>) -> bool {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "wants", ""));
+            false
+        }
+
+        fn on_response(&self, ctx: &mut ResponseCtx<'_>) -> ResponseFlow {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "response", ""));
+            ResponseFlow::Continue
+        }
+
+        fn on_config_change(&self, ctx: &ConfigChangeCtx<'_>) -> Flow {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "config_change", ""));
+            Flow::Continue
+        }
+
+        fn on_config_changed(&self, ctx: &ConfigChangeCtx<'_>) {
+            ctx.notify(ExtNotification::new(
+                ExtSeverity::Info,
+                "config_changed",
+                "",
+            ));
+        }
+
+        fn on_complete(&self, ctx: &CompleteCtx<'_>) {
+            ctx.notify(
+                ExtNotification::new(ExtSeverity::Critical, "complete", "body")
+                    .with_model("p/m")
+                    .with_profile("p"),
+            );
+        }
+    }
+
+    fn run_every_phase(set: &ExtensionSet) {
+        run_http(set);
+        run_request(set);
+        run_attempt(set);
+        run_response(set);
+        let ctx = ConfigChangeCtx::new(ConfigKind::KeepWarm, None);
+        set.config_change(&ctx);
+        set.config_changed(&ctx);
+        set.complete(&CompleteCtx::new(&RequestOutcome::default(), None));
+    }
+
+    fn notifier(enabled: bool) -> Arc<Notifier> {
+        let config = NotifyConfig {
+            enabled,
+            ..NotifyConfig::default()
+        };
+        Notifier::new(&config, None)
+    }
+
+    #[test]
+    fn a_notify_call_in_any_phase_lands_in_the_inbox_from_the_extension() {
+        let notifier = notifier(true);
+        let set = ExtensionSet::new(vec![Arc::new(Notifying)]).with_notifier(Arc::clone(&notifier));
+
+        run_every_phase(&set);
+
+        let listed = notifier.list();
+        let mut titles: Vec<&str> = listed.iter().map(|n| n.title.as_str()).collect();
+        titles.sort_unstable();
+        assert_eq!(
+            titles,
+            [
+                "attempt",
+                "complete",
+                "config_change",
+                "config_changed",
+                "http_request",
+                "http_response",
+                "request",
+                "response",
+                "wants"
+            ]
+        );
+        assert!(listed.iter().all(|n| n.source == "ext:notifying"
+            && n.kind == NotificationKind::Custom
+            && n.status == NotificationStatus::Pending));
+        let complete = listed.iter().find(|n| n.title == "complete").unwrap();
+        assert_eq!(complete.severity, NotificationSeverity::Critical);
+        assert_eq!(complete.body, "body");
+        assert_eq!(complete.model.as_deref(), Some("p/m"));
+        assert_eq!(complete.profile.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn disabled_notifications_store_nothing() {
+        let notifier = notifier(false);
+        let set = ExtensionSet::new(vec![Arc::new(Notifying)]).with_notifier(Arc::clone(&notifier));
+
+        run_every_phase(&set);
+
+        assert!(notifier.list().is_empty());
+    }
+
+    #[test]
+    fn without_a_notifier_notify_calls_are_dropped() {
+        let set = ExtensionSet::new(vec![Arc::new(Notifying)]);
+
+        run_every_phase(&set);
+
+        assert!(set.notifier.is_none());
     }
 }

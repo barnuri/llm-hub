@@ -90,6 +90,7 @@ Auth: when `LLM_HUB_MASTER_KEY` is set or a hub API key exists, every `/v1/*`, `
         (name = "sessions", description = "Coding-agent sessions."),
         (name = "smart-auto", description = "Smart Auto routing: selections, rules, outcomes, dry runs."),
         (name = "copilot", description = "GitHub Copilot quota, prices and Auto decisions."),
+        (name = "notifications", description = "Notifications inbox, tuner approvals, mute rules and desktop popup setup."),
         (name = "system", description = "Liveness and restart."),
     )
 )]
@@ -246,9 +247,10 @@ mod tests {
             for (method, op) in item.as_object().unwrap() {
                 assert!(op["tags"].is_array(), "{method} {path} has no tag");
                 assert!(op["summary"].is_string(), "{method} {path} has no summary");
+                let responses = &op["responses"];
                 assert!(
-                    op["responses"]["200"].is_object(),
-                    "{method} {path} has no 200"
+                    responses["200"].is_object() || responses["204"].is_object(),
+                    "{method} {path} has no 200 or 204"
                 );
             }
         }

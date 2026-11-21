@@ -132,11 +132,15 @@ pub async fn refresh_models(state: &AppState) -> Value {
                 fallback_models(state, profile)
             }
             Some(Ok(listing)) => {
-                state.set_upstream_health(&profile.name, true);
+                state.set_upstream_health(&profile.name, true, "The models list answered.");
                 listing
             }
             Some(Err(reason)) => {
-                state.set_upstream_health(&profile.name, false);
+                state.set_upstream_health(
+                    &profile.name,
+                    false,
+                    &format!("The models fetch failed: {reason}"),
+                );
                 tracing::warn!(profile = %profile.name, "models fetch failed: {reason}");
                 fallback_models(state, profile)
             }
@@ -849,7 +853,7 @@ mod tests {
                 .iter()
                 .any(|m| m["id"] == "whisper/whisper-large-v3")
         );
-        state.set_upstream_health("whisper", true);
+        state.set_upstream_health("whisper", true, "up");
         assert!(!state.is_upstream_idle("whisper"));
     }
 
@@ -1645,6 +1649,8 @@ mod tests {
             copilot: None,
             keep_warm: true,
             first_byte_timeout_ms: None,
+            tuner: crate::configs::LocalTunerConfig::default(),
+            budget_monthly_usd: None,
         }
     }
 
