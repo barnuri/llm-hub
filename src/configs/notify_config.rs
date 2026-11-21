@@ -262,7 +262,7 @@ mod tests {
         for (key, value) in [
             ("NOTIFY_WEBHOOK_URL", "ftp://example.com/x"),
             ("NOTIFY_WEBHOOK_URL", "not a url"),
-            ("NOTIFY_COMMAND", "notify 'open"),
+            ("NOTIFY_COMMAND", r#"notify "open"#),
             ("NOTIFY_MIN_SEVERITY", "debug"),
             ("NOTIFY_TIMEOUT_MS", "0"),
             ("NOTIFY_TIMEOUT_MS", "soon"),

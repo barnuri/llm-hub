@@ -405,8 +405,8 @@ mod tests {
     fn backup_dir_error_is_an_io_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("models.txt");
-        std::fs::create_dir(backup_path(&path, 1, 0)).unwrap();
-        std::fs::create_dir(dir.path().join("models.txt.bak-1-1")).unwrap();
+        std::fs::write(backup_path(&path, 1, 0), b"old").unwrap();
+        std::fs::write(dir.path().join("models.txt.bak-1-1"), b"old").unwrap();
         let err = write_backup(&dir.path().join("missing").join("m"), 1, b"x").unwrap_err();
         assert!(matches!(err, RegistryError::Io(_)));
         let written = write_backup(&path, 1, b"x").unwrap();
