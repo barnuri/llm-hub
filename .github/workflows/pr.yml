@@ -55,6 +55,7 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}
           shared-key: lint
           cache-on-failure: true
       - run: scripts/check.sh fast
@@ -73,6 +74,7 @@ jobs:
           tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }},nextest
       - uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}
           shared-key: coverage
           cache-on-failure: true
       - name: Tests with the coverage gate
@@ -95,6 +97,7 @@ jobs:
           tool: nextest
       - uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}
           shared-key: test-windows
           cache-on-failure: true
       - run: cargo nextest run --all-targets --no-fail-fast
@@ -112,6 +115,7 @@ jobs:
           tool: nextest
       - uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}
           shared-key: test-macos
           cache-on-failure: true
       - run: cargo nextest run --all-targets --no-fail-fast
