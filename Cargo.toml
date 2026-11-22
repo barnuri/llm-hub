@@ -80,6 +80,13 @@ media-pdf = ["dep:lopdf"]
 # Embedded mistral.rs worker for `mistralrs` registry rows. Metal on macOS.
 mistralrs = ["dep:mistralrs-core", "dep:mistralrs-server-core"]
 
+[profile.dev]
+# Line tables keep backtraces; full debuginfo for every crate made target/debug 111 GB.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

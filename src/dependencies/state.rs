@@ -92,6 +92,8 @@ struct Inner {
     unsupported_body_fields: UnsupportedBodyFields,
     /// `<profile>/<upstream model>` keys that refused image input, learned from upstream rejections.
     vision_unsupported: DashSet<String>,
+    /// `<profile>/<upstream model>/<endpoint>` keys a Copilot upstream refused as "no model endpoints available".
+    refused_endpoints: DashSet<String>,
     /// The texts media fallback made from media, most recently used first.
     media_cache: MediaCache,
     /// `<profile>/<upstream model>` -> the prompt limit an upstream 400 named in its message.
@@ -208,6 +210,7 @@ impl AppState {
             model_limits,
             unsupported_body_fields,
             vision_unsupported,
+            refused_endpoints: DashSet::new(),
             media_cache: MediaCache::new(MEDIA_FALLBACK_CACHE_ENTRIES),
             rejected_prompt_limits: DashMap::new(),
             smart_auto_affinity: SmartAutoAffinity::new(),
@@ -561,6 +564,28 @@ impl AppState {
         self.0
             .vision_unsupported
             .contains(&format!("{profile}/{model}"))
+    }
+
+    /// Whether `model` on `profile` refused `endpoint` before, so requests go to another endpoint.
+    pub fn endpoint_refused(&self, profile: &str, model: &str, endpoint: &str) -> bool {
+        self.0
+            .refused_endpoints
+            .contains(&format!("{profile}/{model}/{endpoint}"))
+    }
+
+    /// Records that `model` on `profile` refused `endpoint`, and returns whether it is new.
+    /// Held in memory: a restart relearns it once.
+    pub fn learn_endpoint_refused(&self, profile: &str, model: &str, endpoint: &str) -> bool {
+        let new = self
+            .0
+            .refused_endpoints
+            .insert(format!("{profile}/{model}/{endpoint}"));
+        if new {
+            tracing::info!(
+                "profile {profile}: model {model} refuses {endpoint}; requests go to another endpoint"
+            );
+        }
+        new
     }
 
     /// The texts media fallback made from media, held in memory.
