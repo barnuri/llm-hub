@@ -16,7 +16,7 @@ use super::command::build_argv;
 use super::memory::{self, LoadedModel, NoRoom};
 use super::registry_rows::{self, Engine, RegistryRow};
 use crate::configs::{HubConfig, LocalServingConfig};
-use crate::consts::MANAGED_IDLE_CHECK_INTERVAL;
+use crate::consts::{MANAGED_IDLE_CHECK_INTERVAL, MANAGED_STOP_GRACE};
 use crate::services::managed_process::{
     NotReady, kill_process_group, spawn_logged, terminate, wait_ready,
 };
@@ -349,6 +349,11 @@ impl LocalPool {
             if command_line(record.pid).is_some_and(|line| record.matches(&line)) {
                 tracing::info!(model = %record.key, pid = record.pid, "stopping an orphaned local model process");
                 signal_orphan(record.pid);
+                let pid = record.pid;
+                tokio::spawn(async move {
+                    tokio::time::sleep(MANAGED_STOP_GRACE).await;
+                    kill_orphan_group(pid);
+                });
             }
         }
         self.write_pid_file_locked();
@@ -424,12 +429,6 @@ impl LocalPool {
             .get(profile)
             .map(Arc::clone)
             .ok_or_else(|| format!("profile {profile} does not serve local models"))?;
-        let row = local.row(id).ok_or_else(|| {
-            format!(
-                "model {id} is not in the local model registry {}",
-                local.config.registry.display()
-            )
-        })?;
         let entry = self.entry_for(profile, id);
         entry.touch();
         let mut process = entry.process.lock().await;
@@ -450,6 +449,12 @@ impl LocalPool {
         if let Some(reason) = lock(&entry.backoff).reason() {
             return Err(reason);
         }
+        let row = local.row(id).ok_or_else(|| {
+            format!(
+                "model {id} is not in the local model registry {}",
+                local.config.registry.display()
+            )
+        })?;
         let model_path = registry_rows::resolve_model_file(
             &row,
             &local.config.models_dir,
@@ -1022,6 +1027,24 @@ fn signal_orphan(pid: u32) {
 
 #[cfg(not(unix))]
 fn signal_orphan(_pid: u32) {}
+
+#[cfg(unix)]
+fn kill_orphan_group(pid: u32) {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    // SAFETY: kill(2) takes plain integers and touches no memory. The pid names the orphan
+    // process group created by the hub.
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
+        // SAFETY: as above, for the process alone when its group is gone.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_orphan_group(_pid: u32) {}
 
 #[cfg(test)]
 #[cfg(unix)]
@@ -1607,7 +1630,7 @@ http.server.HTTPServer(("127.0.0.1", port), Health).serve_forever()
     }
 
     #[tokio::test]
-    async fn boot_kills_only_orphans_that_still_run_their_model_command() {
+    async fn boot_kills_an_orphan_that_ignores_sigterm_after_the_grace() {
         let dir = tempfile::tempdir().unwrap();
         let model = dir.path().join("orphan.gguf");
         let spawn = |args: &[&str]| {
@@ -1616,7 +1639,14 @@ http.server.HTTPServer(("127.0.0.1", port), Health).serve_forever()
             command.spawn().unwrap()
         };
         let model_arg = model.display().to_string();
-        let mut orphan = spawn(&["-c", "sleep 300; :", "sh", "--port", "4242", &model_arg]);
+        let mut orphan = spawn(&[
+            "-c",
+            "trap '' TERM; sleep 300; :",
+            "sh",
+            "--port",
+            "4242",
+            &model_arg,
+        ]);
         let mut stranger = spawn(&["-c", "sleep 300; :", "sh", "--port", "4243"]);
         let records = vec![
             PidRecord {
@@ -1640,7 +1670,7 @@ http.server.HTTPServer(("127.0.0.1", port), Health).serve_forever()
         pool.kill_orphans();
 
         let mut exited = None;
-        for _ in 0..50 {
+        for _ in 0..80 {
             exited = orphan.try_wait().unwrap();
             if exited.is_some() {
                 break;
