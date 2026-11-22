@@ -121,6 +121,8 @@ const CAPTURE_TEXT_BYTES: usize = 256 * 1024;
 const STAGE_CHAT_PATH: &str = "/v1/chat/completions";
 /// The text an upstream 500 carries when the model refuses image input.
 const IMAGE_INPUT_REJECTION: &str = "image input is not supported";
+/// Copilot's 400 for an endpoint the model does not serve, e.g. chat-completions on a Responses-only model.
+const NO_ENDPOINT_REFUSAL: &str = "no model endpoints available given user constraints";
 /// The rule name a prefill guard event carries, so mutes and the inbox dedupe can match it.
 const PREFILL_GUARD_RULE: &str = "prefill_guard";
 static NO_BODY: Value = Value::Null;
@@ -325,7 +327,11 @@ pub(crate) async fn attempt_loop(
     // The selection template of the routed request. Every dispatch in the chain shares it.
     let mut routed = smart.as_ref().map(|plan| plan.template.clone());
 
-    for (index, requested) in chain.iter().enumerate() {
+    // A learned endpoint refusal sets `next` back to the same model, which is then routed again.
+    let mut next = 0;
+    while let Some(requested) = chain.get(next) {
+        let index = next;
+        next += 1;
         if let (Some(limit), Some(ends)) = (deadline_limit, deadline)
             && Instant::now() >= ends
         {
@@ -422,11 +428,21 @@ pub(crate) async fn attempt_loop(
             session_token,
         )
         .with_deadline(deadline);
-        let mut keep_warm = keep_warm_lease(state, &attempt, model_id, worker.as_deref());
         let mut sent = sender.send(attempt.body.clone()).await;
         if media_fallback && !text_only {
             sent = resend_as_text(state, model_id, &sender, &mut attempt, sent).await;
         }
+        // A newly refused endpoint is learned, and the same model is routed again on another endpoint.
+        let (sent, refused) =
+            learn_refused_endpoint(state, model_id, sent, attempt.path.as_str()).await;
+        if refused {
+            if let Some(event) = &selection {
+                record_transition(state, event, SelectionState::Rejected, None);
+            }
+            next = index;
+            continue;
+        }
+        let mut keep_warm = keep_warm_lease(state, &attempt, model_id, worker.as_deref());
         let (result, retried_body) = match sent {
             Ok(response) if attempt.native_messages => {
                 let rephase = AttemptRephase {
@@ -1403,6 +1419,46 @@ pub(crate) fn upstream_key(state: &AppState, model_id: &ModelId) -> String {
         .map_or_else(|| model_id.model.clone(), |entry| entry.upstream_id)
 }
 
+/// When `sent` is a Copilot 400 that refuses the chat-completions or messages endpoint, learns the
+/// refusal and reports it as new (`true`). Any other reply comes back unchanged, with `false`.
+async fn learn_refused_endpoint(
+    state: &AppState,
+    model_id: &ModelId,
+    sent: Result<reqwest::Response, String>,
+    path: &str,
+) -> (Result<reqwest::Response, String>, bool) {
+    let endpoint = [CHAT_ENDPOINT, MESSAGES_ENDPOINT]
+        .into_iter()
+        .find(|known| path.ends_with(known));
+    let response = match (sent, endpoint) {
+        (Ok(response), Some(_))
+            if response.status() == StatusCode::BAD_REQUEST
+                && is_copilot_profile(state, model_id) =>
+        {
+            response
+        }
+        (other, _) => return (other, false),
+    };
+    let endpoint = endpoint.unwrap_or_default();
+    let (status, version, headers) = (
+        response.status(),
+        response.version(),
+        response.headers().clone(),
+    );
+    let (raw, _) = read_upstream_capped(
+        response,
+        usize::try_from(MAX_REJECTION_BYTES).unwrap_or(usize::MAX),
+    )
+    .await;
+    if String::from_utf8_lossy(&raw).contains(NO_ENDPOINT_REFUSAL)
+        && state.learn_endpoint_refused(&model_id.profile, &model_id.model, endpoint)
+    {
+        return (Err(NO_ENDPOINT_REFUSAL.to_string()), true);
+    }
+    let body = reqwest::Body::from(raw);
+    (Ok(rebuilt_response(status, version, headers, body)), false)
+}
+
 /// When `sent` is a 500 that refuses image input, learns the refusal and sends the attempt once
 /// more with its media as text. Any other reply comes back unchanged.
 async fn resend_as_text(
@@ -1637,10 +1693,10 @@ impl<'a> AttemptBodies<'a> {
                 .as_ref()
                 .map_or_else(|| model_id.model.clone(), |m| m.upstream_id.clone()),
         };
-        let native = self
-            .native
-            .as_ref()
-            .filter(|_| catalog.as_ref().is_some_and(|m| m.native_messages));
+        let native = self.native.as_ref().filter(|_| {
+            catalog.as_ref().is_some_and(|m| m.native_messages)
+                && !state.endpoint_refused(&sent_id.profile, &sent_id.model, MESSAGES_ENDPOINT)
+        });
         let bridged = self
             .native
             .as_ref()
@@ -2965,7 +3021,10 @@ fn serves_only_responses(state: &AppState, sent_id: &ModelId) -> bool {
     else {
         return false;
     };
-    let serves = |wanted: &str| endpoints.iter().any(|e| e.as_str() == Some(wanted));
+    let serves = |wanted: &str| {
+        endpoints.iter().any(|e| e.as_str() == Some(wanted))
+            && !state.endpoint_refused(&sent_id.profile, &sent_id.model, wanted)
+    };
     serves(RESPONSES_ENDPOINT) && !serves(CHAT_ENDPOINT) && !serves(MESSAGES_ENDPOINT)
 }
 
@@ -7127,6 +7186,86 @@ mod tests {
                 })
             );
             assert!(requests_to(&copilot, UPSTREAM_CHAT_PATH).await.is_empty());
+        }
+
+        const MIXED_ID: &str = "mai-code-2-flash";
+        const NO_ENDPOINT_BODY: &str =
+            r#"{"error":{"message":"no model endpoints available given user constraints"}}"#;
+
+        /// A model that lists chat-completions and `/responses`, as Copilot lists MAI models.
+        fn list_mixed_model(copilot: &Copilot) {
+            copilot.state.set_copilot_catalog(
+                PROFILE,
+                vec![json!({"id": MIXED_ID, "supported_endpoints": ["/chat/completions", "/responses"]})],
+            );
+        }
+
+        #[tokio::test]
+        async fn refused_chat_completions_is_retried_on_responses_then_skipped() {
+            let copilot = copilot().await;
+            list_mixed_model(&copilot);
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(
+                    ResponseTemplate::new(400).set_body_raw(NO_ENDPOINT_BODY, "application/json"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+            mount_responses_reply(&copilot, &responses_text_reply("bridged")).await;
+            let body = chat_body(MIXED_ID, false);
+
+            let (status, bytes) = send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
+
+            assert_eq!(status, 200);
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(reply["choices"][0]["message"]["content"], "bridged");
+            assert_eq!(requests_to(&copilot, UPSTREAM_CHAT_PATH).await.len(), 1);
+            assert_eq!(requests_to(&copilot, RESPONSES_ENDPOINT).await.len(), 1);
+            assert!(
+                copilot
+                    .state
+                    .endpoint_refused(PROFILE, MIXED_ID, CHAT_ENDPOINT)
+            );
+
+            let (status, _) = send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
+
+            assert_eq!(status, 200);
+            assert_eq!(
+                requests_to(&copilot, UPSTREAM_CHAT_PATH).await.len(),
+                1,
+                "a learned refusal is not sent to chat-completions again"
+            );
+            assert_eq!(requests_to(&copilot, RESPONSES_ENDPOINT).await.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn other_bad_request_passes_through_and_teaches_nothing() {
+            let copilot = copilot().await;
+            list_mixed_model(&copilot);
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(
+                    ResponseTemplate::new(400)
+                        .set_body_json(json!({"error": {"message": "bad field"}})),
+                )
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, _) = send(
+                &copilot,
+                &client_headers(),
+                &chat_body(MIXED_ID, false),
+                RouteKind::OpenAi,
+            )
+            .await;
+
+            assert_eq!(status, 400);
+            assert!(
+                !copilot
+                    .state
+                    .endpoint_refused(PROFILE, MIXED_ID, CHAT_ENDPOINT)
+            );
+            assert!(requests_to(&copilot, RESPONSES_ENDPOINT).await.is_empty());
         }
 
         #[tokio::test]
