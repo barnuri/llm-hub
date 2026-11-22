@@ -49,8 +49,18 @@ pub(crate) fn load_env_vars() -> HashMap<String, String> {
     vars
 }
 
-/// Runs llm-hub: a CLI command when one is given, else the server until it is told to stop.
+/// Runs a CLI command, ensures an installed service is up, or starts the server.
 pub async fn run() {
+    if std::env::args().nth(1).is_none() && !services::restart::is_supervised() {
+        match services::service_manager::ensure_installed_service().await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("service check failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     Hub::new().run().await;
 }
 
@@ -68,13 +78,16 @@ async fn serve(hub: Hub) {
     }
 
     let vars = load_env_vars();
-    let config = match HubConfig::from_map(&vars) {
-        Ok(config) => config,
+    let (config, profile_errors) = match HubConfig::from_map_skipping_invalid_profiles(&vars) {
+        Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("config error: {e}");
             std::process::exit(1);
         }
     };
+    for error in profile_errors {
+        tracing::warn!(%error, "skipping profile with invalid configuration");
+    }
 
     let store = match open_store(&config) {
         Ok(store) => store,
@@ -296,7 +309,7 @@ const HELP: &str = "llm-hub — one local endpoint for every LLM provider and co
 usage: llm-hub [command] [args...]
 
 Server:
-  llm-hub                         run the hub in the foreground (same as `serve`)
+  llm-hub                         ensure the installed service is up, or run in the foreground
   llm-hub serve                   run the hub in the foreground
   llm-hub service install         install or reload the background service (macOS LaunchAgent)
   llm-hub service uninstall       remove the background service

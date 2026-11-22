@@ -39,7 +39,7 @@ jobs:
           fi
           changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
           has() { echo "$changed" | grep -qE "$1" && echo true || echo false; }
-          echo "rust=$(has '^(src/|tests/|ui/|docs/openapi.json|build.rs|Cargo\.(toml|lock)|rust-toolchain.toml|clippy.toml|scripts/check.sh|\.github/workflows/)')" >> "$GITHUB_OUTPUT"
+          echo "rust=$(has '^(src/|tests/|ui/|docs/openapi.json|build.rs|Cargo\.(toml|lock)|rust-toolchain.toml|clippy.toml|scripts/(check.sh|auto-reinstall)|\.github/workflows/)')" >> "$GITHUB_OUTPUT"
           echo "ui=$(has '^(ui-src/|\.github/workflows/)')" >> "$GITHUB_OUTPUT"
 
   lint:
@@ -56,6 +56,7 @@ jobs:
           shared-key: lint
           cache-on-failure: true
       - run: scripts/check.sh fast
+      - run: bash -n scripts/auto-reinstall.sh && node --test scripts/auto-reinstall.test.mjs
 
   coverage:
     needs: changes

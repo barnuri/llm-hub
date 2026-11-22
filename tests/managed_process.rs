@@ -80,6 +80,7 @@ async fn start_hub(dir: &Path, vars: HashMap<String, String>) -> (HubProcess, St
     let port = free_port();
     let mut command = Command::new(env!("CARGO_BIN_EXE_llm-hub"));
     command
+        .arg("serve")
         .current_dir(dir)
         .env("LLM_HUB_PORT", port.to_string())
         .env("LLM_HUB_AUTO_UPDATE", "0")
