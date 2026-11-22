@@ -94,6 +94,7 @@ struct Inner {
     vision_unsupported: DashSet<String>,
     /// `<profile>/<upstream model>/<endpoint>` keys a Copilot upstream refused as "no model endpoints available".
     refused_endpoints: DashSet<String>,
+
     /// The texts media fallback made from media, most recently used first.
     media_cache: MediaCache,
     /// `<profile>/<upstream model>` -> the prompt limit an upstream 400 named in its message.
@@ -211,6 +212,7 @@ impl AppState {
             unsupported_body_fields,
             vision_unsupported,
             refused_endpoints: DashSet::new(),
+
             media_cache: MediaCache::new(MEDIA_FALLBACK_CACHE_ENTRIES),
             rejected_prompt_limits: DashMap::new(),
             smart_auto_affinity: SmartAutoAffinity::new(),

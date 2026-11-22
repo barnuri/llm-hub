@@ -76,6 +76,7 @@ use crate::services::first_event::{FirstEventCheck, first_event};
 use crate::services::harness::client_signature;
 use crate::services::keep_warm::{ApiShape, KeepWarm, KeepWarmLease, PingPlan, PingTarget};
 use crate::services::local_serving::pool::{Lease, LocalPool};
+
 use crate::services::media_fallback;
 use crate::services::model_health::FailureKind;
 use crate::services::multipart_model;
@@ -299,7 +300,7 @@ pub(crate) async fn attempt_loop(
     };
     let chain = servable_chain(state, &config, chain, &needs)?;
     // Media fallback scans the parsed body once per request, and only when it is on.
-    let media_fallback = config.media_fallback.active()
+    let media_fallback = config.media_fallback.enabled
         && media_fallback::request_has_media(needs.input.0, needs.input.1);
 
     let client_path = bare_path(path_and_query);
@@ -435,6 +436,7 @@ pub(crate) async fn attempt_loop(
             sent = resend_as_text(state, model_id, &sender, &mut attempt, sent).await;
         }
         let mut keep_warm = keep_warm_lease(state, &attempt, model_id, worker.as_deref());
+
         let (result, retried_body) = match sent {
             Ok(response) if attempt.native_messages => {
                 let rephase = AttemptRephase {
@@ -1283,7 +1285,7 @@ fn refusal(
     let descriptor = snapshot.for_model(&model_id.profile, &model_id.model);
     let upstream = upstream_key(state, model_id);
     // With media fallback on, the attempt turns images into text, so the model may still serve.
-    if !config.media_fallback.active()
+    if !config.media_fallback.enabled
         && refuses_images(state, model_id)
         && request_has_image(needs.input.0, needs.input.1)
     {

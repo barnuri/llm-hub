@@ -136,14 +136,12 @@ pub fn set_keep_warm(path: &Path, enabled: bool, idle_cap_minutes: u64) -> Resul
 pub fn set_media_fallback(
     path: &Path,
     enabled: bool,
-    skip: bool,
     vision_model: &str,
     stt_model: &str,
 ) -> Result<(), String> {
     let flag = |on: bool| if on { "true" } else { "false" };
     let mut lines = read_lines(path)?;
     set_var(&mut lines, "MEDIA_FALLBACK", flag(enabled));
-    set_var(&mut lines, "MEDIA_SKIP", flag(skip));
     set_var(&mut lines, "MEDIA_FALLBACK_VISION_MODEL", vision_model);
     set_var(&mut lines, "MEDIA_FALLBACK_STT_MODEL", stt_model);
     write_atomic(path, &lines)
@@ -253,7 +251,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".env");
 
-        set_media_fallback(&path, true, false, "local/eye", "").unwrap();
+        set_media_fallback(&path, true, "local/eye", "").unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(

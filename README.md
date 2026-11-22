@@ -100,6 +100,7 @@ command when `bunx` is on PATH, and another asserts every `operationId` is uniqu
 - [Local model tuner](docs/local-tuner.md): prefill speed of local models, the prefill guard and flag proposals.
 - [Local models: known issues](docs/local-models.md): stream stalls, dense-model prefill limits and other measured local-model problems.
 - [Notifications](docs/notifications.md): the inbox, desktop, webhook and command sinks, mutes and budget steps.
+
 - [Usage and insights](docs/usage-and-insights.md): UI tabs, stats and model rankings.
 - [Configuration](docs/configuration.md): every `LLM_HUB_*` variable.
 - [Service and updates](docs/service-and-updates.md): install, the background service, Docker and updates.
