@@ -1,6 +1,0 @@
-[test-groups]
-local-serving = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = 'test(/local_serving/)'
-test-group = 'local-serving'
