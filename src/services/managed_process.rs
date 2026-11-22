@@ -331,9 +331,8 @@ async fn start(profile: &str, command: &ManagedCommand, log_path: &Path) -> Resu
         if Instant::now() >= deadline {
             terminate(child).await;
             return Err(format!(
-                "nothing listened on {} within {}s",
-                command.address,
-                command.start_timeout.as_secs()
+                "nothing listened on {} within {:?}",
+                command.address, command.start_timeout
             ));
         }
         tokio::time::sleep(MANAGED_READY_POLL_INTERVAL).await;

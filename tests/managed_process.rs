@@ -281,7 +281,7 @@ async fn idle_process_is_stopped_and_restarted_on_next_request() {
     let (command, spawn_log) = test_server_command(dir.path(), server_port);
     let (hub, base) = start_hub(
         dir.path(),
-        managed_profile(server_port, &command, &[("IDLE_SECS", "1")]),
+        managed_profile(server_port, &command, &[("IDLE_MS", "300")]),
     )
     .await;
 
@@ -306,7 +306,7 @@ async fn start_timeout_fails_the_attempt_and_names_profile_and_log() {
         managed_profile(
             server_port,
             &format!(r#"{PYTHON} -c "import time; time.sleep(30)""#),
-            &[("START_TIMEOUT_SECS", "1")],
+            &[("START_TIMEOUT_MS", "300")],
         ),
     )
     .await;
@@ -318,7 +318,7 @@ async fn start_timeout_fails_the_attempt_and_names_profile_and_log() {
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("profile whisper"), "{message}");
     assert!(message.contains("whisper.log"), "{message}");
-    assert!(message.contains("within 1s"), "{message}");
+    assert!(message.contains("within 300ms"), "{message}");
     drop(hub);
 }
 
