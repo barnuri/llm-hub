@@ -135,6 +135,7 @@ impl Fixture {
             let port = free_port();
             let mut command = Command::new(env!("CARGO_BIN_EXE_llm-hub"));
             command
+                .arg("serve")
                 .current_dir(self.dir.path())
                 .env("LLM_HUB_PORT", port.to_string())
                 .env("LLM_HUB_AUTO_UPDATE", "0")
