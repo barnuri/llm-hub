@@ -306,9 +306,8 @@ async fn start(profile: &str, command: &ManagedCommand, log_path: &Path) -> Resu
     .map_err(|error| match error {
         NotReady::Exited(status) => format!("the process exited with {status} before it listened"),
         NotReady::TimedOut => format!(
-            "nothing listened on {} within {}s",
-            command.address,
-            command.start_timeout.as_secs()
+            "nothing listened on {} within {:?}",
+            command.address, command.start_timeout
         ),
     })
 }

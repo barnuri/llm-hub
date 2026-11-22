@@ -6,7 +6,7 @@ use crate::utils::atomic_write::write_atomically;
 const PREFIX: &str = "LLM_HUB_";
 /// Profile keys only an operator may set (they run a program or pick the
 /// upstream credential); upsert keeps them as written and never writes them itself.
-const OPERATOR_ONLY_KEYS: [&str; 23] = [
+const OPERATOR_ONLY_KEYS: [&str; 25] = [
     "COMMAND",
     "KIND",
     "REGISTRY",
@@ -18,7 +18,9 @@ const OPERATOR_ONLY_KEYS: [&str; 23] = [
     "ALLOW_UNGATED",
     "FIRST_BYTE_TIMEOUT_MS",
     "IDLE_SECS",
+    "IDLE_MS",
     "START_TIMEOUT_SECS",
+    "START_TIMEOUT_MS",
     "AUTH",
     "GITHUB_TOKEN_SOURCE",
     "GH_PATH",
