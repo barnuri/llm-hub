@@ -116,11 +116,24 @@ impl HubConfig {
         self.usage_sources.get(profile).copied()
     }
 
+    pub fn from_map(vars: &HashMap<String, String>) -> Result<HubConfig, String> {
+        Self::from_map_inner(vars, false).map(|(config, _)| config)
+    }
+
+    pub(crate) fn from_map_skipping_invalid_profiles(
+        vars: &HashMap<String, String>,
+    ) -> Result<(HubConfig, Vec<String>), String> {
+        Self::from_map_inner(vars, true)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "flat list of env keys; splitting adds no clarity"
     )]
-    pub fn from_map(vars: &HashMap<String, String>) -> Result<HubConfig, String> {
+    fn from_map_inner(
+        vars: &HashMap<String, String>,
+        skip_invalid_profiles: bool,
+    ) -> Result<(HubConfig, Vec<String>), String> {
         let get = |key: &str| {
             vars.get(&format!("{PREFIX}{key}"))
                 .map(|v| v.trim().to_string())
@@ -137,11 +150,26 @@ impl HubConfig {
         };
 
         let mut profiles = Vec::with_capacity(profile_names.len());
+        #[allow(
+            clippy::zero_sized_map_values,
+            reason = "UsageSource is an enum meant to gain variants"
+        )]
+        let mut usage_sources = HashMap::new();
+        let mut profile_errors = Vec::new();
         for name in &profile_names {
-            profiles.push(Self::parse_profile(name, vars)?);
+            let parsed = Self::parse_profile(name, vars).and_then(|profile| {
+                let sources = usage_sources_from_map(std::slice::from_ref(&profile), vars)?;
+                Ok((profile, sources))
+            });
+            match parsed {
+                Ok((profile, sources)) => {
+                    profiles.push(profile);
+                    usage_sources.extend(sources);
+                }
+                Err(error) if skip_invalid_profiles => profile_errors.push(error),
+                Err(error) => return Err(error),
+            }
         }
-
-        let usage_sources = usage_sources_from_map(&profiles, vars)?;
 
         let master_key = get("MASTER_KEY").filter(|k| !k.is_empty());
         let default_fallbacks: Vec<String> = get("DEFAULT_FALLBACKS")
@@ -226,7 +254,7 @@ impl HubConfig {
             )?,
         };
 
-        Ok(HubConfig {
+        let config = HubConfig {
             smart_auto_presets: smart_auto_presets_from_map(vars)?,
             smart_auto_rules_env: get("SMART_AUTO_RULES").filter(|v| !v.trim().is_empty()),
             extensions_disabled: get("EXTENSIONS_DISABLED")
@@ -272,7 +300,8 @@ impl HubConfig {
             local_tuner_enabled: get("LOCAL_TUNER").is_some_and(|v| is_truthy(&v)),
             notify,
             budget_monthly_usd: parse_budget_usd(get("BUDGET_MONTHLY_USD"), "BUDGET_MONTHLY_USD")?,
-        })
+        };
+        Ok((config, profile_errors))
     }
 
     fn parse_profile(name: &str, vars: &HashMap<String, String>) -> Result<ProfileConfig, String> {
@@ -542,6 +571,69 @@ mod tests {
             ),
             ("LLM_HUB_GROQ_API_KEY".into(), "gsk-abc".into()),
         ])
+    }
+
+    #[test]
+    fn startup_parse_skips_invalid_profiles_and_keeps_valid_ones() {
+        let mut vars = base_vars();
+        vars.remove("LLM_HUB_GROQ_BASE_URL");
+
+        let (config, errors) = HubConfig::from_map_skipping_invalid_profiles(&vars).unwrap();
+
+        let names: Vec<&str> = config
+            .profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect();
+        assert_eq!(names, ["openai"]);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("missing LLM_HUB_GROQ_BASE_URL"),
+            "{errors:?}"
+        );
+        assert!(HubConfig::from_map(&vars).is_err());
+    }
+
+    #[test]
+    fn startup_parse_preserves_valid_config() {
+        let vars = base_vars();
+        let (config, errors) = HubConfig::from_map_skipping_invalid_profiles(&vars).unwrap();
+        let strict = HubConfig::from_map(&vars).unwrap();
+        assert_eq!(format!("{config:?}"), format!("{strict:?}"));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn startup_parse_allows_all_profiles_to_be_invalid() {
+        let mut vars = base_vars();
+        vars.remove("LLM_HUB_OPENAI_BASE_URL");
+        vars.remove("LLM_HUB_GROQ_BASE_URL");
+        let (config, errors) = HubConfig::from_map_skipping_invalid_profiles(&vars).unwrap();
+        assert!(config.profiles.is_empty());
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn startup_parse_still_rejects_invalid_server_settings() {
+        let mut vars = base_vars();
+        vars.remove("LLM_HUB_GROQ_BASE_URL");
+        vars.insert("LLM_HUB_PORT".into(), "invalid".into());
+        let error = HubConfig::from_map_skipping_invalid_profiles(&vars).unwrap_err();
+        assert!(error.contains("LLM_HUB_PORT"), "{error}");
+    }
+
+    #[test]
+    fn startup_parse_skips_invalid_profile_usage_source() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_GROQ_USAGE".into(), "invalid".into());
+        vars.insert("LLM_HUB_OPENAI_USAGE".into(), "bifrost".into());
+        let (config, errors) = HubConfig::from_map_skipping_invalid_profiles(&vars).unwrap();
+        assert!(config.profile("groq").is_none());
+        assert!(config.profile("openai").is_some());
+        assert_eq!(config.usage_source("openai"), Some(UsageSource::Bifrost));
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("LLM_HUB_GROQ_USAGE"), "{errors:?}");
+        assert!(HubConfig::from_map(&vars).is_err());
     }
 
     #[test]

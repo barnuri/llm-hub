@@ -206,9 +206,8 @@ mod tests {
         }
     }
 
-    fn json_store(dir: &tempfile::TempDir) -> Store {
-        let path = dir.path().join("store.json");
-        Store::open("json", path.to_str()).unwrap()
+    fn memory_store() -> Store {
+        Store::open("sqlite", Some(":memory:")).unwrap()
     }
 
     #[test]
@@ -361,8 +360,7 @@ mod tests {
 
     #[test]
     fn load_reads_saved_notifications() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = json_store(&dir);
+        let store = memory_store();
         store.save_notification(&notification("a", 1)).unwrap();
         store.save_notification(&notification("b", 2)).unwrap();
         let (inbox, evicted) = Inbox::load(Some(&store));
@@ -376,8 +374,7 @@ mod tests {
 
     #[test]
     fn load_bounds_the_saved_notifications_and_reports_the_evicted() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = json_store(&dir);
+        let store = memory_store();
         let mut settled = notification("settled", 5);
         settled.status = NotificationStatus::Dismissed;
         store.save_notification(&settled).unwrap();
