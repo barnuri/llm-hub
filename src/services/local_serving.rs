@@ -173,11 +173,14 @@ mod tests {
             .as_secs();
         std::fs::write(
             &cfg.gate_file,
-            format!(
-                r#"{{"model":"m","path":"{}","size":{},"mtime":{mtime},"verdict":"pass"}}"#,
-                path.display(),
-                meta.len()
-            ),
+            serde_json::json!({
+                "model": "m",
+                "path": path.display().to_string(),
+                "size": meta.len(),
+                "mtime": mtime,
+                "verdict": "pass",
+            })
+            .to_string(),
         )
         .unwrap();
         assert_eq!(check_gate(&cfg, "m", &path), Ok(()));

@@ -272,6 +272,7 @@ mod tests {
         assert_eq!(argv(&row).unwrap(), expected);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bin_override_runs_without_serve_and_keeps_quoted_flags_whole() {
         // The "muse-glimmer-30b" row: its own --n-gpu-layers replaces the shared one.
@@ -458,11 +459,14 @@ mod tests {
         let gate = dir.path().join("gates.jsonl");
         std::fs::write(
             &gate,
-            format!(
-                r#"{{"model":"m","path":"{}","size":{},"mtime":{mtime},"verdict":"pass"}}"#,
-                model.display(),
-                meta.len()
-            ),
+            serde_json::json!({
+                "model": "m",
+                "path": model.display().to_string(),
+                "size": meta.len(),
+                "mtime": mtime,
+                "verdict": "pass",
+            })
+            .to_string(),
         )
         .unwrap();
         let cfg = mistral_config(&gate, false);
