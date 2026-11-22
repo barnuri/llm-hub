@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -36,7 +37,7 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, String, String)> {
 fn write_response(stream: &mut TcpStream, status: &str, content_type: Option<&str>, body: &[u8]) {
     let mut response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n", body.len());
     if let Some(content_type) = content_type {
-        response.push_str(&format!("Content-Type: {content_type}\r\n"));
+        let _ = write!(response, "Content-Type: {content_type}\r\n");
     }
     response.push_str("Connection: close\r\n\r\n");
     let _ = stream.write_all(response.as_bytes());
@@ -48,7 +49,10 @@ fn main() {
     let port: u16 = argument_value(&arguments, "--port")
         .or_else(|| arguments.first().cloned())
         .and_then(|value| value.parse().ok())
-        .expect("port is required");
+        .unwrap_or_else(|| {
+            eprintln!("test-local-server: port is required");
+            std::process::exit(2)
+        });
     let model = argument_value(&arguments, "-m");
 
     if let Some(model) = model.as_deref() {
@@ -72,23 +76,24 @@ fn main() {
         eprintln!("fake llama stderr");
     }
 
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind test server");
+    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|err| {
+        eprintln!("test-local-server: cannot bind 127.0.0.1:{port}: {err}");
+        std::process::exit(2)
+    });
     for stream in listener.incoming().flatten() {
         let model = model.clone();
-        thread::spawn(move || handle(stream, model));
+        thread::spawn(move || handle(stream, model.as_deref()));
     }
 }
 
-fn handle(mut stream: TcpStream, model: Option<String>) {
+fn handle(mut stream: TcpStream, model: Option<&str>) {
     let Some((method, path, body_text)) = read_request(&mut stream) else {
         return;
     };
 
     if method == "GET" {
         if path == "/health" || path == "/healthz" {
-            let ready = model
-                .as_deref()
-                .is_none_or(|model| !model.contains("unready"));
+            let ready = model.is_none_or(|model| !model.contains("unready"));
             write_response(
                 &mut stream,
                 if ready {
@@ -111,7 +116,7 @@ fn handle(mut stream: TcpStream, model: Option<String>) {
     }
 
     if path == "/v1/chat/completions" {
-        if model.as_deref().is_some_and(|model| model.contains("slow")) {
+        if model.is_some_and(|model| model.contains("slow")) {
             thread::sleep(Duration::from_secs(6));
         }
         if body_text.contains("\"stream\":true") {

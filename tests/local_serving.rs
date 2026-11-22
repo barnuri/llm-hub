@@ -78,7 +78,7 @@ impl Fixture {
                 "LLM_HUB_LOCAL_HF_CACHE".to_owned(),
                 path_str(&root.join("hf")),
             ),
-            ("LLM_HUB_LOCAL_LLAMA_BIN".to_owned(), path_str(&bin)),
+            ("LLM_HUB_LOCAL_LLAMA_BIN".to_owned(), path_str(bin)),
             (
                 "LLM_HUB_LOCAL_START_TIMEOUT_SECS".to_owned(),
                 "20".to_owned(),
