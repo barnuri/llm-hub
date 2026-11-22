@@ -134,6 +134,8 @@ pub struct RequestOutcome {
     pub error: Option<String>,
     /// Caller signature (see `services::harness::client_signature`).
     pub client: Option<String>,
+    /// The caller's validated `OpenCode` or Claude Code session ID.
+    pub session_id: Option<String>,
     /// Salted worker key: the caller's worker id, else its Claude Code session. The same value
     /// `selection_events.worker` stores, so request rows join to selection events. `None` without either.
     pub worker: Option<String>,
@@ -562,6 +564,7 @@ mod tests {
             cache_read_tokens: 4,
             cache_write_tokens: 0,
             error: None,
+            session_id: None,
             client: None,
             worker: None,
             routed_by: None,

@@ -1245,6 +1245,7 @@ mod tests {
             cache_write_tokens: 0,
             error: (status >= 400).then(|| format!("{model_key} failed with {status}")),
             client: None,
+            session_id: None,
             worker: None,
             routed_by: None,
             attempt: None,

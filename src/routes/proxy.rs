@@ -301,6 +301,7 @@ pub(crate) async fn attempt_loop(
         return Ok(local_count_tokens(bodies.original.len()));
     }
     let client = client_signature(headers);
+    let session_id = claude_code_session_id(headers);
     // The Smart Auto template already holds the worker key of the caller's worker id, else its session.
     let worker = smart
         .as_ref()
@@ -552,6 +553,7 @@ pub(crate) async fn attempt_loop(
                                 client_streams,
                                 client,
                                 worker,
+                                session_id.clone(),
                                 commit,
                                 transition.filter(|_| succeeded),
                                 routed_by.clone(),
@@ -570,6 +572,7 @@ pub(crate) async fn attempt_loop(
                                 client_path,
                                 client,
                                 worker,
+                                session_id.clone(),
                                 commit,
                                 transition.filter(|_| succeeded),
                                 shape_body.clone(),
@@ -632,6 +635,7 @@ pub(crate) async fn attempt_loop(
                     ),
                     client.clone(),
                     worker.clone(),
+                    session_id.clone(),
                     routed_by.clone(),
                     selection.as_ref(),
                     LogPaths {
@@ -654,6 +658,7 @@ pub(crate) async fn attempt_loop(
                     reason,
                     client.clone(),
                     worker.clone(),
+                    session_id.clone(),
                     routed_by.clone(),
                     selection.as_ref(),
                     LogPaths {
@@ -2022,6 +2027,7 @@ async fn deliver(
     client_path: &str,
     client: Option<String>,
     worker: Option<String>,
+    session_id: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
     prompt_body: Option<Bytes>,
@@ -2046,6 +2052,7 @@ async fn deliver(
             plan,
             client,
             worker,
+            session_id.clone(),
             commit,
             selection,
             prompt_body,
@@ -2066,6 +2073,7 @@ async fn deliver(
             transform,
             client,
             worker,
+            session_id,
             commit,
             selection,
             prompt_body,
@@ -2134,6 +2142,7 @@ async fn review_deliver(
     streams: bool,
     client: Option<String>,
     worker: Option<String>,
+    session_id: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
     routed_by: String,
@@ -2262,6 +2271,7 @@ async fn review_deliver(
         cache_write_tokens: 0,
         error: None,
         client,
+        session_id,
         worker,
         routed_by: Some(routed_by),
         attempt,
@@ -2364,6 +2374,7 @@ async fn attempt_single(
         None,
         client_signature(headers),
         worker_key(state, headers),
+        claude_code_session_id(headers),
         None,
         None,
         None,
@@ -2884,6 +2895,7 @@ async fn record_internal_call(state: &AppState, model_id: &ModelId, call: Intern
         cache_write_tokens: usage.cache_write_tokens,
         error: (!call.ok).then(|| error_reason(call.status, call.raw)),
         client: Some(call.client.to_string()),
+        session_id: None,
         worker: call.worker,
         routed_by: Some(ROUTED_BY_PINNED.to_owned()),
         attempt: None,
@@ -3548,6 +3560,7 @@ fn build_response(
     transform: Option<BodyTransform>,
     client: Option<String>,
     worker: Option<String>,
+    session_id: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
     prompt_body: Option<Bytes>,
@@ -3599,6 +3612,7 @@ fn build_response(
         cache_write_tokens: 0,
         error: None,
         client,
+        session_id,
         worker,
         routed_by: Some(routed_by),
         attempt,
@@ -3977,6 +3991,7 @@ async fn build_anthropic_response(
     plan: &TransformPlan,
     client: Option<String>,
     worker: Option<String>,
+    session_id: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
     prompt_body: Option<Bytes>,
@@ -4067,6 +4082,7 @@ async fn build_anthropic_response(
         tokens_out: usage.tokens_out,
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        session_id,
         error: (status.as_u16() >= ERROR_STATUS_MIN).then(|| {
             if overflowed {
                 "upstream response too large to translate".to_string()
@@ -4238,6 +4254,7 @@ fn record_failure(
     reason: String,
     client: Option<String>,
     worker: Option<String>,
+    session_id: Option<String>,
     routed_by: String,
     selection: Option<&SelectionEvent>,
     paths: LogPaths<'_>,
@@ -4258,6 +4275,7 @@ fn record_failure(
         cache_write_tokens: 0,
         error: Some(reason),
         client,
+        session_id,
         worker,
         routed_by: Some(routed_by),
         attempt,
@@ -4354,6 +4372,7 @@ async fn passthrough_oversized(
         None,
         client_signature(headers),
         worker_key(state, headers),
+        claude_code_session_id(headers),
         None,
         None,
         None,
@@ -7521,6 +7540,22 @@ mod tests {
                 claude_code_session_id(&headers).as_deref(),
                 Some("ses_oc_unit")
             );
+        }
+
+        #[test]
+        fn opencode_session_header_is_preserved_for_usage_rows() {
+            let mut headers = client_headers();
+            headers.insert(
+                crate::consts::HEADER_SESSION_ID,
+                HeaderValue::from_static("ses_usage_1"),
+            );
+
+            let outcome = RequestOutcome {
+                session_id: claude_code_session_id(&headers),
+                ..RequestOutcome::default()
+            };
+
+            assert_eq!(outcome.session_id.as_deref(), Some("ses_usage_1"));
         }
 
         #[test]

@@ -1180,6 +1180,7 @@ mod tests {
             cache_write_tokens: 0,
             error: (status >= ERROR_STATUS_MIN).then(|| format!("boom {status}")),
             client: None,
+            session_id: None,
             worker: None,
             routed_by: None,
             attempt: None,
