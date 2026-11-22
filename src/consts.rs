@@ -36,6 +36,8 @@ pub const DEFAULT_LOCAL_LLAMA_BIN: &str = "~/.local/bin/llama";
 pub const LOCAL_LLAMA_BIN_ON_PATH: &str = "llama";
 pub const DEFAULT_LOCAL_MODELS_DIR: &str = "~/models";
 pub const DEFAULT_LOCAL_HF_CACHE: &str = "~/.cache/huggingface/hub";
+/// JSONL file of mistral.rs gate records (one JSON object per line) that `LOCAL_GATE_FILE` reads.
+pub const DEFAULT_LOCAL_GATE_FILE: &str = "~/.config/llama/mistralrs-gates.jsonl";
 pub const STATS_MAX_MODEL_KEYS: usize = 1000;
 pub const STATS_OVERFLOW_KEY: &str = "other";
 /// Rolling tail kept per response for scraping the `usage` object.

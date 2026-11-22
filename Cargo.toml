@@ -57,6 +57,14 @@ utoipa-swagger-ui = { version = "10.0.2", features = ["axum", "vendored"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+mistralrs-core = { git = "https://github.com/EricLBuehler/mistral.rs", tag = "v0.9.5", default-features = false, features = ["metal"], optional = true }
+mistralrs-server-core = { git = "https://github.com/EricLBuehler/mistral.rs", tag = "v0.9.5", default-features = false, features = ["metal"], optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+mistralrs-core = { git = "https://github.com/EricLBuehler/mistral.rs", tag = "v0.9.5", default-features = false, optional = true }
+mistralrs-server-core = { git = "https://github.com/EricLBuehler/mistral.rs", tag = "v0.9.5", default-features = false, optional = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
@@ -69,6 +77,8 @@ windows-sys = { version = "0.61.2", features = [
 [features]
 # PDF text for media fallback. Adds a PDF parser to the binary.
 media-pdf = ["dep:lopdf"]
+# Embedded mistral.rs worker for `mistralrs` registry rows. Metal on macOS.
+mistralrs = ["dep:mistralrs-core", "dep:mistralrs-server-core"]
 
 [profile.release]
 lto = "fat"

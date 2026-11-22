@@ -34,7 +34,11 @@ fi
     echo "ui build failed, keeping the running service"
     exit 1
   fi
-  if ! cargo build --release; then
+  args=(build --release)
+  if [ -n "${LLM_HUB_CARGO_FEATURES:-}" ]; then
+    args+=(--features "$LLM_HUB_CARGO_FEATURES")
+  fi
+  if ! cargo "${args[@]}"; then
     echo "cargo build failed, keeping the running service"
     exit 1
   fi

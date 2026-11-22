@@ -1,13 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::hub_config::{is_falsy, is_truthy};
 use super::managed_command::ManagedCommand;
 use crate::consts::{
-    DEFAULT_LOCAL_HF_CACHE, DEFAULT_LOCAL_IDLE_SECS, DEFAULT_LOCAL_LLAMA_BIN,
-    DEFAULT_LOCAL_MODELS_DIR, DEFAULT_LOCAL_START_TIMEOUT_SECS, LOCAL_LLAMA_BIN_ON_PATH,
-    LOCAL_PROFILE_KIND,
+    DEFAULT_LOCAL_GATE_FILE, DEFAULT_LOCAL_HF_CACHE, DEFAULT_LOCAL_IDLE_SECS,
+    DEFAULT_LOCAL_LLAMA_BIN, DEFAULT_LOCAL_MODELS_DIR, DEFAULT_LOCAL_START_TIMEOUT_SECS,
+    LOCAL_LLAMA_BIN_ON_PATH, LOCAL_PROFILE_KIND,
 };
 
 /// Settings of a profile with `LLM_HUB_<P>_KIND=local`, where the hub serves registry models
@@ -30,7 +30,11 @@ pub struct LocalServingConfig {
     pub models_dir: PathBuf,
     /// `LLM_HUB_<P>_HF_CACHE`: the Hugging Face hub cache searched for a row's file.
     pub hf_cache: PathBuf,
-    /// `LLM_HUB_<P>_ALLOW_UNGATED`: serve a `mistralrs` row whose model has no passed gate.
+    /// `LLM_HUB_<P>_GATE_FILE`: JSONL file of gate records that `mistralrs` rows must pass.
+    pub gate_file: PathBuf,
+    /// `LLM_HUB_<P>_UNGATED_MODELS`: ids of `mistralrs` rows that may start without a passed gate.
+    pub ungated_models: HashSet<String>,
+    /// `LLM_HUB_<P>_ALLOW_UNGATED`: serve every `mistralrs` row without a passed gate.
     pub allow_ungated: bool,
 }
 
@@ -95,6 +99,16 @@ impl LocalServingConfig {
                 present("MODELS_DIR").unwrap_or_else(|| DEFAULT_LOCAL_MODELS_DIR.into()),
             ),
             hf_cache: expand(present("HF_CACHE").unwrap_or_else(|| DEFAULT_LOCAL_HF_CACHE.into())),
+            gate_file: expand(
+                present("GATE_FILE").unwrap_or_else(|| DEFAULT_LOCAL_GATE_FILE.into()),
+            ),
+            ungated_models: present("UNGATED_MODELS").map_or_else(HashSet::new, |raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            }),
             allow_ungated: Self::allow_ungated(upper, present("ALLOW_UNGATED"))?,
         }))
     }
@@ -228,7 +242,33 @@ mod tests {
             config.hf_cache,
             PathBuf::from("/home/op/.cache/huggingface/hub")
         );
+        assert_eq!(
+            config.gate_file,
+            PathBuf::from("/home/op/.config/llama/mistralrs-gates.jsonl")
+        );
+        assert!(config.ungated_models.is_empty());
         assert!(!config.allow_ungated);
+    }
+
+    #[test]
+    fn ungated_models_is_a_trimmed_comma_list() {
+        let config = parse(&[("UNGATED_MODELS", " gemma-4-e4b, ,qwen-x ")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config.ungated_models,
+            HashSet::from(["gemma-4-e4b".to_owned(), "qwen-x".to_owned()])
+        );
+    }
+
+    #[test]
+    fn gate_file_expands_home_and_takes_an_override() {
+        let config = parse(&[("GATE_FILE", "/data/gates.jsonl")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.gate_file, PathBuf::from("/data/gates.jsonl"));
+        let config = parse(&[("GATE_FILE", "~/g.jsonl")]).unwrap().unwrap();
+        assert_eq!(config.gate_file, PathBuf::from("/home/op/g.jsonl"));
     }
 
     #[test]
@@ -248,6 +288,8 @@ mod tests {
             ("LLAMA_BIN", "~/bin/llama-dev"),
             ("MODELS_DIR", "~/gguf"),
             ("HF_CACHE", "/data/hf"),
+            ("GATE_FILE", "/etc/gates.jsonl"),
+            ("UNGATED_MODELS", "a,b"),
             ("ALLOW_UNGATED", "true"),
         ])
         .unwrap()
@@ -266,6 +308,8 @@ mod tests {
         assert_eq!(config.llama_bin, PathBuf::from("/home/op/bin/llama-dev"));
         assert_eq!(config.models_dir, PathBuf::from("/home/op/gguf"));
         assert_eq!(config.hf_cache, PathBuf::from("/data/hf"));
+        assert_eq!(config.gate_file, PathBuf::from("/etc/gates.jsonl"));
+        assert_eq!(config.ungated_models.len(), 2);
         assert!(config.allow_ungated);
     }
 
