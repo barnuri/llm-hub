@@ -25,7 +25,7 @@ unwrap_used = "warn"
 
 [[bin]]
 name = "test-local-server"
-path = "src/bin/test_local_server.rs"
+path = "tests/support/test_local_server.rs"
 test = false
 bench = false
 
