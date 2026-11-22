@@ -31,6 +31,7 @@ pub async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
             .current_dir(&dir)
             .env("LLM_HUB_PORT", port.to_string())
             .env("LLM_HUB_AUTO_UPDATE", "0")
+            .env("LLM_HUB_NOTIFY_DESKTOP", "false")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (key, value) in &vars {
@@ -89,10 +90,9 @@ async fn wait_ready(base: &str, child: &mut Child, listening: &AtomicBool) -> bo
             && response.status().is_success()
             && response.text().await.is_ok_and(|text| text == "ok")
         {
-            tokio::time::sleep(Duration::from_millis(200)).await;
             return child.try_wait().unwrap().is_none();
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("hub did not become ready within 30 s");
 }

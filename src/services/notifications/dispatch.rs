@@ -546,9 +546,8 @@ mod tests {
         notification(id, NotificationSeverity::Warning)
     }
 
-    fn json_store(dir: &tempfile::TempDir) -> Arc<Store> {
-        let path = dir.path().join("store.json");
-        Arc::new(Store::open("json", path.to_str()).unwrap())
+    fn memory_store() -> Arc<Store> {
+        Arc::new(Store::open("sqlite", Some(":memory:")).unwrap())
     }
 
     fn mute(id: &str, source: &str, scope: MuteScope, until_ms: Option<u64>) -> NotificationMute {
@@ -769,8 +768,7 @@ mod tests {
 
     #[test]
     fn stored_error_groups_never_notify_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = json_store(&dir);
+        let store = memory_store();
         store.record(&failure("old boom")).unwrap();
         let notifier = Notifier::new(&NotifyConfig::default(), Some(Arc::clone(&store)));
         notifier.note_error(&failure("old boom"));
@@ -781,8 +779,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_background_seed_sends_groups_held_before_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = json_store(&dir);
+        let store = memory_store();
         store.record(&failure("old boom")).unwrap();
         let notifier = Notifier::new(&NotifyConfig::default(), Some(Arc::clone(&store)));
         notifier.note_error(&failure("new boom"));
@@ -823,8 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_status_saves_and_reports_unknown() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = json_store(&dir);
+        let store = memory_store();
         let notifier = Notifier::new(&NotifyConfig::default(), Some(Arc::clone(&store)));
         notifier.notify(warning("a"));
         let updated = notifier
@@ -851,8 +847,7 @@ mod tests {
 
     #[test]
     fn outside_a_runtime_saves_inline_and_loads_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = json_store(&dir);
+        let store = memory_store();
         let notifier = Notifier::new(&NotifyConfig::default(), Some(Arc::clone(&store)));
         notifier.notify(warning("a"));
         notifier
@@ -896,8 +891,7 @@ mod tests {
 
     #[test]
     fn a_late_mute_job_writes_the_live_rule_not_its_own() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = json_store(&dir);
+        let store = memory_store();
         let notifier = Notifier::new(&NotifyConfig::default(), Some(Arc::clone(&store)));
         let rule = NotificationMute {
             origin: MuteOrigin::Ui,
@@ -917,8 +911,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mute_jobs_in_a_runtime_leave_the_removed_rule_deleted() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = json_store(&dir);
+        let store = memory_store();
         let notifier = Notifier::new(&NotifyConfig::default(), Some(Arc::clone(&store)));
         for _ in 0..20 {
             notifier
@@ -944,8 +937,7 @@ mod tests {
 
     #[test]
     fn startup_deletes_saved_notifications_past_the_inbox_bound() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = json_store(&dir);
+        let store = memory_store();
         for index in 0..=INBOX_CAP {
             let mut saved = warning(&format!("n{index}"));
             saved.created_ms = index as u64 + 1;
@@ -960,8 +952,7 @@ mod tests {
 
     #[test]
     fn an_eviction_deletes_the_evicted_notification_from_the_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = json_store(&dir);
+        let store = memory_store();
         let notifier = Notifier::new(&NotifyConfig::default(), Some(Arc::clone(&store)));
         for index in 0..INBOX_CAP {
             let mut item = warning(&format!("n{index}"));
@@ -981,8 +972,7 @@ mod tests {
 
     #[test]
     fn an_evicted_id_back_in_the_inbox_is_not_deleted() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = json_store(&dir);
+        let store = memory_store();
         let notifier = Notifier::new(&NotifyConfig::default(), Some(Arc::clone(&store)));
         notifier.notify(warning("a"));
         notifier.delete_evicted(vec!["a".into()]);
@@ -992,8 +982,7 @@ mod tests {
 
     #[test]
     fn prune_tick_removes_expired_snoozes_from_the_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = json_store(&dir);
+        let store = memory_store();
         let notifier = Notifier::new(&NotifyConfig::default(), Some(Arc::clone(&store)));
         notifier
             .add_mute(mute("snooze", "api", MuteScope::All, Some(100)))
