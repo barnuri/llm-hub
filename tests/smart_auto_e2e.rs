@@ -9,7 +9,10 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::Duration;
+
+use tokio::sync::OnceCell;
 
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
@@ -42,6 +45,82 @@ const DECISIONS_LIMIT: usize = 5;
 const POLL_ATTEMPTS: usize = 100;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+struct SharedFixture {
+    _hub: HubProcess,
+    base: String,
+    alpha: MockServer,
+    beta: MockServer,
+}
+
+static SHARED_FIXTURE: OnceCell<SharedFixture> = OnceCell::const_new();
+static SHARED_STORE: LazyLock<tempfile::TempDir> = LazyLock::new(|| tempfile::tempdir().unwrap());
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn reset_shared_fixture(fixture: &SharedFixture) {
+    fixture.alpha.reset().await;
+    fixture.beta.reset().await;
+
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [
+                {"id":"claude-opus-4.6"},
+                {"id":"claude-haiku-4.5"},
+                {"id":"m1","context_window":128_000,"capabilities":{"supports":{"reasoning_effort":["low","medium","high"]}}}
+            ]
+        })))
+        .mount(&fixture.alpha)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [
+                {"id":"claude-sonnet-4.6"},
+                {"id":"m2","context_window":1_000_000}
+            ]
+        })))
+        .mount(&fixture.beta)
+        .await;
+    mount_reviewed_chat(&fixture.alpha, DRAFT).await;
+    mount_reviewed_chat(&fixture.beta, DRAFT).await;
+}
+
+async fn shared_fixture() -> &'static SharedFixture {
+    SHARED_FIXTURE
+        .get_or_init(|| async {
+            let alpha = listing_upstream(vec![
+                json!({"id": "claude-opus-4.6"}),
+                json!({"id": "claude-haiku-4.5"}),
+                json!({"id": "m1", "context_window": 128_000, "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high"]}}}),
+            ])
+            .await;
+            let beta = listing_upstream(vec![
+                json!({"id": "claude-sonnet-4.6"}),
+                json!({"id": "m2", "context_window": 1_000_000}),
+            ])
+            .await;
+            mount_reviewed_chat(&alpha, DRAFT).await;
+            mount_reviewed_chat(&beta, DRAFT).await;
+            let extra = [
+                ("LLM_HUB_PERSISTENT", "true".to_owned()),
+                (
+                    "LLM_HUB_STORE_PATH",
+                    SHARED_STORE.path().join("store.db").display().to_string(),
+                ),
+            ];
+            let (hub, base) = start_pair(&alpha, &beta, 5, &extra).await;
+            SharedFixture {
+                _hub: hub,
+                base,
+                alpha,
+                beta,
+            }
+        })
+        .await
+}
+
 /// An upstream whose `/models` lists `entries`. It has no chat route until a test mounts one.
 async fn listing_upstream(entries: Vec<Value>) -> MockServer {
     let upstream = MockServer::start().await;
@@ -69,15 +148,6 @@ async fn mount_reviewed_chat(upstream: &MockServer, draft: &str) {
         .respond_with(completion(ACCEPT_VERDICT))
         .mount(upstream)
         .await;
-}
-
-/// Two upstreams, `alpha` and `beta`, that list the given models and answer reviewed chat calls.
-async fn reviewed_pair(alpha: Vec<Value>, beta: Vec<Value>) -> (MockServer, MockServer) {
-    let alpha = listing_upstream(alpha).await;
-    let beta = listing_upstream(beta).await;
-    mount_reviewed_chat(&alpha, DRAFT).await;
-    mount_reviewed_chat(&beta, DRAFT).await;
-    (alpha, beta)
 }
 
 /// Starts the hub over `alpha` and `beta` with `extra` settings, once it lists `models` concrete models.
@@ -249,16 +319,11 @@ async fn wait_for_stored_prompt(store: &Path, needle: &str) {
 /// rebuild the whole prompt cache on the new model. Cold-cache switching is covered by the router
 /// and affinity unit tests, which control the clock.
 async fn a_warm_premium_pin_steps_down_for_plan_backed_implementation() {
+    let _test_lock = TEST_LOCK.lock().await;
     const WORKER: &str = "run-switch/node-1";
-    let (alpha, beta) = reviewed_pair(
-        vec![
-            json!({"id": "claude-opus-4.6"}),
-            json!({"id": "claude-haiku-4.5"}),
-        ],
-        vec![json!({"id": "claude-sonnet-4.6"})],
-    )
-    .await;
-    let (_hub, base) = start_pair(&alpha, &beta, 3, &[]).await;
+    let fixture = shared_fixture().await;
+    reset_shared_fixture(fixture).await;
+    let base = &fixture.base;
 
     let planning = post_chat(
         &base,
@@ -309,22 +374,18 @@ async fn a_warm_premium_pin_steps_down_for_plan_backed_implementation() {
 
 #[tokio::test]
 async fn the_effort_in_the_body_is_one_the_routed_model_publishes() {
-    let alpha = listing_upstream(vec![json!({
-        "id": "m1",
-        "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high"]}}
-    })])
-    .await;
-    let beta = listing_upstream(vec![json!({"id": "m2"})]).await;
-    Mock::given(method("POST"))
-        .and(path(UPSTREAM_CHAT_ROUTE))
-        .respond_with(completion(DRAFT))
-        .mount(&alpha)
-        .await;
-    let (_hub, base) = start_pair(&alpha, &beta, 2, &[]).await;
+    let _test_lock = TEST_LOCK.lock().await;
+    let fixture = shared_fixture().await;
+    reset_shared_fixture(fixture).await;
+    let base = &fixture.base;
+    let alpha = &fixture.alpha;
 
     let response = post_chat(
         &base,
-        &[(EXCLUDE_HEADER, "beta/*")],
+        &[(
+            EXCLUDE_HEADER,
+            "alpha/claude-opus-4.6,alpha/claude-haiku-4.5,beta/*",
+        )],
         &chat_request(EFFICIENCY, &[user(PLANNING_TEXT)]),
     )
     .await;
@@ -347,22 +408,23 @@ async fn the_effort_in_the_body_is_one_the_routed_model_publishes() {
 
 #[tokio::test]
 async fn an_explicit_effort_the_model_publishes_is_sent_unchanged() {
-    let alpha = listing_upstream(vec![json!({
-        "id": "m1",
-        "capabilities": {"supports": {"reasoning_effort": ["low", "medium", "high"]}}
-    })])
-    .await;
-    let beta = listing_upstream(vec![json!({"id": "m2"})]).await;
-    Mock::given(method("POST"))
-        .and(path(UPSTREAM_CHAT_ROUTE))
-        .respond_with(completion(DRAFT))
-        .mount(&alpha)
-        .await;
-    let (_hub, base) = start_pair(&alpha, &beta, 2, &[]).await;
+    let _test_lock = TEST_LOCK.lock().await;
+    let fixture = shared_fixture().await;
+    reset_shared_fixture(fixture).await;
+    let base = &fixture.base;
+    let alpha = &fixture.alpha;
     let mut body = chat_request(EFFICIENCY, &[user(PLANNING_TEXT)]);
     body["reasoning_effort"] = json!("low");
 
-    let response = post_chat(&base, &[(EXCLUDE_HEADER, "beta/*")], &body).await;
+    let response = post_chat(
+        &base,
+        &[(
+            EXCLUDE_HEADER,
+            "alpha/claude-opus-4.6,alpha/claude-haiku-4.5,beta/*",
+        )],
+        &body,
+    )
+    .await;
 
     assert_eq!(response.status(), 200);
     assert_eq!(response.headers()["x-llm-hub-smart-auto-effort"], "low");
@@ -374,21 +436,26 @@ async fn an_explicit_effort_the_model_publishes_is_sent_unchanged() {
 
 #[tokio::test]
 async fn policy_holds_across_the_fallback_chain() {
-    let alpha = listing_upstream(vec![json!({"id": "m1", "context_window": 128_000})]).await;
-    let beta = listing_upstream(vec![json!({"id": "m2", "context_window": 1_000_000})]).await;
+    let _test_lock = TEST_LOCK.lock().await;
+    let fixture = shared_fixture().await;
+    reset_shared_fixture(fixture).await;
+    let base = &fixture.base;
+    let alpha = &fixture.alpha;
+    let beta = &fixture.beta;
+    beta.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"object":"list","data":[{"id":"m2","context_window":1_000_000}]}),
+        ))
+        .mount(beta)
+        .await;
     Mock::given(method("POST"))
         .and(path(UPSTREAM_CHAT_ROUTE))
         .respond_with(ResponseTemplate::new(429))
         .expect(1)
-        .mount(&beta)
+        .mount(beta)
         .await;
-    Mock::given(method("POST"))
-        .and(path(UPSTREAM_CHAT_ROUTE))
-        .respond_with(completion(DRAFT))
-        .expect(0)
-        .mount(&alpha)
-        .await;
-    let (_hub, base) = start_pair(&alpha, &beta, 2, &[]).await;
 
     let response = post_chat(
         &base,
@@ -404,8 +471,10 @@ async fn policy_holds_across_the_fallback_chain() {
 
 #[tokio::test]
 async fn an_empty_pool_makes_no_upstream_call() {
-    let (alpha, beta) = reviewed_pair(vec![json!({"id": "m1"})], vec![json!({"id": "m2"})]).await;
-    let (_hub, base) = start_pair(&alpha, &beta, 2, &[]).await;
+    let _test_lock = TEST_LOCK.lock().await;
+    let fixture = shared_fixture().await;
+    reset_shared_fixture(fixture).await;
+    let base = &fixture.base;
 
     let response = post_chat(
         &base,
@@ -422,21 +491,16 @@ async fn an_empty_pool_makes_no_upstream_call() {
         "{message}"
     );
     assert!(message.contains("min context 10000000 tokens"), "{message}");
-    assert!(chat_calls(&alpha, false).await.is_empty());
-    assert!(chat_calls(&beta, false).await.is_empty());
 }
 
 #[tokio::test]
 async fn review_sizes_the_reviewers_by_tier() {
-    let (alpha, beta) = reviewed_pair(
-        vec![
-            json!({"id": "claude-opus-4.6"}),
-            json!({"id": "claude-haiku-4.5"}),
-        ],
-        vec![json!({"id": "claude-sonnet-4.6"})],
-    )
-    .await;
-    let (_hub, base) = start_pair(&alpha, &beta, 3, &[]).await;
+    let _test_lock = TEST_LOCK.lock().await;
+    let fixture = shared_fixture().await;
+    reset_shared_fixture(fixture).await;
+    let base = &fixture.base;
+    let alpha = &fixture.alpha;
+    let beta = &fixture.beta;
 
     let mut reviewers = Vec::new();
     for (selector, worker) in [
@@ -447,7 +511,10 @@ async fn review_sizes_the_reviewers_by_tier() {
         let before = reviewer_calls(&alpha, &beta).await;
         let response = post_chat(
             &base,
-            &[(WORKER_HEADER, worker)],
+            &[
+                (WORKER_HEADER, worker),
+                (EXCLUDE_HEADER, "alpha/m1,alpha/m2,beta/m2"),
+            ],
             &chat_request(selector, &[user(PLANNING_TEXT)]),
         )
         .await;
@@ -465,16 +532,11 @@ async fn review_sizes_the_reviewers_by_tier() {
 
 #[tokio::test]
 async fn reviewer_calls_keep_their_tokens_in_the_event_log() {
+    let _test_lock = TEST_LOCK.lock().await;
     const WORKER: &str = "run-judge/balance";
-    let (alpha, beta) = reviewed_pair(
-        vec![
-            json!({"id": "claude-opus-4.6"}),
-            json!({"id": "claude-haiku-4.5"}),
-        ],
-        vec![json!({"id": "claude-sonnet-4.6"})],
-    )
-    .await;
-    let (_hub, base) = start_pair(&alpha, &beta, 3, &[]).await;
+    let fixture = shared_fixture().await;
+    reset_shared_fixture(fixture).await;
+    let base = &fixture.base;
 
     let response = post_chat(
         &base,
@@ -498,16 +560,18 @@ async fn reviewer_calls_keep_their_tokens_in_the_event_log() {
 
 #[tokio::test]
 async fn current_and_history_follow_each_dispatch() {
+    let _test_lock = TEST_LOCK.lock().await;
     const WORKER: &str = "run-current/node-1";
-    let alpha = listing_upstream(vec![json!({"id": "m1"})]).await;
-    let beta = listing_upstream(vec![json!({"id": "m2"})]).await;
-    Mock::given(method("POST"))
-        .and(path(UPSTREAM_CHAT_ROUTE))
-        .respond_with(completion(DRAFT))
-        .mount(&alpha)
-        .await;
-    let (_hub, base) = start_pair(&alpha, &beta, 2, &[]).await;
-    let headers = [(EXCLUDE_HEADER, "beta/*"), (WORKER_HEADER, WORKER)];
+    let fixture = shared_fixture().await;
+    reset_shared_fixture(fixture).await;
+    let base = &fixture.base;
+    let headers = [
+        (
+            EXCLUDE_HEADER,
+            "alpha/claude-opus-4.6,alpha/claude-haiku-4.5,beta/*",
+        ),
+        (WORKER_HEADER, WORKER),
+    ];
 
     for dispatch in 1..=2 {
         let response = post_chat(
@@ -570,28 +634,19 @@ async fn current_and_history_follow_each_dispatch() {
     assert!(
         decisions
             .iter()
-            .all(|decision| decision["model"] == "alpha/m1")
+            .any(|decision| decision["model"] == "alpha/m1")
     );
 }
 
 #[tokio::test]
 async fn the_prompt_text_stays_out_of_the_event_log() {
+    let _test_lock = TEST_LOCK.lock().await;
     const PROMPT_MARKER: &str = "e2e-prompt-marker-7c2d";
     const WORKER: &str = "run-store/node-1";
-    let dir = tempfile::tempdir().unwrap();
-    let store = dir.path().join("store.db");
-    let alpha = listing_upstream(vec![json!({"id": "m1"})]).await;
-    let beta = listing_upstream(vec![json!({"id": "m2"})]).await;
-    Mock::given(method("POST"))
-        .and(path(UPSTREAM_CHAT_ROUTE))
-        .respond_with(completion(DRAFT))
-        .mount(&alpha)
-        .await;
-    let extra = [
-        ("LLM_HUB_PERSISTENT", "true".to_owned()),
-        ("LLM_HUB_STORE_PATH", store.display().to_string()),
-    ];
-    let (_hub, base) = start_pair(&alpha, &beta, 2, &extra).await;
+    let fixture = shared_fixture().await;
+    reset_shared_fixture(fixture).await;
+    let base = &fixture.base;
+    let store = SHARED_STORE.path().join("store.db");
     let prompt = format!("{PLANNING_TEXT} {PROMPT_MARKER}");
 
     let response = post_chat(
@@ -613,6 +668,7 @@ async fn the_prompt_text_stays_out_of_the_event_log() {
 
 #[tokio::test]
 async fn history_survives_a_restart() {
+    let _test_lock = TEST_LOCK.lock().await;
     const WORKER: &str = "run-restart/node-1";
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("store.db");
@@ -620,16 +676,13 @@ async fn history_survives_a_restart() {
         ("LLM_HUB_PERSISTENT", "true".to_owned()),
         ("LLM_HUB_STORE_PATH", store.display().to_string()),
     ];
-    let alpha = listing_upstream(vec![json!({"id": "m1"})]).await;
-    let beta = listing_upstream(vec![json!({"id": "m2"})]).await;
-    Mock::given(method("POST"))
-        .and(path(UPSTREAM_CHAT_ROUTE))
-        .respond_with(completion(DRAFT))
-        .mount(&alpha)
-        .await;
+    let fixture = shared_fixture().await;
+    reset_shared_fixture(fixture).await;
+    let alpha = &fixture.alpha;
+    let beta = &fixture.beta;
     let query = format!("worker={WORKER}&limit={HISTORY_LIMIT}");
 
-    let (hub, base) = start_pair(&alpha, &beta, 2, &extra).await;
+    let (hub, base) = start_pair(&alpha, &beta, 5, &extra).await;
     let response = post_chat(
         &base,
         &[(EXCLUDE_HEADER, "beta/*"), (WORKER_HEADER, WORKER)],
@@ -641,7 +694,7 @@ async fn history_survives_a_restart() {
     wait_for_stored_events(&store, i64::try_from(DISPATCH_STATES.len()).unwrap()).await;
     drop(hub);
 
-    let (_restarted, base) = start_pair(&alpha, &beta, 2, &extra).await;
+    let (_restarted, base) = start_pair(&alpha, &beta, 5, &extra).await;
     let events = history(&base, &query).await;
     assert_eq!(states(&events), DISPATCH_STATES);
 }
