@@ -70,6 +70,13 @@ windows-sys = { version = "0.61.2", features = [
 # PDF text for media fallback. Adds a PDF parser to the binary.
 media-pdf = ["dep:lopdf"]
 
+[profile.dev]
+# Line tables keep backtraces; full debuginfo for every crate made target/debug 111 GB.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
