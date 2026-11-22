@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use super::copilot_auth::CopilotAuth;
 use super::keep_warm_config::KeepWarmConfig;
+use super::local_serving_config::LocalServingConfig;
 use super::local_tuner_config::LocalTunerConfig;
 use super::managed_command::ManagedCommand;
 use super::media_fallback_config::MediaFallbackConfig;
@@ -13,7 +14,7 @@ use crate::consts::{
     DEFAULT_BIND, DEFAULT_COPILOT_PRICES_REFRESH_SECS, DEFAULT_FIRST_BYTE_TIMEOUT_MS,
     DEFAULT_KEEP_WARM_ENABLED, DEFAULT_KEEP_WARM_IDLE_CAP_MINUTES, DEFAULT_MAX_REPLAY_BYTES,
     DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_PORT, DEFAULT_QUOTA_COOLDOWN_SECS,
-    DEFAULT_SSE_KEEPALIVE_MS,
+    DEFAULT_SSE_KEEPALIVE_MS, LOCAL_PROFILE_BASE_URL,
 };
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
@@ -132,7 +133,7 @@ impl HubConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            // No index var: discover profiles from LLM_HUB_<NAME>_BASE_URL keys.
+            // No index var: discover profiles from LLM_HUB_<NAME>_BASE_URL or _KIND keys.
             _ => discover_profile_names(vars),
         };
 
@@ -291,15 +292,6 @@ impl HubConfig {
                 .map(|v| v.trim().to_string())
         };
 
-        let base_url = get("BASE_URL")
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| format!("missing LLM_HUB_{upper}_BASE_URL for profile {name}"))?;
-        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-            return Err(format!(
-                "LLM_HUB_{upper}_BASE_URL must start with http:// or https://"
-            ));
-        }
-
         let extra_headers = match get("HEADERS") {
             None => Vec::new(),
             Some(raw) if raw.is_empty() => Vec::new(),
@@ -316,7 +308,6 @@ impl HubConfig {
 
         let display_name = get("DISPLAY_NAME").filter(|v| !v.is_empty());
         let home = home_dir(vars);
-        let managed = ManagedCommand::from_env(&upper, &base_url, home, &get)?;
         let first_byte_timeout_ms = match get("FIRST_BYTE_TIMEOUT_MS").filter(|v| !v.is_empty()) {
             None => None,
             Some(v) => Some(v.parse().map_err(|_| {
@@ -325,6 +316,27 @@ impl HubConfig {
         };
         let tuner =
             LocalTunerConfig::from_env(&upper, home, &get, timeout_ms, first_byte_timeout_ms)?;
+        let local = LocalServingConfig::from_env(&upper, home, &get, tuner.registry.as_deref())?;
+        let base_url = match get("BASE_URL").filter(|v| !v.is_empty()) {
+            Some(url) => url,
+            None if local.is_some() => LOCAL_PROFILE_BASE_URL.to_string(),
+            None => {
+                return Err(format!(
+                    "missing LLM_HUB_{upper}_BASE_URL for profile {name}"
+                ));
+            }
+        };
+        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+            return Err(format!(
+                "LLM_HUB_{upper}_BASE_URL must start with http:// or https://"
+            ));
+        }
+        if local.is_some() && get("COMMAND").is_some_and(|v| !v.is_empty()) {
+            return Err(format!(
+                "LLM_HUB_{upper}_COMMAND and LLM_HUB_{upper}_KIND=local cannot both be set: the hub starts the models of a local profile itself"
+            ));
+        }
+        let managed = ManagedCommand::from_env(&upper, &base_url, home, &get)?;
         let (pricing, model_prices) =
             crate::configs::token_rates::profile_rates_from_env(name, &get)?;
         let api_key = get("API_KEY").unwrap_or_default();
@@ -356,6 +368,7 @@ impl HubConfig {
             keep_warm: get("KEEP_WARM").is_none_or(|v| !is_falsy(&v)),
             first_byte_timeout_ms,
             tuner,
+            local,
             budget_monthly_usd: parse_budget_usd(
                 get("BUDGET_MONTHLY_USD"),
                 &format!("{upper}_BUDGET_MONTHLY_USD"),
@@ -450,17 +463,21 @@ fn parse_headers_json(upper: &str, raw: &str) -> Result<Vec<(String, String)>, S
     Ok(headers)
 }
 
-/// Profiles found by scanning for `LLM_HUB_<NAME>_BASE_URL` vars — the one
-/// key every profile must have. Names come back lowercased (env segments
-/// lose the original case/dashes); sorted for a stable order.
+/// Profile names from `LLM_HUB_<NAME>_BASE_URL` and `LLM_HUB_<NAME>_KIND` keys, lowercased
+/// (env segments lose the original case), sorted and deduplicated.
 fn discover_profile_names(vars: &HashMap<String, String>) -> Vec<String> {
     let mut names: Vec<String> = vars
         .keys()
-        .filter_map(|key| key.strip_prefix(PREFIX)?.strip_suffix("_BASE_URL"))
+        .filter_map(|key| {
+            let rest = key.strip_prefix(PREFIX)?;
+            rest.strip_suffix("_BASE_URL")
+                .or_else(|| rest.strip_suffix("_KIND"))
+        })
         .filter(|segment| !segment.is_empty())
         .map(str::to_lowercase)
         .collect();
     names.sort_unstable();
+    names.dedup();
     names
 }
 
@@ -501,12 +518,12 @@ fn keep_warm_from_map(get: &impl Fn(&str) -> Option<String>) -> Result<KeepWarmC
     })
 }
 
-fn is_truthy(v: &str) -> bool {
+pub(super) fn is_truthy(v: &str) -> bool {
     matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
 /// Opt-out flags default to true: only an explicit negative turns them off.
-fn is_falsy(v: &str) -> bool {
+pub(super) fn is_falsy(v: &str) -> bool {
     matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off")
 }
 
@@ -986,6 +1003,92 @@ mod tests {
         vars.insert("LLM_HUB_GROQ_PREFILL_GUARD".into(), "on".into());
         let err = HubConfig::from_map(&vars).unwrap_err();
         assert!(err.contains("LLM_HUB_GROQ_PREFILL_GUARD"), "{err}");
+    }
+
+    #[test]
+    fn profiles_without_kind_have_no_local_serving() {
+        let cfg = HubConfig::from_map(&base_vars()).unwrap();
+        assert!(cfg.profiles.iter().all(|p| p.local.is_none()));
+    }
+
+    #[test]
+    fn kind_local_makes_base_url_optional_and_keeps_the_profile_local() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_PROFILES".into(), "openai, mac".into());
+        vars.insert("HOME".into(), "/home/op".into());
+        vars.insert("LLM_HUB_MAC_KIND".into(), "local".into());
+        vars.insert(
+            "LLM_HUB_MAC_TUNER_REGISTRY".into(),
+            "~/models/registry.txt".into(),
+        );
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        let mac = cfg.profile("mac").unwrap();
+        assert_eq!(mac.base_url, LOCAL_PROFILE_BASE_URL);
+        assert!(mac.is_local());
+        assert_eq!(mac.managed, None);
+        let local = mac.local.clone().unwrap();
+        assert_eq!(
+            local.registry,
+            std::path::PathBuf::from("/home/op/models/registry.txt")
+        );
+        assert_eq!(local.idle_timeout, Some(Duration::from_mins(30)));
+    }
+
+    #[test]
+    fn kind_local_keeps_an_explicit_base_url() {
+        let mut vars = base_vars();
+        vars.insert(
+            "LLM_HUB_GROQ_BASE_URL".into(),
+            "http://localhost:9000".into(),
+        );
+        vars.insert("LLM_HUB_GROQ_KIND".into(), "local".into());
+        vars.insert("LLM_HUB_GROQ_REGISTRY".into(), "/r.txt".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert_eq!(
+            cfg.profile("groq").unwrap().base_url,
+            "http://localhost:9000"
+        );
+    }
+
+    #[test]
+    fn kind_local_with_a_command_is_rejected() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_GROQ_KIND".into(), "local".into());
+        vars.insert("LLM_HUB_GROQ_REGISTRY".into(), "/r.txt".into());
+        vars.insert("LLM_HUB_GROQ_COMMAND".into(), "srv".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_GROQ_COMMAND"), "{err}");
+        assert!(err.contains("LLM_HUB_GROQ_KIND=local"), "{err}");
+    }
+
+    #[test]
+    fn kind_local_errors_fail_the_load() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_GROQ_KIND".into(), "local".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_GROQ_REGISTRY"), "{err}");
+    }
+
+    #[test]
+    fn base_url_stays_required_without_kind_local() {
+        let mut vars = base_vars();
+        vars.remove("LLM_HUB_GROQ_BASE_URL");
+        vars.insert("LLM_HUB_GROQ_REGISTRY".into(), "/r.txt".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("missing LLM_HUB_GROQ_BASE_URL"), "{err}");
+    }
+
+    #[test]
+    fn discovery_finds_a_profile_by_its_kind_key_once() {
+        let mut vars = base_vars();
+        vars.remove("LLM_HUB_PROFILES");
+        vars.insert("LLM_HUB_MAC_KIND".into(), "local".into());
+        vars.insert("LLM_HUB_MAC_REGISTRY".into(), "/r.txt".into());
+        vars.insert("LLM_HUB_GROQ_KIND".into(), "local".into());
+        vars.insert("LLM_HUB_GROQ_REGISTRY".into(), "/r.txt".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        let names: Vec<&str> = cfg.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["groq", "mac", "openai"]);
     }
 
     #[test]

@@ -6,8 +6,16 @@ use crate::utils::atomic_write::write_atomically;
 const PREFIX: &str = "LLM_HUB_";
 /// Profile keys only an operator may set (they run a program or pick the
 /// upstream credential); upsert keeps them as written and never writes them itself.
-const OPERATOR_ONLY_KEYS: [&str; 15] = [
+const OPERATOR_ONLY_KEYS: [&str; 23] = [
     "COMMAND",
+    "KIND",
+    "REGISTRY",
+    "MEMORY_GB",
+    "MODEL_TTL_SECS",
+    "LLAMA_BIN",
+    "MODELS_DIR",
+    "HF_CACHE",
+    "ALLOW_UNGATED",
     "FIRST_BYTE_TIMEOUT_MS",
     "IDLE_SECS",
     "START_TIMEOUT_SECS",
@@ -233,6 +241,7 @@ mod tests {
             keep_warm: true,
             first_byte_timeout_ms: None,
             tuner: crate::configs::LocalTunerConfig::default(),
+            local: None,
             budget_monthly_usd: None,
         }
     }
@@ -415,6 +424,25 @@ mod tests {
         upsert_profile(&path, &profile, &["groq".to_string()]).unwrap();
         let on = std::fs::read_to_string(&path).unwrap();
         assert!(!on.contains("KEEP_WARM"), "{on}");
+    }
+
+    #[test]
+    fn upsert_keeps_local_serving_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let local_lines = "LLM_HUB_GROQ_KIND=local\nLLM_HUB_GROQ_REGISTRY=~/registry.txt\nLLM_HUB_GROQ_MEMORY_GB=96\nLLM_HUB_GROQ_IDLE_SECS=60\nLLM_HUB_GROQ_MODEL_TTL_SECS=a=0\nLLM_HUB_GROQ_START_TIMEOUT_SECS=30\nLLM_HUB_GROQ_LLAMA_BIN=~/bin/llama\nLLM_HUB_GROQ_MODELS_DIR=~/gguf\nLLM_HUB_GROQ_HF_CACHE=/data/hf\nLLM_HUB_GROQ_ALLOW_UNGATED=true\n";
+        std::fs::write(&path, local_lines).unwrap();
+
+        upsert_profile(&path, &sample_profile(), &["groq".to_string()]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        for line in local_lines.lines() {
+            assert_eq!(
+                content.matches(&format!("{line}\n")).count(),
+                1,
+                "{content}"
+            );
+        }
     }
 
     #[test]

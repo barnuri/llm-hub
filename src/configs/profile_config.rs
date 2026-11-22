@@ -27,6 +27,9 @@ pub struct ProfileConfig {
     pub first_byte_timeout_ms: Option<u64>,
     /// Local model tuner and prefill guard settings; env-only, never set through the admin API.
     pub tuner: crate::configs::LocalTunerConfig,
+    /// Models the hub serves itself when `LLM_HUB_<NAME>_KIND=local`; env-only, never set through
+    /// the admin API.
+    pub local: Option<crate::configs::LocalServingConfig>,
     /// `LLM_HUB_<NAME>_BUDGET_MONTHLY_USD`, env-only: this profile's monthly spend budget in USD.
     pub budget_monthly_usd: Option<f64>,
 }
@@ -81,6 +84,7 @@ mod tests {
             keep_warm: true,
             first_byte_timeout_ms: None,
             tuner: crate::configs::LocalTunerConfig::default(),
+            local: None,
             budget_monthly_usd: None,
         }
     }

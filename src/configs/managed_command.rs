@@ -143,7 +143,8 @@ impl ManagedCommand {
         Ok(format!("{host}:{port}"))
     }
 
-    fn parse_secs(
+    /// Reads `key` as whole seconds through `get`, or `default` when it is unset or empty.
+    pub(crate) fn parse_secs(
         upper: &str,
         key: &str,
         get: &dyn Fn(&str) -> Option<String>,

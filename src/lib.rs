@@ -102,7 +102,9 @@ async fn serve(hub: Hub) {
     spawn_notifications(&state);
     services::local_tuner::probe::spawn_probe_loop(state.clone());
     state.managed().spawn_idle_reaper();
+    state.local_pool().spawn_background();
     let managed = std::sync::Arc::clone(state.managed());
+    let local_pool = std::sync::Arc::clone(state.local_pool());
     let restart_notify = state.restart_notify();
     services::update::spawn_auto_update(auto_update, std::sync::Arc::clone(&restart_notify));
     services::config_reload::spawn_env_watcher(
@@ -134,10 +136,12 @@ async fn serve(hub: Hub) {
         .await
     {
         managed.stop_all().await;
+        local_pool.stop_all().await;
         eprintln!("server error: {e}");
         std::process::exit(1);
     }
     managed.stop_all().await;
+    local_pool.stop_all().await;
 
     match services::restart::respawn_if_requested() {
         Ok(true) => tracing::info!("respawned llm-hub after restart request"),

@@ -519,7 +519,7 @@ fn resolve_dry_run(state: &AppState, mut body: ResolveBody) -> Result<ResolveRep
     let config = state.config();
     let selector = tier_selector(&config.smart_auto_presets, tier)?;
     let rules = state.smart_auto_rules().current();
-    let policy = hub_policy(&rules, &selector, &caller);
+    let policy = hub_policy(&config, &rules, &selector, &caller);
     let text = non_empty(body.text);
     let signals = TurnSignals {
         estimated_prompt_tokens: 0,
@@ -626,7 +626,7 @@ pub async fn tiers(State(state): State<AppState>) -> Response {
             Ok(selector) => selector,
             Err(error) => return error.into_response(),
         };
-        let policy = hub_policy(&rules, &selector, &SmartAutoHeaders::default());
+        let policy = hub_policy(&config, &rules, &selector, &SmartAutoHeaders::default());
         let pool = SmartAutoPool::eligible(&snapshot, &policy, RESOLVE_ENDPOINT, 0)
             .into_iter()
             .map(|descriptor| descriptor.qualified_id.clone())
@@ -1318,7 +1318,12 @@ mod tests {
             SmartAutoTier::default(),
         )
         .unwrap();
-        let policy = hub_policy(&hub.state.smart_auto_rules().current(), &selector, &caller);
+        let policy = hub_policy(
+            &hub.state.config(),
+            &hub.state.smart_auto_rules().current(),
+            &selector,
+            &caller,
+        );
         let signals = TurnSignals {
             estimated_prompt_tokens: 0,
             tool_continuation: false,

@@ -1,5 +1,5 @@
-//! Edits rows `id|repo|file|size_gb|ctx|quant|extra_flags[|bin_override]` of a model registry.
-//! The editor keeps `#` comments and blank lines byte for byte.
+//! Edits rows `id|repo|file|size_gb|ctx|quant|extra_flags[|bin_override[|engine]]` of a model
+//! registry. The editor keeps `#` comments, blank lines and untouched columns byte for byte.
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -141,7 +141,7 @@ fn split_ending(line: &str) -> (&str, &str) {
 }
 
 /// Returns column 1 of a data row, or `None` for a comment or blank line.
-fn row_id(line: &str) -> Option<&str> {
+pub(crate) fn row_id(line: &str) -> Option<&str> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
@@ -317,6 +317,17 @@ mod tests {
         assert!(read(&path).contains(
             "qwen|org/qwen|qwen.gguf|20|32768|Q4_K_M|--cache-reuse 256 -ngl -1 --jinja|/opt/llama-server\n"
         ));
+    }
+
+    #[test]
+    fn keeps_the_engine_column() {
+        let row = "m|org/m|m.gguf|5|8192|Q4|--jinja| ~/bin/llama |mistralrs \n";
+        let (_dir, path) = registry(row);
+        apply(&path, "m", &diff(&["--x"], &[], Some(4096)), 1).unwrap();
+        assert_eq!(
+            read(&path),
+            "m|org/m|m.gguf|5|4096|Q4|--jinja --x| ~/bin/llama |mistralrs \n"
+        );
     }
 
     #[test]
