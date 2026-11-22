@@ -9,10 +9,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || github.run_id }}
-  cancel-in-progress: false
-
 env:
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: 0
@@ -23,7 +19,7 @@ env:
 jobs:
   changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       ui: ${{ steps.filter.outputs.ui }}
@@ -50,7 +46,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
@@ -89,7 +85,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
@@ -107,7 +103,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
@@ -125,7 +121,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.ui == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -140,7 +136,7 @@ jobs:
     if: always()
     needs: [changes, lint, coverage, test-windows, test-macos, ui]
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - name: Fail when a required job fails
         if: |
