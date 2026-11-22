@@ -141,10 +141,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - run: |
-          for result in ${{ join(needs.*.result, ' ') }}; do
-            if [ "$result" != success ] && [ "$result" != skipped ]; then
-              echo "a required job ended as $result"
-              exit 1
-            fi
-          done
+      - name: Fail when a required job fails
+        if: |
+          needs.changes.result != 'success' ||
+          (needs.lint.result != 'success' && needs.lint.result != 'skipped') ||
+          (needs.coverage.result != 'success' && needs.coverage.result != 'skipped') ||
+          (needs.test-windows.result != 'success' && needs.test-windows.result != 'skipped') ||
+          (needs.test-macos.result != 'success' && needs.test-macos.result != 'skipped') ||
+          (needs.ui.result != 'success' && needs.ui.result != 'skipped')
+        run: |
+          echo "A required job failed or was cancelled"
+          exit 1
