@@ -21,7 +21,7 @@ env:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: chkp-genai-scaleset
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
@@ -48,7 +48,7 @@ jobs:
   lint:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: chkp-genai-scaleset
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -62,7 +62,7 @@ jobs:
   coverage:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: chkp-genai-large-scaleset
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -102,7 +102,7 @@ jobs:
   ui:
     needs: changes
     if: needs.changes.outputs.ui == 'true'
-    runs-on: ubuntu-latest
+    runs-on: chkp-genai-scaleset
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -117,7 +117,7 @@ jobs:
   pr-ok:
     if: always()
     needs: [changes, lint, coverage, test-windows, ui]
-    runs-on: ubuntu-latest
+    runs-on: chkp-genai-scaleset
     timeout-minutes: 5
     steps:
       - run: |
