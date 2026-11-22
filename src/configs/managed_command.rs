@@ -166,6 +166,21 @@ impl ManagedCommand {
         };
         Ok(Duration::from_secs(secs))
     }
+
+    /// Reads `key` as whole seconds through `get`, or `default` when it is unset or empty.
+    pub(crate) fn parse_secs(
+        upper: &str,
+        key: &str,
+        get: &dyn Fn(&str) -> Option<String>,
+        default: u64,
+    ) -> Result<u64, String> {
+        match get(key).filter(|v| !v.is_empty()) {
+            None => Ok(default),
+            Some(v) => v
+                .parse()
+                .map_err(|_| format!("LLM_HUB_{upper}_{key} is not a number of seconds: {v}")),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::configs::ProfileConfig;
+use crate::configs::{HubConfig, ProfileConfig};
 use crate::consts::{CONTEXT_TOKENS_1M, MODELS_CACHE_TTL, MODELS_FANOUT_TIMEOUT};
 use crate::dependencies::state::AppState;
 use crate::routes::proxy::hub_policy;
@@ -165,6 +165,7 @@ pub async fn refresh_models(state: &AppState) -> Value {
         &state.copilot_descriptions().snapshot(),
     );
     merged.extend(smart_auto_entries(
+        &config,
         &state.model_descriptors(),
         &state.smart_auto_rules().current(),
     ));
@@ -209,6 +210,9 @@ async fn fetch_profile_models(
     state: &AppState,
     profile: &ProfileConfig,
 ) -> Result<ProfileListing, String> {
+    if profile.local.is_some() {
+        return Ok(local_models(state, profile));
+    }
     state.managed().ensure_resident(profile).await?;
     let client = state.client(&profile.name).ok_or("no client for profile")?;
     let body = tokio::time::timeout(
@@ -238,6 +242,18 @@ async fn fetch_profile_models(
         upstream_catalog(profile, &usable),
     );
     Ok(copilot_models(state, profile, &usable))
+}
+
+/// The registry rows of a `KIND=local` profile, each with its context size. Listing them reads
+/// the pool's in-memory rows, so it neither calls a model process nor starts one.
+fn local_models(state: &AppState, profile: &ProfileConfig) -> ProfileListing {
+    let rows = state.local_pool().rows(&profile.name).unwrap_or_default();
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| json!({ "id": row.id, "object": "model", "context_length": row.ctx }))
+        .collect();
+    let items: Vec<&Value> = items.iter().collect();
+    describe_and_rewrite(profile, &items, None)
 }
 
 /// A failed fetch lists the profile's last Copilot catalog, so a restart with
@@ -621,13 +637,17 @@ fn limit_provenance(evidence: &LimitEvidence) -> Value {
 }
 
 /// The virtual `hub/*` Smart Auto entries, each limited to the pool the active rules let it pick from.
-fn smart_auto_entries(snapshot: &ModelDescriptorSnapshot, rules: &LoadedRules) -> Vec<Value> {
+fn smart_auto_entries(
+    config: &HubConfig,
+    snapshot: &ModelDescriptorSnapshot,
+    rules: &LoadedRules,
+) -> Vec<Value> {
     HubSelector::builtin_names()
         .into_iter()
         .filter_map(|name| {
             let id = format!("{}/{name}", HubSelector::NAMESPACE);
             let selector = HubSelector::parse(&id, &BTreeMap::new()).ok()??;
-            let policy = hub_policy(rules, &selector, &SmartAutoHeaders::default());
+            let policy = hub_policy(config, rules, &selector, &SmartAutoHeaders::default());
             let pool = eligible_pool(snapshot, &policy);
             Some(smart_auto_entry(&id, &selector, &pool))
         })
@@ -1650,6 +1670,7 @@ mod tests {
             keep_warm: true,
             first_byte_timeout_ms: None,
             tuner: crate::configs::LocalTunerConfig::default(),
+            local: None,
             budget_monthly_usd: None,
         }
     }
@@ -1679,7 +1700,7 @@ mod tests {
             chat_model("copilot/small", 200_000, None),
         ]);
 
-        let entries = smart_auto_entries(&snapshot, &rules(None));
+        let entries = smart_auto_entries(&remote_config(), &snapshot, &rules(None));
         let entry = |id: &str| {
             entries
                 .iter()
@@ -1702,6 +1723,17 @@ mod tests {
         assert_eq!(long["max_output_tokens"], 128_000);
     }
 
+    fn remote_config() -> HubConfig {
+        HubConfig::from_map(&HashMap::from([
+            ("LLM_HUB_PROFILES".to_owned(), "copilot".to_owned()),
+            (
+                "LLM_HUB_COPILOT_BASE_URL".to_owned(),
+                DEAD_BASE_URL.to_owned(),
+            ),
+        ]))
+        .unwrap()
+    }
+
     fn rules(json: Option<&str>) -> Arc<LoadedRules> {
         let dir = std::env::temp_dir().join("llm-hub-models-rules-absent");
         crate::services::smart_auto_rules::SmartAutoRulesStore::open(&dir, json)
@@ -1719,8 +1751,12 @@ mod tests {
             },
         ]);
 
-        let unruled = smart_auto_entries(&snapshot, &rules(None));
-        let ruled = smart_auto_entries(&snapshot, &rules(Some(r#"{"exclude":["local/*"]}"#)));
+        let unruled = smart_auto_entries(&remote_config(), &snapshot, &rules(None));
+        let ruled = smart_auto_entries(
+            &remote_config(),
+            &snapshot,
+            &rules(Some(r#"{"exclude":["local/*"]}"#)),
+        );
 
         let balance = |entries: &[Value]| {
             entries
@@ -1733,6 +1769,78 @@ mod tests {
         let balance = balance(&ruled);
         assert_eq!(balance["context_window"], 272_000);
         assert_eq!(balance["max_output_tokens"], 128_000);
+    }
+
+    #[tokio::test]
+    async fn a_local_profile_lists_its_registry_rows_without_starting_a_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("registry.txt");
+        std::fs::write(&registry, "a|org/a|a.gguf|1|4096\nb|org/b|b.gguf|2|32768\n").unwrap();
+        let registry_var = registry.display().to_string();
+        let state = state_from(&[
+            ("LLM_HUB_PROFILES", "mac"),
+            ("LLM_HUB_MAC_KIND", "local"),
+            ("LLM_HUB_MAC_REGISTRY", &registry_var),
+            ("LLM_HUB_MAC_LLAMA_BIN", "/nonexistent/llama"),
+        ]);
+
+        let payload = refresh_models(&state).await;
+
+        let entry = |id: &str| {
+            payload["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["id"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("{id} missing from {payload}"))
+        };
+        assert_eq!(entry("mac/a")["context_length"], 4096);
+        assert_eq!(entry("mac/b")["context_length"], 32768);
+        assert!(
+            state.local_pool().snapshot().is_empty(),
+            "listing starts no model"
+        );
+        assert_eq!(state.upstream_health().get("mac").copied(), Some(true));
+        let descriptors = state.model_descriptors();
+        assert!(descriptors.iter().any(|d| d.qualified_id == "mac/a"));
+    }
+
+    #[test]
+    fn smart_auto_entries_leave_out_the_models_of_a_local_profile() {
+        let snapshot = ModelDescriptorSnapshot::new(vec![
+            chat_model("copilot/known", 272_000, Some(128_000)),
+            chat_model("mac/small", 4_096, None),
+        ]);
+        let local = HubConfig::from_map(&HashMap::from([
+            ("LLM_HUB_PROFILES".to_owned(), "copilot,mac".to_owned()),
+            (
+                "LLM_HUB_COPILOT_BASE_URL".to_owned(),
+                DEAD_BASE_URL.to_owned(),
+            ),
+            ("LLM_HUB_MAC_KIND".to_owned(), "local".to_owned()),
+            (
+                "LLM_HUB_MAC_REGISTRY".to_owned(),
+                "/nonexistent/registry.txt".to_owned(),
+            ),
+        ]))
+        .unwrap();
+        let balance = |entries: Vec<Value>| {
+            entries
+                .into_iter()
+                .find(|model| model["id"] == "hub/smart-auto-balance")
+                .unwrap()
+        };
+
+        let remote = balance(smart_auto_entries(
+            &remote_config(),
+            &snapshot,
+            &rules(None),
+        ));
+        let local = balance(smart_auto_entries(&local, &snapshot, &rules(None)));
+
+        assert_eq!(remote["context_window"], 4_096);
+        assert_eq!(local["context_window"], 272_000);
     }
 
     #[test]

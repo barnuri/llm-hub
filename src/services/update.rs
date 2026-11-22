@@ -58,6 +58,21 @@ async fn check_and_maybe_update(auto_update_enabled: bool, restart_notify: &toki
         .await;
 }
 
+/// The `cargo build` arguments for a source rebuild. A binary built with the
+/// `mistralrs` feature keeps it, so the rebuilt binary has the same engines.
+fn cargo_build_args() -> &'static [&'static str] {
+    let mistralrs = cfg!(feature = "mistralrs");
+    cargo_build_args_for(mistralrs)
+}
+
+fn cargo_build_args_for(mistralrs: bool) -> &'static [&'static str] {
+    if mistralrs {
+        &["build", "--release", "--features", "mistralrs"]
+    } else {
+        &["build", "--release"]
+    }
+}
+
 /// Runs git and cargo inside the source checkout.
 trait RepoCommands {
     async fn run(
@@ -269,7 +284,7 @@ impl<C: RepoCommands> Updater<C> {
         let set_aside = set_aside_if_running_build(&self.current, &built)?;
         if let Err(e) = self
             .commands
-            .run(repo, "cargo", &["build", "--release"], BUILD_HINT)
+            .run(repo, "cargo", cargo_build_args(), BUILD_HINT)
             .await
         {
             restore_set_aside(set_aside.as_deref(), &built);
@@ -951,6 +966,15 @@ mod tests {
         );
         assert_eq!(read(&updater.current), b"fresh build");
         assert_eq!(installed_head(&repo).as_deref(), Some(HEAD));
+    }
+
+    #[test]
+    fn a_source_rebuild_keeps_the_mistralrs_feature_when_the_binary_has_it() {
+        assert_eq!(
+            cargo_build_args_for(true),
+            ["build", "--release", "--features", "mistralrs"]
+        );
+        assert_eq!(cargo_build_args_for(false), ["build", "--release"]);
     }
 
     #[tokio::test]

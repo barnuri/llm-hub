@@ -25,6 +25,7 @@ use crate::services::keep_warm::KeepWarm;
 use crate::services::keyring_credential_store::KeyringCredentialStore;
 use crate::services::listed_prices::ListedPrices;
 use crate::services::live_feed::LiveFeed;
+use crate::services::local_serving::pool::LocalPool;
 use crate::services::local_tuner::LocalTuner;
 use crate::services::managed_process::ProcessManager;
 use crate::services::media_fallback::MediaCache;
@@ -76,6 +77,8 @@ struct Inner {
     /// Fired to trigger graceful shutdown (auto-update, env watcher, /api/restart).
     restart_notify: Arc<tokio::sync::Notify>,
     managed: Arc<ProcessManager>,
+    /// The model processes of the `KIND=local` profiles.
+    local_pool: Arc<LocalPool>,
     copilot_sessions: CopilotSessionCache,
     copilot_auto: CopilotAutoRouter,
     profile_usage: ProfileUsageCache,
@@ -176,6 +179,7 @@ impl AppState {
         let extensions = all_extensions
             .filtered(&extension_toggles)
             .with_notifier(Arc::clone(&notifier));
+        let local_pool = Arc::new(LocalPool::new(&config, LOGS_DIR));
         let state = AppState(Arc::new(Inner {
             config: ArcSwap::from_pointee(config),
             clients: ArcSwap::from_pointee(clients),
@@ -195,6 +199,7 @@ impl AppState {
             first_refresh: tokio::sync::OnceCell::new(),
             restart_notify: Arc::new(tokio::sync::Notify::new()),
             managed: Arc::new(ProcessManager::new(LOGS_DIR)),
+            local_pool,
             copilot_sessions: CopilotSessionCache::new(Arc::clone(&credentials), Arc::clone(&gh)),
             copilot_auto: CopilotAutoRouter::with_limits(Arc::clone(&model_limits)),
             profile_usage: ProfileUsageCache::new(credentials, gh),
@@ -234,6 +239,7 @@ impl AppState {
         let clients = build_clients(&config)?;
         self.0.clients.store(Arc::new(clients));
         self.0.managed.reconcile(&config);
+        self.0.local_pool.reconcile(&config);
         self.0.copilot_sessions.reconcile(&config);
         self.0.profile_usage.reconcile(&config);
         self.0.notifier.reconfigure(&config.notify);
@@ -685,6 +691,10 @@ impl AppState {
 
     pub fn managed(&self) -> &Arc<ProcessManager> {
         &self.0.managed
+    }
+
+    pub fn local_pool(&self) -> &Arc<LocalPool> {
+        &self.0.local_pool
     }
 
     pub fn copilot_sessions(&self) -> &CopilotSessionCache {

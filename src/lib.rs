@@ -68,6 +68,9 @@ async fn serve(hub: Hub) {
     if run_smart_auto_command().await {
         return;
     }
+    if run_local_worker_command().await {
+        return;
+    }
     if run_launch_command().await {
         return;
     }
@@ -115,7 +118,9 @@ async fn serve(hub: Hub) {
     spawn_notifications(&state);
     services::local_tuner::probe::spawn_probe_loop(state.clone());
     state.managed().spawn_idle_reaper();
+    state.local_pool().spawn_background();
     let managed = std::sync::Arc::clone(state.managed());
+    let local_pool = std::sync::Arc::clone(state.local_pool());
     let restart_notify = state.restart_notify();
     services::update::spawn_auto_update(auto_update, std::sync::Arc::clone(&restart_notify));
     services::config_reload::spawn_env_watcher(
@@ -147,10 +152,12 @@ async fn serve(hub: Hub) {
         .await
     {
         managed.stop_all().await;
+        local_pool.stop_all().await;
         eprintln!("server error: {e}");
         std::process::exit(1);
     }
     managed.stop_all().await;
+    local_pool.stop_all().await;
 
     match services::restart::respawn_if_requested() {
         Ok(true) => tracing::info!("respawned llm-hub after restart request"),
@@ -338,6 +345,9 @@ Other:
   llm-hub smart-auto export --workflow <id> --out <path>
                                   write a workflow's Smart Auto history into the generated
                                   block of a Markdown file (git-tracked files are refused)
+  llm-hub local-worker --id <id> --model <gguf> --port <port> [flags]
+                                  serve one local model with mistral.rs (needs the `mistralrs`
+                                  build); the hub starts it for `mistralrs` registry rows
   llm-hub help                    show this help (also --help, -h)
 
 Environment: LLM_HUB_URL (default http://localhost:8888) and LLM_HUB_API_KEY for the agent commands.";
@@ -386,6 +396,20 @@ async fn run_cli_command() -> bool {
             std::process::exit(2);
         }
     }
+}
+
+/// `llm-hub local-worker --id … --model … --port … [mapped flags]` serves one local model. It runs
+/// before tracing starts. Returns true when the command was handled.
+async fn run_local_worker_command() -> bool {
+    if std::env::args().nth(1).as_deref() != Some("local-worker") {
+        return false;
+    }
+    let words: Vec<String> = std::env::args().skip(2).collect();
+    if let Err(message) = services::local_serving::worker::run(&words).await {
+        eprintln!("llm-hub local-worker: {message}");
+        std::process::exit(1);
+    }
+    true
 }
 
 /// `llm-hub smart-auto export --workflow <id> --out <path>`. It runs before tracing starts, so no

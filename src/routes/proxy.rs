@@ -75,6 +75,7 @@ use crate::services::fallback::{
 use crate::services::first_event::{FirstEventCheck, first_event};
 use crate::services::harness::client_signature;
 use crate::services::keep_warm::{ApiShape, KeepWarm, KeepWarmLease, PingPlan, PingTarget};
+use crate::services::local_serving::pool::{Lease, LocalPool};
 use crate::services::media_fallback;
 use crate::services::model_health::FailureKind;
 use crate::services::multipart_model;
@@ -125,6 +126,13 @@ const IMAGE_INPUT_REJECTION: &str = "image input is not supported";
 const NO_ENDPOINT_REFUSAL: &str = "no model endpoints available given user constraints";
 /// The rule name a prefill guard event carries, so mutes and the inbox dedupe can match it.
 const PREFILL_GUARD_RULE: &str = "prefill_guard";
+/// The path a local model process serves its OpenAI-compatible API under.
+const LOCAL_API_ROOT: &str = "/v1";
+/// The `error.type` of a 503 for a local model that found no room in the memory budget.
+const LOCAL_NO_ROOM_ERROR: &str = "upstream_error";
+const JSON_CONTENT_TYPE: &str = "application/json";
+/// The glob that matches every model of a profile.
+const EVERY_MODEL_GLOB: &str = "*";
 static NO_BODY: Value = Value::Null;
 /// The status codes that count as a success for Smart Auto affinity.
 const SUCCESS_STATUS_RANGE: std::ops::Range<u16> = 200..300;
@@ -916,7 +924,7 @@ fn resolve_hub(
     };
     let caller = SmartAutoHeaders::from_headers(headers)?;
     let rules = state.smart_auto_rules().current();
-    let policy = hub_policy(&rules, &selector, &caller);
+    let policy = hub_policy(config, &rules, &selector, &caller);
     let endpoint = match bodies.route {
         RouteKind::OpenAi => bare_path(bodies.upstream_path),
         RouteKind::Anthropic => MESSAGES_ENDPOINT,
@@ -1052,7 +1060,7 @@ fn resolve_hub(
         &|profile: &str| {
             config
                 .profile(profile)
-                .is_some_and(|found| found.managed.is_some())
+                .is_some_and(|found| found.managed.is_some() || found.local.is_some())
         },
     );
     if review.is_none()
@@ -1106,8 +1114,10 @@ fn resolve_hub(
 }
 
 /// The policy of a `hub/*` turn: rules, then the selector, then the caller's headers. A tier
-/// header overrides the tier the selector names; every other header only tightens.
+/// header overrides the tier the selector names; every other header only tightens. The models
+/// of a `KIND=local` profile stay out unless an allow glob names them, so a turn never starts one.
 pub(crate) fn hub_policy(
+    config: &HubConfig,
     rules: &LoadedRules,
     selector: &HubSelector,
     caller: &SmartAutoHeaders,
@@ -1119,6 +1129,13 @@ pub(crate) fn hub_policy(
     );
     if let Some(tier) = caller.policy.tier {
         policy.tier = Some(tier);
+    }
+    for profile in config.profiles.iter().filter(|p| p.local.is_some()) {
+        policy
+            .profile_exclude
+            .entry(profile.name.clone())
+            .or_default()
+            .insert(EVERY_MODEL_GLOB.to_owned());
     }
     policy
 }
@@ -2539,11 +2556,19 @@ impl<'a> AttemptSender<'a> {
         }
         let client = state.client(&profile.name).ok_or("no client for profile")?;
         state.managed().ensure_running(profile).await?;
+        let lease =
+            match LocalModel::acquire(state.local_pool(), profile, &self.model_id.model).await? {
+                LocalModel::NotLocal => None,
+                LocalModel::Leased(lease) => Some(lease),
+                LocalModel::NoRoom(message) => return Ok(local_no_room(&message)),
+            };
+        let api_base = lease.as_ref().map(local_api_base);
 
         let upstream = UpstreamRequest {
             state,
             client: &client,
             profile,
+            api_base: api_base.as_deref(),
             method: self.method,
             upstream_path: self.path.as_str(),
             headers: self.headers,
@@ -2564,11 +2589,86 @@ impl<'a> AttemptSender<'a> {
             copilot_bearer.as_deref(),
         )
         .await;
-        if !rejected {
-            return Ok(response);
-        }
-        upstream.send(body).await.map(|(retried, _)| retried)
+        let response = if rejected {
+            upstream.send(body).await?.0
+        } else {
+            response
+        };
+        Ok(match lease {
+            Some(lease) => hold_lease(response, lease),
+            None => response,
+        })
     }
+}
+
+/// How a request reaches the model of its profile when the hub serves that model itself.
+enum LocalModel {
+    /// The profile is not `KIND=local`; the request goes to the profile's base URL.
+    NotLocal,
+    /// The model process runs, and the lease keeps the pool from stopping it.
+    Leased(Lease),
+    /// The memory budget had no room for the model; the message says why.
+    NoRoom(String),
+}
+
+impl LocalModel {
+    /// Leases `model` of a local profile, and starts its process first when none runs.
+    ///
+    /// # Errors
+    ///
+    /// The pool's message when the model did not start. A failed start names the model log.
+    async fn acquire(
+        pool: &LocalPool,
+        profile: &ProfileConfig,
+        model: &str,
+    ) -> Result<LocalModel, String> {
+        if profile.local.is_none() {
+            return Ok(LocalModel::NotLocal);
+        }
+        match pool.acquire(&profile.name, model).await {
+            Ok(lease) => Ok(LocalModel::Leased(lease)),
+            Err(reason) if LocalPool::is_no_room(&reason) => Ok(LocalModel::NoRoom(reason)),
+            Err(reason) => Err(reason),
+        }
+    }
+}
+
+/// The API root of a leased local model process, which `UpstreamPath` paths are relative to.
+fn local_api_base(lease: &Lease) -> String {
+    format!("{}{LOCAL_API_ROOT}", lease.base_url())
+}
+
+/// `response` with a body that holds `lease` until the body ends or its reader drops it, so
+/// the pool never stops a model that still streams.
+fn hold_lease(mut response: reqwest::Response, lease: Lease) -> reqwest::Response {
+    let (status, version) = (response.status(), response.version());
+    let headers = std::mem::take(response.headers_mut());
+    let chunks = Box::pin(response.bytes_stream());
+    let held = futures_util::stream::unfold((chunks, lease), |(mut chunks, lease)| async move {
+        let chunk = chunks.next().await?;
+        Some((chunk, (chunks, lease)))
+    });
+    rebuilt_response(status, version, headers, reqwest::Body::wrap_stream(held))
+}
+
+/// The error body of a request whose local model found no room in the memory budget.
+fn no_room_body(message: &str) -> String {
+    serde_json::json!({ "error": { "message": message, "type": LOCAL_NO_ROOM_ERROR } }).to_string()
+}
+
+/// The 503 an attempt gets when the local memory budget has no room for its model.
+fn local_no_room(message: &str) -> reqwest::Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(JSON_CONTENT_TYPE),
+    );
+    rebuilt_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        reqwest::Version::HTTP_11,
+        headers,
+        no_room_body(message),
+    )
 }
 
 /// Learns the fields a Copilot "Extra inputs are not permitted" 400 names and retries once
@@ -3251,6 +3351,8 @@ struct UpstreamRequest<'a> {
     state: &'a AppState,
     client: &'a reqwest::Client,
     profile: &'a ProfileConfig,
+    /// The API root of a leased local model, used instead of the profile's base URL.
+    api_base: Option<&'a str>,
     method: &'a Method,
     upstream_path: &'a str,
     headers: &'a HeaderMap,
@@ -3299,6 +3401,7 @@ impl UpstreamRequest<'_> {
             &mut forwarded,
         )
         .await?;
+        let base = self.api_base.unwrap_or(&base);
         let mut request = self
             .client
             .request(self.method.clone(), format!("{base}{}", self.upstream_path))
@@ -4306,6 +4409,22 @@ async fn passthrough_oversized(
         .ensure_running(profile)
         .await
         .map_err(AppError::UpstreamUnavailable)?;
+    let lease = match LocalModel::acquire(state.local_pool(), profile, &model_id.model)
+        .await
+        .map_err(AppError::UpstreamUnavailable)?
+    {
+        LocalModel::NotLocal => None,
+        LocalModel::Leased(lease) => Some(lease),
+        LocalModel::NoRoom(message) => {
+            let headers = [(axum::http::header::CONTENT_TYPE, JSON_CONTENT_TYPE)];
+            let reply = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                headers,
+                no_room_body(&message),
+            );
+            return Ok(axum::response::IntoResponse::into_response(reply));
+        }
+    };
 
     let upstream_path = path_and_query.strip_prefix("/v1").unwrap_or(path_and_query);
     let mut forwarded = filter_request_headers(headers);
@@ -4319,6 +4438,7 @@ async fn passthrough_oversized(
     )
     .await
     .map_err(AppError::UpstreamUnavailable)?;
+    let base = lease.as_ref().map_or(base, local_api_base);
     let url = format!("{base}{upstream_path}");
 
     let combined = futures_util::stream::iter(vec![Ok::<Bytes, axum::Error>(buffered)]).chain(rest);
@@ -4334,6 +4454,10 @@ async fn passthrough_oversized(
         .send()
         .await
         .map_err(|e| AppError::UpstreamUnavailable(e.to_string()))?;
+    let response = match lease {
+        Some(lease) => hold_lease(response, lease),
+        None => response,
+    };
     // A streamed body cannot be replayed, so a rejected Copilot session is only dropped.
     upstream_auth::invalidate_if_unauthorized(
         state,
@@ -8964,6 +9088,381 @@ mod tests {
         assert!(translated.contains("event: message_stop"), "{translated}");
         assert!(!translated.contains("keepalive"), "{translated}");
         assert!(receiver.await.is_ok());
+    }
+
+    #[cfg(unix)]
+    mod local_serving {
+        use std::collections::{BTreeMap, HashMap};
+        use std::fmt::Write as _;
+        use std::path::{Path, PathBuf};
+        use std::sync::OnceLock;
+
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::schemas::smart_auto_rules::SmartAutoRulesMode;
+        use crate::services::fake_gh_cli::FakeGhCli;
+        use crate::services::gh_cli::GhOutcome;
+        use crate::services::local_serving::pool::LocalModelSnapshot;
+        use crate::services::memory_credential_store::MemoryCredentialStore;
+        use crate::services::smart_auto_rules::SmartAutoRulesStore;
+
+        const PROFILE: &str = "mac";
+        const REMOTE: &str = "openai";
+        const CHAT_PATH: &str = "/chat/completions";
+        const REPLY: &str = "local reply";
+        fn fake_llama_server() -> &'static Path {
+            static SERVER: OnceLock<PathBuf> = OnceLock::new();
+            SERVER.get_or_init(|| {
+                let executable = std::env::current_exe().unwrap();
+                let deps_dir = executable.parent().unwrap();
+                let candidate = deps_dir.parent().unwrap().join("test-local-server");
+                if candidate.is_file() {
+                    candidate
+                } else {
+                    deps_dir.join("test-local-server")
+                }
+            })
+        }
+
+        /// A `KIND=local` profile on a temp registry next to a remote profile. Its own pool logs
+        /// to the temp dir, so no test writes into the hub's `logs/`.
+        struct Fixture {
+            dir: tempfile::TempDir,
+            config: HubConfig,
+            pool: LocalPool,
+        }
+
+        impl Fixture {
+            fn new(rows: &[(&str, f64)], extra: &[(&str, &str)]) -> Fixture {
+                let dir = tempfile::tempdir().unwrap();
+                let models = dir.path().join("models");
+                std::fs::create_dir_all(&models).unwrap();
+                let mut registry = String::new();
+                for (id, size_gb) in rows {
+                    writeln!(registry, "{id}|org/{id}|{id}.gguf|{size_gb}|8192").unwrap();
+                    std::fs::write(models.join(format!("{id}.gguf")), "x").unwrap();
+                }
+                std::fs::write(dir.path().join("registry.txt"), registry).unwrap();
+                let at = |name: &str| dir.path().join(name).display().to_string();
+                let mut vars: HashMap<String, String> = HashMap::from([
+                    ("LLM_HUB_PROFILES".into(), format!("{PROFILE},{REMOTE}")),
+                    ("LLM_HUB_MAC_KIND".into(), "local".into()),
+                    ("LLM_HUB_MAC_REGISTRY".into(), at("registry.txt")),
+                    ("LLM_HUB_MAC_MODELS_DIR".into(), at("models")),
+                    ("LLM_HUB_MAC_HF_CACHE".into(), at("hf")),
+                    (
+                        "LLM_HUB_MAC_LLAMA_BIN".into(),
+                        fake_llama_server().display().to_string(),
+                    ),
+                    ("LLM_HUB_MAC_START_TIMEOUT_SECS".into(), "20".into()),
+                    (
+                        "LLM_HUB_OPENAI_BASE_URL".into(),
+                        "http://127.0.0.1:9/v1".into(),
+                    ),
+                ]);
+                for (key, value) in extra {
+                    vars.insert(format!("LLM_HUB_MAC_{key}"), (*value).to_owned());
+                }
+                let config = HubConfig::from_map(&vars).unwrap();
+                let pool = LocalPool::new(&config, dir.path().join("logs"));
+                Fixture { dir, config, pool }
+            }
+
+            fn state(&self) -> AppState {
+                AppState::with_seams(
+                    self.config.clone(),
+                    None,
+                    Arc::new(MemoryCredentialStore::default()),
+                    Arc::new(FakeGhCli::new(GhOutcome::Token("gho_test".into()))),
+                )
+                .unwrap()
+            }
+
+            fn profile(&self, name: &str) -> &ProfileConfig {
+                self.config.profile(name).unwrap()
+            }
+
+            async fn acquire(&self, id: &str) -> Result<LocalModel, String> {
+                LocalModel::acquire(&self.pool, self.profile(PROFILE), id).await
+            }
+
+            async fn lease(&self, id: &str) -> Lease {
+                match self.acquire(id).await.unwrap() {
+                    LocalModel::Leased(lease) => lease,
+                    _ => panic!("{id} was not leased"),
+                }
+            }
+
+            fn model(&self, id: &str) -> LocalModelSnapshot {
+                self.pool
+                    .snapshot()
+                    .into_iter()
+                    .find(|model| model.id == id)
+                    .unwrap()
+            }
+        }
+
+        async fn send_through(
+            state: &AppState,
+            profile: &ProfileConfig,
+            api_base: &str,
+            body: Value,
+        ) -> reqwest::Response {
+            let client = state.client(&profile.name).unwrap();
+            let headers = HeaderMap::new();
+            let upstream = UpstreamRequest {
+                state,
+                client: &client,
+                profile,
+                api_base: Some(api_base),
+                method: &Method::POST,
+                upstream_path: CHAT_PATH,
+                headers: &headers,
+                force_identity_encoding: true,
+                timeout: Some(Duration::from_secs(10)),
+                session_token: None,
+            };
+            upstream
+                .send(Bytes::from(body.to_string()))
+                .await
+                .unwrap()
+                .0
+        }
+
+        #[tokio::test]
+        async fn a_remote_profile_is_not_local_and_starts_nothing() {
+            let fx = Fixture::new(&[("a", 1.0)], &[]);
+
+            let outcome = LocalModel::acquire(&fx.pool, fx.profile(REMOTE), "a").await;
+
+            assert!(matches!(outcome, Ok(LocalModel::NotLocal)));
+            assert!(fx.pool.snapshot().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_local_request_reaches_the_leased_process_and_releases_it_with_the_body() {
+            let fx = Fixture::new(&[("a", 1.0)], &[]);
+            let state = fx.state();
+            let lease = fx.lease("a").await;
+            let api_base = local_api_base(&lease);
+            assert!(api_base.starts_with("http://127.0.0.1:") && api_base.ends_with("/v1"));
+
+            let body = json!({"model": "a", "messages": []});
+            let response = send_through(&state, fx.profile(PROFILE), &api_base, body).await;
+            let response = hold_lease(response, lease);
+            assert_eq!(fx.model("a").in_flight, 1);
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let reply: Value = response.json().await.unwrap();
+            assert_eq!(reply["choices"][0]["message"]["content"], REPLY);
+            assert_eq!(fx.model("a").in_flight, 0);
+            assert!(
+                state.local_pool().snapshot().is_empty(),
+                "the hub pool started nothing"
+            );
+            fx.pool.stop_all().await;
+        }
+
+        #[tokio::test]
+        async fn a_local_stream_passes_through_and_holds_the_lease_until_it_ends() {
+            let fx = Fixture::new(&[("a", 1.0)], &[]);
+            let state = fx.state();
+            let lease = fx.lease("a").await;
+            let api_base = local_api_base(&lease);
+            let body = json!({"model": "a", "stream": true, "messages": []});
+
+            let response = send_through(&state, fx.profile(PROFILE), &api_base, body).await;
+            let mut chunks = hold_lease(response, lease).bytes_stream();
+            let mut text =
+                String::from_utf8(chunks.next().await.unwrap().unwrap().to_vec()).unwrap();
+            assert_eq!(
+                fx.model("a").in_flight,
+                1,
+                "a streaming body holds the lease"
+            );
+            while let Some(chunk) = chunks.next().await {
+                text.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+            }
+
+            assert!(
+                text.contains("\"local\"") && text.contains("[DONE]"),
+                "{text}"
+            );
+            assert_eq!(
+                fx.model("a").in_flight,
+                0,
+                "the end of the body releases the lease"
+            );
+            fx.pool.stop_all().await;
+        }
+
+        #[tokio::test]
+        async fn a_client_that_drops_a_stream_releases_the_lease() {
+            let fx = Fixture::new(&[("a", 1.0)], &[]);
+            let state = fx.state();
+            let lease = fx.lease("a").await;
+            let api_base = local_api_base(&lease);
+            let body = json!({"model": "a", "stream": true, "messages": []});
+
+            let response = send_through(&state, fx.profile(PROFILE), &api_base, body).await;
+            let mut chunks = hold_lease(response, lease).bytes_stream();
+            chunks.next().await.unwrap().unwrap();
+            drop(chunks);
+
+            assert_eq!(fx.model("a").in_flight, 0);
+            fx.pool.stop_all().await;
+        }
+
+        #[tokio::test]
+        async fn a_full_memory_budget_answers_503_and_a_failed_start_names_its_reason() {
+            let fx = Fixture::new(
+                &[("a", 4.0), ("b", 4.0), ("c", 4.0)],
+                &[("MEMORY_GB", "10"), ("START_TIMEOUT_SECS", "5")],
+            );
+            let held = (fx.lease("a").await, fx.lease("b").await);
+
+            let LocalModel::NoRoom(message) = fx.acquire("c").await.unwrap() else {
+                panic!("c started without room");
+            };
+            let reply = local_no_room(&message);
+            assert_eq!(reply.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: Value = reply.json().await.unwrap();
+            assert_eq!(body["error"]["type"], LOCAL_NO_ROOM_ERROR);
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no room to start local model mac/c"),
+                "{body}"
+            );
+
+            let missing = fx.acquire("nope").await.err().unwrap();
+            assert!(
+                missing.contains("not in the local model registry"),
+                "{missing}"
+            );
+            drop(held);
+            fx.pool.stop_all().await;
+        }
+
+        #[tokio::test]
+        async fn a_local_model_that_cannot_start_fails_the_request_with_502() {
+            let fx = Fixture::new(&[("a", 1.0)], &[]);
+            std::fs::remove_file(fx.dir.path().join("models/a.gguf")).unwrap();
+            let state = fx.state();
+            let body = json!({"model": format!("{PROFILE}/a"), "messages": []});
+
+            let error = attempt_loop(
+                &state,
+                Method::POST,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+            assert!(
+                error.message().contains("not on disk"),
+                "{}",
+                error.message()
+            );
+            assert!(
+                state
+                    .local_pool()
+                    .snapshot()
+                    .iter()
+                    .all(|m| m.pid.is_none())
+            );
+        }
+
+        #[tokio::test]
+        async fn an_api_base_replaces_the_profile_base_url() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let fx = Fixture::new(&[], &[]);
+            let state = fx.state();
+            let api_base = format!("{}/v1", upstream.uri());
+
+            let response = send_through(&state, fx.profile(PROFILE), &api_base, json!({})).await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        fn rules(json: Option<&str>) -> Arc<LoadedRules> {
+            let dir = tempfile::tempdir().unwrap();
+            SmartAutoRulesStore::open(dir.path(), json)
+                .unwrap()
+                .current()
+        }
+
+        fn eligible_ids(config: &HubConfig, rules: &LoadedRules) -> Vec<String> {
+            let snapshot =
+                crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot::new(vec![
+                    ModelDescriptor::for_test("mac/a"),
+                    ModelDescriptor::for_test("openai/gpt"),
+                ]);
+            let selector = HubSelector::parse("hub/smart-auto-balance", &BTreeMap::new())
+                .unwrap()
+                .unwrap();
+            let policy = hub_policy(config, rules, &selector, &SmartAutoHeaders::default());
+            SmartAutoPool::eligible(&snapshot, &policy, "/v1/chat/completions", 0)
+                .into_iter()
+                .map(|descriptor| descriptor.qualified_id.clone())
+                .collect()
+        }
+
+        #[test]
+        fn smart_auto_leaves_local_models_out_unless_a_rule_allows_them() {
+            let fx = Fixture::new(&[("a", 1.0)], &[]);
+
+            assert_eq!(eligible_ids(&fx.config, &rules(None)), ["openai/gpt"]);
+            let allowed = rules(Some(r#"{"allow":["mac/*"]}"#));
+            assert_eq!(eligible_ids(&fx.config, &allowed), ["mac/a", "openai/gpt"]);
+        }
+
+        #[test]
+        fn a_config_without_local_profiles_keeps_the_smart_auto_policy() {
+            let config = HubConfig::from_map(&HashMap::from([
+                ("LLM_HUB_PROFILES".to_owned(), "mac,openai".to_owned()),
+                (
+                    "LLM_HUB_MAC_BASE_URL".to_owned(),
+                    "http://127.0.0.1:8080/v1".to_owned(),
+                ),
+                (
+                    "LLM_HUB_OPENAI_BASE_URL".to_owned(),
+                    "http://127.0.0.1:9/v1".to_owned(),
+                ),
+            ]))
+            .unwrap();
+            let rules = rules(None);
+            let selector = HubSelector::parse("hub/smart-auto-balance", &BTreeMap::new())
+                .unwrap()
+                .unwrap();
+            let caller = SmartAutoHeaders::default();
+
+            let policy = hub_policy(&config, &rules, &selector, &caller);
+
+            assert_eq!(
+                policy,
+                rules.layer(
+                    SmartAutoRulesMode::default(),
+                    &selector.policy,
+                    &caller.policy
+                )
+            );
+            assert_eq!(eligible_ids(&config, &rules), ["mac/a", "openai/gpt"]);
+        }
     }
 }
 

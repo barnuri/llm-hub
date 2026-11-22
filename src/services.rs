@@ -37,6 +37,7 @@ pub mod keyring_credential_store;
 pub mod launch;
 pub mod listed_prices;
 pub mod live_feed;
+pub mod local_serving;
 pub mod local_tuner;
 pub mod managed_process;
 pub mod media_fallback;

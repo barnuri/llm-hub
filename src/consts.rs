@@ -25,6 +25,19 @@ pub const MANAGED_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 pub const MANAGED_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a managed process gets to exit after SIGTERM before it is killed.
 pub const MANAGED_STOP_GRACE: Duration = Duration::from_secs(5);
+/// `LLM_HUB_<P>_KIND` value of a profile whose registry models the hub serves itself.
+pub const LOCAL_PROFILE_KIND: &str = "local";
+/// Base URL a `KIND=local` profile gets when it sets none, so it counts as a local profile.
+pub const LOCAL_PROFILE_BASE_URL: &str = "http://127.0.0.1";
+pub const DEFAULT_LOCAL_IDLE_SECS: u64 = 1800;
+pub const DEFAULT_LOCAL_START_TIMEOUT_SECS: u64 = 600;
+pub const DEFAULT_LOCAL_LLAMA_BIN: &str = "~/.local/bin/llama";
+/// Program name the hub resolves on PATH when `DEFAULT_LOCAL_LLAMA_BIN` is not executable.
+pub const LOCAL_LLAMA_BIN_ON_PATH: &str = "llama";
+pub const DEFAULT_LOCAL_MODELS_DIR: &str = "~/models";
+pub const DEFAULT_LOCAL_HF_CACHE: &str = "~/.cache/huggingface/hub";
+/// JSONL file of mistral.rs gate records (one JSON object per line) that `LOCAL_GATE_FILE` reads.
+pub const DEFAULT_LOCAL_GATE_FILE: &str = "~/.config/llama/mistralrs-gates.jsonl";
 pub const STATS_MAX_MODEL_KEYS: usize = 1000;
 pub const STATS_OVERFLOW_KEY: &str = "other";
 /// Rolling tail kept per response for scraping the `usage` object.
