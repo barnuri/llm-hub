@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde_json::{Map, Value, json};
 
 use super::hub_endpoint::HubEndpoint;
@@ -21,6 +23,8 @@ impl OpencodeLauncher {
     /// process's `OPENCODE_CONFIG_CONTENT`; a private server does.
     const STANDALONE_FLAG: &str = "--standalone";
     const SERVER_FLAG: &str = "--server";
+    const PLUGIN_SOURCE: &str = include_str!("opencode_session.ts");
+    const PLUGIN_FILE: &str = "llm-hub-session.ts";
 
     /// The opencode command, with every catalog model in the `llm-hub` provider, labelled and
     /// priced as the hub lists it. Profile and Smart Auto flags become provider headers.
@@ -50,6 +54,35 @@ impl OpencodeLauncher {
                 || arg == Self::SERVER_FLAG
                 || arg.starts_with(&format!("{}=", Self::SERVER_FLAG))
         })
+    }
+
+    /// Writes the `OpenCode` session header plugin into the user config directory.
+    ///
+    /// # Errors
+    /// Returns a message when no config directory is known or the plugin cannot be written.
+    pub fn write_plugin(lookup: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+        let dir = Self::config_dir(lookup)
+            .ok_or("cannot find an OpenCode config dir: set HOME or XDG_CONFIG_HOME")?
+            .join("plugins");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let path = dir.join(Self::PLUGIN_FILE);
+        std::fs::write(&path, Self::PLUGIN_SOURCE)
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        Ok(path)
+    }
+
+    fn config_dir(lookup: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+        let read = |name: &str| lookup(name).filter(|value| !value.is_empty());
+        if let Some(xdg) = read("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(xdg).join("opencode"));
+        }
+        if cfg!(windows)
+            && let Some(app_data) = read("APPDATA")
+        {
+            return Some(PathBuf::from(app_data).join("opencode"));
+        }
+        read("HOME").map(|home| PathBuf::from(home).join(".config/opencode"))
     }
 
     fn headers(profiles: &ProfileFilter, smart_auto: &SmartAutoFlags) -> Map<String, Value> {
@@ -136,6 +169,33 @@ mod tests {
             &ProfileFilter::default(),
             &SmartAutoFlags::default(),
         )
+    }
+
+    #[test]
+    fn plugin_is_written_under_the_xdg_config_dir() {
+        let config = tempfile::tempdir().unwrap();
+        let config_path = config.path().to_string_lossy().to_string();
+
+        let path = OpencodeLauncher::write_plugin(|name| {
+            (name == "XDG_CONFIG_HOME").then(|| config_path.clone())
+        })
+        .unwrap();
+
+        assert_eq!(
+            path,
+            config.path().join("opencode/plugins/llm-hub-session.ts")
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("x-llm-hub-session-id"));
+        assert!(written.contains("event.sessionID"));
+    }
+
+    #[test]
+    fn plugin_uses_the_opencode_home_config_as_a_fallback() {
+        let dir =
+            OpencodeLauncher::config_dir(|name| (name == "HOME").then(|| "/home/u".to_string()));
+
+        assert_eq!(dir, Some(PathBuf::from("/home/u/.config/opencode")));
     }
 
     fn smart_auto(flags: &[&str]) -> SmartAutoFlags {
