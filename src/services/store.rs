@@ -637,8 +637,8 @@ impl Store {
                 let recent = stmt
                     .query_map(rusqlite::params_from_iter(list_params), |r| {
                         Ok(ErrorEntry {
-                            id: Some(r.get(13)?),
-                            resolved_ms: r.get::<_, Option<i64>>(14)?.map(db_u64),
+                            id: Some(r.get(14)?),
+                            resolved_ms: r.get::<_, Option<i64>>(15)?.map(db_u64),
                             row: map_usage_row(r)?,
                         })
                     })
@@ -1121,7 +1121,7 @@ impl Store {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
                 let mut sql = String::from(
                     "SELECT model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error, client, worker,
+                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error, client, session_id, worker,
                             routed_by, attempt, role
                      FROM requests WHERE 1=1",
                 );
@@ -3074,6 +3074,32 @@ mod tests {
             };
             let read = store.filtered_outcomes(&filter).unwrap();
             assert_eq!(read[0].worker.as_deref(), Some("salted-worker"));
+        }
+    }
+
+    #[test]
+    fn session_id_round_trips_through_each_store() {
+        for kind in ["sqlite", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session");
+            let store = Store::open(kind, Some(path.to_str().unwrap())).unwrap();
+            let mut outcome = sample_outcome();
+            outcome.session_id = Some("ses_usage_1".into());
+            store.record(&outcome).unwrap();
+
+            assert_eq!(
+                store.usage().unwrap().recent[0].session_id.as_deref(),
+                Some("ses_usage_1")
+            );
+            let filter = StatsFilter {
+                since_ms: None,
+                profile: None,
+                model: None,
+                routed_by_prefix: None,
+                range_label: String::new(),
+            };
+            let read = store.filtered_outcomes(&filter).unwrap();
+            assert_eq!(read[0].session_id.as_deref(), Some("ses_usage_1"));
         }
     }
 

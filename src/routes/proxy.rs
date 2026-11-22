@@ -2850,6 +2850,7 @@ async fn send_internal(
             raw: &raw,
             client,
             worker,
+            session_id: claude_code_session_id(headers),
         },
     )
     .await;
@@ -2869,6 +2870,7 @@ struct InternalCall<'a> {
     raw: &'a [u8],
     client: &'a str,
     worker: Option<String>,
+    session_id: Option<String>,
 }
 
 /// Records a call the hub made on its own behalf under its `client` marker, and returns its cost.
@@ -2895,7 +2897,7 @@ async fn record_internal_call(state: &AppState, model_id: &ModelId, call: Intern
         cache_write_tokens: usage.cache_write_tokens,
         error: (!call.ok).then(|| error_reason(call.status, call.raw)),
         client: Some(call.client.to_string()),
-        session_id: None,
+        session_id: call.session_id,
         worker: call.worker,
         routed_by: Some(ROUTED_BY_PINNED.to_owned()),
         attempt: None,
@@ -2963,6 +2965,7 @@ pub(crate) async fn send_media_call(
             raw: &raw,
             client: MEDIA_FALLBACK_CLIENT,
             worker: None,
+            session_id: None,
         },
     )
     .await;
@@ -7556,6 +7559,23 @@ mod tests {
             };
 
             assert_eq!(outcome.session_id.as_deref(), Some("ses_usage_1"));
+        }
+
+        #[test]
+        fn internal_request_preserves_the_opencode_session_header() {
+            let mut headers = client_headers();
+            headers.insert(
+                crate::consts::HEADER_SESSION_ID,
+                HeaderValue::from_static("ses_internal_1"),
+            );
+
+            let session_id = claude_code_session_id(&headers);
+            let outcome = RequestOutcome {
+                session_id,
+                ..RequestOutcome::default()
+            };
+
+            assert_eq!(outcome.session_id.as_deref(), Some("ses_internal_1"));
         }
 
         #[test]
