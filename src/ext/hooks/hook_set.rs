@@ -73,6 +73,19 @@ impl HookSet {
         self.all().filter(|hook| hook.shadow).count()
     }
 
+    /// The phases that hold at least one hook.
+    pub(crate) fn phases(&self) -> Vec<PhaseName> {
+        [
+            (PhaseName::Request, &self.request),
+            (PhaseName::Attempt, &self.attempt),
+            (PhaseName::Complete, &self.complete),
+        ]
+        .into_iter()
+        .filter(|(_, hooks)| !hooks.is_empty())
+        .map(|(phase, _)| phase)
+        .collect()
+    }
+
     fn all(&self) -> impl Iterator<Item = &Hook> {
         self.request
             .iter()
@@ -736,8 +749,22 @@ mod tests {
         let mut rules = parse(yaml, false, &env).unwrap();
 
         assert_eq!(rules.hook_counts(), (4, 0));
-        assert_eq!(rules.take_hooks().unwrap().len(), 4);
+        let hooks = rules.take_hooks().unwrap();
+        assert_eq!(hooks.len(), 4);
+        assert_eq!(
+            hooks.phases(),
+            [PhaseName::Request, PhaseName::Attempt, PhaseName::Complete]
+        );
         assert_eq!(rules.hook_counts(), (0, 0));
+        let request_only = parse(
+            "hooks: [{name: a, phase: request, url: 'http://localhost:9/x'}]",
+            false,
+            &env,
+        )
+        .unwrap()
+        .take_hooks()
+        .unwrap();
+        assert_eq!(request_only.phases(), [PhaseName::Request]);
     }
 
     #[test]

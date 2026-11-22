@@ -3,6 +3,7 @@ pub mod anthropic;
 pub mod api_docs;
 pub mod claude_code;
 pub mod copilot;
+pub mod extensions;
 pub mod live;
 pub mod models;
 pub mod notifications;

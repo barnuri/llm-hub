@@ -91,6 +91,7 @@ Auth: when `LLM_HUB_MASTER_KEY` is set or a hub API key exists, every `/v1/*`, `
         (name = "smart-auto", description = "Smart Auto routing: selections, rules, outcomes, dry runs."),
         (name = "copilot", description = "GitHub Copilot quota, prices and Auto decisions."),
         (name = "notifications", description = "Notifications inbox, tuner approvals, mute rules and desktop popup setup."),
+        (name = "extensions", description = "Turn built-in, library and rule extensions on and off."),
         (name = "system", description = "Liveness and restart."),
     )
 )]

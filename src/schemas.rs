@@ -19,6 +19,7 @@ pub mod effort_level;
 pub mod error_body;
 pub mod errors_report;
 pub mod evidence_source;
+pub mod extension_status;
 pub mod fallbacks_input;
 pub mod history_query;
 pub mod hub_selector;

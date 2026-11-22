@@ -395,6 +395,41 @@ rest, so do not call it on every request.
 `llm_hub::axum` and `llm_hub::serde_json` re-export the versions llm-hub uses. The library API is new
 and can change between minor versions. Pin a tag.
 
+## Turn extensions on and off
+
+Every extension can be turned off without a change to its code or the rules file:
+
+| Name | Kind | Phases |
+|---|---|---|
+| `copilot-context-code`, `payload-too-large`, `local-not-ready`, `upstream-limits` | builtin | `response` |
+| `rules` | rules | The phases its rules use. Each rule can also be turned off by its own name |
+| `hooks` | hook | The phases of the hooks in the rules file, all of them together |
+| The `name()` of a Rust extension | library | Not listed, because the hub cannot see which methods it overrides |
+
+There are two ways:
+
+- **The Settings > Extensions page** (or `PUT /api/extensions/{name}` and
+  `PUT /api/extensions/rules/{rule}` with `{"enabled": false}`). The hub saves the choice in its
+  store, so it survives a restart when `LLM_HUB_PERSISTENT=true`. Without a store it holds the
+  choice until the hub stops. `GET /api/extensions` lists every extension and rule with
+  `enabled` and `disabled_by` (`env`, `ui` or `null`).
+- **`LLM_HUB_EXTENSIONS_DISABLED`**, a comma list of extension names or globs, and
+  `rules:<name or glob>` for single rules:
+
+  ```sh
+  LLM_HUB_EXTENSIONS_DISABLED=upstream-limits,hooks,rules:no-opus-*
+  ```
+
+  The env wins. The page shows such an entry as "off by env", and the API answers 409 to a
+  change of it. The hub applies a changed list when `.env` changes.
+
+The hub removes what is off when it builds the extension set: at startup, on a toggle, on a
+rules file reload and on an env change. A request runs only the extensions that are on, so a
+toggle costs a request nothing. A turned-off rule keeps its place, and turning it back on needs
+no reload of the rules file. A UI choice for a name that is gone, such as a deleted rule, stays
+saved and applies again when the name comes back. Media fallback is not an extension in this
+list: `LLM_HUB_MEDIA_FALLBACK` turns it on and off.
+
 ## Use cases
 
 | Need | How |
@@ -414,6 +449,7 @@ and can change between minor versions. Pin a tag.
 | Per-team metrics or billing from a library build | Rust: keep the team in request state in `on_request`, read it in `on_complete` |
 | Custom auth on the inference routes | Rust: `on_request` with `Flow::reject`. It also runs, headers only, for unbuffered bodies and `GET /v1/models/{id}` |
 | Freeze or audit settings | Rust: `on_config_change` and `on_config_changed` |
+| Turn off a built-in or a rule that misbehaves | Settings > Extensions, or `LLM_HUB_EXTENSIONS_DISABLED` |
 | An extra endpoint | Rust: `Hub::routes` |
 | Access log, panic recovery or CORS on every route | Rust: `Hub::router` with a `tower` layer |
 

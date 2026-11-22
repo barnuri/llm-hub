@@ -41,6 +41,8 @@ pub struct HubConfig {
     pub smart_auto_presets: BTreeMap<String, SmartAutoPolicy>,
     /// Smart Auto include and exclude rules from `LLM_HUB_SMART_AUTO_RULES`; set, they replace the saved file.
     pub smart_auto_rules_env: Option<String>,
+    /// Extension names and globs, and `rules:<glob>` for rules, from `LLM_HUB_EXTENSIONS_DISABLED`.
+    pub extensions_disabled: Vec<String>,
     pub master_key: Option<String>,
     pub default_fallbacks: Vec<String>,
     pub max_replay_bytes: usize,
@@ -227,6 +229,9 @@ impl HubConfig {
         Ok(HubConfig {
             smart_auto_presets: smart_auto_presets_from_map(vars)?,
             smart_auto_rules_env: get("SMART_AUTO_RULES").filter(|v| !v.trim().is_empty()),
+            extensions_disabled: get("EXTENSIONS_DISABLED")
+                .map(|list| split_list(&list))
+                .unwrap_or_default(),
             profiles,
             usage_sources,
             master_key,

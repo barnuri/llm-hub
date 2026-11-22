@@ -11,6 +11,7 @@ import { formatNumber } from "./lib/format";
 import { pricesById } from "./lib/pricing";
 import { navigate, useRoute } from "./lib/router";
 import type { ErrorsReport, HubMeta, HubModel, NotificationsResponse } from "./lib/types";
+import { ExtensionsScreen } from "./screens/ExtensionsScreen";
 import { KeysScreen } from "./screens/KeysScreen";
 import { ModelsScreen } from "./screens/ModelsScreen";
 import { ProfilesScreen } from "./screens/ProfilesScreen";
@@ -37,6 +38,7 @@ interface NavTab {
 const SETTINGS_PAGES: readonly Page[] = [
   { id: "keys", label: "API keys" },
   { id: "setup", label: "Setup" },
+  { id: "extensions", label: "Extensions" },
 ];
 
 const INSIGHTS_PAGES: readonly Page[] = [
@@ -351,6 +353,7 @@ export function App() {
               <ProfilesScreen meta={meta} models={models} onChanged={loadAll} onToast={toast} />
             ) : null}
             {tab === "keys" ? <KeysScreen onToast={toast} authEnabled={meta?.auth_enabled} /> : null}
+            {tab === "extensions" ? <ExtensionsScreen onToast={toast} /> : null}
             {tab === "setup" ? (
               <SetupScreen models={models} authEnabled={meta?.auth_enabled ?? false} onCopy={copy} />
             ) : null}

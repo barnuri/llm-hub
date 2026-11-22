@@ -21,6 +21,7 @@ pub mod error_signature;
 pub mod extension_http;
 pub mod extension_loader;
 pub mod extension_phases;
+pub mod extension_toggles;
 #[cfg(test)]
 pub mod fake_gh_cli;
 pub mod fallback;
