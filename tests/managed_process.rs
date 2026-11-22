@@ -29,7 +29,7 @@ port, spawn_log = int(sys.argv[1]), sys.argv[2]
 with open(spawn_log, "a") as f:
     f.write("spawn\n")
 threading.Timer(60, lambda: os._exit(0)).start()
-time.sleep(0.5)
+time.sleep(0.05)
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.rfile.read(int(self.headers.get("content-length", 0)))
@@ -82,7 +82,8 @@ async fn start_hub(dir: &Path, vars: HashMap<String, String>) -> (HubProcess, St
     command
         .current_dir(dir)
         .env("LLM_HUB_PORT", port.to_string())
-        .env("LLM_HUB_AUTO_UPDATE", "0");
+        .env("LLM_HUB_AUTO_UPDATE", "0")
+        .env("LLM_HUB_NOTIFY_DESKTOP", "false");
     for (key, value) in vars {
         command.env(key, value);
     }

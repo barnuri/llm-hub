@@ -36,6 +36,7 @@ async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
         .current_dir(&dir)
         .env("LLM_HUB_PORT", port.to_string())
         .env("LLM_HUB_AUTO_UPDATE", "0")
+        .env("LLM_HUB_NOTIFY_DESKTOP", "false")
         .env("LLM_HUB_PERSISTENT", "true")
         .env("LLM_HUB_STORE", "sqlite")
         .env("LLM_HUB_STORE_PATH", dir.join("hub.db"));

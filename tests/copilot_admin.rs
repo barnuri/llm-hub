@@ -35,6 +35,7 @@ async fn start_copilot_hub(dir: &Path) -> (HubProcess, String) {
         .current_dir(dir)
         .env("LLM_HUB_PORT", port.to_string())
         .env("LLM_HUB_AUTO_UPDATE", "0")
+        .env("LLM_HUB_NOTIFY_DESKTOP", "false")
         .env("LLM_HUB_PROFILES", "copilot")
         .env("LLM_HUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
         .env("LLM_HUB_COPILOT_AUTH", "github-copilot")
