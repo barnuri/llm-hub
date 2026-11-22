@@ -245,20 +245,25 @@ async fn never_idle_process_is_started_at_boot() {
     let vars = managed_profile(server_port, &command, &[("IDLE_SECS", "0")]);
     let (_hub, base) = start_hub(dir.path(), vars).await;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let status = profile_status(&base).await;
-        if status["running"] == true || Instant::now() >= deadline {
+    reqwest::get(format!("{base}/v1/models"))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if is_listening(server_port) && profile_status(&base).await["running"] == true {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    assert_eq!(profile_status(&base).await["running"], true);
     assert!(
         is_listening(server_port),
         "resident process not started at boot"
     );
+    assert_eq!(profile_status(&base).await["running"], true);
     assert_eq!(spawn_count(&spawn_log), 1);
     // The start holds its lock until its next readiness poll, so wait for it.
     let deadline = Instant::now() + Duration::from_secs(5);
