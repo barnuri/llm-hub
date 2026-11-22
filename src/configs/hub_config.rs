@@ -150,6 +150,10 @@ impl HubConfig {
         };
 
         let mut profiles = Vec::with_capacity(profile_names.len());
+        #[allow(
+            clippy::zero_sized_map_values,
+            reason = "UsageSource is an enum meant to gain variants"
+        )]
         let mut usage_sources = HashMap::new();
         let mut profile_errors = Vec::new();
         for name in &profile_names {
