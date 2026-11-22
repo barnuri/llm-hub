@@ -90,10 +90,9 @@ async fn wait_ready(base: &str, child: &mut Child, listening: &AtomicBool) -> bo
             && response.status().is_success()
             && response.text().await.is_ok_and(|text| text == "ok")
         {
-            tokio::time::sleep(Duration::from_millis(200)).await;
             return child.try_wait().unwrap().is_none();
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("hub did not become ready within 30 s");
 }
