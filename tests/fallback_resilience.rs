@@ -284,12 +284,15 @@ async fn the_deadline_skips_the_remaining_fallbacks_with_a_504() {
 #[tokio::test]
 async fn the_configured_deadline_cuts_a_slow_last_attempt() {
     let failing = upstream(ResponseTemplate::new(500)).await;
-    let slow = upstream(ok_completion().set_delay(Duration::from_secs(1))).await;
-    let (_hub, base) = two_profile_hub(&failing, &slow, &[("LLM_HUB_DEADLINE_MS", "300")]).await;
+    let slow = upstream(ok_completion().set_delay(Duration::from_secs(3))).await;
+    let (_hub, base) = two_profile_hub(&failing, &slow, &[("LLM_HUB_DEADLINE_MS", "500")]).await;
 
+    let started = std::time::Instant::now();
     let response = send(&base, &chat_body("first/main", false), &[]).await;
 
     assert_eq!(response.status(), 504);
+    assert!(started.elapsed() < Duration::from_secs(2));
+
     let body: serde_json::Value = response.json().await.unwrap();
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("first/main=500"), "{message}");
