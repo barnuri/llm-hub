@@ -23,6 +23,20 @@ The tuner needs persistence (`LLM_HUB_PERSISTENT=true`). The probe measures spee
 stored request rows. Without a store it has no rows: it fits nothing, the guard lets every request
 through, and only the rules that read the server's flags can fire.
 
+## Native local probe
+
+For a `KIND=local` profile, the native probe reads the local pool and the registry without starting a model. The probe reports running model ids, process state and registry health. Use the [configuration keys](configuration.md#native-local-serving) to set the registry, memory budget and process limits.
+
+The native pool also tracks llama.cpp process state. A llama.cpp stream stall may leave `/health` responsive while response bytes stop. Check a non-streaming request before changing the registry:
+
+```sh
+curl -H 'Content-Type: application/json' -d '{"model":"<profile>/<model>","messages":[{"role":"user","content":"reply with ok"}],"stream":false}' <hub-url>/v1/chat/completions
+```
+
+For a mistral.rs row, use `--reasoning off` when the engine returns no stream data. The native worker supports context size, temperature, top-p, top-k, min-p, reasoning, multimodal projector and tokenizer model flags from `extra_flags`.
+
+A native probe does not start a model. It does not replace the health check or the request fallback rules.
+
 ## The probe
 
 The probe runs in the background, never on the request path. Its loop always runs: the first pass

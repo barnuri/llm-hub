@@ -67,6 +67,26 @@ cannot read them. Off by default. See [Media fallback](media-fallback.md).
 The Models page writes the first three variables to `.env`, and shows its controls disabled when
 the service environment sets one of them.
 
+## Native local serving
+
+A native profile sets `LLM_HUB_<NAME>_KIND=local`. The hub serves each model from the profile registry and starts only the selected model. `LLM_HUB_<NAME>_REGISTRY` is the primary key. `LLM_HUB_<NAME>_TUNER_REGISTRY` is the fallback for registry discovery and tuner approval.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_HUB_<NAME>_KIND` | unset | Set to `local` to make the hub start registry models itself. |
+| `LLM_HUB_<NAME>_MEMORY_GB` | runtime default | Positive memory budget in GB for the local process pool. |
+| `LLM_HUB_<NAME>_IDLE_SECS` | `1800` | Stop an idle model after this many seconds. `0` keeps it loaded. |
+| `LLM_HUB_<NAME>_MODEL_TTL_SECS` | unset | Comma-separated `id=seconds` idle overrides. `0` keeps that model loaded. |
+| `LLM_HUB_<NAME>_START_TIMEOUT_SECS` | `600` | Longest startup and health wait for one model. |
+| `LLM_HUB_<NAME>_LLAMA_BIN` | `~/.local/bin/llama` or `llama` on PATH | llama.cpp server binary. |
+| `LLM_HUB_<NAME>_MODELS_DIR` | `~/models` | Folder that contains pinned `<id>.gguf` files. |
+| `LLM_HUB_<NAME>_HF_CACHE` | `~/.cache/huggingface/hub` | Hugging Face cache searched for registry files. |
+| `LLM_HUB_<NAME>_GATE_FILE` | `~/.config/llama/mistralrs-gates.jsonl` | JSONL pass records for mistral.rs model files. |
+| `LLM_HUB_<NAME>_UNGATED_MODELS` | empty | Comma-separated mistral.rs model ids that may start without a pass. |
+| `LLM_HUB_<NAME>_ALLOW_UNGATED` | `false` | Allow every mistral.rs row to start without a pass. |
+
+The native profile keys come only from process environment or `.env`. The Profiles page does not write or change them.
+
 ## Local model tuner
 
 The tuner measures how fast local models prefill, and proposes server flag changes. See
