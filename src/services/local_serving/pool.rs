@@ -1261,7 +1261,10 @@ http.server.HTTPServer(("127.0.0.1", port), Health).serve_forever()
             .find(|model| model.id == "unready");
         if let Some(model) = model {
             assert_eq!(model.state, LocalModelState::Stopped);
-            assert_eq!(model.estimate_gb, 0.0, "the reserved memory is released");
+            assert!(
+                model.estimate_gb.abs() < f64::EPSILON,
+                "the reserved memory is released"
+            );
             assert_eq!(model.pid, None);
         }
         assert!(fx.pid_file().is_empty());

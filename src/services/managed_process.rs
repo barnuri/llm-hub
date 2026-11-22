@@ -423,34 +423,50 @@ pub(crate) async fn terminate(child: Child) {
     terminate_within(child, MANAGED_STOP_GRACE).await;
 }
 
+/// Sends SIGKILL to the process group that `pid` leads. A start calls it when its owner drops
+/// the start before the process answers `/health`.
+#[cfg(unix)]
+pub(crate) fn kill_process_group(pid: u32) {
+    signal_group(Some(pid), libc::SIGKILL);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn kill_process_group(_pid: u32) {}
+
 async fn terminate_within(mut child: Child, grace: Duration) {
+    let pid = child.id();
     if request_exit(&child) && tokio::time::timeout(grace, child.wait()).await.is_ok() {
+        // The leader is reaped, so `child.id()` is gone. `pid` still names the group that
+        // may hold members which ignored SIGTERM.
+        kill_group(pid);
         return;
     }
-    kill_group(&child);
+    kill_group(pid);
     let _ = child.kill().await;
 }
 
 #[cfg(unix)]
 fn request_exit(child: &Child) -> bool {
-    signal_group(child, libc::SIGTERM)
+    signal_group(child.id(), libc::SIGTERM)
 }
 
 #[cfg(unix)]
-fn kill_group(child: &Child) {
-    signal_group(child, libc::SIGKILL);
+fn kill_group(pid: Option<u32>) {
+    signal_group(pid, libc::SIGKILL);
 }
 
 #[cfg(not(unix))]
-fn kill_group(_child: &Child) {}
+fn kill_group(_pid: Option<u32>) {}
 
+/// Sends `signal` to the process group that `pid` leads. Returns false when `pid` is unknown
+/// or the signal cannot be sent, which includes a group that no longer exists.
 #[cfg(unix)]
-fn signal_group(child: &Child, signal: libc::c_int) -> bool {
-    let Some(pid) = child.id().and_then(|id| libc::pid_t::try_from(id).ok()) else {
+fn signal_group(pid: Option<u32>, signal: libc::c_int) -> bool {
+    let Some(pid) = pid.and_then(|id| libc::pid_t::try_from(id).ok()) else {
         return false;
     };
-    // SAFETY: kill(2) takes plain integers and touches no memory. `pid` is our own unreaped
-    // child and leads its own process group, so `-pid` names that group alone.
+    // SAFETY: kill(2) takes plain integers and touches no memory. `pid` is our own child,
+    // which leads its own process group, so `-pid` names that group alone.
     unsafe { libc::kill(-pid, signal) == 0 }
 }
 
@@ -736,6 +752,28 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
 
             terminate_within(child, Duration::from_millis(200)).await;
+
+            assert!(wait_until_group_gone(pgid).await);
+        }
+
+        #[tokio::test]
+        async fn terminate_within_kills_a_group_member_that_ignores_sigterm_after_the_leader_exits()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let child = spawn_logged(
+                &argv(&[
+                    "sh",
+                    "-c",
+                    "trap 'exit 0' TERM; (trap '' TERM; exec sleep 30) & wait",
+                ]),
+                &dir.path().join("a.log"),
+                "test",
+            )
+            .unwrap();
+            let pgid = pgid_of(&child);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            terminate_within(child, Duration::from_secs(5)).await;
 
             assert!(wait_until_group_gone(pgid).await);
         }
