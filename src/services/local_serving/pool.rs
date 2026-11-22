@@ -17,7 +17,9 @@ use super::memory::{self, LoadedModel, NoRoom};
 use super::registry_rows::{self, Engine, RegistryRow};
 use crate::configs::{HubConfig, LocalServingConfig};
 use crate::consts::MANAGED_IDLE_CHECK_INTERVAL;
-use crate::services::managed_process::{NotReady, spawn_logged, terminate, wait_ready};
+use crate::services::managed_process::{
+    NotReady, kill_process_group, spawn_logged, terminate, wait_ready,
+};
 
 const LOCAL_LOGS_SUBDIR: &str = "local";
 const PID_FILE: &str = "pids.json";
@@ -456,7 +458,19 @@ impl LocalPool {
         let estimate_gb = memory::estimate_gb(&row, &model_path);
         self.reserve_memory(&local, &entry, &row, estimate_gb)
             .await?;
-        match self.launch(&local, &row, &entry, &model_path).await {
+        let mut start = StartGuard {
+            pool: self,
+            entry: &entry,
+            armed: true,
+        };
+        if local.row(id).as_ref() != Some(&row) {
+            return Err(format!(
+                "local model {id} changed in the registry while it waited for memory; retry"
+            ));
+        }
+        let launched = self.launch(&local, &row, &entry, &model_path).await;
+        start.armed = false;
+        match launched {
             Ok(child) => {
                 entry.update(|d| d.state = LocalModelState::Running);
                 *process = Some(child);
@@ -716,7 +730,7 @@ impl LocalPool {
     fn lease(&self, entry: &Arc<ModelEntry>) -> Lease {
         entry.in_flight.fetch_add(1, Ordering::SeqCst);
         entry.touch();
-        let port = entry.details().port.unwrap_or_default();
+        let port = lock(&entry.details).port.unwrap_or_default();
         Lease {
             base_url: format!("http://{LOOPBACK}:{port}"),
             entry: Arc::clone(entry),
@@ -742,6 +756,28 @@ impl Lease {
     /// The base URL of the model process, `http://127.0.0.1:<port>`.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+}
+
+/// Undoes a start that its `acquire` future drops before the start ends. It kills the process
+/// group, clears the reservation and rewrites the pid file. `armed` is false once the start ends.
+struct StartGuard<'a> {
+    pool: &'a LocalPool,
+    entry: &'a ModelEntry,
+    armed: bool,
+}
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(pid) = self.entry.details().pid {
+            kill_process_group(pid);
+        }
+        self.entry.set_stopped(LocalModelState::Stopped);
+        self.pool.write_pid_file();
+        self.pool.released.notify_waiters();
     }
 }
 
@@ -908,9 +944,14 @@ impl Backoff {
 }
 
 impl PidRecord {
-    /// Whether `command_line` is still this model's server: it holds the port and model path.
+    /// Whether `command_line` is still this model's server: it holds `--port <port>` as whole
+    /// words and the model path.
     fn matches(&self, command_line: &str) -> bool {
-        command_line.contains(&format!("--port {}", self.port))
+        let port = self.port.to_string();
+        let words: Vec<&str> = command_line.split_whitespace().collect();
+        words
+            .windows(2)
+            .any(|pair| pair[0] == "--port" && pair[1] == port)
             && command_line.contains(&*self.model_path.to_string_lossy())
     }
 }
@@ -1199,6 +1240,85 @@ http.server.HTTPServer(("127.0.0.1", port), Health).serve_forever()
         fx.pool.restart(PROFILE, "broken").await;
         assert!(fx.acquire("broken").await.is_err());
         assert_eq!(fx.starts("broken"), 2, "restart clears the backoff");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_start_kills_the_process_and_clears_its_reservation() {
+        let fx = Fixture::new(&[("unready", 1.0)], &[]);
+        let mut acquire = Box::pin(fx.acquire("unready"));
+        let pid = tokio::select! {
+            _ = acquire.as_mut() => panic!("the start ended before it was dropped"),
+            pid = wait_for_pid(&fx, "unready") => pid,
+        };
+
+        drop(acquire);
+
+        assert!(wait_until_gone(pid).await, "the process group is gone");
+        let model = fx
+            .pool
+            .snapshot()
+            .into_iter()
+            .find(|model| model.id == "unready");
+        if let Some(model) = model {
+            assert_eq!(model.state, LocalModelState::Stopped);
+            assert_eq!(model.estimate_gb, 0.0, "the reserved memory is released");
+            assert_eq!(model.pid, None);
+        }
+        assert!(fx.pid_file().is_empty());
+    }
+
+    /// The pid of model `id` once its start has spawned the process.
+    async fn wait_for_pid(fx: &Fixture, id: &str) -> u32 {
+        loop {
+            let pid = fx
+                .pool
+                .snapshot()
+                .into_iter()
+                .find(|model| model.id == id)
+                .and_then(|model| model.pid);
+            if let Some(pid) = pid {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registry_edit_during_a_memory_wait_fails_the_start_and_the_next_start_uses_the_new_row()
+     {
+        let fx = Fixture::new(&[("a", 4.0), ("b", 4.0)], &[("MEMORY_GB", "5")]);
+        let lease = fx.acquire("a").await.unwrap();
+
+        let edit = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            fx.write_registry(&[("a", 4.0), ("b", 4.0)], 8192);
+            fx.pool.reload_now();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(lease);
+        };
+        let (waited, ()) = tokio::join!(fx.acquire("b"), edit);
+
+        let err = waited.err().unwrap();
+        assert!(err.contains("changed in the registry"), "{err}");
+        assert_eq!(fx.starts("b"), 0, "the stale row never starts a process");
+        assert_eq!(fx.model("b").state, LocalModelState::Stopped);
+
+        drop(fx.acquire("b").await.unwrap());
+        assert_eq!(fx.starts("b"), 1);
+        fx.pool.stop_all().await;
+    }
+
+    #[test]
+    fn a_pid_record_matches_the_port_as_a_whole_word() {
+        let record = PidRecord {
+            key: "mac/a".into(),
+            pid: 1,
+            port: 808,
+            model_path: PathBuf::from("/m/a.gguf"),
+        };
+        assert!(record.matches("llama --port 808 -m /m/a.gguf"));
+        assert!(!record.matches("llama --port 8080 -m /m/a.gguf"));
+        assert!(!record.matches("llama --port 8 08 -m /m/a.gguf"));
     }
 
     #[tokio::test]

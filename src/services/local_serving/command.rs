@@ -2,7 +2,10 @@
 
 use std::path::Path;
 
+use super::check_gate;
+use super::mistralrs_flags::{self, MistralrsOptions};
 use super::registry_rows::{Engine, RegistryRow};
+use super::worker::MISTRALRS_NOT_BUILT;
 use crate::configs::{LocalServingConfig, ManagedCommand};
 
 /// The `llama` wrapper's subcommand that runs `llama-server`.
@@ -38,15 +41,19 @@ const SHARED_AFTER_GPU: [&str; 11] = [
     "--repeat-penalty",
     "1.0",
 ];
-const MISTRALRS_UNAVAILABLE: &str = "the mistralrs engine is not available yet";
+/// True when this binary embeds the mistral.rs worker (cargo feature `mistralrs`).
+const MISTRALRS_BUILT: bool = cfg!(feature = "mistralrs");
+/// The worker subcommand of this binary that serves a `mistralrs` row.
+const WORKER_SUBCOMMAND: &str = "local-worker";
 
 /// Builds the argv (program first, no shell) that serves `row` from `model_path` on `port`.
 /// `home` expands a leading `~` in `bin_override` and in `extra_flags` words.
 ///
 /// # Errors
 ///
-/// Returns a message when the row's engine is `mistralrs`, when `extra_flags` has unbalanced
-/// quotes, or when the binary or model path is not valid UTF-8.
+/// Returns a message when `extra_flags` has unbalanced quotes or an unsupported flag, when the
+/// binary or model path is not valid UTF-8, when a `mistralrs` row has no passed gate, or when
+/// this binary lacks the `mistralrs` feature.
 pub fn build_argv(
     row: &RegistryRow,
     config: &LocalServingConfig,
@@ -56,8 +63,45 @@ pub fn build_argv(
 ) -> Result<Vec<String>, String> {
     match row.engine {
         Engine::Llama => llama_argv(row, &config.llama_bin, model_path, port, home),
-        Engine::Mistralrs => Err(MISTRALRS_UNAVAILABLE.to_owned()),
+        Engine::Mistralrs => {
+            let exe = std::env::current_exe().map_err(|err| {
+                format!("model {}: cannot find the llm-hub binary: {err}", row.id)
+            })?;
+            mistralrs_argv(row, config, model_path, port, home, &exe, MISTRALRS_BUILT)
+        }
     }
+}
+
+/// The `local-worker` command of this binary for a `mistralrs` row. `built` says whether the
+/// worker is compiled in. Flags are checked first, so a bad row reports its flag, then the
+/// feature, then the gate.
+fn mistralrs_argv(
+    row: &RegistryRow,
+    config: &LocalServingConfig,
+    model_path: &Path,
+    port: u16,
+    home: Option<&str>,
+    exe: &Path,
+    built: bool,
+) -> Result<Vec<String>, String> {
+    let extra = extra_flags(row, home)?;
+    let opts: MistralrsOptions = mistralrs_flags::parse(&row.id, row.ctx, &extra)?;
+    if !built {
+        return Err(MISTRALRS_NOT_BUILT.to_owned());
+    }
+    check_gate(config, &row.id, model_path)?;
+    let mut argv = vec![
+        utf8(exe, row, "llm-hub binary")?,
+        WORKER_SUBCOMMAND.to_owned(),
+        "--id".to_owned(),
+        row.id.clone(),
+        "--model".to_owned(),
+        utf8(model_path, row, "model path")?,
+        "--port".to_owned(),
+        port.to_string(),
+    ];
+    argv.extend(opts.worker_args());
+    Ok(argv)
 }
 
 /// The `cmd_sync_swap` command of `llama-models`, with the row's `extra_flags` last so they win.
@@ -121,7 +165,7 @@ fn utf8(path: &Path, row: &RegistryRow, what: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -139,6 +183,8 @@ mod tests {
             llama_bin: PathBuf::from("/Users/me/.local/bin/llama"),
             models_dir: PathBuf::from("/Users/me/models"),
             hf_cache: PathBuf::from("/Users/me/hf"),
+            gate_file: PathBuf::from("/Users/me/gates.jsonl"),
+            ungated_models: HashSet::new(),
             allow_ungated: false,
         }
     }
@@ -297,11 +343,152 @@ mod tests {
         assert_eq!(err, "model m: extra_flags has unbalanced quotes");
     }
 
+    /// A config whose gate file is `gate`, with `m` listed as ungated when `ungated`.
+    fn mistral_config(gate: &Path, ungated: bool) -> LocalServingConfig {
+        LocalServingConfig {
+            gate_file: gate.to_path_buf(),
+            ungated_models: if ungated {
+                HashSet::from(["m".to_owned()])
+            } else {
+                HashSet::new()
+            },
+            ..config()
+        }
+    }
+
+    fn mistral_row(flags: &str) -> RegistryRow {
+        RegistryRow {
+            engine: Engine::Mistralrs,
+            ..row("m", flags, None)
+        }
+    }
+
     #[test]
-    fn mistralrs_rows_are_not_served_yet() {
-        let mut row = row("m", "", None);
-        row.engine = Engine::Mistralrs;
-        assert_eq!(argv(&row).unwrap_err(), MISTRALRS_UNAVAILABLE);
+    fn mistralrs_argv_runs_the_worker_of_this_binary() {
+        let model = PathBuf::from("/models/m.gguf");
+        let cfg = mistral_config(Path::new("/none.jsonl"), true);
+        let built = mistralrs_argv(
+            &mistral_row("--reasoning off --mmproj /m/proj.gguf --tok-model-id org/x"),
+            &cfg,
+            &model,
+            5801,
+            Some(HOME),
+            Path::new("/bin/llm-hub"),
+            true,
+        )
+        .unwrap();
+        let mut expected =
+            words("/bin/llm-hub local-worker --id m --model /models/m.gguf --port 5801");
+        expected.extend(words(
+            "--ctx-size 131072 --temp 1.0 --top-p 0.95 --top-k 40 --min-p 0.01 \
+             --reasoning off --mmproj /m/proj.gguf --tok-model-id org/x",
+        ));
+        assert_eq!(built, expected);
+    }
+
+    fn words(text: &str) -> Vec<String> {
+        text.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn mistralrs_row_without_the_feature_names_it_after_the_flags() {
+        let model = PathBuf::from("/models/m.gguf");
+        let cfg = mistral_config(Path::new("/none.jsonl"), true);
+        let err = mistralrs_argv(
+            &mistral_row(""),
+            &cfg,
+            &model,
+            1,
+            None,
+            Path::new("/bin/llm-hub"),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err, MISTRALRS_NOT_BUILT);
+        let flag_err = mistralrs_argv(
+            &mistral_row("--spec-type ngram-cache"),
+            &cfg,
+            &model,
+            1,
+            None,
+            Path::new("/bin/llm-hub"),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            flag_err.contains("--spec-type is not supported"),
+            "{flag_err}"
+        );
+    }
+
+    #[test]
+    fn mistralrs_row_without_a_passed_gate_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("m.gguf");
+        std::fs::write(&model, b"x").unwrap();
+        let cfg = mistral_config(&dir.path().join("gates.jsonl"), false);
+        let err = mistralrs_argv(
+            &mistral_row(""),
+            &cfg,
+            &model,
+            1,
+            None,
+            Path::new("/bin/llm-hub"),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("model m: the mistralrs engine refuses to start"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn mistralrs_row_with_a_passed_gate_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("m.gguf");
+        std::fs::write(&model, b"x").unwrap();
+        let meta = std::fs::metadata(&model).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let gate = dir.path().join("gates.jsonl");
+        std::fs::write(
+            &gate,
+            format!(
+                r#"{{"model":"m","path":"{}","size":{},"mtime":{mtime},"verdict":"pass"}}"#,
+                model.display(),
+                meta.len()
+            ),
+        )
+        .unwrap();
+        let cfg = mistral_config(&gate, false);
+        let built = mistralrs_argv(
+            &mistral_row(""),
+            &cfg,
+            &model,
+            7,
+            None,
+            Path::new("/bin/llm-hub"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(built[1], WORKER_SUBCOMMAND);
+    }
+
+    #[test]
+    fn build_argv_dispatches_mistralrs_rows() {
+        let model = PathBuf::from("/models/m.gguf");
+        let cfg = mistral_config(Path::new("/none.jsonl"), true);
+        let result = build_argv(&mistral_row(""), &cfg, &model, 1, None);
+        // The test binary has no worker, so the feature check decides the outcome.
+        match result {
+            Ok(argv) => assert_eq!(argv[1], WORKER_SUBCOMMAND),
+            Err(err) => assert_eq!(err, MISTRALRS_NOT_BUILT),
+        }
     }
 
     #[cfg(unix)]
