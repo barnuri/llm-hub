@@ -26,6 +26,59 @@ pub fn status() -> Result<(), String> {
     platform::status()
 }
 
+pub async fn ensure_installed_service() -> Result<bool, String> {
+    if !platform::installed()? {
+        return Ok(false);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .no_proxy()
+        .build()
+        .map_err(|error| error.to_string())?;
+    let url = format!("http://127.0.0.1:{SERVICE_PORT}/healthz");
+    ensure_healthy(
+        || async { platform::running() && endpoint_healthy(&client, &url).await },
+        platform::start,
+        25,
+        std::time::Duration::from_millis(200),
+    )
+    .await?;
+    println!("llm-hub service is running at http://127.0.0.1:{SERVICE_PORT}");
+    Ok(true)
+}
+
+async fn endpoint_healthy(client: &reqwest::Client, url: &str) -> bool {
+    match client.get(url).send().await {
+        Ok(response) if response.status().is_success() => {
+            response.text().await.is_ok_and(|body| body == "ok")
+        }
+        _ => false,
+    }
+}
+
+async fn ensure_healthy<F, Fut>(
+    mut healthy: F,
+    start: impl FnOnce() -> Result<(), String>,
+    attempts: usize,
+    delay: std::time::Duration,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    if healthy().await {
+        return Ok(());
+    }
+    start()?;
+    for _ in 0..attempts {
+        if healthy().await {
+            return Ok(());
+        }
+        tokio::time::sleep(delay).await;
+    }
+    Err("service did not become healthy; check the service logs".to_string())
+}
+
 #[cfg_attr(
     not(target_os = "macos"),
     allow(dead_code, reason = "Only the macOS service manager uses it")
@@ -395,6 +448,42 @@ mod platform {
         run("launchctl", &["print", &target])
     }
 
+    pub fn installed() -> Result<bool, String> {
+        plist_path()?
+            .try_exists()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn running() -> bool {
+        let Ok(uid) = uid() else {
+            return false;
+        };
+        let target = format!("gui/{uid}/{SERVICE_LABEL}");
+        std::process::Command::new("launchctl")
+            .args(["print", &target])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|line| line.trim() == "state = running")
+            })
+    }
+
+    pub fn start() -> Result<(), String> {
+        let domain = format!("gui/{}", uid()?);
+        let target = format!("{domain}/{SERVICE_LABEL}");
+        if is_loaded(&target) {
+            run("launchctl", &["kickstart", &target])
+        } else {
+            let plist = plist_path()?;
+            run(
+                "launchctl",
+                &["bootstrap", &domain, &plist.display().to_string()],
+            )
+        }
+    }
+
     fn is_loaded(target: &str) -> bool {
         std::process::Command::new("launchctl")
             .args(["print", target])
@@ -443,6 +532,21 @@ mod platform {
 
     pub fn status() -> Result<(), String> {
         run("systemctl", &["--user", "status", SERVICE_NAME])
+    }
+
+    pub fn installed() -> Result<bool, String> {
+        unit_path()?.try_exists().map_err(|error| error.to_string())
+    }
+
+    pub fn running() -> bool {
+        std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", SERVICE_NAME])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    pub fn start() -> Result<(), String> {
+        run("systemctl", &["--user", "start", SERVICE_NAME])
     }
 
     pub(super) fn unit_path() -> Result<PathBuf, String> {
@@ -504,6 +608,29 @@ mod platform {
         )
     }
 
+    pub fn installed() -> Result<bool, String> {
+        launcher_path()?
+            .try_exists()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn running() -> bool {
+        let script = format!(
+            "if ((Get-ScheduledTask -TaskName '{SERVICE_NAME}').State -eq 'Running') {{ exit 0 }} else {{ exit 1 }}"
+        );
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    pub fn start() -> Result<(), String> {
+        if running() {
+            return Ok(());
+        }
+        run("schtasks", &["/Run", "/TN", SERVICE_NAME])
+    }
+
     fn launcher_path() -> Result<PathBuf, String> {
         let local_app_data = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is not set")?;
         Ok(PathBuf::from(local_app_data)
@@ -537,11 +664,106 @@ mod platform {
     pub fn status() -> Result<(), String> {
         Err(UNSUPPORTED.to_string())
     }
+
+    pub fn installed() -> Result<bool, String> {
+        Ok(false)
+    }
+
+    pub fn running() -> bool {
+        false
+    }
+
+    pub fn start() -> Result<(), String> {
+        Err(UNSUPPORTED.to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn health_endpoint_requires_ok_response() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        assert!(endpoint_healthy(&client, &server.uri()).await);
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_rejects_errors_and_wrong_body() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+
+        let server = MockServer::start().await;
+        Mock::given(path("/wrong"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not ok"))
+            .mount(&server)
+            .await;
+        Mock::given(path("/error"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("ok"))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        assert!(!endpoint_healthy(&client, &format!("{}/wrong", server.uri())).await);
+        assert!(!endpoint_healthy(&client, &format!("{}/error", server.uri())).await);
+    }
+
+    #[tokio::test]
+    async fn healthy_service_is_not_restarted() {
+        let result = ensure_healthy(
+            || async { true },
+            || Err("unexpected start".to_string()),
+            1,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn stopped_service_is_started_and_checked() {
+        let checks = std::cell::Cell::new(0);
+        let starts = std::cell::Cell::new(0);
+        let result = ensure_healthy(
+            || {
+                checks.set(checks.get() + 1);
+                async { checks.get() > 1 }
+            },
+            || {
+                starts.set(starts.get() + 1);
+                Ok(())
+            },
+            2,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(starts.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn service_start_error_is_reported() {
+        let result = ensure_healthy(
+            || async { false },
+            || Err("start failed".to_string()),
+            1,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result, Err("start failed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn service_that_stays_unhealthy_returns_an_error() {
+        let result =
+            ensure_healthy(|| async { false }, || Ok(()), 1, std::time::Duration::ZERO).await;
+        assert!(result.is_err());
+    }
 
     #[test]
     fn launchd_plist_runs_exe_in_cwd_with_keepalive() {
