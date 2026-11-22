@@ -257,9 +257,24 @@ async fn multipart_over_upload_limit_is_rejected() {
     let body = String::from_utf8(transcription_form("healthy/whisper"))
         .unwrap()
         .replace("AUDIO-BYTES", &oversized_audio);
-    let response = post_transcription(&base, body.into_bytes()).await;
+    let outcome = reqwest::Client::new()
+        .post(format!("{base}/v1/audio/transcriptions"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={AUDIO_BOUNDARY}"),
+        )
+        .header("x-llm-hub-fallbacks", "healthy/whisper-fallback")
+        .body(body.into_bytes())
+        .send()
+        .await;
 
-    assert_eq!(response.status(), 400);
+    // The hub may close the socket before the upload ends. That close is the rejection.
+    match outcome {
+        Ok(response) => assert_eq!(response.status(), 400),
+        Err(error) => assert!(error.is_request() || error.is_body(), "{error}"),
+    }
+    let health = reqwest::get(format!("{base}/healthz")).await.unwrap();
+    assert_eq!(health.status(), 200);
     drop(hub);
 }
 
