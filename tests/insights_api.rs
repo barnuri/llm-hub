@@ -33,6 +33,7 @@ async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
     let dir = tempfile::tempdir().unwrap().keep();
     let mut command = Command::new(binary);
     command
+        .arg("serve")
         .current_dir(&dir)
         .env("LLM_HUB_PORT", port.to_string())
         .env("LLM_HUB_AUTO_UPDATE", "0")
