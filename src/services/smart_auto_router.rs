@@ -1318,7 +1318,8 @@ mod tests {
         }
 
         let elapsed = started.elapsed();
-        let per_selection = elapsed / TIMED_SELECTIONS as u32;
+        let timed_selections = u32::try_from(TIMED_SELECTIONS).expect("benchmark count fits u32");
+        let per_selection = elapsed / timed_selections;
         println!(
             "selection average over {TIMED_SELECTIONS} runs: {per_selection:?} (target {P95_TARGET:?})"
         );
