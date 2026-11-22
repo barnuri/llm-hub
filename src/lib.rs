@@ -78,13 +78,16 @@ async fn serve(hub: Hub) {
     }
 
     let vars = load_env_vars();
-    let config = match HubConfig::from_map(&vars) {
-        Ok(config) => config,
+    let (config, profile_errors) = match HubConfig::from_map_skipping_invalid_profiles(&vars) {
+        Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("config error: {e}");
             std::process::exit(1);
         }
     };
+    for error in profile_errors {
+        tracing::warn!(%error, "skipping profile with invalid configuration");
+    }
 
     let store = match open_store(&config) {
         Ok(store) => store,
