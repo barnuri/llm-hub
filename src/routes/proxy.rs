@@ -9094,7 +9094,6 @@ mod tests {
     mod local_serving {
         use std::collections::{BTreeMap, HashMap};
         use std::fmt::Write as _;
-        use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
         use std::sync::OnceLock;
 
@@ -9114,51 +9113,18 @@ mod tests {
         const REMOTE: &str = "openai";
         const CHAT_PATH: &str = "/chat/completions";
         const REPLY: &str = "local reply";
-        const FAKE_LLAMA_SERVER: &str = r#"#!/usr/bin/env python3
-import http.server, json, sys, time
-args = sys.argv[1:]
-port = int(args[args.index("--port") + 1])
-class Server(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200 if self.path == "/health" else 404)
-        self.end_headers()
-    def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        if self.path != "/v1/chat/completions":
-            self.send_response(404)
-            self.end_headers()
-            return
-        self.send_response(200)
-        if not body.get("stream"):
-            reply = json.dumps({"choices": [{"message": {"content": "local reply"}}]}).encode()
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(reply)))
-            self.end_headers()
-            self.wfile.write(reply)
-            return
-        self.send_header("Content-Type", "text/event-stream")
-        self.end_headers()
-        self.wfile.write(b'data: {"choices":[{"delta":{"content":"local"}}]}\n\n')
-        self.wfile.flush()
-        time.sleep(0.5)
-        self.wfile.write(b'data: {"choices":[{"delta":{"content":" reply"}}]}\n\ndata: [DONE]\n\n')
-        self.wfile.flush()
-    def log_message(self, *args):
-        pass
-http.server.HTTPServer(("127.0.0.1", port), Server).serve_forever()
-"#;
-
-        /// One fake server script per test binary, so no test writes an executable while another forks.
         fn fake_llama_server() -> &'static Path {
-            static SCRIPT: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
-            let (_, path) = SCRIPT.get_or_init(|| {
-                let dir = tempfile::tempdir().unwrap();
-                let path = dir.path().join("fake-llama-server");
-                std::fs::write(&path, FAKE_LLAMA_SERVER).unwrap();
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-                (dir, path)
-            });
-            path
+            static SERVER: OnceLock<PathBuf> = OnceLock::new();
+            SERVER.get_or_init(|| {
+                let executable = std::env::current_exe().unwrap();
+                let deps_dir = executable.parent().unwrap();
+                let candidate = deps_dir.parent().unwrap().join("test-local-server");
+                if candidate.is_file() {
+                    candidate
+                } else {
+                    deps_dir.join("test-local-server")
+                }
+            })
         }
 
         /// A `KIND=local` profile on a temp registry next to a remote profile. Its own pool logs

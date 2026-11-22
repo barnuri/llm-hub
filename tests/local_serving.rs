@@ -9,40 +9,9 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
-const FAKE_LLAMA_SERVER: &str = r#"#!/usr/bin/env python3
-import http.server, os, sys, time
-args = sys.argv[1:]
-port = int(args[args.index("--port") + 1])
-model = os.path.basename(args[args.index("-m") + 1])
-with open(os.environ["SPAWN_LOG"], "a") as f:
-    f.write(f"{os.getpid()} {model} {port}\n")
-print("fake llama stderr", file=sys.stderr, flush=True)
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b"ok"
-        self.send_response(200)
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-    def do_POST(self):
-        self.rfile.read(int(self.headers.get("content-length", 0)))
-        if "slow" in model:
-            time.sleep(6)
-        body = b'{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}'
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-    def log_message(self, *args):
-        pass
-http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
-"#;
 
 /// Owns one test's hub, temp dir, fake server and spawn log. Dropping it stops every child.
 struct Fixture {
@@ -92,9 +61,7 @@ impl Fixture {
             std::fs::write(root.join(format!("models/{id}.gguf")), "x").unwrap();
         }
         std::fs::write(root.join("registry.txt"), registry).unwrap();
-        let bin = root.join("fake-llama-server");
-        std::fs::write(&bin, FAKE_LLAMA_SERVER).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = std::path::Path::new(env!("CARGO_BIN_EXE_test-local-server"));
 
         let vars = HashMap::from([
             ("LLM_HUB_PROFILES".to_owned(), "local".to_owned()),

@@ -23,6 +23,12 @@ undocumented_unsafe_blocks = "warn"
 unimplemented = "warn"
 unwrap_used = "warn"
 
+[[bin]]
+name = "test-local-server"
+path = "src/bin/test_local_server.rs"
+test = false
+bench = false
+
 [dependencies]
 arc-swap = "1.9.2"
 base64 = "0.22.1"

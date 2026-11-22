@@ -1050,7 +1050,6 @@ fn kill_orphan_group(_pid: u32) {}
 #[cfg(unix)]
 mod tests {
     use std::fmt::Write as _;
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     use std::sync::OnceLock;
 
@@ -1058,36 +1057,18 @@ mod tests {
 
     const PROFILE: &str = "mac";
     const START_LINE: &str = "fake server start";
-    const FAKE_SERVER: &str = r#"#!/usr/bin/env python3
-import http.server, sys
-args = sys.argv[1:]
-port = int(args[args.index("--port") + 1])
-model = args[args.index("-m") + 1]
-print("fake server start", flush=True)
-if "broken" in model:
-    print("cannot load the model", flush=True)
-    sys.exit(3)
-class Health(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        ready = self.path == "/health" and "unready" not in model
-        self.send_response(200 if ready else 503)
-        self.end_headers()
-    def log_message(self, *args):
-        pass
-http.server.HTTPServer(("127.0.0.1", port), Health).serve_forever()
-"#;
-
-    /// One fake server script per test binary, so no test writes an executable while another forks.
     fn fake_server() -> &'static Path {
-        static SCRIPT: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
-        let (_, path) = SCRIPT.get_or_init(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("fake-llama");
-            std::fs::write(&path, FAKE_SERVER).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            (dir, path)
-        });
-        path
+        static SERVER: OnceLock<PathBuf> = OnceLock::new();
+        SERVER.get_or_init(|| {
+            let executable = std::env::current_exe().unwrap();
+            let deps_dir = executable.parent().unwrap();
+            let candidate = deps_dir.parent().unwrap().join("test-local-server");
+            if candidate.is_file() {
+                candidate
+            } else {
+                deps_dir.join("test-local-server")
+            }
+        })
     }
 
     fn no_local_config() -> HubConfig {
