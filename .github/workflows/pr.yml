@@ -99,6 +99,23 @@ jobs:
           cache-on-failure: true
       - run: cargo nextest run --all-targets --no-fail-fast
 
+  test-macos:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-macos
+          cache-on-failure: true
+      - run: cargo nextest run --all-targets --no-fail-fast
+
   ui:
     needs: changes
     if: needs.changes.outputs.ui == 'true'
@@ -116,7 +133,7 @@ jobs:
   # The one check the master ruleset requires.
   pr-ok:
     if: always()
-    needs: [changes, lint, coverage, test-windows, ui]
+    needs: [changes, lint, coverage, test-windows, test-macos, ui]
     runs-on: chkp-genai-scaleset
     timeout-minutes: 5
     steps:
