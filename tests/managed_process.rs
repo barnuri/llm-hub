@@ -246,10 +246,15 @@ async fn never_idle_process_is_started_at_boot() {
     let (_hub, base) = start_hub(dir.path(), vars).await;
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !is_listening(server_port) && Instant::now() < deadline {
+    loop {
+        let status = profile_status(&base).await;
+        if status["running"] == true || Instant::now() >= deadline {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    assert_eq!(profile_status(&base).await["running"], true);
     assert!(
         is_listening(server_port),
         "resident process not started at boot"
