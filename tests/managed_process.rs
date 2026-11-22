@@ -29,7 +29,7 @@ port, spawn_log = int(sys.argv[1]), sys.argv[2]
 with open(spawn_log, "a") as f:
     f.write("spawn\n")
 threading.Timer(60, lambda: os._exit(0)).start()
-time.sleep(0.5)
+time.sleep(0.05)
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.rfile.read(int(self.headers.get("content-length", 0)))
@@ -80,9 +80,11 @@ async fn start_hub(dir: &Path, vars: HashMap<String, String>) -> (HubProcess, St
     let port = free_port();
     let mut command = Command::new(env!("CARGO_BIN_EXE_llm-hub"));
     command
+        .arg("serve")
         .current_dir(dir)
         .env("LLM_HUB_PORT", port.to_string())
-        .env("LLM_HUB_AUTO_UPDATE", "0");
+        .env("LLM_HUB_AUTO_UPDATE", "0")
+        .env("LLM_HUB_NOTIFY_DESKTOP", "false");
     for (key, value) in vars {
         command.env(key, value);
     }
@@ -245,8 +247,17 @@ async fn never_idle_process_is_started_at_boot() {
     let vars = managed_profile(server_port, &command, &[("IDLE_SECS", "0")]);
     let (_hub, base) = start_hub(dir.path(), vars).await;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !is_listening(server_port) && Instant::now() < deadline {
+    reqwest::get(format!("{base}/v1/models"))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if is_listening(server_port) && profile_status(&base).await["running"] == true {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -254,6 +265,7 @@ async fn never_idle_process_is_started_at_boot() {
         is_listening(server_port),
         "resident process not started at boot"
     );
+    assert_eq!(profile_status(&base).await["running"], true);
     assert_eq!(spawn_count(&spawn_log), 1);
     // The start holds its lock until its next readiness poll, so wait for it.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -270,7 +282,7 @@ async fn idle_process_is_stopped_and_restarted_on_next_request() {
     let (command, spawn_log) = test_server_command(dir.path(), server_port);
     let (hub, base) = start_hub(
         dir.path(),
-        managed_profile(server_port, &command, &[("IDLE_SECS", "1")]),
+        managed_profile(server_port, &command, &[("IDLE_MS", "300")]),
     )
     .await;
 
@@ -295,7 +307,7 @@ async fn start_timeout_fails_the_attempt_and_names_profile_and_log() {
         managed_profile(
             server_port,
             &format!(r#"{PYTHON} -c "import time; time.sleep(30)""#),
-            &[("START_TIMEOUT_SECS", "1")],
+            &[("START_TIMEOUT_MS", "300")],
         ),
     )
     .await;
@@ -307,7 +319,7 @@ async fn start_timeout_fails_the_attempt_and_names_profile_and_log() {
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("profile whisper"), "{message}");
     assert!(message.contains("whisper.log"), "{message}");
-    assert!(message.contains("within 1s"), "{message}");
+    assert!(message.contains("within 300ms"), "{message}");
     drop(hub);
 }
 

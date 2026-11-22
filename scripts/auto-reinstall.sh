@@ -20,25 +20,40 @@ fi
 trap 'rmdir "$LOCK"' EXIT
 
 cd "$REPO" || exit 1
-if ! newer_than_binary src ui-src/src Cargo.toml Cargo.lock; then
+rebuild=false
+if newer_than_binary src ui-src/src Cargo.toml Cargo.lock; then
+  rebuild=true
+fi
+if [ "$rebuild" = false ] && curl -fsS -o /dev/null --max-time 1 "$HEALTH_URL"; then
   exit 0
 fi
 if [ -n "${AUTO_REINSTALL_DRY_RUN:-}" ]; then
-  echo "would rebuild: sources are newer than $BINARY"
+  if [ "$rebuild" = true ]; then
+    echo "would rebuild: sources are newer than $BINARY"
+  else
+    echo "would reinstall: service is unhealthy"
+  fi
   exit 0
 fi
 
 {
-  echo "== $(date '+%Y-%m-%d %H:%M:%S') sources changed, rebuilding"
-  if newer_than_binary ui-src/src && ! npm run build:ui; then
-    echo "ui build failed, keeping the running service"
+  if [ "$rebuild" = true ]; then
+    echo "== $(date '+%Y-%m-%d %H:%M:%S') sources changed, rebuilding"
+    if newer_than_binary ui-src/src && ! npm run build:ui; then
+      echo "ui build failed, keeping the running service"
+      exit 1
+    fi
+    if ! cargo build --release; then
+      echo "cargo build failed, keeping the running service"
+      exit 1
+    fi
+  else
+    echo "== $(date '+%Y-%m-%d %H:%M:%S') service unhealthy, reinstalling"
+  fi
+  if ! "$BINARY" service install; then
+    echo "service install failed"
     exit 1
   fi
-  if ! cargo build --release; then
-    echo "cargo build failed, keeping the running service"
-    exit 1
-  fi
-  "$BINARY" service install
   for _ in $(seq 1 30); do
     if curl -fsS -o /dev/null --max-time 1 "$HEALTH_URL"; then
       echo "healthz 200"
