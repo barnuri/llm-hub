@@ -169,6 +169,7 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+    #[cfg(unix)]
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
     }

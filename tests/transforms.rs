@@ -35,7 +35,8 @@ async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
     command
         .current_dir(&dir)
         .env("LLM_HUB_PORT", port.to_string())
-        .env("LLM_HUB_AUTO_UPDATE", "0");
+        .env("LLM_HUB_AUTO_UPDATE", "0")
+        .env("LLM_HUB_NOTIFY_DESKTOP", "false");
     for (key, value) in vars {
         command.env(key, value);
     }
