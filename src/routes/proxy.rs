@@ -7510,6 +7510,20 @@ mod tests {
         }
 
         #[test]
+        fn opencode_header_names_the_session_when_present() {
+            let mut headers = client_headers();
+            headers.insert(
+                crate::consts::HEADER_SESSION_ID,
+                HeaderValue::from_static("ses_oc_unit"),
+            );
+
+            assert_eq!(
+                claude_code_session_id(&headers).as_deref(),
+                Some("ses_oc_unit")
+            );
+        }
+
+        #[test]
         fn hub_session_header_names_the_session_when_claude_code_header_is_absent() {
             let mut headers = client_headers();
             headers.insert(
