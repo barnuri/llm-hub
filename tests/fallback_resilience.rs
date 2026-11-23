@@ -292,6 +292,7 @@ async fn the_configured_deadline_cuts_a_slow_last_attempt() {
 
     assert_eq!(response.status(), 504);
     assert!(started.elapsed() < Duration::from_secs(2));
+
     let body: serde_json::Value = response.json().await.unwrap();
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("first/main=500"), "{message}");

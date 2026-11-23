@@ -482,6 +482,204 @@
         }
       }
     },
+    "/api/extensions": {
+      "get": {
+        "tags": [
+          "extensions"
+        ],
+        "summary": "List extensions and rules",
+        "description": "Every extension in run order, then the hooks, with the rules of the rules file. `disabled_by` says whether the env or the UI turned one off.",
+        "operationId": "list_extensions",
+        "responses": {
+          "200": {
+            "description": "Extensions and rules",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/extensions/rules/{rule}": {
+      "put": {
+        "tags": [
+          "extensions"
+        ],
+        "summary": "Turn one rule on or off",
+        "description": "Turns one rule of the rules file on or off, and saves the choice in the store.",
+        "operationId": "set_extension_rule",
+        "parameters": [
+          {
+            "name": "rule",
+            "in": "path",
+            "description": "Rule name from the rules file.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtensionToggleInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Extensions and rules after the change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No rule has that name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`LLM_HUB_EXTENSIONS_DISABLED` turns it off with `rules:<name>`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The store could not save the choice.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/extensions/{name}": {
+      "put": {
+        "tags": [
+          "extensions"
+        ],
+        "summary": "Turn an extension on or off",
+        "description": "Saves the choice in the store, so it survives a restart. The hooks of the rules file go by the name `hooks`.",
+        "operationId": "set_extension",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Extension name, for example `upstream-limits`, `rules` or `hooks`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtensionToggleInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Extensions and rules after the change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No extension has that name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`LLM_HUB_EXTENSIONS_DISABLED` turns it off.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The store could not save the choice.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/fallbacks": {
       "post": {
         "tags": [
@@ -1337,6 +1535,574 @@
           },
           "500": {
             "description": "Internal error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications": {
+      "get": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "List notifications",
+        "operationId": "list_notifications",
+        "parameters": [
+          {
+            "name": "include_muted",
+            "in": "query",
+            "description": "`1` also lists the notifications a mute rule with scope `all` hides. Default `0`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Notifications, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Send a notification",
+        "description": "Stores the notification and delivers it to the sinks unless a mute or the severity filter stops it. Each source may send 60 per minute.",
+        "operationId": "ingest",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The stored notification",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Notification"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Notifications are off (`{\"disabled\": true}`); nothing was stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid source, kind or text.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The source sent more than 60 in the last minute.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications/desktop": {
+      "get": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Desktop popup status",
+        "operationId": "desktop_status",
+        "responses": {
+          "200": {
+            "description": "Status and fix steps for this OS",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesktopStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The desktop sink is not set up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications/desktop/confirm": {
+      "post": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Confirm the test popup showed",
+        "operationId": "desktop_confirm",
+        "responses": {
+          "200": {
+            "description": "Status with `confirmed` set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesktopStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The desktop sink is not set up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications/desktop/fix/{step_id}": {
+      "post": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Run a desktop fix step",
+        "operationId": "desktop_fix",
+        "parameters": [
+          {
+            "name": "step_id",
+            "in": "path",
+            "description": "Fix step id from the status `steps`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Status after the step ran",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesktopStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown or copy-only step.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The desktop sink is not set up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The step's command failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications/desktop/test": {
+      "post": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Send a test popup",
+        "description": "A failed send answers 200 too; `last_error` then holds the reason.",
+        "operationId": "desktop_test",
+        "responses": {
+          "200": {
+            "description": "Status after the send",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesktopStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The desktop sink is not set up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications/mutes": {
+      "get": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "List mute rules",
+        "operationId": "list_mutes",
+        "responses": {
+          "200": {
+            "description": "Mute rules, env rules first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MuteList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Add a mute rule",
+        "operationId": "add_mute",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MuteInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The saved rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationMute"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty match, glob too long, too many rules, a past `until_ms` or a note too long.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications/mutes/{id}": {
+      "delete": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Delete a mute rule",
+        "operationId": "delete_mute",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Mute rule id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The rule comes from `LLM_HUB_NOTIFY_MUTE`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications/{id}/approve": {
+      "post": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Approve a proposal",
+        "description": "Edits the profile's model registry and runs its apply command. An apply that fails still answers 200, with status `failed` and the output tail in `result`.",
+        "operationId": "approve",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Notification id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The notification, `applied` or `failed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Notification"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not a pending proposal, no registry or diff, unknown profile, or another apply runs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications/{id}/dismiss": {
+      "post": {
+        "tags": [
+          "notifications"
+        ],
+        "summary": "Dismiss a notification",
+        "operationId": "dismiss",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Notification id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The dismissed notification",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Notification"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The notification is not pending.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3035,6 +3801,82 @@
           }
         }
       },
+      "DesktopOs": {
+        "type": "string",
+        "description": "The desktop family the hub runs on.",
+        "enum": [
+          "macos",
+          "linux",
+          "windows",
+          "other"
+        ]
+      },
+      "DesktopStatus": {
+        "type": "object",
+        "description": "A snapshot of the desktop sink for the setup banner.",
+        "required": [
+          "enabled",
+          "os",
+          "confirmed",
+          "steps"
+        ],
+        "properties": {
+          "confirmed": {
+            "type": "boolean",
+            "description": "True once the user said they saw the test popup."
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the last popup failed. A later success clears it."
+          },
+          "last_ok_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the last popup succeeded.",
+            "minimum": 0
+          },
+          "os": {
+            "$ref": "#/components/schemas/DesktopOs"
+          },
+          "session_ok": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Linux only: whether the hub sees a D-Bus session or a display."
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FixStep"
+            }
+          },
+          "tool_found": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the popup tool is on `PATH`. `None` when the OS has no tool."
+          }
+        }
+      },
+      "DisabledBy": {
+        "type": "string",
+        "description": "What turned an extension or a rule off.",
+        "enum": [
+          "env",
+          "ui"
+        ]
+      },
       "ErrorBody": {
         "type": "object",
         "description": "Error envelope the hub returns on a failed `/api/*` or `/v1/*` call.",
@@ -3064,6 +3906,91 @@
           }
         }
       },
+      "ExtensionKind": {
+        "type": "string",
+        "description": "Where an extension comes from.",
+        "enum": [
+          "builtin",
+          "rules",
+          "library",
+          "hook"
+        ]
+      },
+      "ExtensionList": {
+        "type": "object",
+        "description": "Every extension, in the order request phases run them, then the hooks.",
+        "required": [
+          "extensions"
+        ],
+        "properties": {
+          "extensions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExtensionStatus"
+            }
+          }
+        }
+      },
+      "ExtensionStatus": {
+        "type": "object",
+        "description": "One extension of the running hub.",
+        "required": [
+          "name",
+          "kind",
+          "phases",
+          "enabled"
+        ],
+        "properties": {
+          "disabled_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DisabledBy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ExtensionKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "phases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The phases it runs in. Empty for a library extension, whose phases the hub cannot see."
+          },
+          "rules": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/RuleStatus"
+            },
+            "description": "The rules of the rules extension. Absent for every other kind."
+          }
+        }
+      },
+      "ExtensionToggleInput": {
+        "type": "object",
+        "description": "Turns an extension or a rule on or off.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
       "FallbacksInput": {
         "type": "object",
         "description": "Admin API request body for setting the default fallback chain.",
@@ -3076,6 +4003,122 @@
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "FixStep": {
+        "type": "object",
+        "description": "One numbered setup step for the desktop sink.",
+        "required": [
+          "id",
+          "text",
+          "runnable"
+        ],
+        "properties": {
+          "command": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A command the user can copy, when the step has one."
+          },
+          "id": {
+            "type": "string",
+            "description": "A stable id. `POST /api/notifications/desktop/fix/{id}` runs it when `runnable`."
+          },
+          "runnable": {
+            "type": "boolean",
+            "description": "True when the hub may run the step itself: a fixed command with no input and no sudo."
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "FlagDiff": {
+        "type": "object",
+        "description": "The flag change a proposal makes to a model's registry row.",
+        "properties": {
+          "add": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Flags and values appended to the row, for example `--cache-type-k`, `q8_0`."
+          },
+          "ctx": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The new context size, when the proposal changes it.",
+            "minimum": 0
+          },
+          "old_ctx": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The context size before the change, so the UI can show `old → new`.",
+            "minimum": 0
+          },
+          "remove": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Flags the apply step deletes from the row, with their values, before it appends `add`."
+          }
+        }
+      },
+      "IngestInput": {
+        "type": "object",
+        "description": "A notification a hook, script or extension sends.",
+        "required": [
+          "source",
+          "severity",
+          "title",
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "kind": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NotificationKind",
+                "description": "`custom` (default), `advisory` or `guard`. A `proposal` needs a flag change, so ingest\nrefuses it."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "severity": {
+            "$ref": "#/components/schemas/NotificationSeverity"
+          },
+          "source": {
+            "type": "string",
+            "description": "Who sends it, 1 to 64 characters, for example `ci` or `ext:backup`."
+          },
+          "title": {
+            "type": "string",
+            "description": "A one-line summary. Title and body hold at most 4 KiB together."
           }
         }
       },
@@ -3131,6 +4174,316 @@
             "description": "The `<profile>/<model>` that captions images."
           }
         }
+      },
+      "MuteInput": {
+        "type": "object",
+        "description": "A new UI mute rule. The hub sets its id, origin and creation time.",
+        "required": [
+          "matcher",
+          "scope"
+        ],
+        "properties": {
+          "matcher": {
+            "$ref": "#/components/schemas/MuteMatch"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/MuteScope"
+          },
+          "until_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the snooze ends, in Unix ms. Absent or `null` mutes forever.",
+            "minimum": 0
+          }
+        }
+      },
+      "MuteList": {
+        "type": "object",
+        "description": "Every mute rule, env rules first.",
+        "required": [
+          "mutes"
+        ],
+        "properties": {
+          "mutes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NotificationMute"
+            }
+          }
+        }
+      },
+      "MuteMatch": {
+        "type": "object",
+        "description": "The glob fields a mute rule matches. A notification matches when every given field matches.",
+        "properties": {
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rule": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "MuteOrigin": {
+        "type": "string",
+        "description": "Where a mute rule came from. Only `ui` rules are saved in the store.",
+        "enum": [
+          "env",
+          "ui"
+        ]
+      },
+      "MuteScope": {
+        "type": "string",
+        "description": "What a mute rule silences.",
+        "enum": [
+          "all",
+          "sinks"
+        ]
+      },
+      "Notification": {
+        "type": "object",
+        "description": "One notification from any source, as the Notifications page shows it.",
+        "required": [
+          "id",
+          "kind",
+          "source",
+          "severity",
+          "title",
+          "body",
+          "actions",
+          "status",
+          "created_ms",
+          "updated_ms"
+        ],
+        "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NotificationAction"
+            },
+            "description": "The buttons the page offers."
+          },
+          "body": {
+            "type": "string",
+            "description": "The main text, such as the facts behind a proposal."
+          },
+          "created_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "diff": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FlagDiff"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "type": "string",
+            "description": "A stable id. Local tuner ids hash profile, model, rule and diff, so a re-run keeps the id."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/NotificationKind"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model the notification is about, when it is about one."
+          },
+          "muted": {
+            "type": "boolean",
+            "description": "True when a mute rule with scope `all` matched, so the page hides it by default."
+          },
+          "profile": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The profile the notification is about, when it is about one."
+          },
+          "result": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The output tail of the apply command, once an apply has run."
+          },
+          "rule": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The rule that raised a proposal or advisory."
+          },
+          "severity": {
+            "$ref": "#/components/schemas/NotificationSeverity"
+          },
+          "source": {
+            "type": "string",
+            "description": "Who sent it, for example `local_tuner`, `errors`, `health`, `api` or `ext:<name>`."
+          },
+          "status": {
+            "$ref": "#/components/schemas/NotificationStatus"
+          },
+          "title": {
+            "type": "string",
+            "description": "A one-line summary."
+          },
+          "updated_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "NotificationAction": {
+        "type": "string",
+        "description": "A button the Notifications page offers for a notification.",
+        "enum": [
+          "approve",
+          "dismiss"
+        ]
+      },
+      "NotificationKind": {
+        "type": "string",
+        "description": "What raised a notification.",
+        "enum": [
+          "proposal",
+          "guard",
+          "advisory",
+          "custom"
+        ]
+      },
+      "NotificationList": {
+        "type": "object",
+        "description": "The inbox and the count of pending notifications that are not muted.",
+        "required": [
+          "notifications",
+          "pending"
+        ],
+        "properties": {
+          "notifications": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Notification"
+            },
+            "description": "Newest first."
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "NotificationMute": {
+        "type": "object",
+        "description": "A rule that mutes or snoozes the notifications it matches.",
+        "required": [
+          "id",
+          "matcher",
+          "scope",
+          "origin",
+          "created_ms"
+        ],
+        "properties": {
+          "created_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string"
+          },
+          "matcher": {
+            "$ref": "#/components/schemas/MuteMatch"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin": {
+            "$ref": "#/components/schemas/MuteOrigin"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/MuteScope"
+          },
+          "until_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the snooze ends. `None` mutes forever.",
+            "minimum": 0
+          }
+        }
+      },
+      "NotificationSeverity": {
+        "type": "string",
+        "description": "How urgent a notification is. The order runs from `Info` up to `Critical`.",
+        "enum": [
+          "info",
+          "warning",
+          "critical"
+        ]
+      },
+      "NotificationStatus": {
+        "type": "string",
+        "description": "Where a notification stands. Notifications without an approve action use only `pending` and `dismissed`.",
+        "enum": [
+          "pending",
+          "approved",
+          "dismissed",
+          "applied",
+          "failed"
+        ]
       },
       "OutcomeBody": {
         "type": "object",
@@ -3391,6 +4744,42 @@
             "description": "`true` marks the errors solved, `false` reopens them."
           }
         }
+      },
+      "RuleStatus": {
+        "type": "object",
+        "description": "One rule of the rules file.",
+        "required": [
+          "name",
+          "phase",
+          "mode",
+          "enabled"
+        ],
+        "properties": {
+          "disabled_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DisabledBy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "mode": {
+            "type": "string",
+            "description": "`enforce` or `shadow`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "phase": {
+            "type": "string",
+            "description": "`http_request`, `request`, `attempt`, `response` or `http_response`."
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -3451,6 +4840,14 @@
     {
       "name": "copilot",
       "description": "GitHub Copilot quota, prices and Auto decisions."
+    },
+    {
+      "name": "notifications",
+      "description": "Notifications inbox, tuner approvals, mute rules and desktop popup setup."
+    },
+    {
+      "name": "extensions",
+      "description": "Turn built-in, library and rule extensions on and off."
     },
     {
       "name": "system",

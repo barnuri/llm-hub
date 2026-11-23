@@ -117,10 +117,14 @@ mod tests {
                 copilot: None,
                 keep_warm: true,
                 first_byte_timeout_ms: None,
+                tuner: crate::configs::LocalTunerConfig::default(),
+                local: None,
+                budget_monthly_usd: None,
             }],
             master_key: None,
             smart_auto_presets: std::collections::BTreeMap::new(),
             smart_auto_rules_env: None,
+            extensions_disabled: vec![],
             default_fallbacks: vec![],
             max_replay_bytes: 1,
             max_request_body_bytes: crate::consts::DEFAULT_MAX_REQUEST_BODY_BYTES,
@@ -140,6 +144,9 @@ mod tests {
             keep_warm: KeepWarmConfig::default(),
             media_fallback: crate::configs::MediaFallbackConfig::default(),
             pricing: TokenRates::default(),
+            local_tuner_enabled: false,
+            notify: crate::configs::NotifyConfig::default(),
+            budget_monthly_usd: None,
         }
     }
 

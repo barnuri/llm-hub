@@ -29,7 +29,7 @@ port, spawn_log = int(sys.argv[1]), sys.argv[2]
 with open(spawn_log, "a") as f:
     f.write("spawn\n")
 threading.Timer(60, lambda: os._exit(0)).start()
-time.sleep(0.5)
+time.sleep(0.05)
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.rfile.read(int(self.headers.get("content-length", 0)))
@@ -80,21 +80,33 @@ async fn start_hub(dir: &Path, vars: HashMap<String, String>) -> (HubProcess, St
     let port = free_port();
     let mut command = Command::new(env!("CARGO_BIN_EXE_llm-hub"));
     command
+        .arg("serve")
         .current_dir(dir)
         .env("LLM_HUB_PORT", port.to_string())
-        .env("LLM_HUB_AUTO_UPDATE", "0");
+        .env("LLM_HUB_AUTO_UPDATE", "0")
+        .env("LLM_HUB_NOTIFY_DESKTOP", "false");
     for (key, value) in vars {
         command.env(key, value);
     }
-    let child = command.spawn().expect("hub starts");
+    let mut child = command.spawn().expect("hub starts");
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    for _ in 0..50 {
-        if client.get(format!("{base}/healthz")).send().await.is_ok() {
+    let mut ready = false;
+    for _ in 0..3000 {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "hub exited before it became ready"
+        );
+        if let Ok(response) = client.get(format!("{base}/healthz")).send().await
+            && response.status().is_success()
+            && response.text().await.is_ok_and(|body| body == "ok")
+        {
+            ready = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(ready, "hub did not become ready");
     (HubProcess(child), base)
 }
 
@@ -245,8 +257,17 @@ async fn never_idle_process_is_started_at_boot() {
     let vars = managed_profile(server_port, &command, &[("IDLE_SECS", "0")]);
     let (_hub, base) = start_hub(dir.path(), vars).await;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !is_listening(server_port) && Instant::now() < deadline {
+    reqwest::get(format!("{base}/v1/models"))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if is_listening(server_port) && profile_status(&base).await["running"] == true {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -254,6 +275,7 @@ async fn never_idle_process_is_started_at_boot() {
         is_listening(server_port),
         "resident process not started at boot"
     );
+    assert_eq!(profile_status(&base).await["running"], true);
     assert_eq!(spawn_count(&spawn_log), 1);
     // The start holds its lock until its next readiness poll, so wait for it.
     let deadline = Instant::now() + Duration::from_secs(5);

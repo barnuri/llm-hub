@@ -32,9 +32,11 @@ async fn start_copilot_hub(dir: &Path) -> (HubProcess, String) {
     let port = free_port();
     let unreachable_api = format!("http://127.0.0.1:{}", free_port());
     let child = Command::new(env!("CARGO_BIN_EXE_llm-hub"))
+        .arg("serve")
         .current_dir(dir)
         .env("LLM_HUB_PORT", port.to_string())
         .env("LLM_HUB_AUTO_UPDATE", "0")
+        .env("LLM_HUB_NOTIFY_DESKTOP", "false")
         .env("LLM_HUB_PROFILES", "copilot")
         .env("LLM_HUB_COPILOT_BASE_URL", "https://api.githubcopilot.com")
         .env("LLM_HUB_COPILOT_AUTH", "github-copilot")

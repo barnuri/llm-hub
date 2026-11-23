@@ -118,7 +118,11 @@ impl LaunchSpec {
     #[cfg(unix)]
     fn replace_process(command: &mut Command) -> std::io::Result<()> {
         use std::os::unix::process::CommandExt;
-        Err(command.exec())
+        let err = command.exec();
+        // std resets SIGPIPE to SIG_DFL before execvp and keeps it after a failed exec.
+        // SAFETY: setting a disposition to SIG_IGN installs no handler code.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        Err(err)
     }
 
     #[cfg(not(unix))]
@@ -198,6 +202,19 @@ mod tests {
             .unwrap_err();
 
         assert!(error.starts_with(&format!("cannot start {program}: ")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_exec_leaves_sigpipe_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("absent").to_string_lossy().into_owned();
+
+        LaunchSpec::new(&program).exec().unwrap_err();
+
+        // SAFETY: the call reads the disposition and puts the same one back.
+        let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        assert_eq!(previous, libc::SIG_IGN);
     }
 
     #[cfg(windows)]

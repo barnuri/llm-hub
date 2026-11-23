@@ -1,22 +1,52 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::configs::{ProfileConfig, env_name};
+use crate::utils::atomic_write::write_atomically;
 
 const PREFIX: &str = "LLM_HUB_";
 /// Profile keys only an operator may set (they run a program or pick the
 /// upstream credential); upsert keeps them as written and never writes them itself.
-const OPERATOR_ONLY_KEYS: [&str; 10] = [
+const OPERATOR_ONLY_KEYS: [&str; 25] = [
     "COMMAND",
+    "KIND",
+    "REGISTRY",
+    "MEMORY_GB",
+    "MODEL_TTL_SECS",
+    "LLAMA_BIN",
+    "MODELS_DIR",
+    "HF_CACHE",
+    "ALLOW_UNGATED",
     "FIRST_BYTE_TIMEOUT_MS",
     "IDLE_SECS",
+    "IDLE_MS",
     "START_TIMEOUT_SECS",
+    "START_TIMEOUT_MS",
     "AUTH",
     "GITHUB_TOKEN_SOURCE",
     "GH_PATH",
     "GH_USER",
     "GITHUB_DOMAIN",
     "GITHUB_API_URL",
+    "PREFILL_GUARD",
+    "TUNER_REGISTRY",
+    "TUNER_APPLY_COMMAND",
+    "TUNER_APPLY_TIMEOUT_MS",
+    "BUDGET_MONTHLY_USD",
+];
+/// Global keys a profile named `extensions`, `local`, `notify` or `budget` would otherwise claim as its own lines.
+const GLOBAL_KEYS: [&str; 12] = [
+    "EXTENSIONS_DISABLED",
+    "EXTENSIONS_FILE",
+    "LOCAL_TUNER",
+    "NOTIFICATIONS",
+    "NOTIFY_DESKTOP",
+    "NOTIFY_WEBHOOK_URL",
+    "NOTIFY_COMMAND",
+    "NOTIFY_MIN_SEVERITY",
+    "NOTIFY_TIMEOUT_MS",
+    "NOTIFY_MUTE",
+    "NOTIFY_BUDGET_STEPS",
+    "BUDGET_MONTHLY_USD",
 ];
 
 /// Rewrites the env file with a profile added/updated. Unrelated lines,
@@ -148,7 +178,11 @@ fn read_lines(path: &Path) -> Result<Vec<String>, String> {
 fn remove_profile_lines(lines: &mut Vec<String>, upper: &str, keep_keys: &[&str]) {
     let var_prefix = format!("{PREFIX}{upper}_");
     lines.retain(|line| {
-        let Some(rest) = line.trim_start().strip_prefix(&var_prefix) else {
+        let trimmed = line.trim_start();
+        if is_global_key(trimmed) {
+            return true;
+        }
+        let Some(rest) = trimmed.strip_prefix(&var_prefix) else {
             return true;
         };
         keep_keys.iter().any(|key| {
@@ -156,6 +190,15 @@ fn remove_profile_lines(lines: &mut Vec<String>, upper: &str, keep_keys: &[&str]
                 .is_some_and(|tail| tail.starts_with('='))
         })
     });
+}
+
+fn is_global_key(line: &str) -> bool {
+    line.strip_prefix(PREFIX).is_some_and(|rest| {
+        GLOBAL_KEYS.iter().any(|key| {
+            rest.strip_prefix(key)
+                .is_some_and(|tail| tail.starts_with('='))
+        })
+    })
 }
 
 /// Replaces `LLM_HUB_<key>=` in place if present, appends otherwise.
@@ -172,20 +215,8 @@ fn set_var(lines: &mut Vec<String>, key: &str, value: &str) {
 }
 
 fn write_atomic(path: &Path, lines: &[String]) -> Result<(), String> {
-    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    // pid + per-process counter so concurrent writers never share a temp file.
-    let tmp = dir.join(format!(
-        ".env.tmp-{}-{}",
-        std::process::id(),
-        WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
     let content = lines.join("\n") + "\n";
-    std::fs::write(&tmp, content).map_err(|e| format!("write temp env failed: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("atomic rename failed: {e}"))
+    write_atomically(path, content.as_bytes()).map_err(|e| format!("atomic env write failed: {e}"))
 }
 
 #[cfg(test)]
@@ -211,6 +242,9 @@ mod tests {
             copilot: None,
             keep_warm: true,
             first_byte_timeout_ms: None,
+            tuner: crate::configs::LocalTunerConfig::default(),
+            local: None,
+            budget_monthly_usd: None,
         }
     }
 
@@ -354,6 +388,30 @@ mod tests {
     }
 
     #[test]
+    fn upsert_keeps_local_tuner_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let tuner_lines = "LLM_HUB_GROQ_PREFILL_GUARD=on\nLLM_HUB_GROQ_TUNER_REGISTRY=~/registry.txt\nLLM_HUB_GROQ_TUNER_APPLY_COMMAND=sync --restart\nLLM_HUB_GROQ_TUNER_APPLY_TIMEOUT_MS=5000\n";
+        std::fs::write(
+            &path,
+            format!("LLM_HUB_GROQ_BASE_URL=https://old\n{tuner_lines}"),
+        )
+        .unwrap();
+
+        upsert_profile(&path, &sample_profile(), &["groq".to_string()]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        for line in tuner_lines.lines() {
+            assert_eq!(
+                content.matches(&format!("{line}\n")).count(),
+                1,
+                "{content}"
+            );
+        }
+        assert!(!content.contains("https://old"));
+    }
+
+    #[test]
     fn upsert_writes_keep_warm_only_when_it_is_off() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".env");
@@ -368,6 +426,25 @@ mod tests {
         upsert_profile(&path, &profile, &["groq".to_string()]).unwrap();
         let on = std::fs::read_to_string(&path).unwrap();
         assert!(!on.contains("KEEP_WARM"), "{on}");
+    }
+
+    #[test]
+    fn upsert_keeps_local_serving_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let local_lines = "LLM_HUB_GROQ_KIND=local\nLLM_HUB_GROQ_REGISTRY=~/registry.txt\nLLM_HUB_GROQ_MEMORY_GB=96\nLLM_HUB_GROQ_IDLE_SECS=60\nLLM_HUB_GROQ_MODEL_TTL_SECS=a=0\nLLM_HUB_GROQ_START_TIMEOUT_SECS=30\nLLM_HUB_GROQ_LLAMA_BIN=~/bin/llama\nLLM_HUB_GROQ_MODELS_DIR=~/gguf\nLLM_HUB_GROQ_HF_CACHE=/data/hf\nLLM_HUB_GROQ_ALLOW_UNGATED=true\n";
+        std::fs::write(&path, local_lines).unwrap();
+
+        upsert_profile(&path, &sample_profile(), &["groq".to_string()]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        for line in local_lines.lines() {
+            assert_eq!(
+                content.matches(&format!("{line}\n")).count(),
+                1,
+                "{content}"
+            );
+        }
     }
 
     #[test]
@@ -390,6 +467,51 @@ mod tests {
     }
 
     #[test]
+    fn upsert_keeps_the_operator_budget_and_never_writes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, "LLM_HUB_GROQ_BUDGET_MONTHLY_USD=50\n").unwrap();
+        let mut profile = sample_profile();
+        profile.budget_monthly_usd = Some(75.0);
+
+        upsert_profile(&path, &profile, &["groq".to_string()]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content.matches("BUDGET_MONTHLY_USD").count(),
+            1,
+            "{content}"
+        );
+        assert!(content.contains("LLM_HUB_GROQ_BUDGET_MONTHLY_USD=50\n"));
+    }
+
+    #[test]
+    fn remove_profile_named_budget_keeps_the_global_budget_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(
+            &path,
+            "LLM_HUB_BUDGET_BASE_URL=http://127.0.0.1:1\nLLM_HUB_BUDGET_MONTHLY_USD=200\n\
+             LLM_HUB_NOTIFY_BUDGET_STEPS=50,100\n",
+        )
+        .unwrap();
+
+        remove_profile(&path, "budget", &[]).unwrap();
+        remove_profile(&path, "notify", &[]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("LLM_HUB_BUDGET_MONTHLY_USD=200\n"),
+            "{content}"
+        );
+        assert!(
+            content.contains("LLM_HUB_NOTIFY_BUDGET_STEPS=50,100\n"),
+            "{content}"
+        );
+        assert!(!content.contains("BASE_URL"), "{content}");
+    }
+
+    #[test]
     fn remove_profile_with_command_drops_operator_keys_too() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".env");
@@ -403,6 +525,40 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(!content.contains("LLM_HUB_GROQ_"), "{content}");
+    }
+
+    #[test]
+    fn remove_profile_named_like_a_global_prefix_keeps_global_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(
+            &path,
+            "LLM_HUB_LOCAL_BASE_URL=http://127.0.0.1:1\nLLM_HUB_LOCAL_TUNER=true\n\
+             LLM_HUB_NOTIFY_BASE_URL=http://127.0.0.1:2\nLLM_HUB_NOTIFY_MUTE=source=errors\n\
+             LLM_HUB_EXTENSIONS_BASE_URL=http://127.0.0.1:3\nLLM_HUB_EXTENSIONS_DISABLED=rules:*\n\
+             LLM_HUB_EXTENSIONS_FILE=/etc/hub/rules.yaml\n",
+        )
+        .unwrap();
+
+        remove_profile(&path, "local", &[]).unwrap();
+        remove_profile(&path, "notify", &[]).unwrap();
+        remove_profile(&path, "extensions", &[]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("LLM_HUB_LOCAL_TUNER=true\n"), "{content}");
+        assert!(
+            content.contains("LLM_HUB_NOTIFY_MUTE=source=errors\n"),
+            "{content}"
+        );
+        assert!(
+            content.contains("LLM_HUB_EXTENSIONS_DISABLED=rules:*\n"),
+            "{content}"
+        );
+        assert!(
+            content.contains("LLM_HUB_EXTENSIONS_FILE=/etc/hub/rules.yaml\n"),
+            "{content}"
+        );
+        assert!(!content.contains("BASE_URL"), "{content}");
     }
 
     #[test]

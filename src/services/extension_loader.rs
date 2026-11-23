@@ -53,15 +53,11 @@ impl ExtensionSources {
     }
 
     /// Built-ins first, then library extensions in registration order, then the rules.
-    pub(crate) fn compose(&self, rules: Option<RulesExtension>) -> ExtensionSet {
+    pub(crate) fn compose(&self, mut rules: Option<RulesExtension>) -> ExtensionSet {
         let mut all = builtins();
         all.extend(self.library.iter().cloned());
-        let mut hooks = None;
-        if let Some(mut rules) = rules {
-            hooks = rules.take_hooks();
-            all.push(Arc::new(rules));
-        }
-        ExtensionSet::new(all).with_hooks(hooks)
+        let hooks = rules.as_mut().and_then(RulesExtension::take_hooks);
+        ExtensionSet::new(all).with_rules(rules).with_hooks(hooks)
     }
 
     /// A hash of the rules file path, its bytes, and the value of each `${NAME}` it names.

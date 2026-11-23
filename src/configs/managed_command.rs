@@ -36,18 +36,18 @@ impl ManagedCommand {
             Self::parse_argv(&raw, home).map_err(|e| format!("LLM_HUB_{upper}_COMMAND {e}"))?;
         let address = Self::address_from_base_url(base_url)
             .map_err(|e| format!("LLM_HUB_{upper}_BASE_URL {e}"))?;
-        let idle_secs = Self::parse_secs(upper, "IDLE_SECS", get, DEFAULT_MANAGED_IDLE_SECS)?;
-        let start_secs = Self::parse_secs(
+        let idle = Self::parse_duration(upper, "IDLE", get, DEFAULT_MANAGED_IDLE_SECS)?;
+        let start = Self::parse_duration(
             upper,
-            "START_TIMEOUT_SECS",
+            "START_TIMEOUT",
             get,
             DEFAULT_MANAGED_START_TIMEOUT_SECS,
         )?;
         Ok(Some(ManagedCommand {
             argv,
             address,
-            idle_timeout: (idle_secs > 0).then(|| Duration::from_secs(idle_secs)),
-            start_timeout: Duration::from_secs(start_secs),
+            idle_timeout: (!idle.is_zero()).then_some(idle),
+            start_timeout: start,
         }))
     }
 
@@ -126,7 +126,8 @@ impl ManagedCommand {
         Some(words)
     }
 
-    fn expand_home(word: String, home: Option<&str>) -> String {
+    /// Replaces a leading `~/` in `word` with `home`. Other words come back unchanged.
+    pub(crate) fn expand_home(word: String, home: Option<&str>) -> String {
         match (word.strip_prefix("~/"), home) {
             (Some(rest), Some(home)) => {
                 format!("{}/{rest}", home.trim_end_matches(['/', '\\']))
@@ -142,7 +143,32 @@ impl ManagedCommand {
         Ok(format!("{host}:{port}"))
     }
 
-    fn parse_secs(
+    /// `<KEY>_MS` wins over `<KEY>_SECS` when both are set. `default_secs` applies when neither is.
+    fn parse_duration(
+        upper: &str,
+        key: &str,
+        get: &dyn Fn(&str) -> Option<String>,
+        default_secs: u64,
+    ) -> Result<Duration, String> {
+        let ms_key = format!("{key}_MS");
+        if let Some(raw) = get(&ms_key).filter(|v| !v.is_empty()) {
+            let ms: u64 = raw.parse().map_err(|_| {
+                format!("LLM_HUB_{upper}_{ms_key} is not a number of milliseconds: {raw}")
+            })?;
+            return Ok(Duration::from_millis(ms));
+        }
+        let secs_key = format!("{key}_SECS");
+        let secs = match get(&secs_key).filter(|v| !v.is_empty()) {
+            None => default_secs,
+            Some(raw) => raw.parse().map_err(|_| {
+                format!("LLM_HUB_{upper}_{secs_key} is not a number of seconds: {raw}")
+            })?,
+        };
+        Ok(Duration::from_secs(secs))
+    }
+
+    /// Reads `key` as whole seconds through `get`, or `default` when it is unset or empty.
+    pub(crate) fn parse_secs(
         upper: &str,
         key: &str,
         get: &dyn Fn(&str) -> Option<String>,
@@ -307,6 +333,35 @@ mod tests {
     fn from_env_without_command_none() {
         assert_eq!(from_vars(&[("IDLE_SECS", "5")]).unwrap(), None);
         assert_eq!(from_vars(&[("COMMAND", "")]).unwrap(), None);
+    }
+
+    #[test]
+    fn idle_and_start_in_milliseconds_win_over_seconds() {
+        let command = from_vars(&[
+            ("COMMAND", "srv --port 11440"),
+            ("IDLE_SECS", "900"),
+            ("IDLE_MS", "250"),
+            ("START_TIMEOUT_SECS", "120"),
+            ("START_TIMEOUT_MS", "300"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(command.idle_timeout, Some(Duration::from_millis(250)));
+        assert_eq!(command.start_timeout, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn idle_ms_zero_disables_the_idle_stop() {
+        let command = from_vars(&[("COMMAND", "srv --port 11440"), ("IDLE_MS", "0")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.idle_timeout, None);
+    }
+
+    #[test]
+    fn a_non_numeric_millisecond_value_names_the_variable() {
+        let err = from_vars(&[("COMMAND", "srv --port 11440"), ("IDLE_MS", "soon")]).unwrap_err();
+        assert!(err.contains("LLM_HUB_WHISPER_IDLE_MS"), "{err}");
     }
 
     #[test]

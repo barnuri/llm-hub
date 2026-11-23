@@ -1,17 +1,26 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
+use crate::ext::builtin::builtin_phases;
 use crate::ext::hooks::HookSet;
+use crate::ext::rules::RulesExtension;
 use crate::ext::{
     AttemptCtx, CompleteCtx, ConfigChangeCtx, Extension, Flow, HttpRequestCtx, HttpResponseCtx,
-    RequestCtx, ResponseCtx, ResponseFlow,
+    Outbox, RequestCtx, ResponseCtx, ResponseFlow, deliver,
 };
+use crate::schemas::extension_status::ExtensionKind;
+use crate::services::extension_toggles::{ExtensionToggles, HOOKS_NAME};
+use crate::services::notifications::dispatch::Notifier;
 
 /// The extensions of a running hub, in the order request phases run them.
 #[derive(Clone, Default)]
 pub(crate) struct ExtensionSet {
     extensions: Vec<Arc<dyn Extension>>,
     hooks: Option<Arc<HookSet>>,
+    /// Receives what extensions send with `ctx.notify(..)`. Without it those notifications drop.
+    notifier: Option<Arc<Notifier>>,
+    /// The rules file's extension, also last in `extensions`. `None` in a filtered set.
+    rules: Option<Arc<RulesExtension>>,
 }
 
 impl ExtensionSet {
@@ -19,7 +28,20 @@ impl ExtensionSet {
         ExtensionSet {
             extensions,
             hooks: None,
+            notifier: None,
+            rules: None,
         }
+    }
+
+    /// The set with the rules file's extension added last.
+    pub(crate) fn with_rules(mut self, rules: Option<RulesExtension>) -> ExtensionSet {
+        if let Some(rules) = rules {
+            let rules = Arc::new(rules);
+            self.extensions
+                .push(Arc::clone(&rules) as Arc<dyn Extension>);
+            self.rules = Some(rules);
+        }
+        self
     }
 
     /// The set with HTTP hooks that run after the extensions in the `request` and `attempt`
@@ -29,13 +51,80 @@ impl ExtensionSet {
         self
     }
 
+    /// The set with the notifier that stores what extensions send with `ctx.notify(..)`.
+    pub(crate) fn with_notifier(mut self, notifier: Arc<Notifier>) -> ExtensionSet {
+        self.notifier = Some(notifier);
+        self
+    }
+
     pub(crate) fn hooks(&self) -> Option<&Arc<HookSet>> {
         self.hooks.as_ref()
     }
 
-    #[cfg(test)]
+    /// The rules file's extension, with every rule. `None` without a rules file and in a filtered set.
+    pub(crate) fn rules(&self) -> Option<&RulesExtension> {
+        self.rules.as_deref()
+    }
+
     pub(crate) fn names(&self) -> Vec<&str> {
         self.extensions.iter().map(|ext| ext.name()).collect()
+    }
+
+    /// The name and kind of every extension, in run order. The hooks are not in it.
+    pub(crate) fn kinds(&self) -> Vec<(&str, ExtensionKind)> {
+        self.extensions
+            .iter()
+            .map(|ext| {
+                let kind = if self.is_rules(ext) {
+                    ExtensionKind::Rules
+                } else if builtin_phases(ext.name()).is_some() {
+                    ExtensionKind::Builtin
+                } else {
+                    ExtensionKind::Library
+                };
+                (ext.name(), kind)
+            })
+            .collect()
+    }
+
+    /// The set without what `toggles` turns off. Rules turned off leave the rules extension, and
+    /// a set with nothing off keeps every extension as it is.
+    pub(crate) fn filtered(&self, toggles: &ExtensionToggles) -> ExtensionSet {
+        if toggles.is_empty() {
+            return self.clone();
+        }
+        let mut extensions = Vec::with_capacity(self.extensions.len());
+        for ext in &self.extensions {
+            if toggles.extension(ext.name()).is_some() {
+                continue;
+            }
+            let reduced = self
+                .rules
+                .as_ref()
+                .filter(|_| self.is_rules(ext))
+                .and_then(|rules| rules.without(|rule| toggles.rule(rule).is_some()));
+            match reduced {
+                Some(reduced) => extensions.push(Arc::new(reduced) as Arc<dyn Extension>),
+                None => extensions.push(Arc::clone(ext)),
+            }
+        }
+        ExtensionSet {
+            extensions,
+            hooks: self
+                .hooks
+                .as_ref()
+                .filter(|_| toggles.extension(HOOKS_NAME).is_none())
+                .map(Arc::clone),
+            notifier: self.notifier.as_ref().map(Arc::clone),
+            rules: None,
+        }
+    }
+
+    /// True when `ext` is the rules file's extension.
+    fn is_rules(&self, ext: &Arc<dyn Extension>) -> bool {
+        self.rules
+            .as_ref()
+            .is_some_and(|rules| std::ptr::addr_eq(Arc::as_ptr(ext), Arc::as_ptr(rules)))
     }
 
     /// Runs `on_http_request` in order. The first rejection stops the phase.
@@ -44,6 +133,7 @@ impl ExtensionSet {
             let flow = guarded(ext.as_ref(), "http_request", Flow::Continue, || {
                 ext.on_http_request(ctx)
             });
+            self.flush(ext.as_ref(), ctx.outbox());
             if flow != Flow::Continue {
                 return flow;
             }
@@ -57,6 +147,7 @@ impl ExtensionSet {
             guarded(ext.as_ref(), "http_response", (), || {
                 ext.on_http_response(ctx);
             });
+            self.flush(ext.as_ref(), ctx.outbox());
         }
     }
 
@@ -66,6 +157,7 @@ impl ExtensionSet {
             let flow = guarded(ext.as_ref(), "request", Flow::Continue, || {
                 ext.on_request(ctx)
             });
+            self.flush(ext.as_ref(), ctx.outbox());
             if flow != Flow::Continue {
                 return flow;
             }
@@ -79,6 +171,7 @@ impl ExtensionSet {
             let flow = guarded(ext.as_ref(), "attempt", Flow::Continue, || {
                 ext.on_attempt(ctx)
             });
+            self.flush(ext.as_ref(), ctx.outbox());
             if flow != Flow::Continue {
                 return flow;
             }
@@ -89,9 +182,11 @@ impl ExtensionSet {
     /// True when any extension wants the error body of this reply.
     pub(crate) fn wants_error_body(&self, ctx: &ResponseCtx<'_>) -> bool {
         self.extensions.iter().any(|ext| {
-            guarded(ext.as_ref(), "wants_error_body", false, || {
+            let wants = guarded(ext.as_ref(), "wants_error_body", false, || {
                 ext.wants_error_body(ctx)
-            })
+            });
+            self.flush(ext.as_ref(), ctx.outbox());
+            wants
         })
     }
 
@@ -102,6 +197,7 @@ impl ExtensionSet {
             let flow = guarded(ext.as_ref(), "response", ResponseFlow::Continue, || {
                 ext.on_response(ctx)
             });
+            self.flush(ext.as_ref(), ctx.outbox());
             if flow == ResponseFlow::RetryNext {
                 decided = ResponseFlow::RetryNext;
             }
@@ -115,6 +211,7 @@ impl ExtensionSet {
             let flow = guarded(ext.as_ref(), "config_change", Flow::Continue, || {
                 ext.on_config_change(ctx)
             });
+            self.flush(ext.as_ref(), ctx.outbox());
             if flow != Flow::Continue {
                 return flow;
             }
@@ -128,6 +225,7 @@ impl ExtensionSet {
             guarded(ext.as_ref(), "config_changed", (), || {
                 ext.on_config_changed(ctx);
             });
+            self.flush(ext.as_ref(), ctx.outbox());
         }
     }
 
@@ -135,10 +233,16 @@ impl ExtensionSet {
     pub(crate) fn complete(&self, ctx: &CompleteCtx<'_>) {
         for ext in &self.extensions {
             guarded(ext.as_ref(), "complete", (), || ext.on_complete(ctx));
+            self.flush(ext.as_ref(), ctx.outbox());
         }
         if let Some(hooks) = &self.hooks {
             hooks.complete(ctx);
         }
+    }
+
+    /// Hands what `ext` sent with `ctx.notify(..)` in its last call to the notifier.
+    fn flush(&self, ext: &dyn Extension, outbox: &Outbox) {
+        deliver(self.notifier.as_deref(), ext.name(), outbox);
     }
 }
 
@@ -158,9 +262,14 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
+    use crate::configs::NotifyConfig;
     use crate::ext::attempt_ctx::AttemptTarget;
     use crate::ext::response_ctx::ResponseTarget;
-    use crate::ext::{Api, ConfigKind};
+    use crate::ext::{Api, ConfigKind, ExtNotification, ExtSeverity};
+    use crate::schemas::notification::{
+        NotificationKind, NotificationSeverity, NotificationStatus,
+    };
+    use crate::services::extension_toggles::sample_set;
     use crate::services::stats::RequestOutcome;
 
     /// Records every call into a shared log, and answers with fixed flows.
@@ -453,5 +562,232 @@ mod tests {
         assert_eq!(run_response(&set), (false, ResponseFlow::Continue));
         set.complete(&CompleteCtx::new(&RequestOutcome::default(), None));
         assert!(ExtensionSet::default().names().is_empty());
+    }
+
+    /// Sends one notification titled after the phase from every phase method.
+    struct Notifying;
+
+    impl Extension for Notifying {
+        fn name(&self) -> &'static str {
+            "notifying"
+        }
+
+        fn on_http_request(&self, ctx: &mut HttpRequestCtx<'_>) -> Flow {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "http_request", ""));
+            Flow::Continue
+        }
+
+        fn on_http_response(&self, ctx: &mut HttpResponseCtx<'_>) {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "http_response", ""));
+        }
+
+        fn on_request(&self, ctx: &mut RequestCtx<'_>) -> Flow {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "request", ""));
+            Flow::Continue
+        }
+
+        fn on_attempt(&self, ctx: &mut AttemptCtx<'_>) -> Flow {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "attempt", ""));
+            Flow::Continue
+        }
+
+        fn wants_error_body(&self, ctx: &ResponseCtx<'_>) -> bool {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "wants", ""));
+            false
+        }
+
+        fn on_response(&self, ctx: &mut ResponseCtx<'_>) -> ResponseFlow {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "response", ""));
+            ResponseFlow::Continue
+        }
+
+        fn on_config_change(&self, ctx: &ConfigChangeCtx<'_>) -> Flow {
+            ctx.notify(ExtNotification::new(ExtSeverity::Info, "config_change", ""));
+            Flow::Continue
+        }
+
+        fn on_config_changed(&self, ctx: &ConfigChangeCtx<'_>) {
+            ctx.notify(ExtNotification::new(
+                ExtSeverity::Info,
+                "config_changed",
+                "",
+            ));
+        }
+
+        fn on_complete(&self, ctx: &CompleteCtx<'_>) {
+            ctx.notify(
+                ExtNotification::new(ExtSeverity::Critical, "complete", "body")
+                    .with_model("p/m")
+                    .with_profile("p"),
+            );
+        }
+    }
+
+    fn run_every_phase(set: &ExtensionSet) {
+        run_http(set);
+        run_request(set);
+        run_attempt(set);
+        run_response(set);
+        let ctx = ConfigChangeCtx::new(ConfigKind::KeepWarm, None);
+        set.config_change(&ctx);
+        set.config_changed(&ctx);
+        set.complete(&CompleteCtx::new(&RequestOutcome::default(), None));
+    }
+
+    fn notifier(enabled: bool) -> Arc<Notifier> {
+        let config = NotifyConfig {
+            enabled,
+            ..NotifyConfig::default()
+        };
+        Notifier::new(&config, None)
+    }
+
+    #[test]
+    fn a_notify_call_in_any_phase_lands_in_the_inbox_from_the_extension() {
+        let notifier = notifier(true);
+        let set = ExtensionSet::new(vec![Arc::new(Notifying)]).with_notifier(Arc::clone(&notifier));
+
+        run_every_phase(&set);
+
+        let listed = notifier.list();
+        let mut titles: Vec<&str> = listed.iter().map(|n| n.title.as_str()).collect();
+        titles.sort_unstable();
+        assert_eq!(
+            titles,
+            [
+                "attempt",
+                "complete",
+                "config_change",
+                "config_changed",
+                "http_request",
+                "http_response",
+                "request",
+                "response",
+                "wants"
+            ]
+        );
+        assert!(listed.iter().all(|n| n.source == "ext:notifying"
+            && n.kind == NotificationKind::Custom
+            && n.status == NotificationStatus::Pending));
+        let complete = listed.iter().find(|n| n.title == "complete").unwrap();
+        assert_eq!(complete.severity, NotificationSeverity::Critical);
+        assert_eq!(complete.body, "body");
+        assert_eq!(complete.model.as_deref(), Some("p/m"));
+        assert_eq!(complete.profile.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn disabled_notifications_store_nothing() {
+        let notifier = notifier(false);
+        let set = ExtensionSet::new(vec![Arc::new(Notifying)]).with_notifier(Arc::clone(&notifier));
+
+        run_every_phase(&set);
+
+        assert!(notifier.list().is_empty());
+    }
+
+    #[test]
+    fn without_a_notifier_notify_calls_are_dropped() {
+        let set = ExtensionSet::new(vec![Arc::new(Notifying)]);
+
+        run_every_phase(&set);
+
+        assert!(set.notifier.is_none());
+    }
+
+    fn toggles(env: &[&str]) -> ExtensionToggles {
+        let env: Vec<String> = env.iter().map(|entry| (*entry).to_owned()).collect();
+        ExtensionToggles::load(&env, None)
+    }
+
+    #[test]
+    fn nothing_off_keeps_every_extension_and_the_hooks_as_they_are() {
+        let full = sample_set();
+
+        let running = full.filtered(&toggles(&[]));
+
+        assert_eq!(running.extensions.len(), full.extensions.len());
+        assert!(
+            running
+                .extensions
+                .iter()
+                .zip(&full.extensions)
+                .all(|(kept, original)| Arc::ptr_eq(kept, original))
+        );
+        assert!(Arc::ptr_eq(running.hooks().unwrap(), full.hooks().unwrap()));
+        assert_eq!(running.rules().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_filter_removes_builtins_rules_and_hooks_and_keeps_the_full_set() {
+        let full = sample_set().with_notifier(notifier(true));
+
+        let running = full.filtered(&toggles(&["upstream-limits", "hooks", "rules:tag"]));
+
+        assert_eq!(
+            running.names(),
+            [
+                "copilot-context-code",
+                "payload-too-large",
+                "local-not-ready",
+                "team-gate",
+                "rules"
+            ]
+        );
+        assert!(running.hooks().is_none());
+        assert!(running.notifier.is_some());
+        assert!(running.rules().is_none());
+        let headers = HeaderMap::new();
+        let mut state = Extensions::new();
+        let target = AttemptTarget {
+            profile: "p",
+            model: "p/m",
+            api: Api::Chat,
+            client_path: "/v1/chat/completions",
+            upstream_path: "/chat/completions",
+        };
+        let mut ctx = AttemptCtx::new(target, &headers, Bytes::new(), &mut state);
+        running.attempt(&mut ctx);
+        assert!(ctx.into_parts().0.is_none(), "the rule `tag` is off");
+
+        let restored = full.filtered(&toggles(&[]));
+        assert_eq!(restored.names().len(), 6);
+        assert_eq!(restored.rules().unwrap().len(), 2);
+        assert!(restored.hooks().is_some());
+    }
+
+    #[test]
+    fn turning_the_rules_off_removes_the_rules_extension() {
+        let running = sample_set().filtered(&toggles(&["rules", "team-*"]));
+
+        assert_eq!(running.names().len(), 4);
+        assert!(running.hooks().is_some());
+    }
+
+    #[test]
+    fn a_rule_filter_that_names_no_rule_keeps_the_rules_extension() {
+        let full = sample_set();
+
+        let running = full.filtered(&toggles(&["rules:nope"]));
+
+        assert!(Arc::ptr_eq(
+            running.extensions.last().unwrap(),
+            full.extensions.last().unwrap()
+        ));
+    }
+
+    #[test]
+    fn kinds_name_builtins_the_rules_and_library_extensions() {
+        let set = sample_set();
+        let kinds = set.kinds();
+
+        assert_eq!(kinds[0], ("copilot-context-code", ExtensionKind::Builtin));
+        assert_eq!(kinds[4], ("team-gate", ExtensionKind::Library));
+        assert_eq!(kinds[5], ("rules", ExtensionKind::Rules));
+        assert_eq!(
+            ExtensionSet::new(vec![Arc::new(Silent)]).kinds(),
+            [("silent", ExtensionKind::Library)]
+        );
+        assert!(ExtensionSet::default().with_rules(None).rules().is_none());
     }
 }

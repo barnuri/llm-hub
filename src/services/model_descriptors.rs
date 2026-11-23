@@ -211,6 +211,9 @@ mod tests {
             copilot,
             keep_warm: true,
             first_byte_timeout_ms: None,
+            tuner: crate::configs::LocalTunerConfig::default(),
+            local: None,
+            budget_monthly_usd: None,
         }
     }
 

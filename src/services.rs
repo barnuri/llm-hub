@@ -21,6 +21,7 @@ pub mod error_signature;
 pub mod extension_http;
 pub mod extension_loader;
 pub mod extension_phases;
+pub mod extension_toggles;
 #[cfg(test)]
 pub mod fake_gh_cli;
 pub mod fallback;
@@ -36,6 +37,8 @@ pub mod keyring_credential_store;
 pub mod launch;
 pub mod listed_prices;
 pub mod live_feed;
+pub mod local_serving;
+pub mod local_tuner;
 pub mod managed_process;
 pub mod media_fallback;
 #[cfg(test)]
@@ -45,12 +48,15 @@ pub mod model_health;
 pub mod model_limits;
 pub(crate) mod model_picker;
 pub mod multipart_model;
+pub mod notifications;
 pub mod pricing;
 pub mod process_gh_cli;
 pub mod profile_usage;
 pub mod prompt_shape_reader;
 pub mod quota_snapshots;
 pub mod rate_limit;
+pub mod rate_limiter;
+
 pub mod request_images;
 pub mod responses_chat;
 pub mod responses_item_ids;

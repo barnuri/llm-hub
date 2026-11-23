@@ -17,6 +17,8 @@ pub enum AppError {
     DeadlineExceeded(String),
     /// An extension refused the request with this status and message.
     Rejected(StatusCode, String),
+    /// The caller sent more than its rate limit allows.
+    TooManyRequests(String),
 }
 
 impl AppError {
@@ -32,6 +34,7 @@ impl AppError {
             AppError::UpstreamUnavailable(_) => StatusCode::BAD_GATEWAY,
             AppError::DeadlineExceeded(_) => StatusCode::GATEWAY_TIMEOUT,
             AppError::Rejected(status, _) => *status,
+            AppError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -47,6 +50,7 @@ impl AppError {
             AppError::UpstreamUnavailable(_) => "upstream_error",
             AppError::DeadlineExceeded(_) => "timeout_error",
             AppError::Rejected(..) => "rejected_error",
+            AppError::TooManyRequests(_) => "rate_limit_error",
         }
     }
 
@@ -59,7 +63,8 @@ impl AppError {
             | AppError::UpstreamUnavailable(m)
             | AppError::DeadlineExceeded(m)
             | AppError::Conflict(m)
-            | AppError::Rejected(_, m) => m.clone(),
+            | AppError::Rejected(_, m)
+            | AppError::TooManyRequests(m) => m.clone(),
             AppError::Unauthorized => "missing or invalid api key".to_string(),
             AppError::ReadOnly => "config is read-only (LLM_HUB_CONFIG_READONLY=true)".to_string(),
         }
@@ -118,6 +123,11 @@ mod tests {
                 AppError::Rejected(StatusCode::FORBIDDEN, "no".into()),
                 403,
                 "rejected_error",
+            ),
+            (
+                AppError::TooManyRequests("slow down".into()),
+                429,
+                "rate_limit_error",
             ),
         ];
 

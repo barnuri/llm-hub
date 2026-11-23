@@ -2,8 +2,11 @@
 #![allow(dead_code, reason = "Each test file uses only part of this module")]
 
 use std::collections::HashMap;
-use std::process::{Child, Command};
-use std::time::Duration;
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use wiremock::{Match, MockServer, Request, ResponseTemplate};
 
@@ -17,7 +20,7 @@ impl Drop for HubProcess {
     }
 }
 
-/// Starts the hub with `vars` set and returns it with its base URL once `/healthz` answers.
+/// Starts the hub with `vars` set and returns it with its base URL once it logs its own bind.
 /// A hub that exits before it is ready lost its port to another listener, so the next port is tried.
 pub async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
     for _ in 0..START_ATTEMPTS {
@@ -25,22 +28,46 @@ pub async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
         let dir = tempfile::tempdir().unwrap().keep();
         let mut command = Command::new(env!("CARGO_BIN_EXE_llm-hub"));
         command
+            .arg("serve")
             .current_dir(&dir)
             .env("LLM_HUB_PORT", port.to_string())
-            .env("LLM_HUB_AUTO_UPDATE", "0");
+            .env("LLM_HUB_AUTO_UPDATE", "0")
+            .env("LLM_HUB_NOTIFY_DESKTOP", "false")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         for (key, value) in &vars {
             command.env(key, value);
         }
         let mut hub = HubProcess(command.spawn().expect("hub starts"));
+        let listening = Arc::new(AtomicBool::new(false));
+        let needle = format!("listening on http://127.0.0.1:{port}");
+        if let Some(stdout) = hub.0.stdout.take() {
+            drain_log(stdout, needle.clone(), Arc::clone(&listening));
+        }
+        if let Some(stderr) = hub.0.stderr.take() {
+            drain_log(stderr, needle, Arc::clone(&listening));
+        }
         let base = format!("http://127.0.0.1:{port}");
-        if wait_ready(&base, &mut hub.0).await {
+        if wait_ready(&base, &mut hub.0, &listening).await {
             return (hub, base);
         }
     }
     panic!("hub did not start on {START_ATTEMPTS} ports");
 }
 
+/// Reads a hub log stream until it closes and sets `listening` when a line names this hub's bind.
+fn drain_log(stream: impl Read + Send + 'static, needle: String, listening: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            if line.contains(&needle) {
+                listening.store(true, Ordering::SeqCst);
+            }
+        }
+    });
+}
+
 const START_ATTEMPTS: usize = 5;
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A local port that nothing listens on yet.
 pub fn free_port() -> u16 {
@@ -51,24 +78,29 @@ pub fn free_port() -> u16 {
         .port()
 }
 
-/// True once `/healthz` answers `ok` while `child` still runs. False when `child` exits first.
-async fn wait_ready(base: &str, child: &mut Child) -> bool {
-    let client = reqwest::Client::new();
-    // A loaded machine can take well over 5 s to start a hub; allow 30 s before failing.
-    for _ in 0..300 {
+/// True once the hub logs its bind and `/healthz` answers `ok` while `child` still runs. False when `child` exits first.
+/// A `/healthz` answer alone can come from another test's hub on the same port, so the log line decides.
+async fn wait_ready(base: &str, child: &mut Child, listening: &AtomicBool) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    // A loaded machine can take well over 5 s to start a hub, so the limit is wall-clock time.
+    let deadline = Instant::now() + READY_TIMEOUT;
+    while Instant::now() < deadline {
         if child.try_wait().unwrap().is_some() {
             return false;
         }
-        if let Ok(response) = client.get(format!("{base}/healthz")).send().await
+        if listening.load(Ordering::SeqCst)
+            && let Ok(response) = client.get(format!("{base}/healthz")).send().await
             && response.status().is_success()
             && response.text().await.is_ok_and(|text| text == "ok")
         {
-            tokio::time::sleep(Duration::from_millis(200)).await;
             return child.try_wait().unwrap().is_none();
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("hub did not become ready within 30 s");
+    panic!("hub did not become ready within {READY_TIMEOUT:?}");
 }
 
 /// Matches a request whose body does not contain `needle`, so solver and judge mocks never overlap.

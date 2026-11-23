@@ -39,11 +39,11 @@ impl Rule {
 #[derive(Debug, Default)]
 pub(crate) struct RulesExtension {
     hooks: Option<Arc<HookSet>>,
-    http_request: Vec<Rule>,
-    request: Vec<Rule>,
-    attempt: Vec<Rule>,
-    response: Vec<Rule>,
-    http_response: Vec<Rule>,
+    http_request: Vec<Arc<Rule>>,
+    request: Vec<Arc<Rule>>,
+    attempt: Vec<Arc<Rule>>,
+    response: Vec<Arc<Rule>>,
+    http_response: Vec<Arc<Rule>>,
 }
 
 impl RulesExtension {
@@ -75,7 +75,7 @@ impl RulesExtension {
                     "rule `{name}`: the complete phase runs hooks only, because a rule has nothing to change there"
                 ));
             }
-            let rule = Rule {
+            let rule = Arc::new(Rule {
                 name: name.clone(),
                 phase,
                 shadow: spec.mode == RuleMode::Shadow,
@@ -87,7 +87,7 @@ impl RulesExtension {
                     .map(|action| Action::compile(action, phase, env))
                     .collect::<Result<_, _>>()
                     .map_err(|e| format!("rule `{name}`: {e}"))?,
-            };
+            });
             match phase {
                 PhaseName::HttpRequest => rules.http_request.push(rule),
                 PhaseName::Request => rules.request.push(rule),
@@ -122,7 +122,50 @@ impl RulesExtension {
         self.hooks.take()
     }
 
-    fn all(&self) -> impl Iterator<Item = &Rule> {
+    /// The name, phase and shadow flag of every rule, grouped by phase.
+    pub fn rule_list(&self) -> impl Iterator<Item = (&str, PhaseName, bool)> {
+        self.all()
+            .map(|rule| (rule.name.as_str(), rule.phase, rule.shadow))
+    }
+
+    /// The phases that hold at least one rule.
+    pub fn phases(&self) -> Vec<PhaseName> {
+        [
+            (PhaseName::HttpRequest, &self.http_request),
+            (PhaseName::Request, &self.request),
+            (PhaseName::Attempt, &self.attempt),
+            (PhaseName::Response, &self.response),
+            (PhaseName::HttpResponse, &self.http_response),
+        ]
+        .into_iter()
+        .filter(|(_, rules)| !rules.is_empty())
+        .map(|(phase, _)| phase)
+        .collect()
+    }
+
+    /// A copy without the rules `off` names and without the hooks. `None` when `off` names none.
+    pub fn without(&self, off: impl Fn(&str) -> bool) -> Option<RulesExtension> {
+        if !self.all().any(|rule| off(&rule.name)) {
+            return None;
+        }
+        let kept = |rules: &[Arc<Rule>]| -> Vec<Arc<Rule>> {
+            rules
+                .iter()
+                .filter(|rule| !off(&rule.name))
+                .map(Arc::clone)
+                .collect()
+        };
+        Some(RulesExtension {
+            hooks: None,
+            http_request: kept(&self.http_request),
+            request: kept(&self.request),
+            attempt: kept(&self.attempt),
+            response: kept(&self.response),
+            http_response: kept(&self.http_response),
+        })
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Arc<Rule>> {
         self.http_request
             .iter()
             .chain(&self.request)
@@ -291,7 +334,7 @@ mod tests {
 
     use super::*;
     use crate::ext::rules::parse;
-    use crate::ext::{Api, AttemptTarget, ResponseTarget};
+    use crate::ext::{Api, AttemptTarget, ExtNotification, ExtSeverity, ResponseTarget};
     use crate::utils::log_capture::LogCapture;
 
     fn rules(yaml: &str) -> RulesExtension {
@@ -632,6 +675,95 @@ mod tests {
             (
                 "rules: [{name: a, phase: http_response, match: {stream: true}, actions: [{set_status: 400}]}]",
                 "match key `stream`",
+            ),
+        ] {
+            let error = parse(yaml, false, &env).unwrap_err();
+            assert!(error.contains(expected), "{yaml}: {error}");
+        }
+    }
+
+    #[test]
+    fn notify_rules_send_from_every_phase_with_the_known_model_and_profile() {
+        let rules = rules(
+            "rules:\n  - name: n-http\n    phase: http_request\n    actions: [{notify: {title: 'http ${TEAM}', severity: info}}]\n  - name: n-request\n    phase: request\n    actions: [{notify: {title: request, body: b}}]\n  - name: n-attempt\n    phase: attempt\n    actions: [{notify: {title: attempt, severity: critical}}]\n  - name: n-response\n    phase: response\n    actions: [{notify: {title: response}}]\n  - name: n-out\n    phase: http_response\n    actions: [{notify: {title: out}}]\n  - name: n-shadow\n    phase: request\n    mode: shadow\n    actions: [{notify: {title: shadow}}]\n",
+        );
+        let mut headers = HeaderMap::new();
+        let mut http = HttpRequestCtx::new(&Method::GET, "/v1/models", &mut headers);
+        rules.on_http_request(&mut http);
+        let sent = http.outbox().take();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0],
+            ExtNotification::new(ExtSeverity::Info, "http blue", "")
+        );
+        let mut out =
+            HttpResponseCtx::new(&Method::GET, "/v1/models", StatusCode::OK, &mut headers);
+        rules.on_http_response(&mut out);
+        assert_eq!(out.outbox().take()[0].title, "out");
+
+        let mut state = Extensions::new();
+        let empty = HeaderMap::new();
+        let mut request = RequestCtx::new(
+            &Method::POST,
+            "/v1/chat/completions",
+            &empty,
+            Bytes::from_static(br#"{"model":"a/b"}"#),
+            &mut state,
+        );
+        rules.on_request(&mut request);
+        assert_eq!(
+            request.outbox().take(),
+            [ExtNotification::new(ExtSeverity::Warning, "request", "b").with_model("a/b")]
+        );
+
+        let target = AttemptTarget {
+            profile: "p",
+            model: "p/m",
+            api: Api::Chat,
+            client_path: "/v1/chat/completions",
+            upstream_path: "/chat/completions",
+        };
+        let mut attempt = AttemptCtx::new(target, &empty, Bytes::new(), &mut state);
+        rules.on_attempt(&mut attempt);
+        assert_eq!(
+            attempt.outbox().take(),
+            [ExtNotification::new(ExtSeverity::Critical, "attempt", "")
+                .with_model("p/m")
+                .with_profile("p")]
+        );
+
+        let target = ResponseTarget {
+            profile: "copilot",
+            model: "copilot/gpt-5",
+            api: Api::Responses,
+            client_path: "/v1/responses",
+            copilot: true,
+            last_attempt: false,
+        };
+        let mut reply_headers = HeaderMap::new();
+        let mut reply = ResponseCtx::new(target, StatusCode::OK, &mut reply_headers, &mut state);
+        assert!(!rules.wants_error_body(&reply));
+        rules.on_response(&mut reply);
+        let sent = reply.outbox().take();
+        assert_eq!(sent[0].model.as_deref(), Some("copilot/gpt-5"));
+        assert_eq!(sent[0].profile.as_deref(), Some("copilot"));
+    }
+
+    #[test]
+    fn a_notify_action_needs_a_title_and_a_known_severity() {
+        let env = |_: &str| None;
+        for (yaml, expected) in [
+            (
+                "rules: [{name: a, phase: request, actions: [{notify: {title: ' '}}]}]",
+                "notify needs a title",
+            ),
+            (
+                "rules: [{name: a, phase: request, actions: [{notify: {title: t, severity: loud}}]}]",
+                "loud",
+            ),
+            (
+                "rules: [{name: a, phase: request, actions: [{notify: {title: t, extra: 1}}]}]",
+                "extra",
             ),
         ] {
             let error = parse(yaml, false, &env).unwrap_err();

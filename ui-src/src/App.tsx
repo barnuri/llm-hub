@@ -11,7 +11,8 @@ import { nameColor } from "./lib/colors";
 import { formatNumber } from "./lib/format";
 import { pricesById } from "./lib/pricing";
 import { navigate, useRoute } from "./lib/router";
-import type { ErrorsReport, HubMeta, HubModel } from "./lib/types";
+import type { ErrorsReport, HubMeta, HubModel, NotificationsResponse } from "./lib/types";
+import { ExtensionsScreen } from "./screens/ExtensionsScreen";
 import { KeysScreen } from "./screens/KeysScreen";
 import { ModelsScreen } from "./screens/ModelsScreen";
 import { ProfilesScreen } from "./screens/ProfilesScreen";
@@ -19,6 +20,7 @@ import { SetupScreen } from "./screens/SetupScreen";
 import { StatsScreen } from "./screens/StatsScreen";
 import { ErrorsScreen } from "./screens/ErrorsScreen";
 import { InsightsScreen } from "./screens/InsightsScreen";
+import { NotificationsScreen } from "./screens/NotificationsScreen";
 import { SessionsScreen } from "./screens/SessionsScreen";
 import { AutoScreen } from "./screens/AutoScreen";
 import { SmartAutoScreen } from "./screens/SmartAutoScreen";
@@ -37,6 +39,7 @@ interface NavTab {
 const SETTINGS_PAGES: readonly Page[] = [
   { id: "keys", label: "API keys" },
   { id: "setup", label: "Setup" },
+  { id: "extensions", label: "Extensions" },
 ];
 
 const INSIGHTS_PAGES: readonly Page[] = [
@@ -48,6 +51,7 @@ const NAV_TABS: readonly NavTab[] = [
   { label: "Overview", pages: [{ id: "overview", label: "Overview" }] },
   { label: "Insights", pages: INSIGHTS_PAGES },
   { label: "Errors", pages: [{ id: "errors", label: "Errors" }] },
+  { label: "Notifications", pages: [{ id: "notifications", label: "Notifications" }] },
   { label: "Stats", pages: [{ id: "stats", label: "Stats" }] },
   { label: "Models", pages: [{ id: "models", label: "Models" }] },
   { label: "Copilot Auto", pages: [{ id: "auto", label: "Copilot Auto" }] },
@@ -79,6 +83,7 @@ export function App() {
   const groupPages = isSettings ? SETTINGS_PAGES : isInsights ? INSIGHTS_PAGES : null;
   const groupLabel = isSettings ? "Settings" : isInsights ? "Insights" : page.label;
   const [errorsToday, setErrorsToday] = useState<number | null>(null);
+  const [notificationsPending, setNotificationsPending] = useState<number | null>(null);
   const [meta, setMeta] = useState<HubMeta | null>(null);
   const [modelEntries, setModelEntries] = useState<readonly HubModel[]>([]);
   const models = modelEntries.map((model) => model.id);
@@ -137,6 +142,25 @@ export function App() {
       }
     };
     void loadErrorCount();
+    return () => {
+      cancelled = true;
+    };
+  }, [tab]);
+
+  useEffect(() => {
+    let cancelled = false;
+    api<NotificationsResponse>("/api/notifications")
+      .then((body) => {
+        if (!cancelled) {
+          setNotificationsPending(body.pending);
+        }
+      })
+      .catch(() => {
+        // Notifications off or auth missing: the tab shows no count; the errors poll asks for the key.
+        if (!cancelled) {
+          setNotificationsPending(null);
+        }
+      });
     return () => {
       cancelled = true;
     };
@@ -215,6 +239,12 @@ export function App() {
                     <Pill tone="danger" title="Errors today">
                       {formatNumber(errorsToday)}
                       <span className="sr-only"> today</span>
+                    </Pill>
+                  ) : null}
+                  {target.id === "notifications" && notificationsPending !== null && notificationsPending > 0 ? (
+                    <Pill tone="warn" title="Pending notifications">
+                      {formatNumber(notificationsPending)}
+                      <span className="sr-only"> pending</span>
                     </Pill>
                   ) : null}
                 </button>
@@ -312,6 +342,9 @@ export function App() {
             {tab === "stats" ? <StatsScreen onError={(message) => toast(message, true)} /> : null}
             {tab === "overview" ? <UsageScreen period={overviewPeriod(route.query.get("range"))} /> : null}
             {tab === "errors" ? <ErrorsScreen /> : null}
+            {tab === "notifications" ? (
+              <NotificationsScreen onCopy={copy} onToast={toast} onPending={setNotificationsPending} />
+            ) : null}
             {tab === "auto" ? <AutoScreen models={modelEntries} /> : null}
             {tab === "smart-auto" ? (
               <SmartAutoScreen profiles={meta?.profiles ?? []} prices={pricesById(modelEntries)} />
@@ -322,6 +355,7 @@ export function App() {
               <ProfilesScreen meta={meta} models={models} onChanged={loadAll} onToast={toast} />
             ) : null}
             {tab === "keys" ? <KeysScreen onToast={toast} authEnabled={meta?.auth_enabled} /> : null}
+            {tab === "extensions" ? <ExtensionsScreen onToast={toast} /> : null}
             {tab === "setup" ? (
               <SetupScreen models={models} authEnabled={meta?.auth_enabled ?? false} onCopy={copy} />
             ) : null}

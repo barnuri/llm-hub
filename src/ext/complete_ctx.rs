@@ -2,6 +2,7 @@ use std::sync::{Arc, LazyLock};
 
 use axum::http::Extensions;
 
+use crate::ext::{ExtNotification, Outbox};
 use crate::services::stats::RequestOutcome;
 
 /// Stands in for the request state of an outcome that has none.
@@ -12,6 +13,7 @@ static NO_STATE: LazyLock<Extensions> = LazyLock::new(Extensions::new);
 pub struct CompleteCtx<'a> {
     outcome: &'a RequestOutcome,
     state: Option<&'a Arc<Extensions>>,
+    outbox: Outbox,
 }
 
 impl<'a> CompleteCtx<'a> {
@@ -19,7 +21,11 @@ impl<'a> CompleteCtx<'a> {
         outcome: &'a RequestOutcome,
         state: Option<&'a Arc<Extensions>>,
     ) -> CompleteCtx<'a> {
-        CompleteCtx { outcome, state }
+        CompleteCtx {
+            outcome,
+            state,
+            outbox: Outbox::default(),
+        }
     }
 
     /// The typed data the request's extensions stored with `state_mut().insert(..)`, as it stood
@@ -82,6 +88,16 @@ impl<'a> CompleteCtx<'a> {
     #[must_use]
     pub fn client(&self) -> Option<&str> {
         self.outcome.client.as_deref()
+    }
+
+    /// Sends `notification` to the Notifications inbox, from `ext:<extension name>`. The hub
+    /// delivers it when this phase method returns, and drops it when notifications are off.
+    pub fn notify(&self, notification: ExtNotification) {
+        self.outbox.push(notification);
+    }
+
+    pub(crate) fn outbox(&self) -> &Outbox {
+        &self.outbox
     }
 }
 

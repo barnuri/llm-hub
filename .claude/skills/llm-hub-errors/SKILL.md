@@ -86,6 +86,8 @@ or patch, reproduce it first with `curl -si` against the hub, using the same end
 | `408 Timed out reading request body` | very large request on Copilot | upstream or client, report only |
 | `a prompt of about N tokens is over the known limit of L tokens` (400, local, not in the feed) | the estimate is body bytes / 4, so large `encrypted_content` reasoning items and JSON escaping count as tokens. The hub refuses above 150% of the known limit | fixed: on `/v1/responses` the estimate never refuses alone. A too-small model is still skipped while a fallback remains |
 | Copilot 400 `model_max_prompt_tokens_exceeded` on `/responses`, Codex ends the turn | Codex compacts only on `code: context_length_exceeded` (as an HTTP 400 from Codex 0.169, before that only in a `response.failed` event) | fixed for Codex 0.169 and later: the built-in extension `src/ext/builtin/copilot_context_code.rs` renames the code and keeps the 400 |
+| `upstream stream error, closing translated stream: error decoding response body` on `llama_swap/*`, or HTTP 200 with an empty body; llama-swap logs `recovered from upstream disconnection during streaming` | llama-server stream stall (process at 0% CPU); a non-streaming request to the same model still answers | config, not hub code: add `--reasoning off` to the model's registry row. See `docs/local-models.md` |
+| `request cancelled ... model=llama_swap/<dense 31B>` after about 5 minutes | prefill of an agent prompt (20k-94k tokens) at about 70-110 tokens/s | capacity, report only: use a smaller or MoE model. See `docs/local-models.md` |
 
 ## Fix rules
 

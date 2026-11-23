@@ -23,6 +23,7 @@ use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub use crate::hub::Hub;
+pub use crate::services::local_serving::watchdog::{StreamWatchdog, stall_event};
 /// The `axum` and `serde_json` versions llm-hub's API uses, so extensions match them.
 pub use {axum, serde_json};
 
@@ -49,13 +50,26 @@ pub(crate) fn load_env_vars() -> HashMap<String, String> {
     vars
 }
 
-/// Runs llm-hub: a CLI command when one is given, else the server until it is told to stop.
+/// Runs a CLI command, ensures an installed service is up, or starts the server.
 pub async fn run() {
+    if std::env::args().nth(1).is_none() && !services::restart::is_supervised() {
+        match services::service_manager::ensure_installed_service().await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("service check failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     Hub::new().run().await;
 }
 
 async fn serve(hub: Hub) {
     if run_smart_auto_command().await {
+        return;
+    }
+    if run_local_worker_command().await {
         return;
     }
     if run_launch_command().await {
@@ -68,13 +82,16 @@ async fn serve(hub: Hub) {
     }
 
     let vars = load_env_vars();
-    let config = match HubConfig::from_map(&vars) {
-        Ok(config) => config,
+    let (config, profile_errors) = match HubConfig::from_map_skipping_invalid_profiles(&vars) {
+        Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("config error: {e}");
             std::process::exit(1);
         }
     };
+    for error in profile_errors {
+        tracing::warn!(%error, "skipping profile with invalid configuration");
+    }
 
     let store = match open_store(&config) {
         Ok(store) => store,
@@ -99,8 +116,12 @@ async fn serve(hub: Hub) {
     services::copilot_prices::CopilotPrices::spawn_refresh_loop(state.clone());
     services::keep_warm::KeepWarm::spawn_refresh_loop(state.clone());
     services::quota_snapshots::QuotaSnapshots::spawn_poll_loop(state.clone());
+    spawn_notifications(&state);
+    services::local_tuner::probe::spawn_probe_loop(state.clone());
     state.managed().spawn_idle_reaper();
+    state.local_pool().spawn_background();
     let managed = std::sync::Arc::clone(state.managed());
+    let local_pool = std::sync::Arc::clone(state.local_pool());
     let restart_notify = state.restart_notify();
     services::update::spawn_auto_update(auto_update, std::sync::Arc::clone(&restart_notify));
     services::config_reload::spawn_env_watcher(
@@ -132,16 +153,66 @@ async fn serve(hub: Hub) {
         .await
     {
         managed.stop_all().await;
+        local_pool.stop_all().await;
         eprintln!("server error: {e}");
         std::process::exit(1);
     }
     managed.stop_all().await;
+    local_pool.stop_all().await;
 
     match services::restart::respawn_if_requested() {
         Ok(true) => tracing::info!("respawned llm-hub after restart request"),
         Ok(false) => {}
         Err(e) => eprintln!("restart respawn failed: {e}"),
     }
+}
+
+/// The install setting that remembers the user saw the desktop test popup.
+const DESKTOP_CONFIRMED_KEY: &str = "desktop_notify_confirmed";
+
+/// Starts notification delivery to the configured sinks, the snooze prune loop and the budget loop.
+fn spawn_notifications(state: &AppState) {
+    let config = state.config();
+    let notify = &config.notify;
+    let confirmed = state
+        .store()
+        .and_then(|store| store.install_setting(DESKTOP_CONFIRMED_KEY).ok().flatten())
+        .is_some_and(|value| value == "1");
+    let hook_state = state.clone();
+    let hook = services::notifications::desktop::ConfirmHook::new(move || {
+        let Some(store) = hook_state.store() else {
+            return;
+        };
+        if let Err(e) = store.set_install_setting(DESKTOP_CONFIRMED_KEY, "1") {
+            tracing::warn!("cannot save the desktop popup confirmation: {e}");
+        }
+    });
+    let desktop = std::sync::Arc::new(
+        services::notifications::desktop::DesktopSink::new(notify.desktop, notify.timeout)
+            .with_confirmation(confirmed, Some(hook)),
+    );
+    state
+        .notifier()
+        .set_desktop(std::sync::Arc::clone(&desktop));
+    let mut sinks: Vec<Box<dyn services::notifications::dispatch::Sink>> = vec![Box::new(desktop)];
+    if let Some(url) = notify.webhook_url.clone() {
+        match reqwest::Client::builder().build() {
+            Ok(client) => sinks.push(Box::new(
+                services::notifications::webhook::WebhookSink::new(client, url, notify.timeout),
+            )),
+            Err(e) => tracing::warn!("notification webhook disabled: {e}"),
+        }
+    }
+    if let Some(argv) = notify.command.clone() {
+        sinks.push(Box::new(
+            services::notifications::command_sink::CommandSink::new(argv, notify.timeout),
+        ));
+    }
+    state.notifier().spawn_delivery(sinks);
+    state
+        .notifier()
+        .spawn_prune_loop(std::time::Duration::from_mins(1));
+    services::notifications::budget_loop::spawn_budget_loop(state.clone());
 }
 
 /// Loads the rules file, sets the running extensions and starts the rules watcher. An invalid
@@ -246,7 +317,7 @@ const HELP: &str = "llm-hub — one local endpoint for every LLM provider and co
 usage: llm-hub [command] [args...]
 
 Server:
-  llm-hub                         run the hub in the foreground (same as `serve`)
+  llm-hub                         ensure the installed service is up, or run in the foreground
   llm-hub serve                   run the hub in the foreground
   llm-hub service install         install or reload the background service (macOS LaunchAgent)
   llm-hub service uninstall       remove the background service
@@ -275,6 +346,9 @@ Other:
   llm-hub smart-auto export --workflow <id> --out <path>
                                   write a workflow's Smart Auto history into the generated
                                   block of a Markdown file (git-tracked files are refused)
+  llm-hub local-worker --id <id> --model <gguf> --port <port> [flags]
+                                  serve one local model with mistral.rs (needs the `mistralrs`
+                                  build); the hub starts it for `mistralrs` registry rows
   llm-hub help                    show this help (also --help, -h)
 
 Environment: LLM_HUB_URL (default http://localhost:8888) and LLM_HUB_API_KEY for the agent commands.";
@@ -323,6 +397,20 @@ async fn run_cli_command() -> bool {
             std::process::exit(2);
         }
     }
+}
+
+/// `llm-hub local-worker --id … --model … --port … [mapped flags]` serves one local model. It runs
+/// before tracing starts. Returns true when the command was handled.
+async fn run_local_worker_command() -> bool {
+    if std::env::args().nth(1).as_deref() != Some("local-worker") {
+        return false;
+    }
+    let words: Vec<String> = std::env::args().skip(2).collect();
+    if let Err(message) = services::local_serving::worker::run(&words).await {
+        eprintln!("llm-hub local-worker: {message}");
+        std::process::exit(1);
+    }
+    true
 }
 
 /// `llm-hub smart-auto export --workflow <id> --out <path>`. It runs before tracing starts, so no
@@ -494,6 +582,9 @@ fn api_router(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(admin::set_keep_warm))
         .routes(routes!(admin::set_media_fallback))
         .routes(routes!(admin::restart_server))
+        .routes(routes!(routes::extensions::list))
+        .routes(routes!(routes::extensions::set_extension))
+        .routes(routes!(routes::extensions::set_rule))
         .routes(routes!(admin::stats))
         .routes(routes!(admin::usage))
         .routes(routes!(live::stream))
@@ -509,6 +600,21 @@ fn api_router(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(admin::insights_analyze))
         .routes(routes!(admin::list_api_keys, admin::create_api_key))
         .routes(routes!(admin::delete_api_key))
+        .routes(routes!(
+            routes::notifications::list,
+            routes::notifications::ingest
+        ))
+        .routes(routes!(routes::notifications::approve))
+        .routes(routes!(routes::notifications::dismiss))
+        .routes(routes!(
+            routes::notifications::list_mutes,
+            routes::notifications::add_mute
+        ))
+        .routes(routes!(routes::notifications::delete_mute))
+        .routes(routes!(routes::notifications::desktop_status))
+        .routes(routes!(routes::notifications::desktop_test))
+        .routes(routes!(routes::notifications::desktop_confirm))
+        .routes(routes!(routes::notifications::desktop_fix))
 }
 
 #[cfg(test)]
@@ -804,6 +910,7 @@ mod tests {
             cache_write_tokens: 0,
             error: None,
             client: Some("claude-code".into()),
+            session_id: None,
             worker: None,
             routed_by: None,
             attempt: None,

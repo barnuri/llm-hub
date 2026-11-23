@@ -27,3 +27,37 @@ pub(crate) fn builtins() -> Vec<Arc<dyn Extension>> {
         Arc::new(UpstreamLimits),
     ]
 }
+
+/// The phases each built-in runs in, by name. The UI shows them.
+const BUILTIN_PHASES: [(&str, &[&str]); 4] = [
+    ("copilot-context-code", &["response"]),
+    ("payload-too-large", &["response"]),
+    ("local-not-ready", &["response"]),
+    ("upstream-limits", &["response"]),
+];
+
+/// The phases of the built-in `name`. `None` when no built-in has that name.
+pub(crate) fn builtin_phases(name: &str) -> Option<&'static [&'static str]> {
+    BUILTIN_PHASES
+        .iter()
+        .find(|(builtin, _)| *builtin == name)
+        .map(|(_, phases)| *phases)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_builtin_lists_its_phases() {
+        for builtin in builtins() {
+            assert!(
+                builtin_phases(builtin.name()).is_some(),
+                "{}",
+                builtin.name()
+            );
+        }
+        assert_eq!(BUILTIN_PHASES.len(), builtins().len());
+        assert_eq!(builtin_phases("library"), None);
+    }
+}

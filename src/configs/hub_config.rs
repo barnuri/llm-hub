@@ -3,15 +3,18 @@ use std::time::Duration;
 
 use super::copilot_auth::CopilotAuth;
 use super::keep_warm_config::KeepWarmConfig;
+use super::local_serving_config::LocalServingConfig;
+use super::local_tuner_config::LocalTunerConfig;
 use super::managed_command::ManagedCommand;
 use super::media_fallback_config::MediaFallbackConfig;
 use super::profile_config::ProfileConfig;
 use super::usage_source::{BIFROST_KEY_PREFIX, UsageSource};
+use crate::configs::NotifyConfig;
 use crate::consts::{
     DEFAULT_BIND, DEFAULT_COPILOT_PRICES_REFRESH_SECS, DEFAULT_FIRST_BYTE_TIMEOUT_MS,
     DEFAULT_KEEP_WARM_ENABLED, DEFAULT_KEEP_WARM_IDLE_CAP_MINUTES, DEFAULT_MAX_REPLAY_BYTES,
     DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_PORT, DEFAULT_QUOTA_COOLDOWN_SECS,
-    DEFAULT_SSE_KEEPALIVE_MS,
+    DEFAULT_SSE_KEEPALIVE_MS, LOCAL_PROFILE_BASE_URL,
 };
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
@@ -39,6 +42,8 @@ pub struct HubConfig {
     pub smart_auto_presets: BTreeMap<String, SmartAutoPolicy>,
     /// Smart Auto include and exclude rules from `LLM_HUB_SMART_AUTO_RULES`; set, they replace the saved file.
     pub smart_auto_rules_env: Option<String>,
+    /// Extension names and globs, and `rules:<glob>` for rules, from `LLM_HUB_EXTENSIONS_DISABLED`.
+    pub extensions_disabled: Vec<String>,
     pub master_key: Option<String>,
     pub default_fallbacks: Vec<String>,
     pub max_replay_bytes: usize,
@@ -86,6 +91,12 @@ pub struct HubConfig {
     pub media_fallback: MediaFallbackConfig,
     /// Global USD/1M token defaults when a profile/model has no rates.
     pub pricing: crate::configs::TokenRates,
+    /// `LLM_HUB_LOCAL_TUNER`, off by default: run the local model probe and its proposals.
+    pub local_tuner_enabled: bool,
+    /// The notification inbox, its sinks and the operator's mute rules.
+    pub notify: NotifyConfig,
+    /// `LLM_HUB_BUDGET_MONTHLY_USD`: the hub-wide monthly spend budget in USD. `None` sets none.
+    pub budget_monthly_usd: Option<f64>,
 }
 
 impl HubConfig {
@@ -106,11 +117,24 @@ impl HubConfig {
         self.usage_sources.get(profile).copied()
     }
 
+    pub fn from_map(vars: &HashMap<String, String>) -> Result<HubConfig, String> {
+        Self::from_map_inner(vars, false).map(|(config, _)| config)
+    }
+
+    pub(crate) fn from_map_skipping_invalid_profiles(
+        vars: &HashMap<String, String>,
+    ) -> Result<(HubConfig, Vec<String>), String> {
+        Self::from_map_inner(vars, true)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "flat list of env keys; splitting adds no clarity"
     )]
-    pub fn from_map(vars: &HashMap<String, String>) -> Result<HubConfig, String> {
+    fn from_map_inner(
+        vars: &HashMap<String, String>,
+        skip_invalid_profiles: bool,
+    ) -> Result<(HubConfig, Vec<String>), String> {
         let get = |key: &str| {
             vars.get(&format!("{PREFIX}{key}"))
                 .map(|v| v.trim().to_string())
@@ -122,16 +146,31 @@ impl HubConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            // No index var: discover profiles from LLM_HUB_<NAME>_BASE_URL keys.
+            // No index var: discover profiles from LLM_HUB_<NAME>_BASE_URL or _KIND keys.
             _ => discover_profile_names(vars),
         };
 
         let mut profiles = Vec::with_capacity(profile_names.len());
+        #[allow(
+            clippy::zero_sized_map_values,
+            reason = "UsageSource is an enum meant to gain variants"
+        )]
+        let mut usage_sources = HashMap::new();
+        let mut profile_errors = Vec::new();
         for name in &profile_names {
-            profiles.push(Self::parse_profile(name, vars)?);
+            let parsed = Self::parse_profile(name, vars).and_then(|profile| {
+                let sources = usage_sources_from_map(std::slice::from_ref(&profile), vars)?;
+                Ok((profile, sources))
+            });
+            match parsed {
+                Ok((profile, sources)) => {
+                    profiles.push(profile);
+                    usage_sources.extend(sources);
+                }
+                Err(error) if skip_invalid_profiles => profile_errors.push(error),
+                Err(error) => return Err(error),
+            }
         }
-
-        let usage_sources = usage_sources_from_map(&profiles, vars)?;
 
         let master_key = get("MASTER_KEY").filter(|k| !k.is_empty());
         let default_fallbacks: Vec<String> = get("DEFAULT_FALLBACKS")
@@ -195,6 +234,7 @@ impl HubConfig {
 
         let keep_warm = keep_warm_from_map(&get)?;
         let media_fallback = MediaFallbackConfig::from_get(&get, is_truthy)?;
+        let notify = NotifyConfig::from_get(&get, home_dir(vars), is_falsy)?;
 
         let pricing = crate::configs::TokenRates {
             input_per_1m: crate::configs::token_rates::parse_optional_f64(
@@ -215,9 +255,12 @@ impl HubConfig {
             )?,
         };
 
-        Ok(HubConfig {
+        let config = HubConfig {
             smart_auto_presets: smart_auto_presets_from_map(vars)?,
             smart_auto_rules_env: get("SMART_AUTO_RULES").filter(|v| !v.trim().is_empty()),
+            extensions_disabled: get("EXTENSIONS_DISABLED")
+                .map(|list| split_list(&list))
+                .unwrap_or_default(),
             profiles,
             usage_sources,
             master_key,
@@ -255,7 +298,11 @@ impl HubConfig {
             keep_warm,
             media_fallback,
             pricing,
-        })
+            local_tuner_enabled: get("LOCAL_TUNER").is_some_and(|v| is_truthy(&v)),
+            notify,
+            budget_monthly_usd: parse_budget_usd(get("BUDGET_MONTHLY_USD"), "BUDGET_MONTHLY_USD")?,
+        };
+        Ok((config, profile_errors))
     }
 
     fn parse_profile(name: &str, vars: &HashMap<String, String>) -> Result<ProfileConfig, String> {
@@ -274,15 +321,6 @@ impl HubConfig {
                 .map(|v| v.trim().to_string())
         };
 
-        let base_url = get("BASE_URL")
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| format!("missing LLM_HUB_{upper}_BASE_URL for profile {name}"))?;
-        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-            return Err(format!(
-                "LLM_HUB_{upper}_BASE_URL must start with http:// or https://"
-            ));
-        }
-
         let extra_headers = match get("HEADERS") {
             None => Vec::new(),
             Some(raw) if raw.is_empty() => Vec::new(),
@@ -298,14 +336,36 @@ impl HubConfig {
         };
 
         let display_name = get("DISPLAY_NAME").filter(|v| !v.is_empty());
-        let managed = ManagedCommand::from_env(
-            &upper,
-            &base_url,
-            vars.get("HOME")
-                .or_else(|| vars.get("USERPROFILE"))
-                .map(String::as_str),
-            &get,
-        )?;
+        let home = home_dir(vars);
+        let first_byte_timeout_ms = match get("FIRST_BYTE_TIMEOUT_MS").filter(|v| !v.is_empty()) {
+            None => None,
+            Some(v) => Some(v.parse().map_err(|_| {
+                format!("LLM_HUB_{upper}_FIRST_BYTE_TIMEOUT_MS is not a number: {v}")
+            })?),
+        };
+        let tuner =
+            LocalTunerConfig::from_env(&upper, home, &get, timeout_ms, first_byte_timeout_ms)?;
+        let local = LocalServingConfig::from_env(&upper, home, &get, tuner.registry.as_deref())?;
+        let base_url = match get("BASE_URL").filter(|v| !v.is_empty()) {
+            Some(url) => url,
+            None if local.is_some() => LOCAL_PROFILE_BASE_URL.to_string(),
+            None => {
+                return Err(format!(
+                    "missing LLM_HUB_{upper}_BASE_URL for profile {name}"
+                ));
+            }
+        };
+        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+            return Err(format!(
+                "LLM_HUB_{upper}_BASE_URL must start with http:// or https://"
+            ));
+        }
+        if local.is_some() && get("COMMAND").is_some_and(|v| !v.is_empty()) {
+            return Err(format!(
+                "LLM_HUB_{upper}_COMMAND and LLM_HUB_{upper}_KIND=local cannot both be set: the hub starts the models of a local profile itself"
+            ));
+        }
+        let managed = ManagedCommand::from_env(&upper, &base_url, home, &get)?;
         let (pricing, model_prices) =
             crate::configs::token_rates::profile_rates_from_env(name, &get)?;
         let api_key = get("API_KEY").unwrap_or_default();
@@ -335,13 +395,27 @@ impl HubConfig {
             managed,
             copilot,
             keep_warm: get("KEEP_WARM").is_none_or(|v| !is_falsy(&v)),
-            first_byte_timeout_ms: match get("FIRST_BYTE_TIMEOUT_MS").filter(|v| !v.is_empty()) {
-                None => None,
-                Some(v) => Some(v.parse().map_err(|_| {
-                    format!("LLM_HUB_{upper}_FIRST_BYTE_TIMEOUT_MS is not a number: {v}")
-                })?),
-            },
+            first_byte_timeout_ms,
+            tuner,
+            local,
+            budget_monthly_usd: parse_budget_usd(
+                get("BUDGET_MONTHLY_USD"),
+                &format!("{upper}_BUDGET_MONTHLY_USD"),
+            )?,
         })
+    }
+}
+
+/// A monthly budget in USD from `LLM_HUB_<key>`: a finite number above 0. Unset or empty sets none.
+fn parse_budget_usd(raw: Option<String>, key: &str) -> Result<Option<f64>, String> {
+    let Some(raw) = raw.filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    match raw.parse::<f64>() {
+        Ok(usd) if usd.is_finite() && usd > 0.0 => Ok(Some(usd)),
+        _ => Err(format!(
+            "{PREFIX}{key} must be a number of USD above 0: {raw}"
+        )),
     }
 }
 
@@ -418,18 +492,29 @@ fn parse_headers_json(upper: &str, raw: &str) -> Result<Vec<(String, String)>, S
     Ok(headers)
 }
 
-/// Profiles found by scanning for `LLM_HUB_<NAME>_BASE_URL` vars — the one
-/// key every profile must have. Names come back lowercased (env segments
-/// lose the original case/dashes); sorted for a stable order.
+/// Profile names from `LLM_HUB_<NAME>_BASE_URL` and `LLM_HUB_<NAME>_KIND` keys, lowercased
+/// (env segments lose the original case), sorted and deduplicated.
 fn discover_profile_names(vars: &HashMap<String, String>) -> Vec<String> {
     let mut names: Vec<String> = vars
         .keys()
-        .filter_map(|key| key.strip_prefix(PREFIX)?.strip_suffix("_BASE_URL"))
+        .filter_map(|key| {
+            let rest = key.strip_prefix(PREFIX)?;
+            rest.strip_suffix("_BASE_URL")
+                .or_else(|| rest.strip_suffix("_KIND"))
+        })
         .filter(|segment| !segment.is_empty())
         .map(str::to_lowercase)
         .collect();
     names.sort_unstable();
+    names.dedup();
     names
+}
+
+/// The user's home directory from `HOME`, or `USERPROFILE` on Windows.
+fn home_dir(vars: &HashMap<String, String>) -> Option<&str> {
+    vars.get("HOME")
+        .or_else(|| vars.get("USERPROFILE"))
+        .map(String::as_str)
 }
 
 /// Env-var segment for a profile name: uppercased, `-` mapped to `_`.
@@ -462,12 +547,12 @@ fn keep_warm_from_map(get: &impl Fn(&str) -> Option<String>) -> Result<KeepWarmC
     })
 }
 
-fn is_truthy(v: &str) -> bool {
+pub(super) fn is_truthy(v: &str) -> bool {
     matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
 /// Opt-out flags default to true: only an explicit negative turns them off.
-fn is_falsy(v: &str) -> bool {
+pub(super) fn is_falsy(v: &str) -> bool {
     matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off")
 }
 
@@ -503,6 +588,69 @@ mod tests {
             ),
             ("LLM_HUB_GROQ_API_KEY".into(), "gsk-abc".into()),
         ])
+    }
+
+    #[test]
+    fn startup_parse_skips_invalid_profiles_and_keeps_valid_ones() {
+        let mut vars = base_vars();
+        vars.remove("LLM_HUB_GROQ_BASE_URL");
+
+        let (config, errors) = HubConfig::from_map_skipping_invalid_profiles(&vars).unwrap();
+
+        let names: Vec<&str> = config
+            .profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect();
+        assert_eq!(names, ["openai"]);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("missing LLM_HUB_GROQ_BASE_URL"),
+            "{errors:?}"
+        );
+        assert!(HubConfig::from_map(&vars).is_err());
+    }
+
+    #[test]
+    fn startup_parse_preserves_valid_config() {
+        let vars = base_vars();
+        let (config, errors) = HubConfig::from_map_skipping_invalid_profiles(&vars).unwrap();
+        let strict = HubConfig::from_map(&vars).unwrap();
+        assert_eq!(format!("{config:?}"), format!("{strict:?}"));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn startup_parse_allows_all_profiles_to_be_invalid() {
+        let mut vars = base_vars();
+        vars.remove("LLM_HUB_OPENAI_BASE_URL");
+        vars.remove("LLM_HUB_GROQ_BASE_URL");
+        let (config, errors) = HubConfig::from_map_skipping_invalid_profiles(&vars).unwrap();
+        assert!(config.profiles.is_empty());
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn startup_parse_still_rejects_invalid_server_settings() {
+        let mut vars = base_vars();
+        vars.remove("LLM_HUB_GROQ_BASE_URL");
+        vars.insert("LLM_HUB_PORT".into(), "invalid".into());
+        let error = HubConfig::from_map_skipping_invalid_profiles(&vars).unwrap_err();
+        assert!(error.contains("LLM_HUB_PORT"), "{error}");
+    }
+
+    #[test]
+    fn startup_parse_skips_invalid_profile_usage_source() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_GROQ_USAGE".into(), "invalid".into());
+        vars.insert("LLM_HUB_OPENAI_USAGE".into(), "bifrost".into());
+        let (config, errors) = HubConfig::from_map_skipping_invalid_profiles(&vars).unwrap();
+        assert!(config.profile("groq").is_none());
+        assert!(config.profile("openai").is_some());
+        assert_eq!(config.usage_source("openai"), Some(UsageSource::Bifrost));
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("LLM_HUB_GROQ_USAGE"), "{errors:?}");
+        assert!(HubConfig::from_map(&vars).is_err());
     }
 
     #[test]
@@ -911,6 +1059,209 @@ mod tests {
         vars.insert("LLM_HUB_GROQ_FIRST_BYTE_TIMEOUT_MS".into(), "soon".into());
         let err = HubConfig::from_map(&vars).unwrap_err();
         assert!(err.contains("GROQ_FIRST_BYTE_TIMEOUT_MS"), "{err}");
+    }
+
+    #[test]
+    fn a_profile_tuner_parses_its_keys_and_resolves_the_guard_budget() {
+        let mut vars = base_vars();
+        vars.insert("HOME".into(), "/home/op".into());
+        vars.insert("LLM_HUB_GROQ_TIMEOUT_MS".into(), "600000".into());
+        vars.insert("LLM_HUB_GROQ_FIRST_BYTE_TIMEOUT_MS".into(), "300000".into());
+        vars.insert("LLM_HUB_GROQ_PREFILL_GUARD".into(), "on".into());
+        vars.insert("LLM_HUB_GROQ_TUNER_REGISTRY".into(), "~/reg.txt".into());
+        vars.insert("LLM_HUB_GROQ_TUNER_APPLY_COMMAND".into(), "sync now".into());
+        vars.insert("LLM_HUB_GROQ_TUNER_APPLY_TIMEOUT_MS".into(), "9000".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        let tuner = &cfg.profile("groq").unwrap().tuner;
+        assert_eq!(tuner.prefill_guard, Some(300_000));
+        assert_eq!(
+            tuner.registry,
+            Some(std::path::PathBuf::from("/home/op/reg.txt"))
+        );
+        assert_eq!(
+            tuner.apply_command,
+            Some(vec!["sync".to_owned(), "now".to_owned()])
+        );
+        assert_eq!(tuner.apply_timeout, Duration::from_secs(9));
+        assert_eq!(
+            cfg.profile("openai").unwrap().tuner,
+            LocalTunerConfig::default()
+        );
+    }
+
+    #[test]
+    fn a_profile_prefill_guard_on_without_a_timeout_fails_the_load() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_GROQ_PREFILL_GUARD".into(), "on".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_GROQ_PREFILL_GUARD"), "{err}");
+    }
+
+    #[test]
+    fn profiles_without_kind_have_no_local_serving() {
+        let cfg = HubConfig::from_map(&base_vars()).unwrap();
+        assert!(cfg.profiles.iter().all(|p| p.local.is_none()));
+    }
+
+    #[test]
+    fn kind_local_makes_base_url_optional_and_keeps_the_profile_local() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_PROFILES".into(), "openai, mac".into());
+        vars.insert("HOME".into(), "/home/op".into());
+        vars.insert("LLM_HUB_MAC_KIND".into(), "local".into());
+        vars.insert(
+            "LLM_HUB_MAC_TUNER_REGISTRY".into(),
+            "~/models/registry.txt".into(),
+        );
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        let mac = cfg.profile("mac").unwrap();
+        assert_eq!(mac.base_url, LOCAL_PROFILE_BASE_URL);
+        assert!(mac.is_local());
+        assert_eq!(mac.managed, None);
+        let local = mac.local.clone().unwrap();
+        assert_eq!(
+            local.registry,
+            std::path::PathBuf::from("/home/op/models/registry.txt")
+        );
+        assert_eq!(local.idle_timeout, Some(Duration::from_mins(30)));
+    }
+
+    #[test]
+    fn kind_local_keeps_an_explicit_base_url() {
+        let mut vars = base_vars();
+        vars.insert(
+            "LLM_HUB_GROQ_BASE_URL".into(),
+            "http://localhost:9000".into(),
+        );
+        vars.insert("LLM_HUB_GROQ_KIND".into(), "local".into());
+        vars.insert("LLM_HUB_GROQ_REGISTRY".into(), "/r.txt".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert_eq!(
+            cfg.profile("groq").unwrap().base_url,
+            "http://localhost:9000"
+        );
+    }
+
+    #[test]
+    fn kind_local_with_a_command_is_rejected() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_GROQ_KIND".into(), "local".into());
+        vars.insert("LLM_HUB_GROQ_REGISTRY".into(), "/r.txt".into());
+        vars.insert("LLM_HUB_GROQ_COMMAND".into(), "srv".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_GROQ_COMMAND"), "{err}");
+        assert!(err.contains("LLM_HUB_GROQ_KIND=local"), "{err}");
+    }
+
+    #[test]
+    fn kind_local_errors_fail_the_load() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_GROQ_KIND".into(), "local".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_GROQ_REGISTRY"), "{err}");
+    }
+
+    #[test]
+    fn base_url_stays_required_without_kind_local() {
+        let mut vars = base_vars();
+        vars.remove("LLM_HUB_GROQ_BASE_URL");
+        vars.insert("LLM_HUB_GROQ_REGISTRY".into(), "/r.txt".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("missing LLM_HUB_GROQ_BASE_URL"), "{err}");
+    }
+
+    #[test]
+    fn discovery_finds_a_profile_by_its_kind_key_once() {
+        let mut vars = base_vars();
+        vars.remove("LLM_HUB_PROFILES");
+        vars.insert("LLM_HUB_MAC_KIND".into(), "local".into());
+        vars.insert("LLM_HUB_MAC_REGISTRY".into(), "/r.txt".into());
+        vars.insert("LLM_HUB_GROQ_KIND".into(), "local".into());
+        vars.insert("LLM_HUB_GROQ_REGISTRY".into(), "/r.txt".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        let names: Vec<&str> = cfg.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["groq", "mac", "openai"]);
+    }
+
+    #[test]
+    fn local_tuner_is_opt_in() {
+        assert!(
+            !HubConfig::from_map(&base_vars())
+                .unwrap()
+                .local_tuner_enabled
+        );
+        for (value, expected) in [("true", true), ("on", true), ("false", false)] {
+            let mut vars = base_vars();
+            vars.insert("LLM_HUB_LOCAL_TUNER".into(), value.into());
+            let cfg = HubConfig::from_map(&vars).unwrap();
+            assert_eq!(cfg.local_tuner_enabled, expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn notify_defaults_on_and_reads_its_keys() {
+        let cfg = HubConfig::from_map(&base_vars()).unwrap();
+        assert_eq!(cfg.notify, NotifyConfig::default());
+        assert!(cfg.notify.enabled);
+        assert!(cfg.notify.desktop);
+
+        let mut vars = base_vars();
+        vars.insert("HOME".into(), "/home/op".into());
+        vars.insert("LLM_HUB_NOTIFICATIONS".into(), "off".into());
+        vars.insert("LLM_HUB_NOTIFY_DESKTOP".into(), "false".into());
+        vars.insert("LLM_HUB_NOTIFY_COMMAND".into(), "~/bin/notify".into());
+        vars.insert("LLM_HUB_NOTIFY_MUTE".into(), "source=errors".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert!(!cfg.notify.enabled);
+        assert!(!cfg.notify.desktop);
+        assert_eq!(
+            cfg.notify.command,
+            Some(vec!["/home/op/bin/notify".to_owned()])
+        );
+        assert_eq!(cfg.notify.mutes.len(), 1);
+
+        vars.insert("LLM_HUB_NOTIFY_MIN_SEVERITY".into(), "loud".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert!(err.contains("LLM_HUB_NOTIFY_MIN_SEVERITY"), "{err}");
+    }
+
+    #[test]
+    fn budgets_are_unset_by_default_and_read_the_global_and_profile_keys() {
+        let cfg = HubConfig::from_map(&base_vars()).unwrap();
+        assert_eq!(cfg.budget_monthly_usd, None);
+        assert!(cfg.profiles.iter().all(|p| p.budget_monthly_usd.is_none()));
+        assert_eq!(cfg.notify.budget_steps, vec![25, 50, 75, 80, 85, 95, 100]);
+
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_BUDGET_MONTHLY_USD".into(), " 200 ".into());
+        vars.insert("LLM_HUB_GROQ_BUDGET_MONTHLY_USD".into(), "12.5".into());
+        vars.insert("LLM_HUB_OPENAI_BUDGET_MONTHLY_USD".into(), String::new());
+        vars.insert("LLM_HUB_NOTIFY_BUDGET_STEPS".into(), "100,50".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert_eq!(cfg.budget_monthly_usd, Some(200.0));
+        assert_eq!(cfg.profile("groq").unwrap().budget_monthly_usd, Some(12.5));
+        assert_eq!(cfg.profile("openai").unwrap().budget_monthly_usd, None);
+        assert_eq!(cfg.notify.budget_steps, vec![50, 100]);
+    }
+
+    #[test]
+    fn budgets_must_be_positive_finite_numbers() {
+        for (key, value) in [
+            ("LLM_HUB_BUDGET_MONTHLY_USD", "0"),
+            ("LLM_HUB_BUDGET_MONTHLY_USD", "-3"),
+            ("LLM_HUB_BUDGET_MONTHLY_USD", "lots"),
+            ("LLM_HUB_BUDGET_MONTHLY_USD", "inf"),
+            ("LLM_HUB_GROQ_BUDGET_MONTHLY_USD", "NaN"),
+            ("LLM_HUB_GROQ_BUDGET_MONTHLY_USD", "0.0"),
+        ] {
+            let mut vars = base_vars();
+            vars.insert(key.into(), value.into());
+            let err = HubConfig::from_map(&vars).unwrap_err();
+            assert!(
+                err.contains(key) && err.contains("above 0"),
+                "{key}={value}: {err}"
+            );
+        }
     }
 
     #[test]

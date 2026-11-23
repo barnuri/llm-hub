@@ -37,6 +37,8 @@ use crate::services::error_signature::{error_signature, group_errors};
 use crate::services::extension_phases;
 use crate::services::insights;
 use crate::services::insights_analysis;
+use crate::services::local_serving::pool::LocalModelState;
+use crate::services::local_serving::registry_rows;
 use crate::services::pricing::PricingBook;
 use crate::services::session_insights;
 use crate::services::stats::RequestOutcome;
@@ -74,7 +76,8 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
                 "idle": state.is_upstream_idle(&p.name),
                 "managed": p.managed.is_some(),
                 "copilot": p.copilot.is_some(),
-                "running": state.managed().is_running(&p.name),
+                "running": state.managed().is_running(&p.name)
+                    || !running_local_models(&state, &p.name).is_empty(),
             })
         })
         .collect();
@@ -172,6 +175,9 @@ fn upsert_profile_apply(
             .or_else(|| existing.map(|p| p.keep_warm))
             .unwrap_or(true),
         first_byte_timeout_ms: existing.and_then(|p| p.first_byte_timeout_ms),
+        tuner: existing.map(|p| p.tuner.clone()).unwrap_or_default(),
+        local: existing.and_then(|p| p.local.clone()),
+        budget_monthly_usd: existing.and_then(|p| p.budget_monthly_usd),
     };
     if !profile.base_url.starts_with("http://") && !profile.base_url.starts_with("https://") {
         return Err(AppError::BadRequest(
@@ -400,9 +406,17 @@ pub async fn test_profile(
         .ok_or_else(|| AppError::Internal("no client".into()))?;
 
     let started = std::time::Instant::now();
+    if let Some(local) = &profile.local {
+        return Ok(Json(probe_local_registry(
+            &state,
+            &name,
+            &local.registry,
+            started,
+        )));
+    }
     // A managed profile's server starts on demand; the probe must not run against a stopped one.
     if let Err(e) = state.managed().ensure_running(profile).await {
-        state.set_upstream_health(&name, false);
+        state.set_upstream_health(&name, false, &format!("The server did not start: {e}"));
         return Ok(Json(json!({ "ok": false, "error": e })));
     }
     let probe = send_models_request(&state, &client, profile);
@@ -412,7 +426,11 @@ pub async fn test_profile(
             let no_models_route = response.status() == reqwest::StatusCode::NOT_FOUND
                 && !profile.static_models.is_empty();
             let healthy = response.status().is_success() || no_models_route;
-            state.set_upstream_health(&name, healthy);
+            state.set_upstream_health(
+                &name,
+                healthy,
+                &format!("The test probe answered {}.", response.status()),
+            );
             Ok(Json(json!({
                 "ok": healthy,
                 "status": response.status().as_u16(),
@@ -420,14 +438,55 @@ pub async fn test_profile(
             })))
         }
         Ok(Err(e)) => {
-            state.set_upstream_health(&name, false);
+            state.set_upstream_health(&name, false, &format!("The test probe failed: {e}"));
             Ok(Json(json!({ "ok": false, "error": e })))
         }
         Err(_) => {
-            state.set_upstream_health(&name, false);
+            state.set_upstream_health(&name, false, "The test probe timed out.");
             Ok(Json(json!({ "ok": false, "error": "timeout" })))
         }
     }
+}
+
+/// Probes a `KIND=local` profile by reading its registry. It starts no model: the profile is
+/// healthy when the registry reads, and the reply names the models that run now.
+fn probe_local_registry(
+    state: &AppState,
+    name: &str,
+    registry: &Path,
+    started: std::time::Instant,
+) -> Value {
+    match registry_rows::read(registry) {
+        Ok(rows) => {
+            state.set_upstream_health(
+                name,
+                true,
+                &format!("The local model registry lists {} models.", rows.len()),
+            );
+            json!({
+                "ok": true,
+                "models": rows.len(),
+                "running": running_local_models(state, name),
+                "latency_ms": elapsed_ms(started),
+            })
+        }
+        Err(e) => {
+            let error = format!("cannot read the local model registry: {e}");
+            state.set_upstream_health(name, false, &format!("The test probe failed: {error}"));
+            json!({ "ok": false, "error": error })
+        }
+    }
+}
+
+/// The ids of the models of local profile `profile` whose process runs now.
+fn running_local_models(state: &AppState, profile: &str) -> Vec<String> {
+    state
+        .local_pool()
+        .snapshot()
+        .into_iter()
+        .filter(|model| model.profile == profile && model.state == LocalModelState::Running)
+        .map(|model| model.id)
+        .collect()
 }
 
 /// Triggers a graceful restart: supervised installs are restarted by their
@@ -1239,6 +1298,7 @@ mod tests {
             cache_write_tokens: 0,
             error: (status >= 400).then(|| format!("{model_key} failed with {status}")),
             client: None,
+            session_id: None,
             worker: None,
             routed_by: None,
             attempt: None,
@@ -1504,6 +1564,68 @@ mod tests {
         assert_eq!(body["ok"], false, "{body}");
         assert!(body["error"].is_string(), "{body}");
         assert_eq!(state.upstream_health().get("dead").copied(), Some(false));
+        let flips: Vec<_> = state
+            .notifier()
+            .list()
+            .into_iter()
+            .filter(|n| n.source == "health")
+            .collect();
+        assert_eq!(flips.len(), 1);
+        assert!(flips[0].id.starts_with("health:dead:unhealthy:"));
+        assert!(
+            flips[0].body.starts_with("The test probe"),
+            "{}",
+            flips[0].body
+        );
+    }
+
+    #[tokio::test]
+    async fn test_profile_reads_a_local_registry_and_starts_no_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("registry.txt");
+        std::fs::write(&registry, "a|org/a|a.gguf|1|4096\nb|org/b|b.gguf|1|4096\n").unwrap();
+        let registry_var = registry.display().to_string();
+        let models_var = dir.path().join("models").display().to_string();
+        let state = state_for(&[
+            ("LLM_HUB_PROFILES", "mac"),
+            ("LLM_HUB_MAC_KIND", "local"),
+            ("LLM_HUB_MAC_REGISTRY", &registry_var),
+            ("LLM_HUB_MAC_MODELS_DIR", &models_var),
+            ("LLM_HUB_MAC_LLAMA_BIN", "/nonexistent/llama"),
+        ]);
+        let missing_file = state.local_pool().acquire("mac", "a").await;
+        assert!(
+            missing_file.is_err(),
+            "a model without its file never starts"
+        );
+
+        let body = probe(&state, "mac").await;
+
+        assert_eq!(body["ok"], true, "{body}");
+        assert_eq!(body["models"], 2);
+        assert_eq!(body["running"], json!([]));
+        assert_eq!(state.upstream_health().get("mac").copied(), Some(true));
+        assert!(
+            state
+                .local_pool()
+                .snapshot()
+                .iter()
+                .all(|m| m.pid.is_none())
+        );
+        let Json(listed) = list_profiles(State(state.clone())).await;
+        assert_eq!(listed["profiles"][0]["running"], false);
+
+        std::fs::remove_file(&registry).unwrap();
+        let unreadable = probe(&state, "mac").await;
+        assert_eq!(unreadable["ok"], false);
+        assert!(
+            unreadable["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("cannot read the local model registry"),
+            "{unreadable}"
+        );
+        assert_eq!(state.upstream_health().get("mac").copied(), Some(false));
     }
 
     #[tokio::test]

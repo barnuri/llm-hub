@@ -18,6 +18,8 @@ pub struct UsageRow {
     pub error: Option<String>,
     /// Caller signature: User-Agent plus harness markers.
     pub client: Option<String>,
+    /// Validated `OpenCode` or Claude Code session ID.
+    pub session_id: Option<String>,
     /// Salted Claude Code session key, the same value `selection_events.worker` stores.
     pub worker: Option<String>,
 }
@@ -47,6 +49,8 @@ impl<'de> Deserialize<'de> for UsageRow {
             #[serde(default)]
             client: Option<String>,
             #[serde(default)]
+            session_id: Option<String>,
+            #[serde(default)]
             worker: Option<String>,
         }
         let raw = Raw::deserialize(d)?;
@@ -64,6 +68,7 @@ impl<'de> Deserialize<'de> for UsageRow {
             cost_usd: raw.cost_usd,
             error: raw.error,
             client: raw.client,
+            session_id: raw.session_id,
             worker: raw.worker,
         })
     }

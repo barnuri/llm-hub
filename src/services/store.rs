@@ -8,6 +8,10 @@ use crate::schemas::attempt_outcome::{AttemptOutcome, OutcomeCode, OutcomeSource
 use crate::schemas::cost_parts::CostParts;
 use crate::schemas::errors_report::ErrorEntry;
 use crate::schemas::insights::solver_verdict::SolverVerdict;
+use crate::schemas::notification::{
+    MuteOrigin, MuteScope, Notification, NotificationKind, NotificationMute, NotificationSeverity,
+    NotificationStatus,
+};
 use crate::schemas::prompt_shape::PromptShape;
 use crate::schemas::selection_event::SelectionEvent;
 use crate::schemas::usage_report::UsageReport;
@@ -35,6 +39,8 @@ const SELECTION_RETENTION_MS: u64 = 60 * MS_PER_DAY;
 const MS_PER_DAY: u64 = 86_400_000;
 /// The `install_settings` name that holds the salt of the scope keys.
 const INSTALL_SALT_NAME: &str = "selection_salt";
+/// Estimated prompt bytes per reported prompt token, for the tool share of a prompt.
+const PROMPT_BYTES_PER_TOKEN: i64 = 4;
 
 /// The directory that holds the store file. Files kept beside the store, such as the Smart Auto rules, live here.
 #[must_use]
@@ -85,6 +91,15 @@ struct JsonState {
     /// The salt behind the selection scope keys. Absent from older files.
     #[serde(default)]
     install_salt: Option<String>,
+    /// Named install settings other than the salt. Absent from older files.
+    #[serde(default)]
+    install_settings: HashMap<String, String>,
+    /// Notifications from every source, in save order. Absent from older files.
+    #[serde(default)]
+    notifications: Vec<Notification>,
+    /// Mute rules made in the UI. Absent from older files.
+    #[serde(default)]
+    notification_mutes: Vec<NotificationMute>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -349,6 +364,38 @@ impl Store {
                 used_usd REAL,
                 limit_usd REAL,
                 PRIMARY KEY (ts_ms, profile, quota)
+            );
+            CREATE TABLE IF NOT EXISTS notifications (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                profile TEXT,
+                model TEXT,
+                rule TEXT,
+                diff TEXT,
+                actions TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL,
+                result TEXT,
+                muted INTEGER NOT NULL DEFAULT 0,
+                CONSTRAINT ck_notifications_kind CHECK (kind IN ('proposal', 'guard', 'advisory', 'custom')),
+                CONSTRAINT ck_notifications_severity CHECK (severity IN ('info', 'warning', 'critical')),
+                CONSTRAINT ck_notifications_status CHECK (status IN ('pending', 'approved', 'dismissed', 'applied', 'failed'))
+            );
+            CREATE TABLE IF NOT EXISTS notification_mutes (
+                id TEXT PRIMARY KEY,
+                matcher TEXT NOT NULL,
+                until_ms INTEGER,
+                scope TEXT NOT NULL,
+                note TEXT,
+                origin TEXT NOT NULL,
+                created_ms INTEGER NOT NULL,
+                CONSTRAINT ck_notification_mutes_scope CHECK (scope IN ('all', 'sinks')),
+                CONSTRAINT ck_notification_mutes_origin CHECK (origin IN ('env', 'ui'))
             );",
         )
         .map_err(|e| format!("sqlite schema init failed: {e}"))?;
@@ -385,6 +432,7 @@ impl Store {
             cost_usd: 0.0,
             error: outcome.error.clone(),
             client: outcome.client.clone(),
+            session_id: outcome.session_id.clone(),
             worker: outcome.worker.clone(),
         };
         match self {
@@ -394,9 +442,9 @@ impl Store {
                     .execute(
                         "INSERT INTO requests (
                             ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker,
+                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, session_id, worker,
                             routed_by, attempt, role
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                         rusqlite::params![
                             db_i64(row.ts_ms),
                             row.model,
@@ -410,6 +458,7 @@ impl Store {
                             db_i64(row.cache_write_tokens),
                             row.error,
                             row.client,
+                            row.session_id,
                             row.worker,
                             outcome.routed_by.as_deref(),
                             outcome.attempt.as_deref(),
@@ -506,7 +555,7 @@ impl Store {
                 let mut stmt = guard
                     .prepare(&format!(
                         "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                                ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker
+                                ttft_ms, cache_read_tokens, cache_write_tokens, error, client, session_id, worker
                          FROM requests WHERE {} ORDER BY id DESC LIMIT ?1",
                         Self::not_keep_warm_sql()
                     ))
@@ -567,7 +616,7 @@ impl Store {
                     .map_err(|e| e.to_string())?;
                 let mut list_sql = format!(
                     "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker,
+                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, session_id, worker,
                             id, {}
                      FROM requests WHERE status >= {ERROR_STATUS_MIN} AND {}",
                     Self::resolved_ms_sql(),
@@ -588,8 +637,8 @@ impl Store {
                 let recent = stmt
                     .query_map(rusqlite::params_from_iter(list_params), |r| {
                         Ok(ErrorEntry {
-                            id: Some(r.get(13)?),
-                            resolved_ms: r.get::<_, Option<i64>>(14)?.map(db_u64),
+                            id: Some(r.get(14)?),
+                            resolved_ms: r.get::<_, Option<i64>>(15)?.map(db_u64),
                             row: map_usage_row(r)?,
                         })
                     })
@@ -914,6 +963,28 @@ impl Store {
         }
     }
 
+    /// The measured spend in USD per profile of every request at or after `since_ms`.
+    /// The store keeps no cost, so `book` prices each request at its own tier, keep-warm pings included.
+    pub fn month_spend_usd(
+        &self,
+        since_ms: u64,
+        book: &PricingBook,
+    ) -> Result<HashMap<String, f64>, String> {
+        let outcomes = self.filtered_outcomes(&StatsFilter {
+            since_ms: Some(since_ms),
+            profile: None,
+            model: None,
+            routed_by_prefix: None,
+            range_label: String::new(),
+        })?;
+        let mut spend: HashMap<String, f64> = HashMap::new();
+        for outcome in &outcomes {
+            *spend.entry(outcome.profile.clone()).or_default() +=
+                outcome_cost_parts(book, outcome).total();
+        }
+        Ok(spend)
+    }
+
     /// Saves an attempt's outcome. A lower-precedence source never replaces a higher one; an equal one does.
     /// The json store keeps no outcomes.
     pub fn save_attempt_outcome(
@@ -1050,7 +1121,7 @@ impl Store {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
                 let mut sql = String::from(
                     "SELECT model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error, client, worker,
+                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error, client, session_id, worker,
                             routed_by, attempt, role
                      FROM requests WHERE 1=1",
                 );
@@ -1088,10 +1159,11 @@ impl Store {
                             ts_ms: db_u64(r.get::<_, i64>(9).unwrap_or(0)),
                             error: r.get::<_, Option<String>>(10).unwrap_or(None),
                             client: r.get::<_, Option<String>>(11).unwrap_or(None),
-                            worker: r.get::<_, Option<String>>(12).unwrap_or(None),
-                            routed_by: r.get::<_, Option<String>>(13).unwrap_or(None),
-                            attempt: r.get::<_, Option<String>>(14).unwrap_or(None),
-                            role: r.get::<_, Option<String>>(15).unwrap_or(None),
+                            session_id: r.get::<_, Option<String>>(12).unwrap_or(None),
+                            worker: r.get::<_, Option<String>>(13).unwrap_or(None),
+                            routed_by: r.get::<_, Option<String>>(14).unwrap_or(None),
+                            attempt: r.get::<_, Option<String>>(15).unwrap_or(None),
+                            role: r.get::<_, Option<String>>(16).unwrap_or(None),
                         })
                     })
                     .map_err(|e| e.to_string())?
@@ -1129,6 +1201,7 @@ impl Store {
                         cache_write_tokens: row.cache_write_tokens,
                         ts_ms: row.ts_ms,
                         error: row.error.clone(),
+                        session_id: row.session_id.clone(),
                         client: row.client.clone(),
                         worker: row.worker.clone(),
                         routed_by: None,
@@ -1651,6 +1724,59 @@ impl Store {
         }
     }
 
+    /// The install setting `name`, or `None` when none is saved.
+    pub fn install_setting(&self, name: &str) -> Result<Option<String>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                guard
+                    .query_row(
+                        "SELECT value FROM install_settings WHERE name = ?1",
+                        [name],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                if name == INSTALL_SALT_NAME {
+                    return Ok(guard.state.install_salt.clone());
+                }
+                Ok(guard.state.install_settings.get(name).cloned())
+            }
+        }
+    }
+
+    /// Saves `value` as the install setting `name`, replacing the saved one.
+    pub fn set_install_setting(&self, name: &str, value: &str) -> Result<(), String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                guard
+                    .execute(
+                        "INSERT INTO install_settings (name, value) VALUES (?1, ?2)
+                         ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+                        [name, value],
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                if name == INSTALL_SALT_NAME {
+                    guard.state.install_salt = Some(value.to_owned());
+                } else {
+                    guard
+                        .state
+                        .install_settings
+                        .insert(name.to_owned(), value.to_owned());
+                }
+                guard.flush()
+            }
+        }
+    }
+
     /// Saves `events`, then drops events older than the retention age. A `max_events` of zero or more also keeps only the newest that many.
     pub fn save_selection_events(
         &self,
@@ -1877,6 +2003,412 @@ impl Store {
             }
         }
     }
+
+    /// Every saved notification, oldest first. Rows with an unknown kind, severity or status, or
+    /// unreadable actions or diff, are skipped.
+    pub fn load_notifications(&self) -> Result<Vec<Notification>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT id, kind, source, severity, title, body, profile, model, rule,
+                                diff, actions, status, created_ms, updated_ms, result, muted
+                         FROM notifications ORDER BY created_ms, id",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows: Vec<StoredNotification> = stmt
+                    .query_map([], |r| {
+                        Ok(StoredNotification {
+                            id: r.get(0)?,
+                            kind: r.get(1)?,
+                            source: r.get(2)?,
+                            severity: r.get(3)?,
+                            title: r.get(4)?,
+                            body: r.get(5)?,
+                            profile: r.get(6)?,
+                            model: r.get(7)?,
+                            rule: r.get(8)?,
+                            diff: r.get(9)?,
+                            actions: r.get(10)?,
+                            status: r.get(11)?,
+                            created_ms: db_u64(r.get(12)?),
+                            updated_ms: db_u64(r.get(13)?),
+                            result: r.get(14)?,
+                            muted: r.get(15)?,
+                        })
+                    })
+                    .map_err(|e| e.to_string())?
+                    .filter_map(Result::ok)
+                    .collect();
+                Ok(rows
+                    .into_iter()
+                    .filter_map(StoredNotification::into_notification)
+                    .collect())
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                Ok(guard.state.notifications.clone())
+            }
+        }
+    }
+
+    /// Inserts `notification`, or replaces the saved one with the same id.
+    pub fn save_notification(&self, notification: &Notification) -> Result<(), String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let diff = notification
+                    .diff
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
+                let actions =
+                    serde_json::to_string(&notification.actions).map_err(|e| e.to_string())?;
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                guard
+                    .execute(
+                        "INSERT INTO notifications (
+                            id, kind, source, severity, title, body, profile, model, rule,
+                            diff, actions, status, created_ms, updated_ms, result, muted
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                         ON CONFLICT(id) DO UPDATE SET
+                            kind = excluded.kind,
+                            source = excluded.source,
+                            severity = excluded.severity,
+                            title = excluded.title,
+                            body = excluded.body,
+                            profile = excluded.profile,
+                            model = excluded.model,
+                            rule = excluded.rule,
+                            diff = excluded.diff,
+                            actions = excluded.actions,
+                            status = excluded.status,
+                            created_ms = excluded.created_ms,
+                            updated_ms = excluded.updated_ms,
+                            result = excluded.result,
+                            muted = excluded.muted",
+                        rusqlite::params![
+                            notification.id,
+                            notification.kind.as_str(),
+                            notification.source,
+                            notification.severity.as_str(),
+                            notification.title,
+                            notification.body,
+                            notification.profile,
+                            notification.model,
+                            notification.rule,
+                            diff,
+                            actions,
+                            notification.status.as_str(),
+                            db_i64(notification.created_ms),
+                            db_i64(notification.updated_ms),
+                            notification.result,
+                            notification.muted
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                let saved = &mut guard.state.notifications;
+                match saved.iter_mut().find(|n| n.id == notification.id) {
+                    Some(existing) => existing.clone_from(notification),
+                    None => saved.push(notification.clone()),
+                }
+                guard.flush()
+            }
+        }
+    }
+
+    /// Deletes the notifications whose id is in `ids` and returns how many it deleted.
+    pub fn delete_notifications(&self, ids: &[String]) -> Result<usize, String> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        match self {
+            Store::Sqlite(conn) => {
+                let mut guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let tx = guard.transaction().map_err(|e| e.to_string())?;
+                let mut deleted = 0;
+                {
+                    let mut delete = tx
+                        .prepare("DELETE FROM notifications WHERE id = ?1")
+                        .map_err(|e| e.to_string())?;
+                    for id in ids {
+                        deleted += delete.execute([id]).map_err(|e| e.to_string())?;
+                    }
+                }
+                tx.commit().map_err(|e| e.to_string())?;
+                Ok(deleted)
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                let before = guard.state.notifications.len();
+                guard.state.notifications.retain(|n| !ids.contains(&n.id));
+                let deleted = before - guard.state.notifications.len();
+                if deleted == 0 {
+                    return Ok(0);
+                }
+                guard.flush().map(|()| deleted)
+            }
+        }
+    }
+
+    /// Every saved mute rule, oldest first. Rows with an unknown scope or origin, or an unreadable
+    /// matcher, are skipped.
+    pub fn load_notification_mutes(&self) -> Result<Vec<NotificationMute>, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let mut stmt = guard
+                    .prepare(
+                        "SELECT id, matcher, until_ms, scope, note, origin, created_ms
+                         FROM notification_mutes ORDER BY created_ms, id",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows: Vec<StoredMute> = stmt
+                    .query_map([], |r| {
+                        Ok(StoredMute {
+                            id: r.get(0)?,
+                            matcher: r.get(1)?,
+                            until_ms: r.get::<_, Option<i64>>(2)?.map(db_u64),
+                            scope: r.get(3)?,
+                            note: r.get(4)?,
+                            origin: r.get(5)?,
+                            created_ms: db_u64(r.get(6)?),
+                        })
+                    })
+                    .map_err(|e| e.to_string())?
+                    .filter_map(Result::ok)
+                    .collect();
+                Ok(rows.into_iter().filter_map(StoredMute::into_mute).collect())
+            }
+            Store::Json(store) => {
+                let guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                Ok(guard.state.notification_mutes.clone())
+            }
+        }
+    }
+
+    /// Inserts `mute`, or replaces the saved rule with the same id.
+    pub fn save_notification_mute(&self, mute: &NotificationMute) -> Result<(), String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let matcher = serde_json::to_string(&mute.matcher).map_err(|e| e.to_string())?;
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                guard
+                    .execute(
+                        "INSERT INTO notification_mutes (
+                            id, matcher, until_ms, scope, note, origin, created_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                         ON CONFLICT(id) DO UPDATE SET
+                            matcher = excluded.matcher,
+                            until_ms = excluded.until_ms,
+                            scope = excluded.scope,
+                            note = excluded.note,
+                            origin = excluded.origin,
+                            created_ms = excluded.created_ms",
+                        rusqlite::params![
+                            mute.id,
+                            matcher,
+                            mute.until_ms.map(db_i64),
+                            mute.scope.as_str(),
+                            mute.note,
+                            mute.origin.as_str(),
+                            db_i64(mute.created_ms)
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                let saved = &mut guard.state.notification_mutes;
+                match saved.iter_mut().find(|m| m.id == mute.id) {
+                    Some(existing) => existing.clone_from(mute),
+                    None => saved.push(mute.clone()),
+                }
+                guard.flush()
+            }
+        }
+    }
+
+    /// Deletes the mute rule `id`. Returns false when no rule had that id.
+    pub fn delete_notification_mute(&self, id: &str) -> Result<bool, String> {
+        match self {
+            Store::Sqlite(conn) => {
+                let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+                let deleted = guard
+                    .execute("DELETE FROM notification_mutes WHERE id = ?1", [id])
+                    .map_err(|e| e.to_string())?;
+                Ok(deleted > 0)
+            }
+            Store::Json(store) => {
+                let mut guard = store.lock().map_err(|_| "json store lock poisoned")?;
+                let before = guard.state.notification_mutes.len();
+                guard.state.notification_mutes.retain(|m| m.id != id);
+                if guard.state.notification_mutes.len() == before {
+                    return Ok(false);
+                }
+                guard.flush().map(|()| true)
+            }
+        }
+    }
+
+    /// Qualified model -> the share of its prompt bytes that are tool definitions, over the
+    /// successful requests of `profile` since `since_ms` that have a prompt shape. Prompt bytes are
+    /// estimated from `tokens_in`, and never fall below the system and tool bytes. The json store
+    /// keeps no shapes, so it returns none.
+    pub fn prompt_tool_share(
+        &self,
+        profile: &str,
+        since_ms: u64,
+    ) -> Result<HashMap<String, f64>, String> {
+        let Store::Sqlite(conn) = self else {
+            return Ok(HashMap::new());
+        };
+        let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
+        let mut stmt = guard
+            .prepare(&format!(
+                "SELECT r.model, SUM(s.tool_bytes),
+                        SUM(MAX(r.tokens_in * {PROMPT_BYTES_PER_TOKEN}, s.system_chars + s.tool_bytes))
+                 FROM request_shapes s JOIN requests r ON r.id = s.request_id
+                 WHERE r.profile = ?1 AND r.ts_ms >= ?2 AND r.status < {ERROR_STATUS_MIN} AND {}
+                 GROUP BY r.model",
+                Self::not_keep_warm_sql()
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<(String, i64, i64)> = stmt
+            .query_map(rusqlite::params![profile, db_i64(since_ms)], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows
+            .into_iter()
+            .filter(|(_, _, prompt)| *prompt > 0)
+            .map(|(model, tools, prompt)| {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "summed prompt bytes stay far below 2^52"
+                )]
+                let share = tools as f64 / prompt as f64;
+                (model, share)
+            })
+            .collect())
+    }
+}
+
+/// A `notifications` row before its kind, severity, status, actions and diff are parsed.
+struct StoredNotification {
+    id: String,
+    kind: String,
+    source: String,
+    severity: String,
+    title: String,
+    body: String,
+    profile: Option<String>,
+    model: Option<String>,
+    rule: Option<String>,
+    diff: Option<String>,
+    actions: String,
+    status: String,
+    created_ms: u64,
+    updated_ms: u64,
+    result: Option<String>,
+    muted: bool,
+}
+
+impl StoredNotification {
+    /// The parsed notification, or `None` with a warning when a field is unreadable.
+    fn into_notification(self) -> Option<Notification> {
+        let (Some(kind), Some(severity), Some(status)) = (
+            NotificationKind::parse(&self.kind),
+            NotificationSeverity::parse(&self.severity),
+            NotificationStatus::parse(&self.status),
+        ) else {
+            tracing::warn!(
+                id = self.id,
+                "stored notification has an unknown kind, severity or status"
+            );
+            return None;
+        };
+        let parsed = serde_json::from_str(&self.actions).and_then(|actions| {
+            let diff = self.diff.as_deref().map(serde_json::from_str).transpose()?;
+            Ok((actions, diff))
+        });
+        let (actions, diff) = match parsed {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!(id = self.id, "stored notification is unreadable: {e}");
+                return None;
+            }
+        };
+        Some(Notification {
+            id: self.id,
+            kind,
+            source: self.source,
+            severity,
+            title: self.title,
+            body: self.body,
+            profile: self.profile,
+            model: self.model,
+            rule: self.rule,
+            diff,
+            actions,
+            status,
+            created_ms: self.created_ms,
+            updated_ms: self.updated_ms,
+            result: self.result,
+            muted: self.muted,
+        })
+    }
+}
+
+/// A `notification_mutes` row before its matcher, scope and origin are parsed.
+struct StoredMute {
+    id: String,
+    matcher: String,
+    until_ms: Option<u64>,
+    scope: String,
+    note: Option<String>,
+    origin: String,
+    created_ms: u64,
+}
+
+impl StoredMute {
+    /// The parsed rule, or `None` with a warning when a field is unreadable.
+    fn into_mute(self) -> Option<NotificationMute> {
+        let (Some(scope), Some(origin)) = (
+            MuteScope::parse(&self.scope),
+            MuteOrigin::parse(&self.origin),
+        ) else {
+            tracing::warn!(
+                id = self.id,
+                "stored mute rule has an unknown scope or origin"
+            );
+            return None;
+        };
+        let matcher = match serde_json::from_str(&self.matcher) {
+            Ok(matcher) => matcher,
+            Err(e) => {
+                tracing::warn!(id = self.id, "stored mute rule matcher is unreadable: {e}");
+                return None;
+            }
+        };
+        Some(NotificationMute {
+            id: self.id,
+            matcher,
+            until_ms: self.until_ms,
+            scope,
+            note: self.note,
+            origin,
+            created_ms: self.created_ms,
+        })
+    }
 }
 
 impl JsonStore {
@@ -1944,6 +2476,10 @@ fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
     )?;
     add("error", "ALTER TABLE requests ADD COLUMN error TEXT")?;
     add("client", "ALTER TABLE requests ADD COLUMN client TEXT")?;
+    add(
+        "session_id",
+        "ALTER TABLE requests ADD COLUMN session_id TEXT",
+    )?;
     add("worker", "ALTER TABLE requests ADD COLUMN worker TEXT")?;
     add(
         "routed_by",
@@ -2004,13 +2540,15 @@ fn map_usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRow> {
         cost_usd: 0.0,
         error: r.get::<_, Option<String>>(10).unwrap_or(None),
         client: r.get::<_, Option<String>>(11).unwrap_or(None),
-        worker: r.get::<_, Option<String>>(12).unwrap_or(None),
+        session_id: r.get::<_, Option<String>>(12).unwrap_or(None),
+        worker: r.get::<_, Option<String>>(13).unwrap_or(None),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schemas::notification::{FlagDiff, MuteMatch};
 
     fn sample_outcome() -> RequestOutcome {
         RequestOutcome {
@@ -2025,6 +2563,7 @@ mod tests {
             cache_write_tokens: 1,
             ts_ms: 0,
             error: None,
+            session_id: None,
             client: None,
             worker: None,
             routed_by: None,
@@ -2056,6 +2595,367 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn month_spend_sums_each_profile_priced_by_the_book_since_the_cutoff() {
+        use crate::configs::TokenRates;
+
+        let book = PricingBook {
+            by_profile: HashMap::from([
+                (
+                    "a".to_string(),
+                    TokenRates {
+                        input_per_1m: 1.0,
+                        output_per_1m: 2.0,
+                        ..TokenRates::default()
+                    },
+                ),
+                (
+                    "b".to_string(),
+                    TokenRates {
+                        input_per_1m: 3.0,
+                        ..TokenRates::default()
+                    },
+                ),
+            ]),
+            ..PricingBook::default()
+        };
+        for kind in ["sqlite", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("spend");
+            let store = Store::open(kind, Some(path.to_str().unwrap())).unwrap();
+            assert!(
+                store.month_spend_usd(0, &book).unwrap().is_empty(),
+                "{kind}"
+            );
+            for (profile, tokens_out) in [("a", 1_000_000), ("a", 0), ("b", 0)] {
+                let mut outcome = sample_outcome();
+                outcome.profile = profile.into();
+                outcome.model_key = format!("{profile}/m");
+                outcome.tokens_in = 1_000_000;
+                outcome.tokens_out = tokens_out;
+                outcome.cache_read_tokens = 0;
+                outcome.cache_write_tokens = 0;
+                store.record(&outcome).unwrap();
+            }
+            let spend = store.month_spend_usd(0, &book).unwrap();
+            assert_eq!(spend.len(), 2, "{kind}");
+            assert!((spend["a"] - 4.0).abs() < 1e-9, "{kind}: {spend:?}");
+            assert!((spend["b"] - 3.0).abs() < 1e-9, "{kind}: {spend:?}");
+            let an_hour = 3_600_000;
+            assert!(
+                store
+                    .month_spend_usd(now_ms() + an_hour, &book)
+                    .unwrap()
+                    .is_empty(),
+                "{kind}"
+            );
+        }
+    }
+
+    fn sample_notification(id: &str, created_ms: u64) -> Notification {
+        Notification {
+            id: id.into(),
+            kind: NotificationKind::Proposal,
+            source: "local_tuner".into(),
+            severity: NotificationSeverity::Warning,
+            title: "Quantize the KV cache".into(),
+            body: "cmd has no --cache-type-k".into(),
+            profile: Some("local".into()),
+            model: Some("gemma".into()),
+            rule: Some("kv_cache_q8".into()),
+            diff: Some(FlagDiff {
+                add: vec!["--cache-type-k".into(), "q8_0".into()],
+                remove: Vec::new(),
+                ctx: Some(65_536),
+                old_ctx: None,
+            }),
+            actions: Notification::default_actions(NotificationKind::Proposal),
+            status: NotificationStatus::Pending,
+            created_ms,
+            updated_ms: created_ms,
+            result: None,
+            muted: false,
+        }
+    }
+
+    #[test]
+    fn notifications_upsert_by_id_and_survive_reopen() {
+        for kind in ["sqlite", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("notifications");
+            let path = path.to_str().unwrap();
+            let store = Store::open(kind, Some(path)).unwrap();
+            assert!(store.load_notifications().unwrap().is_empty(), "{kind}");
+            let first = sample_notification("a", 1);
+            let mut custom = sample_notification("b", 2);
+            custom.kind = NotificationKind::Custom;
+            custom.source = "api".into();
+            custom.severity = NotificationSeverity::Critical;
+            custom.profile = None;
+            custom.model = None;
+            custom.rule = None;
+            custom.diff = None;
+            custom.actions = Notification::default_actions(NotificationKind::Custom);
+            store.save_notification(&first).unwrap();
+            store.save_notification(&custom).unwrap();
+            let mut applied = first.clone();
+            applied.status = NotificationStatus::Applied;
+            applied.updated_ms = 5;
+            applied.result = Some("restarted".into());
+            applied.muted = true;
+            store.save_notification(&applied).unwrap();
+            drop(store);
+
+            let reopened = Store::open(kind, Some(path)).unwrap();
+            assert_eq!(
+                reopened.load_notifications().unwrap(),
+                vec![applied, custom],
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_notifications_removes_only_the_given_ids_and_survives_reopen() {
+        for kind in ["sqlite", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("deletes");
+            let path = path.to_str().unwrap();
+            let store = Store::open(kind, Some(path)).unwrap();
+            for (id, created_ms) in [("a", 1), ("b", 2), ("c", 3)] {
+                store
+                    .save_notification(&sample_notification(id, created_ms))
+                    .unwrap();
+            }
+            assert_eq!(store.delete_notifications(&[]).unwrap(), 0, "{kind}");
+            let ids = ["a".to_owned(), "c".to_owned(), "missing".to_owned()];
+            assert_eq!(store.delete_notifications(&ids).unwrap(), 2, "{kind}");
+            assert_eq!(store.delete_notifications(&ids).unwrap(), 0, "{kind}");
+            drop(store);
+
+            let reopened = Store::open(kind, Some(path)).unwrap();
+            let left: Vec<String> = reopened
+                .load_notifications()
+                .unwrap()
+                .into_iter()
+                .map(|n| n.id)
+                .collect();
+            assert_eq!(left, ["b"], "{kind}");
+        }
+    }
+
+    #[test]
+    fn json_store_without_notifications_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.json");
+        std::fs::write(
+            &path,
+            r#"{"totals":{"requests":0,"errors":0,"tokens_in":0,"tokens_out":0,"cache_read_tokens":0,"cache_write_tokens":0},"recent":[],"api_keys":[]}"#,
+        )
+        .unwrap();
+        let store = Store::open("json", Some(path.to_str().unwrap())).unwrap();
+        assert!(store.load_notifications().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sqlite_notifications_skip_unreadable_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        store
+            .save_notification(&sample_notification("good", 1))
+            .unwrap();
+        store
+            .save_notification(&sample_notification("bad-diff", 2))
+            .unwrap();
+        for id in ["bad-actions", "bad-kind", "bad-severity", "bad-status"] {
+            store
+                .save_notification(&sample_notification(id, 3))
+                .unwrap();
+        }
+        {
+            let Store::Sqlite(conn) = &store else {
+                unreachable!()
+            };
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "UPDATE notifications SET diff = 'not json' WHERE id = 'bad-diff'",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "PRAGMA ignore_check_constraints = ON;
+                 UPDATE notifications SET actions = '[\"other\"]' WHERE id = 'bad-actions';
+                 UPDATE notifications SET kind = 'other' WHERE id = 'bad-kind';
+                 UPDATE notifications SET severity = 'other' WHERE id = 'bad-severity';
+                 UPDATE notifications SET status = 'other' WHERE id = 'bad-status';",
+            )
+            .unwrap();
+        }
+        let ids: Vec<String> = store
+            .load_notifications()
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(ids, vec!["good".to_string()]);
+    }
+
+    fn sample_mute(id: &str, created_ms: u64) -> NotificationMute {
+        NotificationMute {
+            id: id.into(),
+            matcher: MuteMatch {
+                source: Some("errors".into()),
+                model: Some("*/gemma-*".into()),
+                ..MuteMatch::default()
+            },
+            until_ms: Some(10_000),
+            scope: MuteScope::Sinks,
+            note: Some("noisy".into()),
+            origin: MuteOrigin::Ui,
+            created_ms,
+        }
+    }
+
+    #[test]
+    fn notification_mutes_upsert_delete_and_survive_reopen() {
+        for kind in ["sqlite", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("mutes");
+            let path = path.to_str().unwrap();
+            let store = Store::open(kind, Some(path)).unwrap();
+            assert!(
+                store.load_notification_mutes().unwrap().is_empty(),
+                "{kind}"
+            );
+            let first = sample_mute("a", 1);
+            let gone = sample_mute("b", 2);
+            let mut forever = sample_mute("c", 3);
+            forever.until_ms = None;
+            forever.scope = MuteScope::All;
+            forever.note = None;
+            for mute in [&first, &gone, &forever] {
+                store.save_notification_mute(mute).unwrap();
+            }
+            let mut edited = first.clone();
+            edited.matcher.title = Some("Quota*".into());
+            store.save_notification_mute(&edited).unwrap();
+            assert!(store.delete_notification_mute("b").unwrap(), "{kind}");
+            assert!(!store.delete_notification_mute("b").unwrap(), "{kind}");
+            drop(store);
+
+            let reopened = Store::open(kind, Some(path)).unwrap();
+            assert_eq!(
+                reopened.load_notification_mutes().unwrap(),
+                vec![edited, forever],
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_notification_mutes_skip_unreadable_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-mutes.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        for id in ["good", "bad-matcher", "bad-scope"] {
+            store.save_notification_mute(&sample_mute(id, 1)).unwrap();
+        }
+        {
+            let Store::Sqlite(conn) = &store else {
+                unreachable!()
+            };
+            conn.lock()
+                .unwrap()
+                .execute_batch(
+                    "PRAGMA ignore_check_constraints = ON;
+                     UPDATE notification_mutes SET matcher = 'not json' WHERE id = 'bad-matcher';
+                     UPDATE notification_mutes SET scope = 'other' WHERE id = 'bad-scope';",
+                )
+                .unwrap();
+        }
+        let ids: Vec<String> = store
+            .load_notification_mutes()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["good".to_string()]);
+    }
+
+    fn tool_shape(system_chars: u64, tool_bytes: u64) -> PromptShape {
+        PromptShape {
+            system_chars,
+            tool_bytes,
+            ..PromptShape::default()
+        }
+    }
+
+    #[test]
+    fn prompt_tool_share_sums_tool_bytes_per_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let mut outcome = sample_outcome();
+        outcome.profile = "local".into();
+        outcome.model_key = "local/gemma".into();
+        // 1000 tokens estimate 4000 prompt bytes, 2000 of them tool schemas.
+        outcome.tokens_in = 1000;
+        let id = store.record(&outcome).unwrap().unwrap();
+        store.record_shape(id, &tool_shape(500, 2000)).unwrap();
+        // A tiny token count falls back to the system and tool bytes.
+        outcome.tokens_in = 1;
+        let id = store.record(&outcome).unwrap().unwrap();
+        store.record_shape(id, &tool_shape(0, 1000)).unwrap();
+        // Failed requests, keep-warm pings, other profiles and shapeless rows are ignored.
+        outcome.status = 500;
+        let id = store.record(&outcome).unwrap().unwrap();
+        store.record_shape(id, &tool_shape(0, 9000)).unwrap();
+        outcome.status = 200;
+        outcome.client = Some(KEEP_WARM_CLIENT.into());
+        let id = store.record(&outcome).unwrap().unwrap();
+        store.record_shape(id, &tool_shape(0, 9000)).unwrap();
+        outcome.client = None;
+        outcome.profile = "openai".into();
+        let id = store.record(&outcome).unwrap().unwrap();
+        store.record_shape(id, &tool_shape(0, 9000)).unwrap();
+        outcome.profile = "local".into();
+        store.record(&outcome).unwrap();
+
+        let shares = store.prompt_tool_share("local", 0).unwrap();
+        assert_eq!(shares.len(), 1);
+        let share = shares["local/gemma"];
+        assert!((share - 3000.0 / 5000.0).abs() < 1e-9, "{share}");
+        let an_hour = 3_600_000;
+        assert!(
+            store
+                .prompt_tool_share("local", now_ms() + an_hour)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn prompt_tool_share_skips_models_with_no_prompt_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty-share.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let mut outcome = sample_outcome();
+        outcome.tokens_in = 0;
+        let id = store.record(&outcome).unwrap().unwrap();
+        store.record_shape(id, &tool_shape(0, 0)).unwrap();
+        assert!(store.prompt_tool_share("openai", 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn json_store_has_no_prompt_tool_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("share.json");
+        let store = Store::open("json", Some(path.to_str().unwrap())).unwrap();
+        store.record(&sample_outcome()).unwrap();
+        assert!(store.prompt_tool_share("openai", 0).unwrap().is_empty());
     }
 
     #[test]
@@ -2174,6 +3074,32 @@ mod tests {
             };
             let read = store.filtered_outcomes(&filter).unwrap();
             assert_eq!(read[0].worker.as_deref(), Some("salted-worker"));
+        }
+    }
+
+    #[test]
+    fn session_id_round_trips_through_each_store() {
+        for kind in ["sqlite", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session");
+            let store = Store::open(kind, Some(path.to_str().unwrap())).unwrap();
+            let mut outcome = sample_outcome();
+            outcome.session_id = Some("ses_usage_1".into());
+            store.record(&outcome).unwrap();
+
+            assert_eq!(
+                store.usage().unwrap().recent[0].session_id.as_deref(),
+                Some("ses_usage_1")
+            );
+            let filter = StatsFilter {
+                since_ms: None,
+                profile: None,
+                model: None,
+                routed_by_prefix: None,
+                range_label: String::new(),
+            };
+            let read = store.filtered_outcomes(&filter).unwrap();
+            assert_eq!(read[0].session_id.as_deref(), Some("ses_usage_1"));
         }
     }
 
@@ -3116,6 +4042,55 @@ mod tests {
     }
 
     #[test]
+    fn install_settings_upsert_and_survive_reopen() {
+        for (kind, file) in [("sqlite", "settings.db"), ("json", "settings.json")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(file);
+            let path = path.to_str().unwrap();
+            {
+                let store = Store::open(kind, Some(path)).unwrap();
+                assert_eq!(store.install_setting("desktop").unwrap(), None, "{kind}");
+                store.set_install_setting("desktop", "0").unwrap();
+                store.set_install_setting("desktop", "1").unwrap();
+                store.set_install_setting("other", "x").unwrap();
+            }
+            let store = Store::open(kind, Some(path)).unwrap();
+            assert_eq!(
+                store.install_setting("desktop").unwrap().as_deref(),
+                Some("1"),
+                "{kind}"
+            );
+            assert_eq!(
+                store.install_setting("other").unwrap().as_deref(),
+                Some("x"),
+                "{kind}"
+            );
+            assert_eq!(store.install_salt("fresh").unwrap(), "fresh", "{kind}");
+            assert_eq!(
+                store.install_setting(INSTALL_SALT_NAME).unwrap().as_deref(),
+                Some("fresh"),
+                "{kind}"
+            );
+            store.set_install_setting(INSTALL_SALT_NAME, "set").unwrap();
+            assert_eq!(store.install_salt("other").unwrap(), "set", "{kind}");
+        }
+    }
+
+    #[test]
+    fn json_store_without_install_settings_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.json");
+        std::fs::write(
+            &path,
+            r#"{"totals":{"requests":0,"errors":0,"tokens_in":0,"tokens_out":0,"cache_read_tokens":0,"cache_write_tokens":0},"recent":[],"api_keys":[],"install_salt":"s"}"#,
+        )
+        .unwrap();
+        let store = Store::open("json", Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(store.install_setting("desktop").unwrap(), None);
+        assert_eq!(store.install_salt("fresh").unwrap(), "s");
+    }
+
+    #[test]
     fn sqlite_install_salt_is_created_once() {
         install_salt_survives_reopen("sqlite", "t.db");
     }
@@ -3151,6 +4126,7 @@ mod tier_role_tests {
             cache_write_tokens: 0,
             ts_ms: 0,
             error: None,
+            session_id: None,
             client: None,
             worker: None,
             routed_by: routed_by.map(Into::into),

@@ -23,6 +23,7 @@ Boolean flags accept `1`, `true`, `yes`, `on` and `0`, `false`, `no`, `off`.
 | `LLM_HUB_DEFAULT_FALLBACKS` | empty | Fallback chain for requests without the fallback header. |
 | `LLM_HUB_MAX_REPLAY_BYTES` | `268435456` (256 MB) | Largest request body the hub buffers for fallback replay and Anthropic translation. |
 | `LLM_HUB_EXTENSIONS_FILE` | `extensions.yaml`, `extensions.yml` or `extensions.json` in the working directory | Rules file for [extensions](extensions.md#rules). Reloaded on change. `llm-hub extensions check` validates it. |
+| `LLM_HUB_EXTENSIONS_DISABLED` | empty | Comma-separated extension names or globs to turn off, such as `upstream-limits` or `local-*`. `hooks` turns off the hooks of the rules file, and `rules:<name or glob>` turns off single rules. The UI cannot turn these back on. Applied when `.env` changes. See [Turn extensions on and off](extensions.md#turn-extensions-on-and-off). |
 | `LLM_HUB_STREAM_ROLE` | `true` | Add `role: "assistant"` to the first streamed delta when the upstream leaves it out. |
 | `LLM_HUB_SSE_KEEPALIVE_MS` | `15000` | Idle time before an SSE keepalive comment. `0` turns it off. |
 | `LLM_HUB_DEADLINE_MS` | none | Default time limit of a whole fallback chain. `X-LLM-Hub-Deadline-Ms` wins. See [Fallbacks](fallbacks-and-transforms.md#fallbacks). |
@@ -66,11 +67,65 @@ cannot read them. Off by default. See [Media fallback](media-fallback.md).
 The Models page writes the first three variables to `.env`, and shows its controls disabled when
 the service environment sets one of them.
 
+## Native local serving
+
+A native profile sets `LLM_HUB_<NAME>_KIND=local`. The hub serves each model from the profile registry and starts only the selected model. `LLM_HUB_<NAME>_REGISTRY` is the primary key. `LLM_HUB_<NAME>_TUNER_REGISTRY` is the fallback for registry discovery and tuner approval.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_HUB_<NAME>_KIND` | unset | Set to `local` to make the hub start registry models itself. |
+| `LLM_HUB_<NAME>_REGISTRY` | none | Primary pipe-delimited model registry. When unset, the native profile uses `LLM_HUB_<NAME>_TUNER_REGISTRY`. |
+| `LLM_HUB_<NAME>_MEMORY_GB` | runtime default | Positive memory budget in GB for the local process pool. |
+| `LLM_HUB_<NAME>_IDLE_SECS` | `1800` | Stop an idle model after this many seconds. `0` keeps it loaded. |
+| `LLM_HUB_<NAME>_MODEL_TTL_SECS` | unset | Comma-separated `id=seconds` idle overrides. `0` keeps that model loaded. |
+| `LLM_HUB_<NAME>_START_TIMEOUT_SECS` | `600` | Longest startup and health wait for one model. |
+| `LLM_HUB_<NAME>_LLAMA_BIN` | `~/.local/bin/llama` or `llama` on PATH | llama.cpp server binary. |
+| `LLM_HUB_<NAME>_MODELS_DIR` | `~/models` | Folder that contains pinned `<id>.gguf` files. |
+| `LLM_HUB_<NAME>_HF_CACHE` | `~/.cache/huggingface/hub` | Hugging Face cache searched for registry files. |
+| `LLM_HUB_<NAME>_GATE_FILE` | `~/.config/llama/mistralrs-gates.jsonl` | JSONL pass records for mistral.rs model files. |
+| `LLM_HUB_<NAME>_UNGATED_MODELS` | empty | Comma-separated mistral.rs model ids that may start without a pass. |
+| `LLM_HUB_<NAME>_ALLOW_UNGATED` | `false` | Allow every mistral.rs row to start without a pass. |
+
+The native profile keys come only from process environment or `.env`. The Profiles page does not write or change them.
+
+## Local model tuner
+
+The tuner measures how fast local models prefill, and proposes server flag changes. See
+[Local model tuner](local-tuner.md). The per-profile keys are env-only, and a profile save on the
+Profiles page keeps them.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_HUB_LOCAL_TUNER` | `false` | Turns the background probe and its proposals on. The prefill guard needs it too, because only the probe measures prefill speed. The probe reads stored request rows, so it needs `LLM_HUB_PERSISTENT=true`. |
+| `LLM_HUB_<NAME>_PREFILL_GUARD` | `off` | Skip a model of this profile that cannot prefill the prompt within the budget. `on` uses `LLM_HUB_<NAME>_FIRST_BYTE_TIMEOUT_MS` when it is above 0, else `LLM_HUB_<NAME>_TIMEOUT_MS`, and fails the config load when neither is above 0. A number is the budget in ms. See [The prefill guard](local-tuner.md#the-prefill-guard). |
+| `LLM_HUB_<NAME>_TUNER_REGISTRY` | none | The pipe-delimited model registry that Approve edits. `~/` is expanded. Without it, Approve answers 409. |
+| `LLM_HUB_<NAME>_TUNER_APPLY_COMMAND` | none | Command that runs after an approved registry edit, for example a script that regenerates the llama-swap config and restarts it. Quotes and `~/` work. It runs without a shell. |
+| `LLM_HUB_<NAME>_TUNER_APPLY_TIMEOUT_MS` | `120000` | The hub kills the apply command after this time and marks the proposal `failed`. Must be above 0. |
+
+## Notifications
+
+See [Notifications](notifications.md). The hub builds the sinks at startup, so a change to
+`LLM_HUB_NOTIFY_DESKTOP`, `LLM_HUB_NOTIFY_WEBHOOK_URL`, `LLM_HUB_NOTIFY_COMMAND` or
+`LLM_HUB_NOTIFY_TIMEOUT_MS` needs a restart. The other variables take effect when `.env` changes.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_HUB_NOTIFICATIONS` | `true` | `false` turns the inbox and every sink off. |
+| `LLM_HUB_NOTIFY_DESKTOP` | `true` | `false` stops the desktop popup. |
+| `LLM_HUB_NOTIFY_WEBHOOK_URL` | none | An `http://` or `https://` URL that receives each notification as a JSON POST. |
+| `LLM_HUB_NOTIFY_COMMAND` | none | A command that receives each notification as JSON on stdin. Quotes and `~/` work. It runs without a shell. |
+| `LLM_HUB_NOTIFY_MIN_SEVERITY` | `warning` | `info`, `warning` or `critical`. A lower severity reaches the inbox but no sink. |
+| `LLM_HUB_NOTIFY_TIMEOUT_MS` | `10000` | Longest wait for one desktop popup, webhook call or command run. Must be above 0. |
+| `LLM_HUB_NOTIFY_MUTE` | empty | Mute rules: `;` between rules, `field=glob` pairs separated by `,` in a rule. Fields: `source`, `kind`, `rule`, `profile`, `model`, `title`. At most 200 rules and 256 characters per glob. See [Mute and snooze](notifications.md#mute-and-snooze). |
+| `LLM_HUB_NOTIFY_BUDGET_STEPS` | `25,50,75,80,85,95,100` | Budget steps in percent, 1 to 1000, at most 20. See [Budget notifications](notifications.md#budget-notifications). |
+| `LLM_HUB_BUDGET_MONTHLY_USD` | none | Monthly spend budget in USD for all profiles together, against the hub's measured cost. A number above 0. Needs `LLM_HUB_PERSISTENT=true`. |
+| `LLM_HUB_<NAME>_BUDGET_MONTHLY_USD` | none | Monthly spend budget in USD for one profile. A number above 0. Env-only: a profile save on the Profiles page keeps it. |
+
 ## Persistence
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LLM_HUB_PERSISTENT` | `false` | Keep usage history, errors, hub API keys, learned Copilot limits and learned rejected fields. |
+| `LLM_HUB_PERSISTENT` | `false` | Keep usage history, errors, hub API keys, learned Copilot limits, learned rejected fields, notifications and the mute rules added in the UI. |
 | `LLM_HUB_STORE` | `sqlite` | `sqlite` keeps every request. `json` keeps a recent window. |
 | `LLM_HUB_STORE_PATH` | `llm-hub.db` (sqlite), `llm-hub-stats.json` (json) | Store file. |
 

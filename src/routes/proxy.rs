@@ -32,6 +32,9 @@ use crate::schemas::launch::profile_filter::ProfileFilter;
 use crate::schemas::model_context::strip_1m_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_id::ModelId;
+use crate::schemas::notification::{
+    Notification, NotificationKind, NotificationSeverity, NotificationStatus,
+};
 use crate::schemas::prompt_shape::PromptShape;
 use crate::schemas::reply_protocol::ReplyProtocol;
 use crate::schemas::review_evidence::ReviewEvidence;
@@ -72,6 +75,8 @@ use crate::services::fallback::{
 use crate::services::first_event::{FirstEventCheck, first_event};
 use crate::services::harness::client_signature;
 use crate::services::keep_warm::{ApiShape, KeepWarm, KeepWarmLease, PingPlan, PingTarget};
+use crate::services::local_serving::pool::{Lease, LocalPool};
+use crate::services::local_serving::watchdog::{StreamWatchdog, stall_event};
 use crate::services::media_fallback;
 use crate::services::model_health::FailureKind;
 use crate::services::multipart_model;
@@ -118,6 +123,17 @@ const CAPTURE_TEXT_BYTES: usize = 256 * 1024;
 const STAGE_CHAT_PATH: &str = "/v1/chat/completions";
 /// The text an upstream 500 carries when the model refuses image input.
 const IMAGE_INPUT_REJECTION: &str = "image input is not supported";
+/// Copilot's 400 for an endpoint the model does not serve, e.g. chat-completions on a Responses-only model.
+const NO_ENDPOINT_REFUSAL: &str = "no model endpoints available given user constraints";
+/// The rule name a prefill guard event carries, so mutes and the inbox dedupe can match it.
+const PREFILL_GUARD_RULE: &str = "prefill_guard";
+/// The path a local model process serves its OpenAI-compatible API under.
+const LOCAL_API_ROOT: &str = "/v1";
+/// The `error.type` of a 503 for a local model that found no room in the memory budget.
+const LOCAL_NO_ROOM_ERROR: &str = "upstream_error";
+const JSON_CONTENT_TYPE: &str = "application/json";
+/// The glob that matches every model of a profile.
+const EVERY_MODEL_GLOB: &str = "*";
 static NO_BODY: Value = Value::Null;
 /// The status codes that count as a success for Smart Auto affinity.
 const SUCCESS_STATUS_RANGE: std::ops::Range<u16> = 200..300;
@@ -294,14 +310,15 @@ pub(crate) async fn attempt_loop(
         return Ok(local_count_tokens(bodies.original.len()));
     }
     let client = client_signature(headers);
+    let session_id = claude_code_session_id(headers);
     // The Smart Auto template already holds the worker key of the caller's worker id, else its session.
     let worker = smart
         .as_ref()
         .and_then(|plan| plan.template.worker.clone())
         .or_else(|| worker_key(state, headers));
     let retry_policy = RetryPolicy::from_headers(headers);
-    // The raw client body, kept only for the Anthropic route's prompt shape row.
-    let shape_body = (bodies.route == RouteKind::Anthropic).then(|| body.clone());
+    // The raw client body, kept only for the prompt shape row of a Messages or chat-completions request.
+    let shape_body = records_prompt_shape(bodies.route, client_path).then(|| body.clone());
     let attempt_timeout = per_attempt_timeout_ms(headers).map(Duration::from_millis);
     let deadline_limit = chain_deadline(headers, config.deadline);
     let deadline = deadline_limit.map(|limit| received + limit);
@@ -319,8 +336,13 @@ pub(crate) async fn attempt_loop(
     let last_index = chain.len() - 1;
     // The selection template of the routed request. Every dispatch in the chain shares it.
     let mut routed = smart.as_ref().map(|plan| plan.template.clone());
+    let mut retried_local_before_first_byte = false;
 
-    for (index, requested) in chain.iter().enumerate() {
+    // A learned endpoint refusal sets `next` back to the same model, which is then routed again.
+    let mut next = 0;
+    while let Some(requested) = chain.get(next) {
+        let index = next;
+        next += 1;
         if let (Some(limit), Some(ends)) = (deadline_limit, deadline)
             && Instant::now() >= ends
         {
@@ -404,10 +426,23 @@ pub(crate) async fn attempt_loop(
         // A caller's own timeout header wins. Otherwise only a streamed Smart Auto attempt on a
         // remote profile gets the short first-byte limit: a buffered answer or a local model
         // that is still loading is slow for good reasons.
-        let first_byte = (attempt_timeout.is_none() && smart.is_some() && client_streams)
-            .then_some(())
-            .filter(|()| reviewing.is_none())
-            .and_then(|()| first_byte_limit(&state.config(), &model_id.profile));
+        let first_byte = if attempt_timeout.is_none()
+            && state
+                .config()
+                .profile(&model_id.profile)
+                .is_some_and(|profile| profile.local.is_some())
+        {
+            let prompt_tokens = estimated_prompt_tokens(bodies.original.len());
+            state
+                .local_tuner()
+                .prefill_budget(&model_id.qualified(), prompt_tokens)
+                .map(Duration::from_millis)
+        } else {
+            (attempt_timeout.is_none() && smart.is_some() && client_streams)
+                .then_some(())
+                .filter(|()| reviewing.is_none())
+                .and_then(|()| first_byte_limit(&state.config(), &model_id.profile))
+        };
         let sender = AttemptSender::for_attempt(
             state,
             &method,
@@ -417,11 +452,22 @@ pub(crate) async fn attempt_loop(
             session_token,
         )
         .with_deadline(deadline);
-        let mut keep_warm = keep_warm_lease(state, &attempt, model_id, worker.as_deref());
         let mut sent = sender.send(attempt.body.clone()).await;
         if media_fallback && !text_only {
             sent = resend_as_text(state, model_id, &sender, &mut attempt, sent).await;
         }
+        // A newly refused endpoint is learned, and the same model is routed again on another endpoint.
+        let (sent, refused) =
+            learn_refused_endpoint(state, model_id, sent, attempt.path.as_str()).await;
+        if refused {
+            if let Some(event) = &selection {
+                record_transition(state, event, SelectionState::Rejected, None);
+            }
+            next = index;
+            continue;
+        }
+        let mut keep_warm = keep_warm_lease(state, &attempt, model_id, worker.as_deref());
+
         let (result, retried_body) = match sent {
             Ok(response) if attempt.native_messages => {
                 let rephase = AttemptRephase {
@@ -505,6 +551,9 @@ pub(crate) async fn attempt_loop(
                     record_transition(state, event, next, Some(status))
                 });
                 if final_attempt {
+                    if succeeded {
+                        observe_warm_prefix(state, &config, model_id, &needs);
+                    }
                     let commit = smart
                         .as_ref()
                         .and_then(|plan| plan.commit(status, model_id));
@@ -528,6 +577,7 @@ pub(crate) async fn attempt_loop(
                                 client_streams,
                                 client,
                                 worker,
+                                session_id.clone(),
                                 commit,
                                 transition.filter(|_| succeeded),
                                 routed_by.clone(),
@@ -546,6 +596,7 @@ pub(crate) async fn attempt_loop(
                                 client_path,
                                 client,
                                 worker,
+                                session_id.clone(),
                                 commit,
                                 transition.filter(|_| succeeded),
                                 shape_body.clone(),
@@ -608,6 +659,7 @@ pub(crate) async fn attempt_loop(
                     ),
                     client.clone(),
                     worker.clone(),
+                    session_id.clone(),
                     routed_by.clone(),
                     selection.as_ref(),
                     LogPaths {
@@ -622,6 +674,11 @@ pub(crate) async fn attempt_loop(
                     record_transition(state, event, SelectionState::Rejected, None);
                 }
                 attempts_trail.push(format!("{}={reason}", model_id.qualified()));
+                let local_timeout = reason.starts_with("timeout:")
+                    && state
+                        .config()
+                        .profile(&model_id.profile)
+                        .is_some_and(|profile| profile.local.is_some());
                 record_failure(
                     state,
                     model_id,
@@ -630,6 +687,7 @@ pub(crate) async fn attempt_loop(
                     reason,
                     client.clone(),
                     worker.clone(),
+                    session_id.clone(),
                     routed_by.clone(),
                     selection.as_ref(),
                     LogPaths {
@@ -640,6 +698,15 @@ pub(crate) async fn attempt_loop(
                         .then(|| Arc::new(ext_state.clone()))
                         .as_ref(),
                 );
+                if local_timeout && !retried_local_before_first_byte {
+                    retried_local_before_first_byte = true;
+                    state
+                        .local_pool()
+                        .restart(&model_id.profile, &model_id.model)
+                        .await;
+                    next = index;
+                    continue;
+                }
                 if index == last_index {
                     if let (Some(limit), Some(ends)) = (deadline_limit, deadline)
                         && Instant::now() >= ends
@@ -892,7 +959,7 @@ fn resolve_hub(
     };
     let caller = SmartAutoHeaders::from_headers(headers)?;
     let rules = state.smart_auto_rules().current();
-    let policy = hub_policy(&rules, &selector, &caller);
+    let policy = hub_policy(config, &rules, &selector, &caller);
     let endpoint = match bodies.route {
         RouteKind::OpenAi => bare_path(bodies.upstream_path),
         RouteKind::Anthropic => MESSAGES_ENDPOINT,
@@ -1028,7 +1095,7 @@ fn resolve_hub(
         &|profile: &str| {
             config
                 .profile(profile)
-                .is_some_and(|found| found.managed.is_some())
+                .is_some_and(|found| found.managed.is_some() || found.local.is_some())
         },
     );
     if review.is_none()
@@ -1082,8 +1149,10 @@ fn resolve_hub(
 }
 
 /// The policy of a `hub/*` turn: rules, then the selector, then the caller's headers. A tier
-/// header overrides the tier the selector names; every other header only tightens.
+/// header overrides the tier the selector names; every other header only tightens. The models
+/// of a `KIND=local` profile stay out unless an allow glob names them, so a turn never starts one.
 pub(crate) fn hub_policy(
+    config: &HubConfig,
     rules: &LoadedRules,
     selector: &HubSelector,
     caller: &SmartAutoHeaders,
@@ -1095,6 +1164,13 @@ pub(crate) fn hub_policy(
     );
     if let Some(tier) = caller.policy.tier {
         policy.tier = Some(tier);
+    }
+    for profile in config.profiles.iter().filter(|p| p.local.is_some()) {
+        policy
+            .profile_exclude
+            .entry(profile.name.clone())
+            .or_default()
+            .insert(EVERY_MODEL_GLOB.to_owned());
     }
     policy
 }
@@ -1171,6 +1247,8 @@ enum Refusal {
     Certain(String),
     /// The size estimate is over the model's known `limit` by more than the margin.
     Estimated { reason: String, limit: u64 },
+    /// The profile's prefill guard expects the prompt to prefill slower than its budget.
+    Guarded(String),
 }
 
 /// The chain models that may serve the request, or the 400 naming every refusal. On a Responses
@@ -1183,29 +1261,52 @@ fn servable_chain(
 ) -> Result<Vec<ModelId>, AppError> {
     let mut servable = Vec::new();
     let mut refusals = Vec::new();
-    let mut roomiest: Option<(ModelId, u64)> = None;
-    for model in chain {
+    let mut roomiest: Option<(ModelId, u64, usize)> = None;
+    // Only a guard skip ahead of the model that serves changes who serves, so only it notifies.
+    let mut guarded = Vec::new();
+    let mut first_servable = None;
+    for (index, model) in chain.into_iter().enumerate() {
         match refusal(state, config, &model, needs) {
-            None => servable.push(model),
+            None => {
+                first_servable.get_or_insert(index);
+                servable.push(model);
+            }
             Some(Refusal::Certain(reason)) => refusals.push(reason),
+            Some(Refusal::Guarded(reason)) => {
+                guarded.push((index, prefill_guard_notification(&model, &reason)));
+                refusals.push(reason);
+            }
             Some(Refusal::Estimated { reason, limit }) => {
                 refusals.push(reason);
-                if roomiest.as_ref().is_none_or(|(_, best)| limit > *best) {
-                    roomiest = Some((model, limit));
+                if roomiest.as_ref().is_none_or(|(_, best, _)| limit > *best) {
+                    roomiest = Some((model, limit, index));
                 }
             }
         }
     }
     if servable.is_empty()
         && is_responses_endpoint(bare_path(needs.path))
-        && let Some((model, _)) = roomiest
+        && let Some((model, _, index)) = roomiest
     {
+        first_servable = Some(index);
         servable.push(model);
+    }
+    for notification in skipped_ahead(guarded, first_servable) {
+        state.notifier().notify_guard(notification);
     }
     if servable.is_empty() {
         return Err(AppError::BadRequest(refusals.join("; ")));
     }
     Ok(servable)
+}
+
+/// The guard events of chain positions before `serving`, or all of them when nothing serves.
+fn skipped_ahead<T>(guarded: Vec<(usize, T)>, serving: Option<usize>) -> Vec<T> {
+    guarded
+        .into_iter()
+        .filter(|(index, _)| serving.is_none_or(|serving| *index < serving))
+        .map(|(_, event)| event)
+        .collect()
 }
 
 /// Why `model_id` cannot serve the request, or `None` when it may be tried. Reads memory only.
@@ -1241,6 +1342,9 @@ fn refusal(
             "{qualified}: image input is not supported"
         )));
     }
+    if let Some(reason) = prefill_guard_refusal(state, config, model_id, &qualified, needs) {
+        return Some(Refusal::Guarded(reason));
+    }
     let limit = known_prompt_limit(state, model_id, is_copilot, &upstream, descriptor)?;
     (needs.prompt_tokens.saturating_mul(100) > limit.saturating_mul(PROMPT_REFUSAL_MARGIN_PERCENT)).then(|| {
         Refusal::Estimated {
@@ -1251,6 +1355,68 @@ fn refusal(
             limit,
         }
     })
+}
+
+/// Why the profile's prefill guard skips `model_id`: its measured prefill time for the prompt is
+/// over the guard budget. Reads memory only. A `count_tokens` call never prefills, so it passes.
+fn prefill_guard_refusal(
+    state: &AppState,
+    config: &HubConfig,
+    model_id: &ModelId,
+    qualified: &str,
+    needs: &RequestNeeds<'_>,
+) -> Option<String> {
+    let budget = guard_budget(config, model_id, needs)?;
+    state
+        .local_tuner()
+        .prefill_refusal(qualified, needs.prompt_tokens, budget)
+}
+
+/// The prefill guard budget of `model_id`'s profile, when the guard is on and the request generates.
+fn guard_budget(config: &HubConfig, model_id: &ModelId, needs: &RequestNeeds<'_>) -> Option<u64> {
+    if bare_path(needs.path) == NATIVE_COUNT_TOKENS_PATH {
+        return None;
+    }
+    config.profile(&model_id.profile)?.tuner.prefill_guard
+}
+
+/// Tells the tuner that a guarded `model_id` served the prompt, so the guard counts only the next
+/// turn's new tokens. Both sides use the hub's byte estimate, never the upstream's count.
+fn observe_warm_prefix(
+    state: &AppState,
+    config: &HubConfig,
+    model_id: &ModelId,
+    needs: &RequestNeeds<'_>,
+) {
+    if guard_budget(config, model_id, needs).is_some() {
+        state
+            .local_tuner()
+            .observe(&model_id.qualified(), needs.prompt_tokens, now_ms());
+    }
+}
+
+/// The guard event for a request the prefill guard kept from `model_id`.
+fn prefill_guard_notification(model_id: &ModelId, reason: &str) -> Notification {
+    let qualified = model_id.qualified();
+    let now = now_ms();
+    Notification {
+        id: format!("tuner:{PREFILL_GUARD_RULE}:{qualified}:{now}"),
+        kind: NotificationKind::Guard,
+        source: crate::services::local_tuner::rules::SOURCE.to_owned(),
+        severity: NotificationSeverity::Warning,
+        title: format!("Prefill guard skipped {qualified}"),
+        body: reason.to_owned(),
+        profile: Some(model_id.profile.clone()),
+        model: Some(model_id.model.clone()),
+        rule: Some(PREFILL_GUARD_RULE.to_owned()),
+        diff: None,
+        actions: Notification::default_actions(NotificationKind::Guard),
+        status: NotificationStatus::Pending,
+        created_ms: now,
+        updated_ms: now,
+        result: None,
+        muted: false,
+    }
 }
 
 /// The smallest prompt size `model_id` is known to accept: a Copilot model's seeded or learned limit,
@@ -1303,6 +1469,46 @@ pub(crate) fn upstream_key(state: &AppState, model_id: &ModelId) -> String {
     state
         .upstream_model(&model_id.profile, &model_id.model)
         .map_or_else(|| model_id.model.clone(), |entry| entry.upstream_id)
+}
+
+/// When `sent` is a Copilot 400 that refuses the chat-completions or messages endpoint, learns the
+/// refusal and reports it as new (`true`). Any other reply comes back unchanged, with `false`.
+async fn learn_refused_endpoint(
+    state: &AppState,
+    model_id: &ModelId,
+    sent: Result<reqwest::Response, String>,
+    path: &str,
+) -> (Result<reqwest::Response, String>, bool) {
+    let endpoint = [CHAT_ENDPOINT, MESSAGES_ENDPOINT]
+        .into_iter()
+        .find(|known| path.ends_with(known));
+    let response = match (sent, endpoint) {
+        (Ok(response), Some(_))
+            if response.status() == StatusCode::BAD_REQUEST
+                && is_copilot_profile(state, model_id) =>
+        {
+            response
+        }
+        (other, _) => return (other, false),
+    };
+    let endpoint = endpoint.unwrap_or_default();
+    let (status, version, headers) = (
+        response.status(),
+        response.version(),
+        response.headers().clone(),
+    );
+    let (raw, _) = read_upstream_capped(
+        response,
+        usize::try_from(MAX_REJECTION_BYTES).unwrap_or(usize::MAX),
+    )
+    .await;
+    if String::from_utf8_lossy(&raw).contains(NO_ENDPOINT_REFUSAL)
+        && state.learn_endpoint_refused(&model_id.profile, &model_id.model, endpoint)
+    {
+        return (Err(NO_ENDPOINT_REFUSAL.to_string()), true);
+    }
+    let body = reqwest::Body::from(raw);
+    (Ok(rebuilt_response(status, version, headers, body)), false)
 }
 
 /// When `sent` is a 500 that refuses image input, learns the refusal and sends the attempt once
@@ -1539,10 +1745,10 @@ impl<'a> AttemptBodies<'a> {
                 .as_ref()
                 .map_or_else(|| model_id.model.clone(), |m| m.upstream_id.clone()),
         };
-        let native = self
-            .native
-            .as_ref()
-            .filter(|_| catalog.as_ref().is_some_and(|m| m.native_messages));
+        let native = self.native.as_ref().filter(|_| {
+            catalog.as_ref().is_some_and(|m| m.native_messages)
+                && !state.endpoint_refused(&sent_id.profile, &sent_id.model, MESSAGES_ENDPOINT)
+        });
         let bridged = self
             .native
             .as_ref()
@@ -1868,6 +2074,7 @@ async fn deliver(
     client_path: &str,
     client: Option<String>,
     worker: Option<String>,
+    session_id: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
     prompt_body: Option<Bytes>,
@@ -1892,6 +2099,7 @@ async fn deliver(
             plan,
             client,
             worker,
+            session_id.clone(),
             commit,
             selection,
             prompt_body,
@@ -1912,6 +2120,7 @@ async fn deliver(
             transform,
             client,
             worker,
+            session_id,
             commit,
             selection,
             prompt_body,
@@ -1929,6 +2138,12 @@ async fn deliver(
 /// True when the attempt is a chat-completions call whose answer review can read.
 fn review_applies(attempt: &Attempt<'_>) -> bool {
     !attempt.native_messages && attempt.path.as_str().ends_with(CHAT_ENDPOINT)
+}
+
+/// True when the request's prompt shape is recorded: an Anthropic Messages or a chat-completions
+/// body, the two shapes `PromptShape::from_body` reads.
+fn records_prompt_shape(route: RouteKind, client_path: &str) -> bool {
+    route == RouteKind::Anthropic || client_path.ends_with(CHAT_ENDPOINT)
 }
 
 /// True for a Responses call; the `OpenAI` route keeps the client's `/v1` prefix in its endpoint.
@@ -1974,6 +2189,7 @@ async fn review_deliver(
     streams: bool,
     client: Option<String>,
     worker: Option<String>,
+    session_id: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
     routed_by: String,
@@ -2102,6 +2318,7 @@ async fn review_deliver(
         cache_write_tokens: 0,
         error: None,
         client,
+        session_id,
         worker,
         routed_by: Some(routed_by),
         attempt,
@@ -2204,6 +2421,7 @@ async fn attempt_single(
         None,
         client_signature(headers),
         worker_key(state, headers),
+        claude_code_session_id(headers),
         None,
         None,
         None,
@@ -2379,11 +2597,19 @@ impl<'a> AttemptSender<'a> {
         }
         let client = state.client(&profile.name).ok_or("no client for profile")?;
         state.managed().ensure_running(profile).await?;
+        let lease =
+            match LocalModel::acquire(state.local_pool(), profile, &self.model_id.model).await? {
+                LocalModel::NotLocal => None,
+                LocalModel::Leased(lease) => Some(lease),
+                LocalModel::NoRoom(message) => return Ok(local_no_room(&message)),
+            };
+        let api_base = lease.as_ref().map(local_api_base);
 
         let upstream = UpstreamRequest {
             state,
             client: &client,
             profile,
+            api_base: api_base.as_deref(),
             method: self.method,
             upstream_path: self.path.as_str(),
             headers: self.headers,
@@ -2404,11 +2630,86 @@ impl<'a> AttemptSender<'a> {
             copilot_bearer.as_deref(),
         )
         .await;
-        if !rejected {
-            return Ok(response);
-        }
-        upstream.send(body).await.map(|(retried, _)| retried)
+        let response = if rejected {
+            upstream.send(body).await?.0
+        } else {
+            response
+        };
+        Ok(match lease {
+            Some(lease) => hold_lease(response, lease),
+            None => response,
+        })
     }
+}
+
+/// How a request reaches the model of its profile when the hub serves that model itself.
+enum LocalModel {
+    /// The profile is not `KIND=local`; the request goes to the profile's base URL.
+    NotLocal,
+    /// The model process runs, and the lease keeps the pool from stopping it.
+    Leased(Lease),
+    /// The memory budget had no room for the model; the message says why.
+    NoRoom(String),
+}
+
+impl LocalModel {
+    /// Leases `model` of a local profile, and starts its process first when none runs.
+    ///
+    /// # Errors
+    ///
+    /// The pool's message when the model did not start. A failed start names the model log.
+    async fn acquire(
+        pool: &LocalPool,
+        profile: &ProfileConfig,
+        model: &str,
+    ) -> Result<LocalModel, String> {
+        if profile.local.is_none() {
+            return Ok(LocalModel::NotLocal);
+        }
+        match pool.acquire(&profile.name, model).await {
+            Ok(lease) => Ok(LocalModel::Leased(lease)),
+            Err(reason) if LocalPool::is_no_room(&reason) => Ok(LocalModel::NoRoom(reason)),
+            Err(reason) => Err(reason),
+        }
+    }
+}
+
+/// The API root of a leased local model process, which `UpstreamPath` paths are relative to.
+fn local_api_base(lease: &Lease) -> String {
+    format!("{}{LOCAL_API_ROOT}", lease.base_url())
+}
+
+/// `response` with a body that holds `lease` until the body ends or its reader drops it, so
+/// the pool never stops a model that still streams.
+fn hold_lease(mut response: reqwest::Response, lease: Lease) -> reqwest::Response {
+    let (status, version) = (response.status(), response.version());
+    let headers = std::mem::take(response.headers_mut());
+    let chunks = Box::pin(response.bytes_stream());
+    let held = futures_util::stream::unfold((chunks, lease), |(mut chunks, lease)| async move {
+        let chunk = chunks.next().await?;
+        Some((chunk, (chunks, lease)))
+    });
+    rebuilt_response(status, version, headers, reqwest::Body::wrap_stream(held))
+}
+
+/// The error body of a request whose local model found no room in the memory budget.
+fn no_room_body(message: &str) -> String {
+    serde_json::json!({ "error": { "message": message, "type": LOCAL_NO_ROOM_ERROR } }).to_string()
+}
+
+/// The 503 an attempt gets when the local memory budget has no room for its model.
+fn local_no_room(message: &str) -> reqwest::Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(JSON_CONTENT_TYPE),
+    );
+    rebuilt_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        reqwest::Version::HTTP_11,
+        headers,
+        no_room_body(message),
+    )
 }
 
 /// Learns the fields a Copilot "Extra inputs are not permitted" 400 names and retries once
@@ -2679,6 +2980,7 @@ async fn send_internal(
             raw: &raw,
             client,
             worker,
+            session_id: claude_code_session_id(headers),
         },
     )
     .await;
@@ -2698,6 +3000,7 @@ struct InternalCall<'a> {
     raw: &'a [u8],
     client: &'a str,
     worker: Option<String>,
+    session_id: Option<String>,
 }
 
 /// Records a call the hub made on its own behalf under its `client` marker, and returns its cost.
@@ -2724,6 +3027,7 @@ async fn record_internal_call(state: &AppState, model_id: &ModelId, call: Intern
         cache_write_tokens: usage.cache_write_tokens,
         error: (!call.ok).then(|| error_reason(call.status, call.raw)),
         client: Some(call.client.to_string()),
+        session_id: call.session_id,
         worker: call.worker,
         routed_by: Some(ROUTED_BY_PINNED.to_owned()),
         attempt: None,
@@ -2791,6 +3095,7 @@ pub(crate) async fn send_media_call(
             raw: &raw,
             client: MEDIA_FALLBACK_CLIENT,
             worker: None,
+            session_id: None,
         },
     )
     .await;
@@ -2861,7 +3166,10 @@ fn serves_only_responses(state: &AppState, sent_id: &ModelId) -> bool {
     else {
         return false;
     };
-    let serves = |wanted: &str| endpoints.iter().any(|e| e.as_str() == Some(wanted));
+    let serves = |wanted: &str| {
+        endpoints.iter().any(|e| e.as_str() == Some(wanted))
+            && !state.endpoint_refused(&sent_id.profile, &sent_id.model, wanted)
+    };
     serves(RESPONSES_ENDPOINT) && !serves(CHAT_ENDPOINT) && !serves(MESSAGES_ENDPOINT)
 }
 
@@ -3088,6 +3396,8 @@ struct UpstreamRequest<'a> {
     state: &'a AppState,
     client: &'a reqwest::Client,
     profile: &'a ProfileConfig,
+    /// The API root of a leased local model, used instead of the profile's base URL.
+    api_base: Option<&'a str>,
     method: &'a Method,
     upstream_path: &'a str,
     headers: &'a HeaderMap,
@@ -3136,6 +3446,7 @@ impl UpstreamRequest<'_> {
             &mut forwarded,
         )
         .await?;
+        let base = self.api_base.unwrap_or(&base);
         let mut request = self
             .client
             .request(self.method.clone(), format!("{base}{}", self.upstream_path))
@@ -3385,6 +3696,7 @@ fn build_response(
     transform: Option<BodyTransform>,
     client: Option<String>,
     worker: Option<String>,
+    session_id: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
     prompt_body: Option<Bytes>,
@@ -3436,6 +3748,7 @@ fn build_response(
         cache_write_tokens: 0,
         error: None,
         client,
+        session_id,
         worker,
         routed_by: Some(routed_by),
         attempt,
@@ -3444,6 +3757,31 @@ fn build_response(
 
     let (summary_sender, summary_receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
     let capture_answer = selection.as_ref().and_then(|event| event.attempt.clone());
+    let watchdog = state
+        .config()
+        .profile(&model_id.profile)
+        .is_some_and(|profile| profile.local.is_some())
+        .then(|| {
+            let prompt_tokens = prompt_body
+                .as_ref()
+                .map_or(0, |body| estimated_prompt_tokens(body.len()));
+            let first_byte = (prompt_tokens > 0)
+                .then(|| {
+                    state
+                        .local_tuner()
+                        .prefill_budget(&model_id.qualified(), prompt_tokens)
+                })
+                .flatten()
+                .map(Duration::from_millis);
+            StreamWatchdog::new(
+                first_byte,
+                state
+                    .config()
+                    .sse_keepalive
+                    .map_or(Duration::from_mins(1), |keepalive| keepalive),
+            )
+        });
+
     let observed = futures_util::stream::unfold(
         StreamState {
             inner: upstream.bytes_stream(),
@@ -3455,6 +3793,18 @@ fn build_response(
             started,
             ttft_ms: None,
             keepalive,
+            watchdog,
+            watchdog_model: state
+                .config()
+                .profile(&model_id.profile)
+                .is_some_and(|profile| profile.local.is_some())
+                .then(|| {
+                    (
+                        model_id.profile.clone(),
+                        model_id.model.clone(),
+                        Arc::clone(state.local_pool()),
+                    )
+                }),
             upstream_end: UpstreamEnd::Open,
             bytes_sent: 0,
             answer: capture_answer.as_ref().map(|_| Vec::new()),
@@ -3579,16 +3929,35 @@ where
 {
     loop {
         if !state.ended {
-            match next_chunk(&mut state.inner, state.keepalive).await {
+            let watchdog_timeout = state
+                .watchdog
+                .as_ref()
+                .and_then(StreamWatchdog::active_timeout);
+            match next_chunk(&mut state.inner, state.keepalive, watchdog_timeout).await {
                 // Nothing from upstream for a whole interval. The frame goes
                 // out ahead of the transform and without touching `tail` or
                 // `ttft_ms`: it is the hub's own byte, not the upstream's, and
                 // must not show up in usage scraping or latency stats.
+                NextChunk::Stall => {
+                    tracing::warn!("local model stream stalled");
+                    state.upstream_end = UpstreamEnd::Error;
+                    state.ended = true;
+                    if let Some((profile, model, pool)) = state.watchdog_model.take() {
+                        tokio::spawn(async move {
+                            pool.restart(&profile, &model).await;
+                        });
+                    }
+                    let event = stall_event("local model stream stalled");
+                    return Some((Ok(event), state));
+                }
                 NextChunk::Idle => {
                     let ping = Bytes::from_static(SSE_KEEPALIVE_FRAME.as_bytes());
                     return Some((Ok(ping), state));
                 }
                 NextChunk::Chunk(Ok(bytes)) => {
+                    if let Some(watchdog) = state.watchdog.as_mut() {
+                        watchdog.received_bytes();
+                    }
                     // The tail always holds the *upstream* bytes, so usage
                     // scraping keeps working when a transform is active but
                     // observed nothing itself.
@@ -3657,6 +4026,7 @@ where
 
 /// What one poll of the upstream body produced.
 enum NextChunk {
+    Stall,
     /// The keepalive interval elapsed with the upstream still silent.
     Idle,
     Chunk(reqwest::Result<Bytes>),
@@ -3669,18 +4039,33 @@ enum NextChunk {
 /// Cancelling the `next()` future on timeout loses nothing: `Stream::poll_next`
 /// only yields an item by returning `Ready`, so a future dropped while `Pending`
 /// has consumed nothing. Without `keepalive` this is a plain `next().await`.
-async fn next_chunk<S>(inner: &mut S, keepalive: Option<Duration>) -> NextChunk
+async fn next_chunk<S>(
+    inner: &mut S,
+    keepalive: Option<Duration>,
+    watchdog_timeout: Option<Duration>,
+) -> NextChunk
 where
     S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
-    let Some(interval) = keepalive else {
+    let interval = watchdog_timeout
+        .zip(keepalive)
+        .map_or(watchdog_timeout, |(watchdog, keepalive)| {
+            Some(watchdog.min(keepalive))
+        });
+    let Some(interval) = interval.or(keepalive) else {
         return match inner.next().await {
             Some(item) => NextChunk::Chunk(item),
             None => NextChunk::End,
         };
     };
     match tokio::time::timeout(interval, inner.next()).await {
-        Err(_elapsed) => NextChunk::Idle,
+        Err(_)
+            if watchdog_timeout
+                .is_some_and(|watchdog| watchdog <= keepalive.unwrap_or(watchdog)) =>
+        {
+            NextChunk::Stall
+        }
+        Err(_) => NextChunk::Idle,
         Ok(Some(item)) => NextChunk::Chunk(item),
         Ok(None) => NextChunk::End,
     }
@@ -3696,6 +4081,8 @@ struct StreamState<S> {
     ended: bool,
     started: Instant,
     ttft_ms: Option<u64>,
+    watchdog: Option<StreamWatchdog>,
+    watchdog_model: Option<(String, String, Arc<LocalPool>)>,
     /// Idle gap after which a keepalive comment goes out. `None` on every
     /// non-SSE body and whenever the knob is off — see `pump`.
     keepalive: Option<Duration>,
@@ -3749,7 +4136,7 @@ struct StreamSummary {
 
 /// How an upstream body ended, as the cancel and failure log lines name it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum UpstreamEnd {
+pub(crate) enum UpstreamEnd {
     /// The hub stopped reading before the upstream body ended.
     #[default]
     Open,
@@ -3814,6 +4201,7 @@ async fn build_anthropic_response(
     plan: &TransformPlan,
     client: Option<String>,
     worker: Option<String>,
+    session_id: Option<String>,
     commit: Option<SmartAutoCommit>,
     selection: Option<SelectionEvent>,
     prompt_body: Option<Bytes>,
@@ -3904,6 +4292,7 @@ async fn build_anthropic_response(
         tokens_out: usage.tokens_out,
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        session_id,
         error: (status.as_u16() >= ERROR_STATUS_MIN).then(|| {
             if overflowed {
                 "upstream response too large to translate".to_string()
@@ -4012,7 +4401,10 @@ fn teaches_stored_limit(upstream_path: &str, upstream_id: &str) -> bool {
 
 /// Reads an upstream body into memory, stopping once `cap` is exceeded.
 /// A read error ends the read with whatever arrived, which the translator then renders as an error.
-async fn read_upstream_capped(upstream: reqwest::Response, cap: usize) -> (Vec<u8>, UpstreamEnd) {
+pub(crate) async fn read_upstream_capped(
+    upstream: reqwest::Response,
+    cap: usize,
+) -> (Vec<u8>, UpstreamEnd) {
     let mut stream = upstream.bytes_stream();
     let mut buffered: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -4027,8 +4419,8 @@ async fn read_upstream_capped(upstream: reqwest::Response, cap: usize) -> (Vec<u
     (buffered, UpstreamEnd::Complete)
 }
 
-/// Writes the request row, then the prompt shape of an Anthropic request beside it. The json store
-/// returns no row id, so it writes no shape.
+/// Writes the request row, then the prompt shape of a Messages or chat-completions request beside it.
+/// The json store returns no row id, so it writes no shape.
 async fn record_request(state: &AppState, outcome: &RequestOutcome, prompt_body: Option<Bytes>) {
     let Some(store) = state.store() else {
         return;
@@ -4072,6 +4464,7 @@ fn record_failure(
     reason: String,
     client: Option<String>,
     worker: Option<String>,
+    session_id: Option<String>,
     routed_by: String,
     selection: Option<&SelectionEvent>,
     paths: LogPaths<'_>,
@@ -4092,6 +4485,7 @@ fn record_failure(
         cache_write_tokens: 0,
         error: Some(reason),
         client,
+        session_id,
         worker,
         routed_by: Some(routed_by),
         attempt,
@@ -4140,6 +4534,22 @@ async fn passthrough_oversized(
         .ensure_running(profile)
         .await
         .map_err(AppError::UpstreamUnavailable)?;
+    let lease = match LocalModel::acquire(state.local_pool(), profile, &model_id.model)
+        .await
+        .map_err(AppError::UpstreamUnavailable)?
+    {
+        LocalModel::NotLocal => None,
+        LocalModel::Leased(lease) => Some(lease),
+        LocalModel::NoRoom(message) => {
+            let headers = [(axum::http::header::CONTENT_TYPE, JSON_CONTENT_TYPE)];
+            let reply = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                headers,
+                no_room_body(&message),
+            );
+            return Ok(axum::response::IntoResponse::into_response(reply));
+        }
+    };
 
     let upstream_path = path_and_query.strip_prefix("/v1").unwrap_or(path_and_query);
     let mut forwarded = filter_request_headers(headers);
@@ -4153,6 +4563,7 @@ async fn passthrough_oversized(
     )
     .await
     .map_err(AppError::UpstreamUnavailable)?;
+    let base = lease.as_ref().map_or(base, local_api_base);
     let url = format!("{base}{upstream_path}");
 
     let combined = futures_util::stream::iter(vec![Ok::<Bytes, axum::Error>(buffered)]).chain(rest);
@@ -4168,6 +4579,10 @@ async fn passthrough_oversized(
         .send()
         .await
         .map_err(|e| AppError::UpstreamUnavailable(e.to_string()))?;
+    let response = match lease {
+        Some(lease) => hold_lease(response, lease),
+        None => response,
+    };
     // A streamed body cannot be replayed, so a rejected Copilot session is only dropped.
     upstream_auth::invalidate_if_unauthorized(
         state,
@@ -4188,6 +4603,7 @@ async fn passthrough_oversized(
         None,
         client_signature(headers),
         worker_key(state, headers),
+        claude_code_session_id(headers),
         None,
         None,
         None,
@@ -4448,6 +4864,8 @@ mod tests {
             started: Instant::now(),
             ttft_ms: None,
             keepalive,
+            watchdog: None,
+            watchdog_model: None,
             upstream_end: UpstreamEnd::Open,
             bytes_sent: 0,
             answer: None,
@@ -5483,7 +5901,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn openai_route_request_writes_no_shape_row() {
+        async fn chat_completion_request_writes_one_shape_row() {
             let dir = tempfile::tempdir().unwrap();
             let db = dir.path().join("hub.db");
             let copilot = copilot_with_store(Some(
@@ -5497,20 +5915,34 @@ mod tests {
                 .await;
             let body = json!({
                 "model": format!("{PROFILE}/{PLAIN_ID}"),
-                "messages": [{"role": "user", "content": "hi"}],
+                "messages": [
+                    {"role": "system", "content": "abcd"},
+                    {"role": "user", "content": "hi"},
+                ],
+                "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
             });
 
             let (status, _) = send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
 
             assert_eq!(status, 200);
             assert_eq!(
-                count_until(&db, "SELECT COUNT(*) FROM requests", 1).await,
+                count_until(
+                    &db,
+                    "SELECT COUNT(*) FROM request_shapes s JOIN requests r ON r.id = s.request_id",
+                    1,
+                )
+                .await,
                 1
             );
-            assert_eq!(
-                count_until(&db, "SELECT COUNT(*) FROM request_shapes", 0).await,
-                0
-            );
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let row: (i64, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT messages, turn_start, system_chars, tool_count FROM request_shapes",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(row, (1, 1, 4, 1));
         }
 
         #[tokio::test]
@@ -7008,6 +7440,86 @@ mod tests {
             assert!(requests_to(&copilot, UPSTREAM_CHAT_PATH).await.is_empty());
         }
 
+        const MIXED_ID: &str = "mai-code-2-flash";
+        const NO_ENDPOINT_BODY: &str =
+            r#"{"error":{"message":"no model endpoints available given user constraints"}}"#;
+
+        /// A model that lists chat-completions and `/responses`, as Copilot lists MAI models.
+        fn list_mixed_model(copilot: &Copilot) {
+            copilot.state.set_copilot_catalog(
+                PROFILE,
+                vec![json!({"id": MIXED_ID, "supported_endpoints": ["/chat/completions", "/responses"]})],
+            );
+        }
+
+        #[tokio::test]
+        async fn refused_chat_completions_is_retried_on_responses_then_skipped() {
+            let copilot = copilot().await;
+            list_mixed_model(&copilot);
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(
+                    ResponseTemplate::new(400).set_body_raw(NO_ENDPOINT_BODY, "application/json"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+            mount_responses_reply(&copilot, &responses_text_reply("bridged")).await;
+            let body = chat_body(MIXED_ID, false);
+
+            let (status, bytes) = send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
+
+            assert_eq!(status, 200);
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(reply["choices"][0]["message"]["content"], "bridged");
+            assert_eq!(requests_to(&copilot, UPSTREAM_CHAT_PATH).await.len(), 1);
+            assert_eq!(requests_to(&copilot, RESPONSES_ENDPOINT).await.len(), 1);
+            assert!(
+                copilot
+                    .state
+                    .endpoint_refused(PROFILE, MIXED_ID, CHAT_ENDPOINT)
+            );
+
+            let (status, _) = send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
+
+            assert_eq!(status, 200);
+            assert_eq!(
+                requests_to(&copilot, UPSTREAM_CHAT_PATH).await.len(),
+                1,
+                "a learned refusal is not sent to chat-completions again"
+            );
+            assert_eq!(requests_to(&copilot, RESPONSES_ENDPOINT).await.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn other_bad_request_passes_through_and_teaches_nothing() {
+            let copilot = copilot().await;
+            list_mixed_model(&copilot);
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(
+                    ResponseTemplate::new(400)
+                        .set_body_json(json!({"error": {"message": "bad field"}})),
+                )
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, _) = send(
+                &copilot,
+                &client_headers(),
+                &chat_body(MIXED_ID, false),
+                RouteKind::OpenAi,
+            )
+            .await;
+
+            assert_eq!(status, 400);
+            assert!(
+                !copilot
+                    .state
+                    .endpoint_refused(PROFILE, MIXED_ID, CHAT_ENDPOINT)
+            );
+            assert!(requests_to(&copilot, RESPONSES_ENDPOINT).await.is_empty());
+        }
+
         #[tokio::test]
         async fn bridged_chat_stream_becomes_chat_chunks_ending_in_done() {
             let copilot = copilot().await;
@@ -7247,6 +7759,53 @@ mod tests {
             assert_eq!(session("has space"), None);
             assert_eq!(session("semi;colon"), None);
             assert_eq!(claude_code_session_id(&client_headers()), None);
+        }
+
+        #[test]
+        fn opencode_header_names_the_session_when_present() {
+            let mut headers = client_headers();
+            headers.insert(
+                crate::consts::HEADER_SESSION_ID,
+                HeaderValue::from_static("ses_oc_unit"),
+            );
+
+            assert_eq!(
+                claude_code_session_id(&headers).as_deref(),
+                Some("ses_oc_unit")
+            );
+        }
+
+        #[test]
+        fn opencode_session_header_is_preserved_for_usage_rows() {
+            let mut headers = client_headers();
+            headers.insert(
+                crate::consts::HEADER_SESSION_ID,
+                HeaderValue::from_static("ses_usage_1"),
+            );
+
+            let outcome = RequestOutcome {
+                session_id: claude_code_session_id(&headers),
+                ..RequestOutcome::default()
+            };
+
+            assert_eq!(outcome.session_id.as_deref(), Some("ses_usage_1"));
+        }
+
+        #[test]
+        fn internal_request_preserves_the_opencode_session_header() {
+            let mut headers = client_headers();
+            headers.insert(
+                crate::consts::HEADER_SESSION_ID,
+                HeaderValue::from_static("ses_internal_1"),
+            );
+
+            let session_id = claude_code_session_id(&headers);
+            let outcome = RequestOutcome {
+                session_id,
+                ..RequestOutcome::default()
+            };
+
+            assert_eq!(outcome.session_id.as_deref(), Some("ses_internal_1"));
         }
 
         #[test]
@@ -8399,6 +8958,261 @@ mod tests {
                     .is_empty()
             );
         }
+
+        /// Sets the profile's prefill guard budget, and gives `PLAIN_ID` a confident fit of
+        /// 3.5 ms per token, so a 2,000-token prompt takes about 7.2 s to prefill.
+        fn guard_plain_model(copilot: &Copilot, budget_ms: Option<u64>) {
+            let mut config = (*copilot.state.config()).clone();
+            for profile in &mut config.profiles {
+                profile.tuner.prefill_guard = budget_ms;
+            }
+            copilot.state.swap_config(config).unwrap();
+            copilot.state.local_tuner().set_fits(HashMap::from([(
+                format!("{PROFILE}/{PLAIN_ID}"),
+                crate::services::local_tuner::prefill::PrefillFit {
+                    a: 3.5,
+                    b: 0.0,
+                    low_confidence: false,
+                    max_tokens_seen: 100_000,
+                },
+            )]));
+        }
+
+        fn guard_events(copilot: &Copilot) -> Vec<Notification> {
+            copilot
+                .state
+                .notifier()
+                .list()
+                .into_iter()
+                .filter(|n| n.kind == NotificationKind::Guard)
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn prefill_guard_skips_a_slow_model_and_reaches_the_fallback() {
+            let copilot = copilot().await;
+            guard_plain_model(&copilot, Some(1_000));
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, _) = send(
+                &copilot,
+                &fallback_to(TRANSLATED_ID),
+                &long_anthropic_body(PLAIN_ID, 2_000),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert_eq!(chat_models(&copilot).await, [TRANSLATED_UPSTREAM_ID]);
+            let events = guard_events(&copilot);
+            assert_eq!(events.len(), 1);
+            let event = &events[0];
+            assert_eq!(event.source, crate::services::local_tuner::rules::SOURCE);
+            assert_eq!(event.rule.as_deref(), Some(PREFILL_GUARD_RULE));
+            assert_eq!(event.severity, NotificationSeverity::Warning);
+            assert_eq!(event.title, "Prefill guard skipped copilot/gpt-4.1");
+            assert_eq!(event.profile.as_deref(), Some(PROFILE));
+            assert_eq!(event.model.as_deref(), Some(PLAIN_ID));
+            assert!(event.body.starts_with("copilot/gpt-4.1: prompt ~2k tokens"));
+        }
+
+        #[tokio::test]
+        async fn prefill_guard_never_notifies_for_a_fallback_the_chain_does_not_reach() {
+            let copilot = copilot().await;
+            guard_plain_model(&copilot, Some(1_000));
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, _) = send(
+                &copilot,
+                &fallback_to(PLAIN_ID),
+                &long_anthropic_body(TRANSLATED_ID, 2_000),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert_eq!(chat_models(&copilot).await, [TRANSLATED_UPSTREAM_ID]);
+            assert!(guard_events(&copilot).is_empty());
+        }
+
+        #[test]
+        fn guard_events_count_only_positions_ahead_of_the_serving_model() {
+            let guarded = vec![(0, "a"), (2, "c")];
+            assert_eq!(skipped_ahead(guarded.clone(), Some(1)), ["a"]);
+            assert_eq!(skipped_ahead(guarded.clone(), Some(0)), Vec::<&str>::new());
+            assert_eq!(skipped_ahead(guarded, None), ["a", "c"]);
+        }
+
+        #[tokio::test]
+        async fn prefill_guard_lets_count_tokens_through_to_the_local_estimate() {
+            let copilot = copilot().await;
+            guard_plain_model(&copilot, Some(1_000));
+            let body = long_anthropic_body(PLAIN_ID, 2_000).to_string();
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                NATIVE_COUNT_TOKENS_PATH,
+                &client_headers(),
+                Bytes::from(body.clone()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), 200);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(reply["input_tokens"], estimated_prompt_tokens(body.len()));
+            assert!(guard_events(&copilot).is_empty());
+            assert!(
+                copilot
+                    .upstream
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn prefill_guard_on_the_only_model_answers_400_without_an_upstream_call() {
+            let copilot = copilot().await;
+            guard_plain_model(&copilot, Some(1_000));
+
+            let message = refused_message(
+                &copilot,
+                MESSAGES_ENDPOINT,
+                RouteKind::Anthropic,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 2_000),
+            )
+            .await;
+
+            assert!(
+                message.starts_with("copilot/gpt-4.1: prompt ~2k tokens, expected ~"),
+                "{message}"
+            );
+            assert!(
+                message.ends_with("budget 1 s. Use a smaller prompt or another model"),
+                "{message}"
+            );
+            assert!(
+                copilot
+                    .upstream
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            // A second refusal within the dedupe window adds no second guard event.
+            refused_message(
+                &copilot,
+                MESSAGES_ENDPOINT,
+                RouteKind::Anthropic,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 2_000),
+            )
+            .await;
+            assert_eq!(guard_events(&copilot).len(), 1);
+        }
+
+        #[tokio::test]
+        async fn prefill_guard_passes_the_request_when_off_under_budget_or_unmeasured() {
+            // Off, a budget the estimate fits in, and a model without a fit.
+            let cases = [
+                (None, PLAIN_ID),
+                (Some(60_000), PLAIN_ID),
+                (Some(1_000), TRANSLATED_ID),
+            ];
+            for (budget, model) in cases {
+                let copilot = copilot().await;
+                guard_plain_model(&copilot, budget);
+                Mock::given(method("POST"))
+                    .and(path(UPSTREAM_CHAT_PATH))
+                    .respond_with(chat_completion())
+                    .mount(&copilot.upstream)
+                    .await;
+
+                let (status, _) = send(
+                    &copilot,
+                    &client_headers(),
+                    &long_anthropic_body(model, 2_000),
+                    RouteKind::Anthropic,
+                )
+                .await;
+
+                assert_eq!(status, 200, "{budget:?} {model}");
+                assert_eq!(chat_models(&copilot).await.len(), 1, "{budget:?} {model}");
+                assert!(guard_events(&copilot).is_empty(), "{budget:?} {model}");
+            }
+        }
+
+        #[tokio::test]
+        async fn prefill_guard_counts_only_the_new_tokens_after_a_warm_prefix() {
+            let warm = copilot().await;
+            let cold = copilot().await;
+            for copilot in [&warm, &cold] {
+                // 1.5 s at 3.5 ms per token admits about 430 cold tokens. The upstream's count of 5
+                // differs from the hub's estimate, so the warm prefix must use the estimate.
+                guard_plain_model(copilot, Some(1_500));
+                Mock::given(method("POST"))
+                    .and(path(UPSTREAM_CHAT_PATH))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "chatcmpl-1",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+                    })))
+                    .mount(&copilot.upstream)
+                    .await;
+            }
+
+            let (first, _) = send(
+                &warm,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 300),
+                RouteKind::Anthropic,
+            )
+            .await;
+            let (follow_up, _) = send(
+                &warm,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 600),
+                RouteKind::Anthropic,
+            )
+            .await;
+
+            assert_eq!((first, follow_up), (200, 200));
+            assert_eq!(chat_models(&warm).await.len(), 2);
+            assert!(guard_events(&warm).is_empty());
+            let message = refused_message(
+                &cold,
+                MESSAGES_ENDPOINT,
+                RouteKind::Anthropic,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 600),
+            )
+            .await;
+            assert!(
+                message.starts_with("copilot/gpt-4.1: prompt ~"),
+                "{message}"
+            );
+            assert!(!message.contains("warm prefix"), "{message}");
+        }
     }
 
     #[tokio::test]
@@ -8450,6 +9264,381 @@ mod tests {
         assert!(!translated.contains("keepalive"), "{translated}");
         assert!(receiver.await.is_ok());
     }
+
+    #[cfg(unix)]
+    mod local_serving {
+        use std::collections::{BTreeMap, HashMap};
+        use std::fmt::Write as _;
+        use std::path::{Path, PathBuf};
+        use std::sync::OnceLock;
+
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::schemas::smart_auto_rules::SmartAutoRulesMode;
+        use crate::services::fake_gh_cli::FakeGhCli;
+        use crate::services::gh_cli::GhOutcome;
+        use crate::services::local_serving::pool::LocalModelSnapshot;
+        use crate::services::memory_credential_store::MemoryCredentialStore;
+        use crate::services::smart_auto_rules::SmartAutoRulesStore;
+
+        const PROFILE: &str = "mac";
+        const REMOTE: &str = "openai";
+        const CHAT_PATH: &str = "/chat/completions";
+        const REPLY: &str = "local reply";
+        fn fake_llama_server() -> &'static Path {
+            static SERVER: OnceLock<PathBuf> = OnceLock::new();
+            SERVER.get_or_init(|| {
+                let executable = std::env::current_exe().unwrap();
+                let deps_dir = executable.parent().unwrap();
+                let candidate = deps_dir.parent().unwrap().join("test-local-server");
+                if candidate.is_file() {
+                    candidate
+                } else {
+                    deps_dir.join("test-local-server")
+                }
+            })
+        }
+
+        /// A `KIND=local` profile on a temp registry next to a remote profile. Its own pool logs
+        /// to the temp dir, so no test writes into the hub's `logs/`.
+        struct Fixture {
+            dir: tempfile::TempDir,
+            config: HubConfig,
+            pool: LocalPool,
+        }
+
+        impl Fixture {
+            fn new(rows: &[(&str, f64)], extra: &[(&str, &str)]) -> Fixture {
+                let dir = tempfile::tempdir().unwrap();
+                let models = dir.path().join("models");
+                std::fs::create_dir_all(&models).unwrap();
+                let mut registry = String::new();
+                for (id, size_gb) in rows {
+                    writeln!(registry, "{id}|org/{id}|{id}.gguf|{size_gb}|8192").unwrap();
+                    std::fs::write(models.join(format!("{id}.gguf")), "x").unwrap();
+                }
+                std::fs::write(dir.path().join("registry.txt"), registry).unwrap();
+                let at = |name: &str| dir.path().join(name).display().to_string();
+                let mut vars: HashMap<String, String> = HashMap::from([
+                    ("LLM_HUB_PROFILES".into(), format!("{PROFILE},{REMOTE}")),
+                    ("LLM_HUB_MAC_KIND".into(), "local".into()),
+                    ("LLM_HUB_MAC_REGISTRY".into(), at("registry.txt")),
+                    ("LLM_HUB_MAC_MODELS_DIR".into(), at("models")),
+                    ("LLM_HUB_MAC_HF_CACHE".into(), at("hf")),
+                    (
+                        "LLM_HUB_MAC_LLAMA_BIN".into(),
+                        fake_llama_server().display().to_string(),
+                    ),
+                    ("LLM_HUB_MAC_START_TIMEOUT_SECS".into(), "20".into()),
+                    (
+                        "LLM_HUB_OPENAI_BASE_URL".into(),
+                        "http://127.0.0.1:9/v1".into(),
+                    ),
+                ]);
+                for (key, value) in extra {
+                    vars.insert(format!("LLM_HUB_MAC_{key}"), (*value).to_owned());
+                }
+                let config = HubConfig::from_map(&vars).unwrap();
+                let pool = LocalPool::new(&config, dir.path().join("logs"));
+                Fixture { dir, config, pool }
+            }
+
+            fn state(&self) -> AppState {
+                AppState::with_seams(
+                    self.config.clone(),
+                    None,
+                    Arc::new(MemoryCredentialStore::default()),
+                    Arc::new(FakeGhCli::new(GhOutcome::Token("gho_test".into()))),
+                )
+                .unwrap()
+            }
+
+            fn profile(&self, name: &str) -> &ProfileConfig {
+                self.config.profile(name).unwrap()
+            }
+
+            async fn acquire(&self, id: &str) -> Result<LocalModel, String> {
+                LocalModel::acquire(&self.pool, self.profile(PROFILE), id).await
+            }
+
+            async fn lease(&self, id: &str) -> Lease {
+                match self.acquire(id).await.unwrap() {
+                    LocalModel::Leased(lease) => lease,
+                    _ => panic!("{id} was not leased"),
+                }
+            }
+
+            fn model(&self, id: &str) -> LocalModelSnapshot {
+                self.pool
+                    .snapshot()
+                    .into_iter()
+                    .find(|model| model.id == id)
+                    .unwrap()
+            }
+        }
+
+        async fn send_through(
+            state: &AppState,
+            profile: &ProfileConfig,
+            api_base: &str,
+            body: Value,
+        ) -> reqwest::Response {
+            let client = state.client(&profile.name).unwrap();
+            let headers = HeaderMap::new();
+            let upstream = UpstreamRequest {
+                state,
+                client: &client,
+                profile,
+                api_base: Some(api_base),
+                method: &Method::POST,
+                upstream_path: CHAT_PATH,
+                headers: &headers,
+                force_identity_encoding: true,
+                timeout: Some(Duration::from_secs(10)),
+                session_token: None,
+            };
+            upstream
+                .send(Bytes::from(body.to_string()))
+                .await
+                .unwrap()
+                .0
+        }
+
+        #[tokio::test]
+        async fn a_remote_profile_is_not_local_and_starts_nothing() {
+            let fx = Fixture::new(&[("a", 1.0)], &[]);
+
+            let outcome = LocalModel::acquire(&fx.pool, fx.profile(REMOTE), "a").await;
+
+            assert!(matches!(outcome, Ok(LocalModel::NotLocal)));
+            assert!(fx.pool.snapshot().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_local_request_reaches_the_leased_process_and_releases_it_with_the_body() {
+            let fx = Fixture::new(&[("a", 1.0)], &[]);
+            let state = fx.state();
+            let lease = fx.lease("a").await;
+            let api_base = local_api_base(&lease);
+            assert!(api_base.starts_with("http://127.0.0.1:") && api_base.ends_with("/v1"));
+
+            let body = json!({"model": "a", "messages": []});
+            let response = send_through(&state, fx.profile(PROFILE), &api_base, body).await;
+            let response = hold_lease(response, lease);
+            assert_eq!(fx.model("a").in_flight, 1);
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let reply: Value = response.json().await.unwrap();
+            assert_eq!(reply["choices"][0]["message"]["content"], REPLY);
+            assert_eq!(fx.model("a").in_flight, 0);
+            assert!(
+                state.local_pool().snapshot().is_empty(),
+                "the hub pool started nothing"
+            );
+            fx.pool.stop_all().await;
+        }
+
+        #[tokio::test]
+        async fn a_local_stream_passes_through_and_holds_the_lease_until_it_ends() {
+            let fx = Fixture::new(&[("a", 1.0)], &[]);
+            let state = fx.state();
+            let lease = fx.lease("a").await;
+            let api_base = local_api_base(&lease);
+            let body = json!({"model": "a", "stream": true, "messages": []});
+
+            let response = send_through(&state, fx.profile(PROFILE), &api_base, body).await;
+            let mut chunks = hold_lease(response, lease).bytes_stream();
+            let mut text =
+                String::from_utf8(chunks.next().await.unwrap().unwrap().to_vec()).unwrap();
+            assert_eq!(
+                fx.model("a").in_flight,
+                1,
+                "a streaming body holds the lease"
+            );
+            while let Some(chunk) = chunks.next().await {
+                text.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+            }
+
+            assert!(
+                text.contains("\"local\"") && text.contains("[DONE]"),
+                "{text}"
+            );
+            assert_eq!(
+                fx.model("a").in_flight,
+                0,
+                "the end of the body releases the lease"
+            );
+            fx.pool.stop_all().await;
+        }
+
+        #[tokio::test]
+        async fn a_client_that_drops_a_stream_releases_the_lease() {
+            let fx = Fixture::new(&[("a", 1.0)], &[]);
+            let state = fx.state();
+            let lease = fx.lease("a").await;
+            let api_base = local_api_base(&lease);
+            let body = json!({"model": "a", "stream": true, "messages": []});
+
+            let response = send_through(&state, fx.profile(PROFILE), &api_base, body).await;
+            let mut chunks = hold_lease(response, lease).bytes_stream();
+            chunks.next().await.unwrap().unwrap();
+            drop(chunks);
+
+            assert_eq!(fx.model("a").in_flight, 0);
+            fx.pool.stop_all().await;
+        }
+
+        #[tokio::test]
+        async fn a_full_memory_budget_answers_503_and_a_failed_start_names_its_reason() {
+            let fx = Fixture::new(
+                &[("a", 4.0), ("b", 4.0), ("c", 4.0)],
+                &[("MEMORY_GB", "10"), ("START_TIMEOUT_SECS", "5")],
+            );
+            let held = (fx.lease("a").await, fx.lease("b").await);
+
+            let LocalModel::NoRoom(message) = fx.acquire("c").await.unwrap() else {
+                panic!("c started without room");
+            };
+            let reply = local_no_room(&message);
+            assert_eq!(reply.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body: Value = reply.json().await.unwrap();
+            assert_eq!(body["error"]["type"], LOCAL_NO_ROOM_ERROR);
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no room to start local model mac/c"),
+                "{body}"
+            );
+
+            let missing = fx.acquire("nope").await.err().unwrap();
+            assert!(
+                missing.contains("not in the local model registry"),
+                "{missing}"
+            );
+            drop(held);
+            fx.pool.stop_all().await;
+        }
+
+        #[tokio::test]
+        async fn a_local_model_that_cannot_start_fails_the_request_with_502() {
+            let fx = Fixture::new(&[("a", 1.0)], &[]);
+            std::fs::remove_file(fx.dir.path().join("models/a.gguf")).unwrap();
+            let state = fx.state();
+            let body = json!({"model": format!("{PROFILE}/a"), "messages": []});
+
+            let error = attempt_loop(
+                &state,
+                Method::POST,
+                "/v1/chat/completions",
+                &HeaderMap::new(),
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+            assert!(
+                error.message().contains("not on disk"),
+                "{}",
+                error.message()
+            );
+            assert!(
+                state
+                    .local_pool()
+                    .snapshot()
+                    .iter()
+                    .all(|m| m.pid.is_none())
+            );
+        }
+
+        #[tokio::test]
+        async fn an_api_base_replaces_the_profile_base_url() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let fx = Fixture::new(&[], &[]);
+            let state = fx.state();
+            let api_base = format!("{}/v1", upstream.uri());
+
+            let response = send_through(&state, fx.profile(PROFILE), &api_base, json!({})).await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        fn rules(json: Option<&str>) -> Arc<LoadedRules> {
+            let dir = tempfile::tempdir().unwrap();
+            SmartAutoRulesStore::open(dir.path(), json)
+                .unwrap()
+                .current()
+        }
+
+        fn eligible_ids(config: &HubConfig, rules: &LoadedRules) -> Vec<String> {
+            let snapshot =
+                crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot::new(vec![
+                    ModelDescriptor::for_test("mac/a"),
+                    ModelDescriptor::for_test("openai/gpt"),
+                ]);
+            let selector = HubSelector::parse("hub/smart-auto-balance", &BTreeMap::new())
+                .unwrap()
+                .unwrap();
+            let policy = hub_policy(config, rules, &selector, &SmartAutoHeaders::default());
+            SmartAutoPool::eligible(&snapshot, &policy, "/v1/chat/completions", 0)
+                .into_iter()
+                .map(|descriptor| descriptor.qualified_id.clone())
+                .collect()
+        }
+
+        #[test]
+        fn smart_auto_leaves_local_models_out_unless_a_rule_allows_them() {
+            let fx = Fixture::new(&[("a", 1.0)], &[]);
+
+            assert_eq!(eligible_ids(&fx.config, &rules(None)), ["openai/gpt"]);
+            let allowed = rules(Some(r#"{"allow":["mac/*"]}"#));
+            assert_eq!(eligible_ids(&fx.config, &allowed), ["mac/a", "openai/gpt"]);
+        }
+
+        #[test]
+        fn a_config_without_local_profiles_keeps_the_smart_auto_policy() {
+            let config = HubConfig::from_map(&HashMap::from([
+                ("LLM_HUB_PROFILES".to_owned(), "mac,openai".to_owned()),
+                (
+                    "LLM_HUB_MAC_BASE_URL".to_owned(),
+                    "http://127.0.0.1:8080/v1".to_owned(),
+                ),
+                (
+                    "LLM_HUB_OPENAI_BASE_URL".to_owned(),
+                    "http://127.0.0.1:9/v1".to_owned(),
+                ),
+            ]))
+            .unwrap();
+            let rules = rules(None);
+            let selector = HubSelector::parse("hub/smart-auto-balance", &BTreeMap::new())
+                .unwrap()
+                .unwrap();
+            let caller = SmartAutoHeaders::default();
+
+            let policy = hub_policy(&config, &rules, &selector, &caller);
+
+            assert_eq!(
+                policy,
+                rules.layer(
+                    SmartAutoRulesMode::default(),
+                    &selector.policy,
+                    &caller.policy
+                )
+            );
+            assert_eq!(eligible_ids(&config, &rules), ["mac/a", "openai/gpt"]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8499,6 +9688,18 @@ mod review_body_tests {
             completed_solver_attempt(&event, SelectionState::Completed),
             None
         );
+    }
+
+    #[test]
+    fn prompt_shape_recorded_for_messages_and_chat_completions_only() {
+        assert!(records_prompt_shape(RouteKind::Anthropic, "/v1/messages"));
+        assert!(records_prompt_shape(
+            RouteKind::OpenAi,
+            "/v1/chat/completions"
+        ));
+        assert!(records_prompt_shape(RouteKind::OpenAi, "/chat/completions"));
+        assert!(!records_prompt_shape(RouteKind::OpenAi, "/v1/responses"));
+        assert!(!records_prompt_shape(RouteKind::OpenAi, "/v1/embeddings"));
     }
 
     #[test]

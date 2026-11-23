@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
@@ -8,6 +8,7 @@ use crate::configs::HubConfig;
 use crate::consts::{LOGS_DIR, MEDIA_FALLBACK_CACHE_ENTRIES};
 use crate::ext::builtin::builtins;
 use crate::ext::{CompleteCtx, ExtensionSet};
+use crate::schemas::extension_status::ExtensionStatus;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
 use crate::schemas::upstream_model::UpstreamModel;
@@ -18,15 +19,19 @@ use crate::services::copilot_descriptions::CopilotDescriptions;
 use crate::services::copilot_prices::CopilotPrices;
 use crate::services::copilot_sessions::CopilotSessionCache;
 use crate::services::credential_store::CredentialStore;
+use crate::services::extension_toggles::{self, ExtensionToggles, ToggleError, ToggleTarget};
 use crate::services::gh_cli::GhCli;
 use crate::services::keep_warm::KeepWarm;
 use crate::services::keyring_credential_store::KeyringCredentialStore;
 use crate::services::listed_prices::ListedPrices;
 use crate::services::live_feed::LiveFeed;
+use crate::services::local_serving::pool::LocalPool;
+use crate::services::local_tuner::LocalTuner;
 use crate::services::managed_process::ProcessManager;
 use crate::services::media_fallback::MediaCache;
 use crate::services::model_health::ModelHealth;
 use crate::services::model_limits::{ModelLimit, ModelLimits};
+use crate::services::notifications::dispatch::Notifier;
 use crate::services::pricing::PricingBook;
 use crate::services::process_gh_cli::ProcessGhCli;
 use crate::services::profile_usage::ProfileUsageCache;
@@ -72,6 +77,8 @@ struct Inner {
     /// Fired to trigger graceful shutdown (auto-update, env watcher, /api/restart).
     restart_notify: Arc<tokio::sync::Notify>,
     managed: Arc<ProcessManager>,
+    /// The model processes of the `KIND=local` profiles.
+    local_pool: Arc<LocalPool>,
     copilot_sessions: CopilotSessionCache,
     copilot_auto: CopilotAutoRouter,
     profile_usage: ProfileUsageCache,
@@ -85,6 +92,9 @@ struct Inner {
     unsupported_body_fields: UnsupportedBodyFields,
     /// `<profile>/<upstream model>` keys that refused image input, learned from upstream rejections.
     vision_unsupported: DashSet<String>,
+    /// `<profile>/<upstream model>/<endpoint>` keys a Copilot upstream refused as "no model endpoints available".
+    refused_endpoints: DashSet<String>,
+
     /// The texts media fallback made from media, most recently used first.
     media_cache: MediaCache,
     /// `<profile>/<upstream model>` -> the prompt limit an upstream 400 named in its message.
@@ -98,8 +108,18 @@ struct Inner {
     smart_auto_rules: SmartAutoRulesStore,
     /// Idle Copilot Claude streams kept warm with pings.
     keep_warm: Arc<KeepWarm>,
-    /// Built-in, library and rule extensions. Swapped whole when a rules file reloads.
+    /// The running extensions: `all_extensions` without what `extension_toggles` turns off.
     extensions: ArcSwap<ExtensionSet>,
+    /// Built-in, library and rule extensions before toggles. Swapped whole when a rules file reloads.
+    all_extensions: ArcSwap<ExtensionSet>,
+    /// The extensions and rules turned off by the env or the UI.
+    extension_toggles: ArcSwap<ExtensionToggles>,
+    /// Serializes rebuilds of `extensions`, so a toggle and a rules reload never lose each other.
+    extensions_lock: Mutex<()>,
+    /// Prefill fits and apply locks of the local model tuner.
+    local_tuner: Arc<LocalTuner>,
+    /// The notifications inbox, mutes and sink delivery every source writes through.
+    notifier: Arc<Notifier>,
 }
 
 #[derive(Clone)]
@@ -149,10 +169,18 @@ impl AppState {
             }
         }
         let selection_log = SelectionLog::open(store.clone());
+        let notifier = Notifier::new(&config.notify, store.as_ref().map(Arc::clone));
         let smart_auto_rules = SmartAutoRulesStore::open(
             &store_dir(config.store_path.as_deref()),
             config.smart_auto_rules_env.as_deref(),
         )?;
+        let extension_toggles =
+            ExtensionToggles::load(&config.extensions_disabled, store.as_deref());
+        let all_extensions = ExtensionSet::new(builtins());
+        let extensions = all_extensions
+            .filtered(&extension_toggles)
+            .with_notifier(Arc::clone(&notifier));
+        let local_pool = Arc::new(LocalPool::new(&config, LOGS_DIR));
         let state = AppState(Arc::new(Inner {
             config: ArcSwap::from_pointee(config),
             clients: ArcSwap::from_pointee(clients),
@@ -172,6 +200,7 @@ impl AppState {
             first_refresh: tokio::sync::OnceCell::new(),
             restart_notify: Arc::new(tokio::sync::Notify::new()),
             managed: Arc::new(ProcessManager::new(LOGS_DIR)),
+            local_pool,
             copilot_sessions: CopilotSessionCache::new(Arc::clone(&credentials), Arc::clone(&gh)),
             copilot_auto: CopilotAutoRouter::with_limits(Arc::clone(&model_limits)),
             profile_usage: ProfileUsageCache::new(credentials, gh),
@@ -182,6 +211,8 @@ impl AppState {
             model_limits,
             unsupported_body_fields,
             vision_unsupported,
+            refused_endpoints: DashSet::new(),
+
             media_cache: MediaCache::new(MEDIA_FALLBACK_CACHE_ENTRIES),
             rejected_prompt_limits: DashMap::new(),
             smart_auto_affinity: SmartAutoAffinity::new(),
@@ -189,7 +220,12 @@ impl AppState {
             selection_log,
             smart_auto_rules,
             keep_warm: Arc::new(KeepWarm::default()),
-            extensions: ArcSwap::from_pointee(ExtensionSet::new(builtins())),
+            extensions: ArcSwap::from_pointee(extensions),
+            all_extensions: ArcSwap::from_pointee(all_extensions),
+            extension_toggles: ArcSwap::from_pointee(extension_toggles),
+            extensions_lock: Mutex::new(()),
+            local_tuner: Arc::new(LocalTuner::default()),
+            notifier,
         }));
         state.refresh_api_key_hashes();
         Ok(state)
@@ -205,8 +241,10 @@ impl AppState {
         let clients = build_clients(&config)?;
         self.0.clients.store(Arc::new(clients));
         self.0.managed.reconcile(&config);
+        self.0.local_pool.reconcile(&config);
         self.0.copilot_sessions.reconcile(&config);
         self.0.profile_usage.reconcile(&config);
+        self.0.notifier.reconfigure(&config.notify);
         let is_copilot = |name: &String| {
             config
                 .profiles
@@ -215,6 +253,16 @@ impl AppState {
         };
         self.0.upstream_models.retain(|name, _| is_copilot(name));
         self.0.copilot_catalogs.retain(|name, _| is_copilot(name));
+        if self.config().extensions_disabled != config.extensions_disabled {
+            let _guard = self.lock_extensions();
+            let toggles = self
+                .0
+                .extension_toggles
+                .load()
+                .with_env(&config.extensions_disabled);
+            self.0.extension_toggles.store(Arc::new(toggles));
+            self.rebuild_extensions();
+        }
         self.0.config.store(Arc::new(config));
         Ok(())
     }
@@ -243,6 +291,7 @@ impl AppState {
         request_state: Option<&Arc<axum::http::Extensions>>,
     ) {
         self.0.stats.record(outcome);
+        self.0.notifier.note_error(outcome);
         self.extensions()
             .complete(&CompleteCtx::new(outcome, request_state));
     }
@@ -251,8 +300,62 @@ impl AppState {
         self.0.extensions.load_full()
     }
 
+    /// Stores `extensions` as the full set and runs it without what the toggles turn off.
     pub fn set_extensions(&self, extensions: ExtensionSet) {
-        self.0.extensions.store(Arc::new(extensions));
+        let _guard = self.lock_extensions();
+        self.0.all_extensions.store(Arc::new(extensions));
+        self.rebuild_extensions();
+    }
+
+    /// Every extension and rule, with whether it runs and what turned it off.
+    pub(crate) fn extension_statuses(&self) -> Vec<ExtensionStatus> {
+        extension_toggles::statuses(
+            &self.0.all_extensions.load(),
+            &self.0.extension_toggles.load(),
+        )
+    }
+
+    /// Turns an extension or a rule on or off from the UI, saves the choice and rebuilds the set.
+    ///
+    /// # Errors
+    /// [`ToggleError::Unknown`] for a name the set lacks, [`ToggleError::SetByEnv`] for a name
+    /// the env turns off, and [`ToggleError::Store`] when the save fails.
+    pub(crate) fn toggle_extension(
+        &self,
+        target: ToggleTarget,
+        name: &str,
+        enabled: bool,
+    ) -> Result<(), ToggleError> {
+        let _guard = self.lock_extensions();
+        if !extension_toggles::knows(&self.0.all_extensions.load(), target, name) {
+            return Err(ToggleError::Unknown(name.to_owned()));
+        }
+        let toggles =
+            self.0
+                .extension_toggles
+                .load()
+                .toggled(target, name, enabled, self.store())?;
+        self.0.extension_toggles.store(Arc::new(toggles));
+        self.rebuild_extensions();
+        Ok(())
+    }
+
+    fn lock_extensions(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.0
+            .extensions_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Filters the full set by the toggles into the running set. The caller holds the lock.
+    fn rebuild_extensions(&self) {
+        let running = self
+            .0
+            .all_extensions
+            .load()
+            .filtered(&self.0.extension_toggles.load())
+            .with_notifier(Arc::clone(&self.0.notifier));
+        self.0.extensions.store(Arc::new(running));
     }
 
     pub fn live_feed(&self) -> &LiveFeed {
@@ -261,6 +364,16 @@ impl AppState {
 
     pub fn publish_live(&self, outcome: &RequestOutcome) {
         self.0.live_feed.publish(outcome, || self.pricing_book());
+    }
+
+    /// The local model tuner's prefill fits and apply locks.
+    pub fn local_tuner(&self) -> &Arc<LocalTuner> {
+        &self.0.local_tuner
+    }
+
+    /// The notifications inbox and dispatcher.
+    pub fn notifier(&self) -> &Arc<Notifier> {
+        &self.0.notifier
     }
 
     pub fn store(&self) -> Option<&Store> {
@@ -455,6 +568,28 @@ impl AppState {
             .contains(&format!("{profile}/{model}"))
     }
 
+    /// Whether `model` on `profile` refused `endpoint` before, so requests go to another endpoint.
+    pub fn endpoint_refused(&self, profile: &str, model: &str, endpoint: &str) -> bool {
+        self.0
+            .refused_endpoints
+            .contains(&format!("{profile}/{model}/{endpoint}"))
+    }
+
+    /// Records that `model` on `profile` refused `endpoint`, and returns whether it is new.
+    /// Held in memory: a restart relearns it once.
+    pub fn learn_endpoint_refused(&self, profile: &str, model: &str, endpoint: &str) -> bool {
+        let new = self
+            .0
+            .refused_endpoints
+            .insert(format!("{profile}/{model}/{endpoint}"));
+        if new {
+            tracing::info!(
+                "profile {profile}: model {model} refuses {endpoint}; requests go to another endpoint"
+            );
+        }
+        new
+    }
+
     /// The texts media fallback made from media, held in memory.
     pub(crate) fn media_cache(&self) -> &MediaCache {
         &self.0.media_cache
@@ -560,6 +695,10 @@ impl AppState {
         &self.0.managed
     }
 
+    pub fn local_pool(&self) -> &Arc<LocalPool> {
+        &self.0.local_pool
+    }
+
     pub fn copilot_sessions(&self) -> &CopilotSessionCache {
         &self.0.copilot_sessions
     }
@@ -595,9 +734,11 @@ impl AppState {
         Arc::clone(&self.0.restart_notify)
     }
 
-    pub fn set_upstream_health(&self, profile: &str, healthy: bool) {
+    /// Sets the health flag of `profile`. A flip to unhealthy, or back to healthy, notifies with `reason`.
+    pub fn set_upstream_health(&self, profile: &str, healthy: bool, reason: &str) {
         self.0.idle_upstreams.remove(profile);
         self.0.upstream_health.insert(profile.to_string(), healthy);
+        self.0.notifier.note_health(profile, healthy, reason);
     }
 
     /// Marks a managed profile as stopped on purpose: neither healthy nor unhealthy.
@@ -658,11 +799,160 @@ mod tests {
     }
 
     #[test]
+    fn notifier_and_tuner_follow_the_config() {
+        use crate::schemas::notification::{
+            Notification, NotificationKind, NotificationSeverity, NotificationStatus,
+        };
+        use crate::services::fake_gh_cli::FakeGhCli;
+        use crate::services::gh_cli::GhOutcome;
+        use crate::services::memory_credential_store::MemoryCredentialStore;
+
+        let vars = |notifications: &str| {
+            [
+                ("LLM_HUB_PROFILES", "local"),
+                ("LLM_HUB_LOCAL_BASE_URL", "http://127.0.0.1:9"),
+                ("LLM_HUB_NOTIFICATIONS", notifications),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect::<HashMap<String, String>>()
+        };
+        let state = AppState::with_seams(
+            HubConfig::from_map(&vars("true")).unwrap(),
+            None,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
+        )
+        .unwrap();
+        let notification = Notification {
+            id: "n".into(),
+            kind: NotificationKind::Custom,
+            source: "api".into(),
+            severity: NotificationSeverity::Warning,
+            title: "t".into(),
+            body: "b".into(),
+            profile: None,
+            model: None,
+            rule: None,
+            diff: None,
+            actions: Notification::default_actions(NotificationKind::Custom),
+            status: NotificationStatus::Pending,
+            created_ms: 1,
+            updated_ms: 1,
+            result: None,
+            muted: false,
+        };
+        assert!(state.notifier().notify(notification.clone()).is_some());
+        assert_eq!(state.local_tuner().prefill_refusal("local/m", 1, 1), None);
+        state
+            .swap_config(HubConfig::from_map(&vars("false")).unwrap())
+            .unwrap();
+        assert!(state.notifier().notify(notification).is_none());
+    }
+
+    #[test]
     fn later_descriptor_with_the_same_id_replaces_the_earlier_one() {
         let mut replacement = descriptor("copilot/gpt-9");
         replacement.chat = false;
         let snapshot = ModelDescriptorSnapshot::new(vec![descriptor("copilot/gpt-9"), replacement]);
         assert_eq!(snapshot.iter().count(), 1);
         assert!(!snapshot.get("copilot/gpt-9").unwrap().chat);
+    }
+
+    fn toggle_state(env: &[(&str, &str)], store: Option<Store>) -> AppState {
+        use crate::services::fake_gh_cli::FakeGhCli;
+        use crate::services::gh_cli::GhOutcome;
+        use crate::services::memory_credential_store::MemoryCredentialStore;
+
+        let vars: HashMap<String, String> = env
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            store,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_env_filters_the_set_at_startup_and_on_every_rebuild() {
+        let state = toggle_state(
+            &[("LLM_HUB_EXTENSIONS_DISABLED", "upstream-*,rules:tag")],
+            None,
+        );
+        assert!(!state.extensions().names().contains(&"upstream-limits"));
+
+        state.set_extensions(crate::services::extension_toggles::sample_set());
+
+        let running = state.extensions();
+        assert_eq!(running.names().len(), 5);
+        assert_eq!(state.extension_statuses().len(), 7);
+        let statuses = state.extension_statuses();
+        let rules = statuses[5].rules.as_ref().unwrap();
+        assert!(rules.iter().any(|rule| rule.name == "tag" && !rule.enabled));
+    }
+
+    #[test]
+    fn a_toggle_rebuilds_the_set_and_re_enabling_restores_it() {
+        let state = toggle_state(&[("LLM_HUB_EXTENSIONS_DISABLED", "rules:trial")], None);
+        state.set_extensions(crate::services::extension_toggles::sample_set());
+
+        state
+            .toggle_extension(ToggleTarget::Extension, "team-gate", false)
+            .unwrap();
+        assert!(!state.extensions().names().contains(&"team-gate"));
+        state
+            .toggle_extension(ToggleTarget::Extension, "team-gate", true)
+            .unwrap();
+        assert!(state.extensions().names().contains(&"team-gate"));
+
+        assert_eq!(
+            state.toggle_extension(ToggleTarget::Rule, "nope", false),
+            Err(ToggleError::Unknown("nope".into()))
+        );
+        assert_eq!(
+            state.toggle_extension(ToggleTarget::Rule, "trial", true),
+            Err(ToggleError::SetByEnv("trial".into()))
+        );
+    }
+
+    #[test]
+    fn ui_toggles_survive_a_rebuilt_state_on_the_same_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.json");
+        let open = || Store::open("json", path.to_str()).unwrap();
+        let first = toggle_state(&[], Some(open()));
+        first
+            .toggle_extension(ToggleTarget::Extension, "upstream-limits", false)
+            .unwrap();
+        drop(first);
+
+        let second = toggle_state(&[], Some(open()));
+
+        assert!(!second.extensions().names().contains(&"upstream-limits"));
+        assert_eq!(second.extensions().names().len(), 3);
+    }
+
+    #[test]
+    fn a_changed_env_list_refilters_the_running_set() {
+        let state = toggle_state(&[], None);
+        assert_eq!(state.extensions().names().len(), 4);
+
+        state
+            .swap_config(
+                HubConfig::from_map(
+                    &[("LLM_HUB_EXTENSIONS_DISABLED".to_owned(), "*".to_owned())]
+                        .into_iter()
+                        .collect(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert!(state.extensions().names().is_empty());
+        assert_eq!(state.extension_statuses().len(), 4);
     }
 }

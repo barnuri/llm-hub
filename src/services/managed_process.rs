@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::process::{Child, Command};
@@ -292,7 +292,46 @@ impl ManagedEntry {
 }
 
 async fn start(profile: &str, command: &ManagedCommand, log_path: &Path) -> Result<Child, String> {
-    let (program, args) = command.argv.split_first().ok_or("the command is empty")?;
+    let child = spawn_logged(&command.argv, log_path, profile)?;
+    tracing::info!(
+        profile,
+        pid = child.id(),
+        "started managed process, waiting for {}",
+        command.address
+    );
+    wait_ready(child, command.start_timeout, || {
+        accepts_connections(&command.address)
+    })
+    .await
+    .map_err(|error| match error {
+        NotReady::Exited(status) => format!("the process exited with {status} before it listened"),
+        NotReady::TimedOut => format!(
+            "nothing listened on {} within {:?}",
+            command.address, command.start_timeout
+        ),
+    })
+}
+
+/// Why a spawned process never became ready.
+#[derive(Debug)]
+pub(crate) enum NotReady {
+    /// The process exited before the probe succeeded.
+    Exited(ExitStatus),
+    /// The probe kept failing until the timeout; the process was terminated.
+    TimedOut,
+}
+
+/// Runs `command_line` with stdin closed and stdout and stderr appended to `log_path`. On unix the
+/// child leads its own process group, so `terminate` also reaches the processes it starts.
+///
+/// # Errors
+/// A message when `command_line` is empty, the log file cannot be opened, or the program cannot run.
+pub(crate) fn spawn_logged(
+    command_line: &[String],
+    log_path: &Path,
+    label: &str,
+) -> Result<Child, String> {
+    let (program, args) = command_line.split_first().ok_or("the command is empty")?;
     let log = open_log(log_path).map_err(|e| format!("cannot open log file: {e}"))?;
     let stderr = log
         .try_clone()
@@ -304,43 +343,55 @@ async fn start(profile: &str, command: &ManagedCommand, log_path: &Path) -> Resu
         .stdout(log)
         .stderr(stderr)
         .kill_on_drop(true);
+    #[cfg(unix)]
+    spawn.process_group(0);
     #[cfg(windows)]
     spawn.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
-    let mut child = spawn
+    let child = spawn
         .spawn()
         .map_err(|e| format!("cannot run {program}: {e}"))?;
     #[cfg(windows)]
-    windows_job::bind_to_hub_lifetime(&child, profile);
-    tracing::info!(
-        profile,
-        pid = child.id(),
-        "started managed process, waiting for {}",
-        command.address
-    );
+    windows_job::bind_to_hub_lifetime(&child, label);
+    #[cfg(not(windows))]
+    let _ = label;
+    Ok(child)
+}
 
-    let deadline = Instant::now() + command.start_timeout;
+/// Polls `probe` until it returns true and hands the child back.
+///
+/// # Errors
+/// `NotReady::Exited` when the child exits first. `NotReady::TimedOut` when `timeout` passes;
+/// the child is terminated before this returns.
+pub(crate) async fn wait_ready<F, Fut>(
+    mut child: Child,
+    timeout: Duration,
+    mut probe: F,
+) -> Result<Child, NotReady>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = Instant::now() + timeout;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!(
-                "the process exited with {status} before it listened"
-            ));
+            return Err(NotReady::Exited(status));
         }
-        if accepts_connections(&command.address).await {
+        if probe().await {
             return Ok(child);
         }
         if Instant::now() >= deadline {
             terminate(child).await;
-            return Err(format!(
-                "nothing listened on {} within {}s",
-                command.address,
-                command.start_timeout.as_secs()
-            ));
+            return Err(NotReady::TimedOut);
         }
         tokio::time::sleep(MANAGED_READY_POLL_INTERVAL).await;
     }
 }
 
-fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
+/// Opens `path` for appending, creating it and its parent directories.
+///
+/// # Errors
+/// The I/O error when the directory or the file cannot be created or opened.
+pub(crate) fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -365,27 +416,57 @@ async fn accepts_connections(address: &str) -> bool {
     )
 }
 
-/// Asks the process to exit (SIGTERM, or Ctrl+Break on Windows), and kills it
-/// when the grace period runs out or the request cannot be delivered.
-async fn terminate(mut child: Child) {
-    if request_exit(&child)
-        && tokio::time::timeout(MANAGED_STOP_GRACE, child.wait())
-            .await
-            .is_ok()
-    {
+/// Asks the process to exit (SIGTERM to its process group, or Ctrl+Break on Windows), and
+/// kills it when the grace period runs out or the request cannot be delivered.
+pub(crate) async fn terminate(child: Child) {
+    terminate_within(child, MANAGED_STOP_GRACE).await;
+}
+
+/// Sends SIGKILL to the process group that `pid` leads. A start calls it when its owner drops
+/// the start before the process answers `/health`.
+#[cfg(unix)]
+pub(crate) fn kill_process_group(pid: u32) {
+    signal_group(Some(pid), libc::SIGKILL);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn kill_process_group(_pid: u32) {}
+
+async fn terminate_within(mut child: Child, grace: Duration) {
+    let pid = child.id();
+    if request_exit(&child) && tokio::time::timeout(grace, child.wait()).await.is_ok() {
+        // The leader is reaped, so `child.id()` is gone. `pid` still names the group that
+        // may hold members which ignored SIGTERM.
+        kill_group(pid);
         return;
     }
+    kill_group(pid);
     let _ = child.kill().await;
 }
 
 #[cfg(unix)]
 fn request_exit(child: &Child) -> bool {
-    let Some(pid) = child.id().and_then(|id| libc::pid_t::try_from(id).ok()) else {
+    signal_group(child.id(), libc::SIGTERM)
+}
+
+#[cfg(unix)]
+fn kill_group(pid: Option<u32>) {
+    signal_group(pid, libc::SIGKILL);
+}
+
+#[cfg(not(unix))]
+fn kill_group(_pid: Option<u32>) {}
+
+/// Sends `signal` to the process group that `pid` leads. Returns false when `pid` is unknown
+/// or the signal cannot be sent, which includes a group that no longer exists.
+#[cfg(unix)]
+fn signal_group(pid: Option<u32>, signal: libc::c_int) -> bool {
+    let Some(pid) = pid.and_then(|id| libc::pid_t::try_from(id).ok()) else {
         return false;
     };
-    // SAFETY: kill(2) takes plain integers and touches no memory. `pid` is our
-    // own child, not yet reaped, so the id cannot belong to another process.
-    unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
+    // SAFETY: kill(2) takes plain integers and touches no memory. `pid` is our own child,
+    // which leads its own process group, so `-pid` names that group alone.
+    unsafe { libc::kill(-pid, signal) == 0 }
 }
 
 #[cfg(windows)]
@@ -479,5 +560,221 @@ mod windows_job {
             return None;
         }
         Some(job)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn spawn_logged_empty_argv_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = spawn_logged(&[], &dir.path().join("a.log"), "test").unwrap_err();
+
+        assert_eq!(error, "the command is empty");
+    }
+
+    #[tokio::test]
+    async fn spawn_logged_missing_program_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = spawn_logged(
+            &argv(&["llm-hub-no-such-program"]),
+            &dir.path().join("a.log"),
+            "test",
+        )
+        .unwrap_err();
+
+        assert!(
+            error.starts_with("cannot run llm-hub-no-such-program"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn spawn_logged_log_path_under_a_file_fails_to_open_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, "").unwrap();
+
+        let error = spawn_logged(&argv(&["true"]), &blocker.join("a.log"), "test").unwrap_err();
+
+        assert!(error.starts_with("cannot open log file"), "{error}");
+    }
+
+    #[test]
+    fn open_log_missing_directories_are_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("deeper").join("a.log");
+
+        open_log(&path).unwrap();
+
+        assert!(path.is_file());
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn group_exists(pgid: libc::pid_t) -> bool {
+            // SAFETY: kill(2) with signal 0 only checks that the group exists; it touches no memory.
+            unsafe { libc::kill(-pgid, 0) == 0 }
+        }
+
+        async fn wait_until_group_gone(pgid: libc::pid_t) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if !group_exists(pgid) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            false
+        }
+
+        fn pgid_of(child: &Child) -> libc::pid_t {
+            libc::pid_t::try_from(child.id().unwrap()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn wait_ready_http_health_answers_returns_the_running_child() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/health"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let url = format!("{}/health", server.uri());
+            let client = reqwest::Client::new();
+            let dir = tempfile::tempdir().unwrap();
+            let child =
+                spawn_logged(&argv(&["sleep", "30"]), &dir.path().join("a.log"), "test").unwrap();
+
+            let mut ready = wait_ready(child, Duration::from_secs(5), || async {
+                client
+                    .get(&url)
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success())
+            })
+            .await
+            .unwrap();
+
+            assert!(is_alive(&mut ready));
+            terminate(ready).await;
+        }
+
+        #[tokio::test]
+        async fn wait_ready_probe_never_succeeds_times_out_and_stops_the_child() {
+            let dir = tempfile::tempdir().unwrap();
+            let child =
+                spawn_logged(&argv(&["sleep", "30"]), &dir.path().join("a.log"), "test").unwrap();
+            let pgid = pgid_of(&child);
+
+            let result = wait_ready(child, Duration::ZERO, || async { false }).await;
+
+            assert!(matches!(result, Err(NotReady::TimedOut)), "{result:?}");
+            assert!(wait_until_group_gone(pgid).await);
+        }
+
+        #[tokio::test]
+        async fn wait_ready_process_exits_first_reports_its_status() {
+            let dir = tempfile::tempdir().unwrap();
+            let child = spawn_logged(
+                &argv(&["sh", "-c", "exit 3"]),
+                &dir.path().join("a.log"),
+                "test",
+            )
+            .unwrap();
+
+            let result = wait_ready(child, Duration::from_secs(5), || async { false }).await;
+
+            let Err(NotReady::Exited(status)) = result else {
+                panic!("expected an early exit, got {result:?}");
+            };
+            assert_eq!(status.code(), Some(3));
+        }
+
+        #[tokio::test]
+        async fn spawn_logged_existing_log_is_appended_with_stdout_and_stderr() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("a.log");
+            std::fs::write(&log, "earlier\n").unwrap();
+
+            let mut child =
+                spawn_logged(&argv(&["sh", "-c", "echo out; echo err >&2"]), &log, "test").unwrap();
+            child.wait().await.unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap(),
+                "earlier\nout\nerr\n"
+            );
+        }
+
+        #[tokio::test]
+        async fn terminate_child_with_background_job_stops_the_whole_group() {
+            let dir = tempfile::tempdir().unwrap();
+            let child = spawn_logged(
+                &argv(&["sh", "-c", "sleep 30 & sleep 30"]),
+                &dir.path().join("a.log"),
+                "test",
+            )
+            .unwrap();
+            let pgid = pgid_of(&child);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(group_exists(pgid));
+
+            terminate(child).await;
+
+            assert!(wait_until_group_gone(pgid).await);
+        }
+
+        #[tokio::test]
+        async fn terminate_within_group_ignores_sigterm_kills_it_after_the_grace() {
+            let dir = tempfile::tempdir().unwrap();
+            let child = spawn_logged(
+                &argv(&["sh", "-c", "trap '' TERM; sleep 30 & sleep 30"]),
+                &dir.path().join("a.log"),
+                "test",
+            )
+            .unwrap();
+            let pgid = pgid_of(&child);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            terminate_within(child, Duration::from_millis(200)).await;
+
+            assert!(wait_until_group_gone(pgid).await);
+        }
+
+        #[tokio::test]
+        async fn terminate_within_kills_a_group_member_that_ignores_sigterm_after_the_leader_exits()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let child = spawn_logged(
+                &argv(&[
+                    "sh",
+                    "-c",
+                    "trap 'exit 0' TERM; (trap '' TERM; exec sleep 30) & wait",
+                ]),
+                &dir.path().join("a.log"),
+                "test",
+            )
+            .unwrap();
+            let pgid = pgid_of(&child);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            terminate_within(child, Duration::from_secs(5)).await;
+
+            assert!(wait_until_group_gone(pgid).await);
+        }
     }
 }

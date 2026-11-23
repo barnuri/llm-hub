@@ -271,6 +271,31 @@ export interface KeysResponse {
   readonly keys: readonly ApiKeyRow[];
 }
 
+export type ExtensionKind = "builtin" | "rules" | "library" | "hook";
+
+export type ExtensionDisabledBy = "env" | "ui" | null;
+
+export interface ExtensionRuleStatus {
+  readonly name: string;
+  readonly phase: string;
+  readonly mode: "enforce" | "shadow";
+  readonly enabled: boolean;
+  readonly disabled_by: ExtensionDisabledBy;
+}
+
+export interface ExtensionStatus {
+  readonly name: string;
+  readonly kind: ExtensionKind;
+  readonly phases: readonly string[];
+  readonly enabled: boolean;
+  readonly disabled_by: ExtensionDisabledBy;
+  readonly rules?: readonly ExtensionRuleStatus[];
+}
+
+export interface ExtensionsResponse {
+  readonly extensions: readonly ExtensionStatus[];
+}
+
 export type ModelHealth = "healthy" | "degraded" | "failing" | "insufficient_data";
 
 export type InsightsRange = "1d" | "7d" | "30d" | "all";
@@ -592,4 +617,90 @@ export interface ModelHealthSnapshot {
   readonly profiles: readonly ProfileCooldownRow[];
   /** Cost score per priced model: 0 dearest, 10 free. */
   readonly costs: Record<string, number>;
+}
+
+export type NotificationKind = "proposal" | "guard" | "advisory" | "custom";
+export type NotificationSeverity = "info" | "warning" | "critical";
+export type NotificationStatus = "pending" | "approved" | "dismissed" | "applied" | "failed";
+export type NotificationAction = "approve" | "dismiss";
+
+/** The flag change a tuner proposal applies; `remove` is informational. */
+export interface NotificationDiff {
+  readonly add: readonly string[];
+  readonly remove: readonly string[];
+  readonly ctx: number | null;
+  readonly old_ctx: number | null;
+}
+
+/** One inbox entry from `GET /api/notifications`. */
+export interface HubNotification {
+  readonly id: string;
+  readonly kind: NotificationKind;
+  readonly source: string;
+  readonly severity: NotificationSeverity;
+  readonly title: string;
+  readonly body: string;
+  readonly profile: string | null;
+  readonly model: string | null;
+  readonly rule: string | null;
+  readonly diff: NotificationDiff | null;
+  readonly actions: readonly NotificationAction[];
+  readonly status: NotificationStatus;
+  readonly created_ms: number;
+  readonly updated_ms: number;
+  /** Output tail of an approved proposal's apply command. */
+  readonly result: string | null;
+  /** True when a mute rule with scope `all` matched. */
+  readonly muted: boolean;
+}
+
+export interface NotificationsResponse {
+  readonly notifications: readonly HubNotification[];
+  readonly pending: number;
+}
+
+/** Glob per field; a rule matches when every field it sets matches. */
+export interface NotificationMatcher {
+  readonly source?: string | null;
+  readonly kind?: string | null;
+  readonly rule?: string | null;
+  readonly profile?: string | null;
+  readonly model?: string | null;
+  readonly title?: string | null;
+}
+
+export type NotificationMuteScope = "all" | "sinks";
+
+export interface NotificationMute {
+  readonly id: string;
+  readonly matcher: NotificationMatcher;
+  /** Unix ms when the snooze ends; null mutes forever. */
+  readonly until_ms: number | null;
+  readonly scope: NotificationMuteScope;
+  readonly note: string | null;
+  readonly origin: "env" | "ui";
+  readonly created_ms: number;
+}
+
+export interface NotificationMutesResponse {
+  readonly mutes: readonly NotificationMute[];
+}
+
+export interface DesktopFixStep {
+  readonly id: string;
+  readonly text: string;
+  readonly command: string | null;
+  /** True when `POST /api/notifications/desktop/fix/{id}` may run it. */
+  readonly runnable: boolean;
+}
+
+export interface DesktopStatus {
+  readonly enabled: boolean;
+  readonly os: "macos" | "linux" | "windows" | "other";
+  readonly tool_found: boolean | null;
+  readonly session_ok: boolean | null;
+  readonly last_ok_ms: number | null;
+  readonly last_error: string | null;
+  readonly confirmed: boolean;
+  readonly steps: readonly DesktopFixStep[];
 }

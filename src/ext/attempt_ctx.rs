@@ -4,7 +4,7 @@ use axum::http::{Extensions, HeaderMap};
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::ext::{Api, JsonBody};
+use crate::ext::{Api, ExtNotification, JsonBody, Outbox};
 
 /// The `attempt` phase view of one upstream call: the primary model or one fallback.
 #[derive(Debug)]
@@ -17,6 +17,7 @@ pub struct AttemptCtx<'a> {
     headers: Cow<'a, HeaderMap>,
     body: JsonBody,
     state: &'a mut Extensions,
+    outbox: Outbox,
 }
 
 /// Where an attempt goes, for [`AttemptCtx::new`].
@@ -45,6 +46,7 @@ impl<'a> AttemptCtx<'a> {
             headers: Cow::Borrowed(headers),
             body: JsonBody::new(body),
             state,
+            outbox: Outbox::default(),
         }
     }
 
@@ -125,6 +127,16 @@ impl<'a> AttemptCtx<'a> {
     /// Typed data for this request, for a change.
     pub fn state_mut(&mut self) -> &mut Extensions {
         self.state
+    }
+
+    /// Sends `notification` to the Notifications inbox, from `ext:<extension name>`. The hub
+    /// delivers it when this phase method returns, and drops it when notifications are off.
+    pub fn notify(&self, notification: ExtNotification) {
+        self.outbox.push(notification);
+    }
+
+    pub(crate) fn outbox(&self) -> &Outbox {
+        &self.outbox
     }
 }
 
