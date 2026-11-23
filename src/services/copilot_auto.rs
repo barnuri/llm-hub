@@ -32,7 +32,7 @@ const AUTO_API_VERSION: &str = "2026-08-01";
 const AUTO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Unit tests run in parallel on loaded machines: a 5 s wall-clock bound there makes the shared-call tests flaky.
 #[cfg(test)]
-const AUTO_TIMEOUT: Duration = Duration::from_secs(60);
+const AUTO_TIMEOUT: Duration = Duration::from_mins(1);
 const SESSION_REFRESH_MARGIN_SECS: u64 = 5 * 60;
 /// A model used this recently has a warm prompt cache, so a scheduled re-route keeps it. This
 /// mirrors the 5-minute warm window of the smart-auto affinity cache; the two modules share no symbol.
