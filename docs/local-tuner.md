@@ -25,15 +25,21 @@ through, and only the rules that read the server's flags can fire.
 
 ## Native local probe
 
-For a `KIND=local` profile, the native probe reads the local pool and the registry without starting a model. The probe reports running model ids, process state and registry health. Use the [configuration keys](configuration.md#native-local-serving) to set the registry, memory budget and process limits.
+For a `KIND=local` profile, the native probe reads the local pool and the registry without starting a model. The native pool starts a model only when a request selects it. The probe reports running model ids and registry health. Use the [configuration keys](configuration.md#native-local-serving) to set the registry, memory budget and process limits.
 
-The native pool also tracks llama.cpp process state. A llama.cpp stream stall may leave `/health` responsive while response bytes stop. Check a non-streaming request before changing the registry:
+The native pool tracks llama.cpp process state. A llama.cpp stream stall may leave `/health` responsive while response bytes stop. Run a non-streaming request through the hub before you change the registry:
 
 ```sh
-curl -H 'Content-Type: application/json' -d '{"model":"<profile>/<model>","messages":[{"role":"user","content":"reply with ok"}],"stream":false}' <hub-url>/v1/chat/completions
+curl -H 'Content-Type: application/json' \
+  -d '{"model":"<profile>/<model>","messages":[{"role":"user","content":"reply with ok"}],"stream":false}' \
+  <hub-url>/v1/chat/completions
 ```
 
-For a mistral.rs row, use `--reasoning off` when the engine returns no stream data. The native worker supports context size, temperature, top-p, top-k, min-p, reasoning, multimodal projector and tokenizer model flags from `extra_flags`.
+For a mistral.rs row, use `--reasoning off` when the worker returns no stream data. The native worker supports context size, temperature, top-p, top-k, min-p, reasoning, multimodal projector and tokenizer model flags in `extra_flags`.
+
+### Apply native registry changes
+
+Approve edits the selected row under `LLM_HUB_<NAME>_REGISTRY` or `LLM_HUB_<NAME>_TUNER_REGISTRY`. It changes only column 5 and column 7. It keeps column 9, the engine name, unchanged. Set `LLM_HUB_<NAME>_TUNER_APPLY_COMMAND` to a command that loads the changed registry and restarts only the process that the change requires.
 
 A native probe does not start a model. It does not replace the health check or the request fallback rules.
 
@@ -165,17 +171,19 @@ generates `config.yaml` from the registry, one entry per row. Set the registry p
 with `LLM_HUB_<NAME>_TUNER_REGISTRY` (`~/` is expanded). Without it, the rules still raise
 proposals, but Approve answers 409 and changes nothing.
 
-Each row has 7 or 8 columns:
+Each row has 7 to 9 columns:
 
 ```text
-id|repo|file|size_gb|ctx|quant|extra_flags[|bin_override]
+id|repo|file|size_gb|ctx|quant|extra_flags[|bin_override[|engine]]
 ```
 
 | Column | Meaning |
 |---|---|
-| 1 `id` | The llama-swap model id. Approve finds the row whose `id` equals the model. |
+| 1 `id` | The model id. Approve finds the row whose `id` equals the model. |
 | 5 `ctx` | The context size. `ctx_too_large` sets it. |
 | 7 `extra_flags` | Flags that go at the end of the server command line. Approve appends to it. |
+| 8 `bin_override` | A server binary override. Native llama.cpp uses it in place of `LLAMA_BIN`. |
+| 9 `engine` | `llama` or `mistralrs`. An empty value uses `llama`. |
 
 Lines that start with `#`, and blank lines, are comments. The hub keeps every comment, every
 other row and every column it does not edit byte for byte, line endings included. When the hub
