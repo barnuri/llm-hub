@@ -1616,7 +1616,13 @@ mod tests {
         let model = dir.path().join("orphan.gguf");
         let spawn = |args: &[&str]| {
             let mut command = std::process::Command::new("sh");
-            command.args(args).process_group(0);
+            // Null stdio: an inherited pipe would keep the test run "leaking" until the sleep ends.
+            command
+                .args(args)
+                .process_group(0)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
             command.spawn().unwrap()
         };
         let model_arg = model.display().to_string();

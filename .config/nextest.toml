@@ -1,0 +1,6 @@
+# Every test runs in its own process, in parallel across all cores (the pr workflow and scripts/check.sh both use nextest).
+# A hung test fails and names itself instead of using the whole job timeout.
+[profile.default]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 5, grace-period = "5s" }
+leak-timeout = "1s"
