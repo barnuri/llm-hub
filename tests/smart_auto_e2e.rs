@@ -325,8 +325,8 @@ async fn wait_for_stored_prompt(store: &Path, needle: &str) {
 /// rebuild the whole prompt cache on the new model. Cold-cache switching is covered by the router
 /// and affinity unit tests, which control the clock.
 async fn a_warm_premium_pin_steps_down_for_plan_backed_implementation() {
-    let _test_lock = TEST_LOCK.lock().await;
     const WORKER: &str = WORKER_SWITCH;
+    let _test_lock = TEST_LOCK.lock().await;
     let fixture = shared_fixture().await;
     reset_shared_fixture(fixture).await;
     let base = &fixture.base;
@@ -538,8 +538,8 @@ async fn review_sizes_the_reviewers_by_tier() {
 
 #[tokio::test]
 async fn reviewer_calls_keep_their_tokens_in_the_event_log() {
-    let _test_lock = TEST_LOCK.lock().await;
     const WORKER: &str = WORKER_JUDGE;
+    let _test_lock = TEST_LOCK.lock().await;
     let fixture = shared_fixture().await;
     reset_shared_fixture(fixture).await;
     let base = &fixture.base;
@@ -566,8 +566,8 @@ async fn reviewer_calls_keep_their_tokens_in_the_event_log() {
 
 #[tokio::test]
 async fn current_and_history_follow_each_dispatch() {
-    let _test_lock = TEST_LOCK.lock().await;
     const WORKER: &str = WORKER_CURRENT;
+    let _test_lock = TEST_LOCK.lock().await;
     let fixture = shared_fixture().await;
     reset_shared_fixture(fixture).await;
     let base = &fixture.base;
@@ -646,8 +646,8 @@ async fn current_and_history_follow_each_dispatch() {
 
 #[tokio::test]
 async fn the_prompt_text_stays_out_of_the_event_log() {
-    let _test_lock = TEST_LOCK.lock().await;
     const WORKER: &str = WORKER_STORE;
+    let _test_lock = TEST_LOCK.lock().await;
     let fixture = shared_fixture().await;
     reset_shared_fixture(fixture).await;
     let base = &fixture.base;
@@ -673,8 +673,8 @@ async fn the_prompt_text_stays_out_of_the_event_log() {
 
 #[tokio::test]
 async fn history_survives_a_restart() {
-    let _test_lock = TEST_LOCK.lock().await;
     const WORKER: &str = WORKER_RESTART;
+    let _test_lock = TEST_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("store.db");
     let extra = [
