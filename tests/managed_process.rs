@@ -80,6 +80,7 @@ async fn start_hub(dir: &Path, vars: HashMap<String, String>) -> (HubProcess, St
     let port = free_port();
     let mut command = Command::new(env!("CARGO_BIN_EXE_llm-hub"));
     command
+        .arg("serve")
         .current_dir(dir)
         .env("LLM_HUB_PORT", port.to_string())
         .env("LLM_HUB_AUTO_UPDATE", "0")
@@ -87,15 +88,25 @@ async fn start_hub(dir: &Path, vars: HashMap<String, String>) -> (HubProcess, St
     for (key, value) in vars {
         command.env(key, value);
     }
-    let child = command.spawn().expect("hub starts");
+    let mut child = command.spawn().expect("hub starts");
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    for _ in 0..50 {
-        if client.get(format!("{base}/healthz")).send().await.is_ok() {
+    let mut ready = false;
+    for _ in 0..3000 {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "hub exited before it became ready"
+        );
+        if let Ok(response) = client.get(format!("{base}/healthz")).send().await
+            && response.status().is_success()
+            && response.text().await.is_ok_and(|body| body == "ok")
+        {
+            ready = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(ready, "hub did not become ready");
     (HubProcess(child), base)
 }
 
