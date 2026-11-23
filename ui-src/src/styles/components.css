@@ -1176,3 +1176,13 @@ tr.row-new td {
   height: 92px;
   border-radius: 0;
 }
+
+/* Header bug-report link: icon-only, opens a new GitHub issue in a new tab. */
+.bug-report {
+  padding: 0 7px;
+  text-decoration: none;
+}
+.bug-report:focus-visible {
+  outline: 2px solid var(--focus, currentColor);
+  outline-offset: 2px;
+}
