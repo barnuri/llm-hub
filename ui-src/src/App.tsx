@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { BugReportLink } from "./components/BugReportLink";
 import { Icon } from "./components/Icon";
 import { Modal } from "./components/Modal";
 import { Pill } from "./components/Pill";
@@ -261,6 +262,7 @@ export function App() {
                 </Pill>
               </>
             ) : null}
+            <BugReportLink />
             <ThemeToggle />
             {meta ? (
               <button type="button" className="btn small danger" onClick={() => setConfirmRestart(true)}>
