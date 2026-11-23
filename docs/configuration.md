@@ -74,6 +74,7 @@ A native profile sets `LLM_HUB_<NAME>_KIND=local`. The hub serves each model fro
 | Variable | Default | Purpose |
 |---|---|---|
 | `LLM_HUB_<NAME>_KIND` | unset | Set to `local` to make the hub start registry models itself. |
+| `LLM_HUB_<NAME>_REGISTRY` | none | Primary pipe-delimited model registry. When unset, the native profile uses `LLM_HUB_<NAME>_TUNER_REGISTRY`. |
 | `LLM_HUB_<NAME>_MEMORY_GB` | runtime default | Positive memory budget in GB for the local process pool. |
 | `LLM_HUB_<NAME>_IDLE_SECS` | `1800` | Stop an idle model after this many seconds. `0` keeps it loaded. |
 | `LLM_HUB_<NAME>_MODEL_TTL_SECS` | unset | Comma-separated `id=seconds` idle overrides. `0` keeps that model loaded. |
