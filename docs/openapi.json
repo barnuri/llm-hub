@@ -4161,10 +4161,6 @@
           "enabled": {
             "type": "boolean"
           },
-          "skip": {
-            "type": "boolean",
-            "description": "Drop media a text-only model cannot read and leave a system reminder in its place."
-          },
           "stt_model": {
             "type": "string",
             "description": "The `<profile>/<model>` that transcribes audio."

@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wiremock::{Match, MockServer, Request, ResponseTemplate};
 
@@ -67,6 +67,7 @@ fn drain_log(stream: impl Read + Send + 'static, needle: String, listening: Arc<
 }
 
 const START_ATTEMPTS: usize = 5;
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A local port that nothing listens on yet.
 pub fn free_port() -> u16 {
@@ -80,9 +81,13 @@ pub fn free_port() -> u16 {
 /// True once the hub logs its bind and `/healthz` answers `ok` while `child` still runs. False when `child` exits first.
 /// A `/healthz` answer alone can come from another test's hub on the same port, so the log line decides.
 async fn wait_ready(base: &str, child: &mut Child, listening: &AtomicBool) -> bool {
-    let client = reqwest::Client::new();
-    // A loaded machine can take well over 5 s to start a hub; allow 30 s before failing.
-    for _ in 0..300 {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    // A loaded machine can take well over 5 s to start a hub, so the limit is wall-clock time.
+    let deadline = Instant::now() + READY_TIMEOUT;
+    while Instant::now() < deadline {
         if child.try_wait().unwrap().is_some() {
             return false;
         }
@@ -95,7 +100,7 @@ async fn wait_ready(base: &str, child: &mut Child, listening: &AtomicBool) -> bo
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("hub did not become ready within 30 s");
+    panic!("hub did not become ready within {READY_TIMEOUT:?}");
 }
 
 /// Matches a request whose body does not contain `needle`, so solver and judge mocks never overlap.

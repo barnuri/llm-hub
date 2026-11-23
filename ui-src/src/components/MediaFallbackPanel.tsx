@@ -28,13 +28,12 @@ export function MediaFallbackPanel({ settings, modelIds, readonly, onSaved, onTo
   const savedVision = settings.vision_model ?? NONE;
   const savedStt = settings.stt_model ?? NONE;
   const [enabled, setEnabled] = useState(settings.enabled);
-  const [skip, setSkip] = useState(settings.skip);
   const [vision, setVision] = useState(savedVision);
   const [stt, setStt] = useState(savedStt);
   const [saving, setSaving] = useState(false);
 
   const locked = readonly || settings.overridden_by_env;
-  const dirty = enabled !== settings.enabled || skip !== settings.skip || vision !== savedVision || stt !== savedStt;
+  const dirty = enabled !== settings.enabled || vision !== savedVision || stt !== savedStt;
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
@@ -42,9 +41,9 @@ export function MediaFallbackPanel({ settings, modelIds, readonly, onSaved, onTo
     try {
       await api("/api/media-fallback", {
         method: "POST",
-        body: JSON.stringify({ enabled, skip, vision_model: vision, stt_model: stt }),
+        body: JSON.stringify({ enabled, vision_model: vision, stt_model: stt }),
       });
-      onToast(enabled || skip ? "Media fallback settings saved" : "Media fallback turned off");
+      onToast(enabled ? "Media fallback settings saved" : "Media fallback turned off");
       onSaved();
     } catch (err) {
       onToast(err instanceof Error ? err.message : String(err), true);
@@ -61,12 +60,6 @@ export function MediaFallbackPanel({ settings, modelIds, readonly, onSaved, onTo
           disabled={locked || saving}
           onChange={setEnabled}
           label="Turn images, audio and files into text"
-        />
-        <Checkbox
-          checked={skip}
-          disabled={locked || saving}
-          onChange={setSkip}
-          label="Skip media no model converts, and tell the model it was removed"
         />
         <label className="keep-warm-field">
           <span>Captions by</span>
@@ -93,10 +86,9 @@ export function MediaFallbackPanel({ settings, modelIds, readonly, onSaved, onTo
         </button>
       </form>
       <p className="dim models-side-note">
-        Saved as <code>LLM_HUB_MEDIA_FALLBACK</code>, <code>LLM_HUB_MEDIA_SKIP</code>,{" "}
-        <code>LLM_HUB_MEDIA_FALLBACK_VISION_MODEL</code> and <code>LLM_HUB_MEDIA_FALLBACK_STT_MODEL</code>. The caption
-        and transcript models get only the image or audio, never the chat. Results are cached, so a resent history is
-        not converted again. Skip drops the part with no model call and leaves a system reminder in its place.
+        Saved as <code>LLM_HUB_MEDIA_FALLBACK</code>, <code>LLM_HUB_MEDIA_FALLBACK_VISION_MODEL</code> and{" "}
+        <code>LLM_HUB_MEDIA_FALLBACK_STT_MODEL</code>. A model that cannot read an image gets a caption instead; results
+        are cached, so a resent history is not converted again.
         {readonly ? " Config is read-only." : ""}
       </p>
       {settings.overridden_by_env ? (

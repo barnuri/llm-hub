@@ -50,6 +50,7 @@ impl LiveFeed {
             cache_write_tokens: outcome.cache_write_tokens,
             cost_usd,
             error: outcome.error.clone(),
+            session_id: None,
             client: outcome.client.clone(),
             worker: outcome.worker.clone(),
         };
@@ -85,6 +86,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             error: None,
+            session_id: None,
             client: client.map(str::to_string),
             worker: Some("worker-1".into()),
             routed_by: None,

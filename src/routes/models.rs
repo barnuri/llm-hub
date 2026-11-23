@@ -132,15 +132,11 @@ pub async fn refresh_models(state: &AppState) -> Value {
                 fallback_models(state, profile)
             }
             Some(Ok(listing)) => {
-                state.set_upstream_health(&profile.name, true, "The models list answered.");
+                state.set_upstream_health(&profile.name, true, "models refresh succeeded");
                 listing
             }
             Some(Err(reason)) => {
-                state.set_upstream_health(
-                    &profile.name,
-                    false,
-                    &format!("The models fetch failed: {reason}"),
-                );
+                state.set_upstream_health(&profile.name, false, &reason);
                 tracing::warn!(profile = %profile.name, "models fetch failed: {reason}");
                 fallback_models(state, profile)
             }
@@ -165,7 +161,7 @@ pub async fn refresh_models(state: &AppState) -> Value {
         &state.copilot_descriptions().snapshot(),
     );
     merged.extend(smart_auto_entries(
-        &config,
+        &state.config(),
         &state.model_descriptors(),
         &state.smart_auto_rules().current(),
     ));
@@ -873,7 +869,7 @@ mod tests {
                 .iter()
                 .any(|m| m["id"] == "whisper/whisper-large-v3")
         );
-        state.set_upstream_health("whisper", true, "up");
+        state.set_upstream_health("whisper", true, "test");
         assert!(!state.is_upstream_idle("whisper"));
     }
 
@@ -1669,9 +1665,9 @@ mod tests {
             copilot: None,
             keep_warm: true,
             first_byte_timeout_ms: None,
-            tuner: crate::configs::LocalTunerConfig::default(),
-            local: None,
             budget_monthly_usd: None,
+            local: None,
+            tuner: crate::configs::local_tuner_config::LocalTunerConfig::default(),
         }
     }
 
@@ -1700,7 +1696,8 @@ mod tests {
             chat_model("copilot/small", 200_000, None),
         ]);
 
-        let entries = smart_auto_entries(&remote_config(), &snapshot, &rules(None));
+        let config = HubConfig::from_map(&HashMap::new()).unwrap();
+        let entries = smart_auto_entries(&config, &snapshot, &rules(None));
         let entry = |id: &str| {
             entries
                 .iter()
@@ -1751,9 +1748,10 @@ mod tests {
             },
         ]);
 
-        let unruled = smart_auto_entries(&remote_config(), &snapshot, &rules(None));
+        let config = HubConfig::from_map(&HashMap::new()).unwrap();
+        let unruled = smart_auto_entries(&config, &snapshot, &rules(None));
         let ruled = smart_auto_entries(
-            &remote_config(),
+            &config,
             &snapshot,
             &rules(Some(r#"{"exclude":["local/*"]}"#)),
         );

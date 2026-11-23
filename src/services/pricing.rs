@@ -795,6 +795,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             error: None,
+            session_id: None,
             client: None,
             worker: None,
             routed_by: None,
@@ -984,6 +985,7 @@ mod tests {
             cache_write_tokens: 0,
             cost_usd: 0.0,
             error: None,
+            session_id: None,
             client: None,
             worker: None,
         }

@@ -88,15 +88,25 @@ async fn start_hub(dir: &Path, vars: HashMap<String, String>) -> (HubProcess, St
     for (key, value) in vars {
         command.env(key, value);
     }
-    let child = command.spawn().expect("hub starts");
+    let mut child = command.spawn().expect("hub starts");
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    for _ in 0..50 {
-        if client.get(format!("{base}/healthz")).send().await.is_ok() {
+    let mut ready = false;
+    for _ in 0..3000 {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "hub exited before it became ready"
+        );
+        if let Ok(response) = client.get(format!("{base}/healthz")).send().await
+            && response.status().is_success()
+            && response.text().await.is_ok_and(|body| body == "ok")
+        {
+            ready = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(ready, "hub did not become ready");
     (HubProcess(child), base)
 }
 
@@ -282,7 +292,7 @@ async fn idle_process_is_stopped_and_restarted_on_next_request() {
     let (command, spawn_log) = test_server_command(dir.path(), server_port);
     let (hub, base) = start_hub(
         dir.path(),
-        managed_profile(server_port, &command, &[("IDLE_MS", "300")]),
+        managed_profile(server_port, &command, &[("IDLE_SECS", "1")]),
     )
     .await;
 
@@ -307,7 +317,7 @@ async fn start_timeout_fails_the_attempt_and_names_profile_and_log() {
         managed_profile(
             server_port,
             &format!(r#"{PYTHON} -c "import time; time.sleep(30)""#),
-            &[("START_TIMEOUT_MS", "300")],
+            &[("START_TIMEOUT_SECS", "1")],
         ),
     )
     .await;
@@ -319,7 +329,7 @@ async fn start_timeout_fails_the_attempt_and_names_profile_and_log() {
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("profile whisper"), "{message}");
     assert!(message.contains("whisper.log"), "{message}");
-    assert!(message.contains("within 300ms"), "{message}");
+    assert!(message.contains("within 1s"), "{message}");
     drop(hub);
 }
 
