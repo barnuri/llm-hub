@@ -404,6 +404,15 @@ impl LocalPool {
         error.starts_with(NO_ROOM)
     }
 
+    /// The registry rows of local profile `profile` as the last registry read left them, or
+    /// `None` when the profile is not local. It reads no file and starts no process.
+    pub fn rows(&self, profile: &str) -> Option<Arc<Vec<RegistryRow>>> {
+        self.profiles
+            .load()
+            .get(profile)
+            .map(|local| local.rows.load_full())
+    }
+
     /// Returns a lease on the running process of model `id` of `profile`, and starts the
     /// process first when none runs. Concurrent calls for one model share one start.
     ///
