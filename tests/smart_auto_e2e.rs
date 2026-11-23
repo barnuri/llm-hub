@@ -44,6 +44,12 @@ const HISTORY_LIMIT: usize = 100;
 const DECISIONS_LIMIT: usize = 5;
 const POLL_ATTEMPTS: usize = 100;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+const WORKER_SWITCH: &str = "run-switch/node-1";
+const WORKER_JUDGE: &str = "run-judge/balance";
+const WORKER_CURRENT: &str = "run-current/node-1";
+const PROMPT_MARKER: &str = "e2e-prompt-marker-7c2d";
+const WORKER_STORE: &str = "run-store/node-1";
+const WORKER_RESTART: &str = "run-restart/node-1";
 
 struct SharedFixture {
     _hub: HubProcess,
@@ -320,13 +326,13 @@ async fn wait_for_stored_prompt(store: &Path, needle: &str) {
 /// and affinity unit tests, which control the clock.
 async fn a_warm_premium_pin_steps_down_for_plan_backed_implementation() {
     let _test_lock = TEST_LOCK.lock().await;
-    const WORKER: &str = "run-switch/node-1";
+    const WORKER: &str = WORKER_SWITCH;
     let fixture = shared_fixture().await;
     reset_shared_fixture(fixture).await;
     let base = &fixture.base;
 
     let planning = post_chat(
-        &base,
+        base,
         &[(WORKER_HEADER, WORKER)],
         &chat_request(BALANCE, &[user(PLANNING_TEXT)]),
     )
@@ -338,10 +344,10 @@ async fn a_warm_premium_pin_steps_down_for_plan_backed_implementation() {
     );
     assert_eq!(planning.headers()["x-llm-hub-smart-auto-role"], "planning");
     assert_eq!(planning.headers()["x-llm-hub-smart-auto-reason"], "fresh");
-    wait_for_completed(&base, WORKER, 1).await;
+    wait_for_completed(base, WORKER, 1).await;
 
     let implementation = post_chat(
-        &base,
+        base,
         &[(WORKER_HEADER, WORKER)],
         &chat_request(
             BALANCE,
@@ -381,7 +387,7 @@ async fn the_effort_in_the_body_is_one_the_routed_model_publishes() {
     let alpha = &fixture.alpha;
 
     let response = post_chat(
-        &base,
+        base,
         &[(
             EXCLUDE_HEADER,
             "alpha/claude-opus-4.6,alpha/claude-haiku-4.5,beta/*",
@@ -400,7 +406,7 @@ async fn the_effort_in_the_body_is_one_the_routed_model_publishes() {
         ["low", "medium", "high"].contains(&effort.as_str()),
         "{effort}"
     );
-    let sent = chat_calls(&alpha, false).await;
+    let sent = chat_calls(alpha, false).await;
     assert_eq!(sent.len(), 1);
     let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
     assert_eq!(body["reasoning_effort"], effort.as_str());
@@ -417,7 +423,7 @@ async fn an_explicit_effort_the_model_publishes_is_sent_unchanged() {
     body["reasoning_effort"] = json!("low");
 
     let response = post_chat(
-        &base,
+        base,
         &[(
             EXCLUDE_HEADER,
             "alpha/claude-opus-4.6,alpha/claude-haiku-4.5,beta/*",
@@ -428,7 +434,7 @@ async fn an_explicit_effort_the_model_publishes_is_sent_unchanged() {
 
     assert_eq!(response.status(), 200);
     assert_eq!(response.headers()["x-llm-hub-smart-auto-effort"], "low");
-    let sent = chat_calls(&alpha, false).await;
+    let sent = chat_calls(alpha, false).await;
     assert_eq!(sent.len(), 1);
     let sent_body: Value = serde_json::from_slice(&sent[0].body).unwrap();
     assert_eq!(sent_body["reasoning_effort"], "low");
@@ -458,7 +464,7 @@ async fn policy_holds_across_the_fallback_chain() {
         .await;
 
     let response = post_chat(
-        &base,
+        base,
         &[(MIN_CONTEXT_HEADER, "1m"), (FALLBACKS_HEADER, "alpha/m1")],
         &chat_request(EFFICIENCY, &[user(PLANNING_TEXT)]),
     )
@@ -466,7 +472,7 @@ async fn policy_holds_across_the_fallback_chain() {
 
     assert_eq!(response.status(), 429);
     assert_eq!(response.headers()["x-llm-hub-attempts"], "beta/m2=429");
-    assert!(chat_calls(&alpha, false).await.is_empty());
+    assert!(chat_calls(alpha, false).await.is_empty());
 }
 
 #[tokio::test]
@@ -477,7 +483,7 @@ async fn an_empty_pool_makes_no_upstream_call() {
     let base = &fixture.base;
 
     let response = post_chat(
-        &base,
+        base,
         &[(MIN_CONTEXT_HEADER, "10m")],
         &chat_request(BALANCE, &[user(PLANNING_TEXT)]),
     )
@@ -508,9 +514,9 @@ async fn review_sizes_the_reviewers_by_tier() {
         (BALANCE, "run-review/balance"),
         (INTELLIGENCE, "run-review/intelligence"),
     ] {
-        let before = reviewer_calls(&alpha, &beta).await;
+        let before = reviewer_calls(alpha, beta).await;
         let response = post_chat(
-            &base,
+            base,
             &[
                 (WORKER_HEADER, worker),
                 (EXCLUDE_HEADER, "alpha/m1,alpha/m2,beta/m2"),
@@ -524,7 +530,7 @@ async fn review_sizes_the_reviewers_by_tier() {
             body["choices"][0]["message"]["content"], DRAFT,
             "{selector}"
         );
-        reviewers.push(reviewer_calls(&alpha, &beta).await - before);
+        reviewers.push(reviewer_calls(alpha, beta).await - before);
     }
 
     assert_eq!(reviewers, [0, 1, 2]);
@@ -533,20 +539,20 @@ async fn review_sizes_the_reviewers_by_tier() {
 #[tokio::test]
 async fn reviewer_calls_keep_their_tokens_in_the_event_log() {
     let _test_lock = TEST_LOCK.lock().await;
-    const WORKER: &str = "run-judge/balance";
+    const WORKER: &str = WORKER_JUDGE;
     let fixture = shared_fixture().await;
     reset_shared_fixture(fixture).await;
     let base = &fixture.base;
 
     let response = post_chat(
-        &base,
+        base,
         &[(WORKER_HEADER, WORKER)],
         &chat_request(BALANCE, &[user(PLANNING_TEXT)]),
     )
     .await;
 
     assert_eq!(response.status(), 200);
-    let events = wait_for_completed(&base, WORKER, 1).await;
+    let events = wait_for_completed(base, WORKER, 1).await;
     let reviewers: Vec<&Value> = events
         .iter()
         .filter(|event| event["stage"] == "judge" && event["state"] != "started")
@@ -561,7 +567,7 @@ async fn reviewer_calls_keep_their_tokens_in_the_event_log() {
 #[tokio::test]
 async fn current_and_history_follow_each_dispatch() {
     let _test_lock = TEST_LOCK.lock().await;
-    const WORKER: &str = "run-current/node-1";
+    const WORKER: &str = WORKER_CURRENT;
     let fixture = shared_fixture().await;
     reset_shared_fixture(fixture).await;
     let base = &fixture.base;
@@ -575,13 +581,13 @@ async fn current_and_history_follow_each_dispatch() {
 
     for dispatch in 1..=2 {
         let response = post_chat(
-            &base,
+            base,
             &headers,
             &chat_request(EFFICIENCY, &[user(PLANNING_TEXT)]),
         )
         .await;
         assert_eq!(response.status(), 200);
-        wait_for_completed(&base, WORKER, dispatch).await;
+        wait_for_completed(base, WORKER, dispatch).await;
     }
 
     let current: Value = reqwest::Client::new()
@@ -596,7 +602,7 @@ async fn current_and_history_follow_each_dispatch() {
     assert_eq!(current["selection"]["state"], "completed");
     assert_eq!(current["selection"]["stale"], false);
 
-    let events = history(&base, &format!("worker={WORKER}&limit={HISTORY_LIMIT}")).await;
+    let events = history(base, &format!("worker={WORKER}&limit={HISTORY_LIMIT}")).await;
     let expected: Vec<&str> = DISPATCH_STATES
         .iter()
         .chain(&DISPATCH_STATES)
@@ -609,7 +615,7 @@ async fn current_and_history_follow_each_dispatch() {
         .collect();
     assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
     let later = history(
-        &base,
+        base,
         &format!(
             "worker={WORKER}&since_seq={}&limit={HISTORY_LIMIT}",
             seqs[2]
@@ -617,7 +623,7 @@ async fn current_and_history_follow_each_dispatch() {
     )
     .await;
     assert_eq!(states(&later), DISPATCH_STATES);
-    assert!(history(&base, "worker=run-other/node-9").await.is_empty());
+    assert!(history(base, "worker=run-other/node-9").await.is_empty());
 
     let decisions: Value = reqwest::Client::new()
         .get(format!(
@@ -641,8 +647,7 @@ async fn current_and_history_follow_each_dispatch() {
 #[tokio::test]
 async fn the_prompt_text_stays_out_of_the_event_log() {
     let _test_lock = TEST_LOCK.lock().await;
-    const PROMPT_MARKER: &str = "e2e-prompt-marker-7c2d";
-    const WORKER: &str = "run-store/node-1";
+    const WORKER: &str = WORKER_STORE;
     let fixture = shared_fixture().await;
     reset_shared_fixture(fixture).await;
     let base = &fixture.base;
@@ -650,14 +655,14 @@ async fn the_prompt_text_stays_out_of_the_event_log() {
     let prompt = format!("{PLANNING_TEXT} {PROMPT_MARKER}");
 
     let response = post_chat(
-        &base,
+        base,
         &[(EXCLUDE_HEADER, "beta/*"), (WORKER_HEADER, WORKER)],
         &chat_request(EFFICIENCY, &[user(&prompt)]),
     )
     .await;
 
     assert_eq!(response.status(), 200);
-    let events = wait_for_completed(&base, WORKER, 1).await;
+    let events = wait_for_completed(base, WORKER, 1).await;
     wait_for_stored_events(&store, i64::try_from(DISPATCH_STATES.len()).unwrap()).await;
     wait_for_stored_prompt(&store, PROMPT_MARKER).await;
     assert!(
@@ -669,7 +674,7 @@ async fn the_prompt_text_stays_out_of_the_event_log() {
 #[tokio::test]
 async fn history_survives_a_restart() {
     let _test_lock = TEST_LOCK.lock().await;
-    const WORKER: &str = "run-restart/node-1";
+    const WORKER: &str = WORKER_RESTART;
     let dir = tempfile::tempdir().unwrap();
     let store = dir.path().join("store.db");
     let extra = [
@@ -682,7 +687,7 @@ async fn history_survives_a_restart() {
     let beta = &fixture.beta;
     let query = format!("worker={WORKER}&limit={HISTORY_LIMIT}");
 
-    let (hub, base) = start_pair(&alpha, &beta, 5, &extra).await;
+    let (hub, base) = start_pair(alpha, beta, 5, &extra).await;
     let response = post_chat(
         &base,
         &[(EXCLUDE_HEADER, "beta/*"), (WORKER_HEADER, WORKER)],
@@ -694,7 +699,7 @@ async fn history_survives_a_restart() {
     wait_for_stored_events(&store, i64::try_from(DISPATCH_STATES.len()).unwrap()).await;
     drop(hub);
 
-    let (_restarted, base) = start_pair(&alpha, &beta, 5, &extra).await;
+    let (_restarted, base) = start_pair(alpha, beta, 5, &extra).await;
     let events = history(&base, &query).await;
     assert_eq!(states(&events), DISPATCH_STATES);
 }
