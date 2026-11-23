@@ -22,6 +22,7 @@ const RULE_CTX_TOO_LARGE: &str = "ctx_too_large";
 const RULE_TOOL_SCHEMA_HEAVY: &str = "tool_schema_heavy";
 const RULE_HARNESS_ADVICE: &str = "harness_advice";
 const RULE_DOES_NOT_FIT: &str = "does_not_fit";
+const RULE_STREAM_STALL: &str = "stream_stall";
 
 const CACHE_TYPE_K: [&str; 2] = ["--cache-type-k", "-ctk"];
 const CACHE_TYPE_V: [&str; 2] = ["--cache-type-v", "-ctv"];
@@ -71,6 +72,8 @@ pub struct RuleInput {
     pub clients: Vec<ClientStats>,
     /// Other local models with their prefill fits.
     pub faster_models: Vec<(String, PrefillFit)>,
+    /// The native process reported a stalled response stream.
+    pub stream_stalled: bool,
 }
 
 /// Runs every rule and returns pending notifications with ids `tuner:<rule>:<profile>/<model>`.
@@ -82,6 +85,7 @@ pub fn evaluate(input: &RuleInput, now_ms: u64) -> Vec<Notification> {
         cache_reuse_unsupported(input),
         ctx_too_large(input),
         tool_schema_heavy(input),
+        stream_stall(input),
     ]
     .into_iter()
     .flatten()
@@ -100,6 +104,27 @@ pub fn evaluate(input: &RuleInput, now_ms: u64) -> Vec<Notification> {
         notification.updated_ms = now_ms;
     }
     out
+}
+
+fn stream_stall(input: &RuleInput) -> Option<Notification> {
+    if !input.stream_stalled {
+        return None;
+    }
+    let body = format!(
+        "{} has a stalled response stream. Turning reasoning off may allow coding-agent streams to answer.",
+        input.model
+    );
+    let diff = FlagDiff {
+        add: vec!["--reasoning".to_owned(), "off".to_owned()],
+        ..FlagDiff::default()
+    };
+    Some(proposal(
+        input,
+        RULE_STREAM_STALL,
+        "Turn off reasoning",
+        body,
+        diff,
+    ))
 }
 
 fn kv_cache_q8(input: &RuleInput) -> Option<Notification> {
@@ -492,6 +517,30 @@ mod tests {
     #[test]
     fn tuned_model_raises_nothing() {
         assert!(evaluate(&quiet(), NOW).is_empty());
+    }
+
+    #[test]
+    fn stream_stall_proposes_reasoning_off() {
+        let input = RuleInput {
+            stream_stalled: true,
+            ..quiet()
+        };
+        let out = evaluate(&input, NOW);
+        let n = only(&out, RULE_STREAM_STALL);
+        assert_eq!(n.id, "tuner:stream_stall:local/big-model");
+        assert_eq!(
+            n.diff.as_ref().map(|d| d.add.clone()),
+            Some(vec!["--reasoning".to_owned(), "off".to_owned()])
+        );
+    }
+
+    #[test]
+    fn no_stream_stall_keeps_the_default_quiet() {
+        let input = RuleInput {
+            stream_stalled: false,
+            ..quiet()
+        };
+        assert!(by_rule(&evaluate(&input, NOW), RULE_STREAM_STALL).is_empty());
     }
 
     #[test]

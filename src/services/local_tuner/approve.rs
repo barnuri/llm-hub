@@ -94,12 +94,44 @@ pub async fn approve(state: &AppState, id: &str) -> Result<Notification, Approve
     // The task owns the lock and the apply, so a dropped request cannot stop them midway.
     let task = tokio::spawn({
         let notifier = Arc::clone(notifier);
+        let state = state.clone();
         let id = id.to_owned();
+        let profile_name = profile.clone();
         async move {
             let _guard = guard;
-            let (status, result) =
-                apply(path, model, diff, tuner.apply_command, tuner.apply_timeout).await;
-            notifier.set_status(&id, status, Some(result))
+            let (status, result) = apply(
+                path,
+                model.clone(),
+                diff,
+                tuner.apply_command,
+                tuner.apply_timeout,
+            )
+            .await;
+            if status == NotificationStatus::Applied
+                && state
+                    .config()
+                    .profile(&profile_name)
+                    .is_some_and(crate::configs::ProfileConfig::is_local)
+                && state.local_pool().rows(&profile_name).is_some()
+            {
+                let restart = state
+                    .local_pool()
+                    .restart_when_idle(&profile_name, &model, Duration::from_secs(30))
+                    .await;
+                match restart {
+                    Ok(()) => {
+                        let _ = super::probe::run_once(&state, now_ms()).await;
+                        notifier.set_status(&id, status, Some(result))
+                    }
+                    Err(error) => notifier.set_status(
+                        &id,
+                        NotificationStatus::Failed,
+                        Some(format!("registry updated; {error}")),
+                    ),
+                }
+            } else {
+                notifier.set_status(&id, status, Some(result))
+            }
         }
     });
     let done = match task.await {

@@ -4,6 +4,7 @@
 pub mod approve;
 pub mod command;
 pub mod llama_swap;
+pub mod native;
 pub mod prefill;
 pub mod probe;
 pub mod registry;
