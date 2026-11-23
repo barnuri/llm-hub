@@ -123,6 +123,8 @@ const CAPTURE_TEXT_BYTES: usize = 256 * 1024;
 const STAGE_CHAT_PATH: &str = "/v1/chat/completions";
 /// The text an upstream 500 carries when the model refuses image input.
 const IMAGE_INPUT_REJECTION: &str = "image input is not supported";
+/// Copilot's 400 for an endpoint the model does not serve, e.g. chat-completions on a Responses-only model.
+const NO_ENDPOINT_REFUSAL: &str = "no model endpoints available given user constraints";
 /// The rule name a prefill guard event carries, so mutes and the inbox dedupe can match it.
 const PREFILL_GUARD_RULE: &str = "prefill_guard";
 /// The path a local model process serves its OpenAI-compatible API under.
@@ -335,7 +337,11 @@ pub(crate) async fn attempt_loop(
     // The selection template of the routed request. Every dispatch in the chain shares it.
     let mut routed = smart.as_ref().map(|plan| plan.template.clone());
 
-    for (index, requested) in chain.iter().enumerate() {
+    // A learned endpoint refusal sets `next` back to the same model, which is then routed again.
+    let mut next = 0;
+    while let Some(requested) = chain.get(next) {
+        let index = next;
+        next += 1;
         if let (Some(limit), Some(ends)) = (deadline_limit, deadline)
             && Instant::now() >= ends
         {
@@ -435,6 +441,16 @@ pub(crate) async fn attempt_loop(
         let mut sent = sender.send(attempt.body.clone()).await;
         if media_fallback && !text_only {
             sent = resend_as_text(state, model_id, &sender, &mut attempt, sent).await;
+        }
+        // A newly refused endpoint is learned, and the same model is routed again on another endpoint.
+        let (sent, refused) =
+            learn_refused_endpoint(state, model_id, sent, attempt.path.as_str()).await;
+        if refused {
+            if let Some(event) = &selection {
+                record_transition(state, event, SelectionState::Rejected, None);
+            }
+            next = index;
+            continue;
         }
         let mut keep_warm = keep_warm_lease(state, &attempt, model_id, worker.as_deref());
 
@@ -1425,6 +1441,46 @@ pub(crate) fn upstream_key(state: &AppState, model_id: &ModelId) -> String {
     state
         .upstream_model(&model_id.profile, &model_id.model)
         .map_or_else(|| model_id.model.clone(), |entry| entry.upstream_id)
+}
+
+/// When `sent` is a Copilot 400 that refuses the chat-completions or messages endpoint, learns the
+/// refusal and reports it as new (`true`). Any other reply comes back unchanged, with `false`.
+async fn learn_refused_endpoint(
+    state: &AppState,
+    model_id: &ModelId,
+    sent: Result<reqwest::Response, String>,
+    path: &str,
+) -> (Result<reqwest::Response, String>, bool) {
+    let endpoint = [CHAT_ENDPOINT, MESSAGES_ENDPOINT]
+        .into_iter()
+        .find(|known| path.ends_with(known));
+    let response = match (sent, endpoint) {
+        (Ok(response), Some(_))
+            if response.status() == StatusCode::BAD_REQUEST
+                && is_copilot_profile(state, model_id) =>
+        {
+            response
+        }
+        (other, _) => return (other, false),
+    };
+    let endpoint = endpoint.unwrap_or_default();
+    let (status, version, headers) = (
+        response.status(),
+        response.version(),
+        response.headers().clone(),
+    );
+    let (raw, _) = read_upstream_capped(
+        response,
+        usize::try_from(MAX_REJECTION_BYTES).unwrap_or(usize::MAX),
+    )
+    .await;
+    if String::from_utf8_lossy(&raw).contains(NO_ENDPOINT_REFUSAL)
+        && state.learn_endpoint_refused(&model_id.profile, &model_id.model, endpoint)
+    {
+        return (Err(NO_ENDPOINT_REFUSAL.to_string()), true);
+    }
+    let body = reqwest::Body::from(raw);
+    (Ok(rebuilt_response(status, version, headers, body)), false)
 }
 
 /// When `sent` is a 500 that refuses image input, learns the refusal and sends the attempt once

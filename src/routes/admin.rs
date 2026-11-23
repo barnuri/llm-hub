@@ -336,7 +336,6 @@ fn set_media_fallback_in(
 fn media_fallback_pinned_by(is_set: impl Fn(&str) -> bool) -> bool {
     [
         "LLM_HUB_MEDIA_FALLBACK",
-        "LLM_HUB_MEDIA_SKIP",
         "LLM_HUB_MEDIA_FALLBACK_VISION_MODEL",
         "LLM_HUB_MEDIA_FALLBACK_STT_MODEL",
     ]
@@ -2064,7 +2063,6 @@ mod tests {
     async fn profiles_list_reports_the_media_fallback_settings() {
         let Json(body) = list_profiles(State(state_for(&[]))).await;
         assert_eq!(body["media_fallback"]["enabled"], json!(false));
-        assert_eq!(body["media_fallback"]["skip"], json!(false));
 
         assert_eq!(
             body["media_fallback"]["vision_model"],

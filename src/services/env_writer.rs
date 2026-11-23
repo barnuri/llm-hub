@@ -256,7 +256,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             content,
-            "LLM_HUB_MEDIA_FALLBACK=true\nLLM_HUB_MEDIA_SKIP=false\nLLM_HUB_MEDIA_FALLBACK_VISION_MODEL=local/eye\nLLM_HUB_MEDIA_FALLBACK_STT_MODEL=\n"
+            "LLM_HUB_MEDIA_FALLBACK=true\nLLM_HUB_MEDIA_FALLBACK_VISION_MODEL=local/eye\nLLM_HUB_MEDIA_FALLBACK_STT_MODEL=\n"
         );
     }
 

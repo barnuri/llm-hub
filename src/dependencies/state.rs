@@ -575,6 +575,21 @@ impl AppState {
             .contains(&format!("{profile}/{model}/{endpoint}"))
     }
 
+    /// Records that `model` on `profile` refused `endpoint`, and returns whether it is new.
+    /// Held in memory: a restart relearns it once.
+    pub fn learn_endpoint_refused(&self, profile: &str, model: &str, endpoint: &str) -> bool {
+        let new = self
+            .0
+            .refused_endpoints
+            .insert(format!("{profile}/{model}/{endpoint}"));
+        if new {
+            tracing::info!(
+                "profile {profile}: model {model} refuses {endpoint}; requests go to another endpoint"
+            );
+        }
+        new
+    }
+
     /// The texts media fallback made from media, held in memory.
     pub(crate) fn media_cache(&self) -> &MediaCache {
         &self.0.media_cache
