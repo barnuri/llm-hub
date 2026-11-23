@@ -1,0 +1,28 @@
+experimental = ["setup-scripts"]
+
+# Every test runs in its own process, in parallel across all cores (the pr workflow and scripts/check.sh both use nextest).
+# A hung test fails and names itself instead of using the whole job timeout.
+[profile.default]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 5, grace-period = "5s" }
+leak-timeout = "1s"
+
+# reqwest loads the operating system's root certificates when its first client is built. That took 3.3 s on a Mac with a
+# corporate keychain, and nextest starts a new process per test, so every one of ~2500 tests paid it (11000 s of waiting in a
+# 700 s run). SSL_CERT_FILE makes rustls-native-certs read one small file instead. Tests talk to local mock servers over http.
+# Only the test processes get it: `cargo run` keeps the real system roots.
+[scripts.setup.test-roots-unix]
+command = ["sh", "-c", "echo \"SSL_CERT_FILE=$PWD/.config/test-roots.pem\" >> \"$NEXTEST_ENV\""]
+
+[scripts.setup.test-roots-windows]
+command = ["powershell", "-NoProfile", "-Command", "Add-Content -Path $env:NEXTEST_ENV -Value ('SSL_CERT_FILE=' + (Resolve-Path '.config/test-roots.pem'))"]
+
+[[profile.default.scripts]]
+filter = "all()"
+platform = { host = "cfg(unix)" }
+setup = "test-roots-unix"
+
+[[profile.default.scripts]]
+filter = "all()"
+platform = { host = "cfg(windows)" }
+setup = "test-roots-windows"
