@@ -86,12 +86,26 @@ pub async fn run_once(state: &AppState, now_ms: u64) -> Vec<Notification> {
         let plain_ctx = server.plain_ctx.filter(|_| models.len() == 1);
         for model in &models {
             let ready = server.ready.get(model);
+            let native_ctx = native_ctx(state, profile, model).await;
             let ctx = registry_ctx
                 .get(model)
                 .copied()
                 .or_else(|| ready.and_then(|r| r.ctx))
+                .or(native_ctx)
                 .or(plain_ctx);
-            let input = rule_input(profile, model, rows, &fits, ready, &server, ctx);
+            let stream_stalled = stream_stalled(rows, &profile.name, model);
+            let input = rule_input(
+                profile,
+                model,
+                &RuleEvidence {
+                    rows,
+                    fits: &fits,
+                    ready,
+                    server: &server,
+                    ctx,
+                    stream_stalled,
+                },
+            );
             let mut found = rules::evaluate(&input, now_ms);
             if ready.is_none() {
                 // Without the server's command line, a flag proposal would guess at the flags.
@@ -263,17 +277,41 @@ async fn read_registry_ctx(
     })
 }
 
-fn rule_input(
-    profile: &ProfileConfig,
-    model: &str,
-    rows: &ProfileRows,
-    fits: &HashMap<String, PrefillFit>,
-    ready: Option<&ReadyModel>,
-    server: &ServerEvidence,
+fn stream_stalled(rows: &ProfileRows, profile: &str, model: &str) -> bool {
+    let qualified = format!("{profile}/{model}");
+    rows.rows
+        .iter()
+        .filter(|row| row.model_key == qualified)
+        .filter(|row| is_success(row.status))
+        .filter(|row| row.ttft_ms.is_none())
+        .filter(|row| row.tokens_out == 0)
+        .count()
+        >= 3
+}
+
+async fn native_ctx(state: &AppState, profile: &ProfileConfig, model: &str) -> Option<u64> {
+    let native = state
+        .local_pool()
+        .snapshot()
+        .into_iter()
+        .find(|candidate| candidate.profile == profile.name && candidate.id == model)?;
+    let client = state.client(&profile.name)?;
+    super::native::probe(&client, &native).await.ctx
+}
+
+struct RuleEvidence<'a> {
+    rows: &'a ProfileRows,
+    fits: &'a HashMap<String, PrefillFit>,
+    ready: Option<&'a ReadyModel>,
+    server: &'a ServerEvidence,
     ctx: Option<u64>,
-) -> RuleInput {
+    stream_stalled: bool,
+}
+
+fn rule_input(profile: &ProfileConfig, model: &str, evidence: &RuleEvidence<'_>) -> RuleInput {
     let qualified = format!("{}/{model}", profile.name);
-    let mut faster_models: Vec<(String, PrefillFit)> = fits
+    let mut faster_models: Vec<(String, PrefillFit)> = evidence
+        .fits
         .iter()
         .filter(|(name, _)| **name != qualified)
         .map(|(name, fit)| (name.clone(), *fit))
@@ -283,13 +321,24 @@ fn rule_input(
         profile: profile.name.clone(),
         model: model.to_owned(),
         budget_ms: budget_ms(profile),
-        fit: fits.get(&qualified).copied(),
-        flags: ready.map(|r| rule_flags(&r.flags)).unwrap_or_default(),
-        cache_reuse_unsupported: ready.is_some() && server.cache_reuse_unsupported,
-        ctx,
-        tool_share: rows.tool_share.get(&qualified).copied(),
-        clients: client_stats(rows.rows.iter().filter(|r| r.model_key == qualified)),
+        fit: evidence.fits.get(&qualified).copied(),
+        flags: evidence
+            .ready
+            .map(|r| rule_flags(&r.flags))
+            .unwrap_or_default(),
+        cache_reuse_unsupported: evidence.ready.is_some()
+            && evidence.server.cache_reuse_unsupported,
+        ctx: evidence.ctx,
+        tool_share: evidence.rows.tool_share.get(&qualified).copied(),
+        clients: client_stats(
+            evidence
+                .rows
+                .rows
+                .iter()
+                .filter(|r| r.model_key == qualified),
+        ),
         faster_models,
+        stream_stalled: evidence.stream_stalled,
     }
 }
 

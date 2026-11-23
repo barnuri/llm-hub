@@ -5,6 +5,7 @@ pub mod memory;
 pub mod mistralrs_flags;
 pub mod pool;
 pub mod registry_rows;
+pub mod watchdog;
 pub mod worker;
 
 use std::path::{Path, PathBuf};

@@ -23,6 +23,7 @@ use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub use crate::hub::Hub;
+pub use crate::services::local_serving::watchdog::{StreamWatchdog, stall_event};
 /// The `axum` and `serde_json` versions llm-hub's API uses, so extensions match them.
 pub use {axum, serde_json};
 

@@ -5,6 +5,30 @@ Mac (M4 Max, 128 GB, llama.cpp build b10217). Read this before you add a local m
 model that does not answer. The [local model tuner](local-tuner.md) measures prefill speed and proposes
 flag changes. This page lists what it does not detect yet.
 
+## Native local serving
+
+Set `LLM_HUB_<NAME>_KIND=local` on a profile to serve registry rows in the same process pool. The hub uses `LLM_HUB_<NAME>_REGISTRY` first, or `LLM_HUB_<NAME>_TUNER_REGISTRY` when no registry key is set. It starts a model only when a request selects it. A request routes to `local/<model-id>`. The configured profile name remains in that qualified id.
+
+Use a pipe-delimited registry row with this shape:
+
+```text
+id|repo|file|size_gb|ctx|quant|extra_flags|bin_override|engine
+```
+
+The engine is `llama` or `mistralrs`. Empty or `llama` in column 9 uses llama.cpp through `llama-server`. `mistralrs` starts the hub's `local-worker` in the current binary. That row needs the `mistralrs` cargo feature.
+
+The pool checks `<LLM_HUB_<NAME>_MODELS_DIR>/<id>.gguf` first. It then searches the first snapshot of the row's repository in `LLM_HUB_<NAME>_HF_CACHE` for the row's `file` value.
+
+The pool stops idle processes after `LLM_HUB_<NAME>_IDLE_SECS`. `LLM_HUB_<NAME>_MODEL_TTL_SECS` sets per-model idle overrides. A value of `0` keeps that model loaded. `LLM_HUB_<NAME>_MEMORY_GB` sets the pool's memory budget. `LLM_HUB_<NAME>_START_TIMEOUT_SECS` sets the model startup deadline.
+
+### mistral.rs gate
+
+A `mistralrs` row starts only after the matching model file passes a gate record. The hub reads JSONL records from `LLM_HUB_<NAME>_GATE_FILE`. A pass record must match the model id, file path, size and modification time.
+
+Use `LLM_HUB_<NAME>_UNGATED_MODELS` for a comma-separated list of model ids that may start without a passed gate. Set `LLM_HUB_<NAME>_ALLOW_UNGATED=true` to allow every `mistralrs` row without a passed gate. Both overrides are unsafe for a model you have not checked.
+
+A llama.cpp row does not use the mistral.rs gate.
+
 ## A stream stalls but a plain request answers
 
 **Symptom.** The client shows no reply. The hub logs

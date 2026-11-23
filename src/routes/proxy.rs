@@ -76,7 +76,7 @@ use crate::services::first_event::{FirstEventCheck, first_event};
 use crate::services::harness::client_signature;
 use crate::services::keep_warm::{ApiShape, KeepWarm, KeepWarmLease, PingPlan, PingTarget};
 use crate::services::local_serving::pool::{Lease, LocalPool};
-
+use crate::services::local_serving::watchdog::{StreamWatchdog, stall_event};
 use crate::services::media_fallback;
 use crate::services::model_health::FailureKind;
 use crate::services::multipart_model;
@@ -336,6 +336,7 @@ pub(crate) async fn attempt_loop(
     let last_index = chain.len() - 1;
     // The selection template of the routed request. Every dispatch in the chain shares it.
     let mut routed = smart.as_ref().map(|plan| plan.template.clone());
+    let mut retried_local_before_first_byte = false;
 
     // A learned endpoint refusal sets `next` back to the same model, which is then routed again.
     let mut next = 0;
@@ -425,10 +426,23 @@ pub(crate) async fn attempt_loop(
         // A caller's own timeout header wins. Otherwise only a streamed Smart Auto attempt on a
         // remote profile gets the short first-byte limit: a buffered answer or a local model
         // that is still loading is slow for good reasons.
-        let first_byte = (attempt_timeout.is_none() && smart.is_some() && client_streams)
-            .then_some(())
-            .filter(|()| reviewing.is_none())
-            .and_then(|()| first_byte_limit(&state.config(), &model_id.profile));
+        let first_byte = if attempt_timeout.is_none()
+            && state
+                .config()
+                .profile(&model_id.profile)
+                .is_some_and(|profile| profile.local.is_some())
+        {
+            let prompt_tokens = estimated_prompt_tokens(bodies.original.len());
+            state
+                .local_tuner()
+                .prefill_budget(&model_id.qualified(), prompt_tokens)
+                .map(Duration::from_millis)
+        } else {
+            (attempt_timeout.is_none() && smart.is_some() && client_streams)
+                .then_some(())
+                .filter(|()| reviewing.is_none())
+                .and_then(|()| first_byte_limit(&state.config(), &model_id.profile))
+        };
         let sender = AttemptSender::for_attempt(
             state,
             &method,
@@ -660,6 +674,11 @@ pub(crate) async fn attempt_loop(
                     record_transition(state, event, SelectionState::Rejected, None);
                 }
                 attempts_trail.push(format!("{}={reason}", model_id.qualified()));
+                let local_timeout = reason.starts_with("timeout:")
+                    && state
+                        .config()
+                        .profile(&model_id.profile)
+                        .is_some_and(|profile| profile.local.is_some());
                 record_failure(
                     state,
                     model_id,
@@ -679,6 +698,15 @@ pub(crate) async fn attempt_loop(
                         .then(|| Arc::new(ext_state.clone()))
                         .as_ref(),
                 );
+                if local_timeout && !retried_local_before_first_byte {
+                    retried_local_before_first_byte = true;
+                    state
+                        .local_pool()
+                        .restart(&model_id.profile, &model_id.model)
+                        .await;
+                    next = index;
+                    continue;
+                }
                 if index == last_index {
                     if let (Some(limit), Some(ends)) = (deadline_limit, deadline)
                         && Instant::now() >= ends
@@ -3729,6 +3757,31 @@ fn build_response(
 
     let (summary_sender, summary_receiver) = tokio::sync::oneshot::channel::<StreamSummary>();
     let capture_answer = selection.as_ref().and_then(|event| event.attempt.clone());
+    let watchdog = state
+        .config()
+        .profile(&model_id.profile)
+        .is_some_and(|profile| profile.local.is_some())
+        .then(|| {
+            let prompt_tokens = prompt_body
+                .as_ref()
+                .map_or(0, |body| estimated_prompt_tokens(body.len()));
+            let first_byte = (prompt_tokens > 0)
+                .then(|| {
+                    state
+                        .local_tuner()
+                        .prefill_budget(&model_id.qualified(), prompt_tokens)
+                })
+                .flatten()
+                .map(Duration::from_millis);
+            StreamWatchdog::new(
+                first_byte,
+                state
+                    .config()
+                    .sse_keepalive
+                    .map_or(Duration::from_mins(1), |keepalive| keepalive),
+            )
+        });
+
     let observed = futures_util::stream::unfold(
         StreamState {
             inner: upstream.bytes_stream(),
@@ -3740,6 +3793,18 @@ fn build_response(
             started,
             ttft_ms: None,
             keepalive,
+            watchdog,
+            watchdog_model: state
+                .config()
+                .profile(&model_id.profile)
+                .is_some_and(|profile| profile.local.is_some())
+                .then(|| {
+                    (
+                        model_id.profile.clone(),
+                        model_id.model.clone(),
+                        Arc::clone(state.local_pool()),
+                    )
+                }),
             upstream_end: UpstreamEnd::Open,
             bytes_sent: 0,
             answer: capture_answer.as_ref().map(|_| Vec::new()),
@@ -3864,16 +3929,35 @@ where
 {
     loop {
         if !state.ended {
-            match next_chunk(&mut state.inner, state.keepalive).await {
+            let watchdog_timeout = state
+                .watchdog
+                .as_ref()
+                .and_then(StreamWatchdog::active_timeout);
+            match next_chunk(&mut state.inner, state.keepalive, watchdog_timeout).await {
                 // Nothing from upstream for a whole interval. The frame goes
                 // out ahead of the transform and without touching `tail` or
                 // `ttft_ms`: it is the hub's own byte, not the upstream's, and
                 // must not show up in usage scraping or latency stats.
+                NextChunk::Stall => {
+                    tracing::warn!("local model stream stalled");
+                    state.upstream_end = UpstreamEnd::Error;
+                    state.ended = true;
+                    if let Some((profile, model, pool)) = state.watchdog_model.take() {
+                        tokio::spawn(async move {
+                            pool.restart(&profile, &model).await;
+                        });
+                    }
+                    let event = stall_event("local model stream stalled");
+                    return Some((Ok(event), state));
+                }
                 NextChunk::Idle => {
                     let ping = Bytes::from_static(SSE_KEEPALIVE_FRAME.as_bytes());
                     return Some((Ok(ping), state));
                 }
                 NextChunk::Chunk(Ok(bytes)) => {
+                    if let Some(watchdog) = state.watchdog.as_mut() {
+                        watchdog.received_bytes();
+                    }
                     // The tail always holds the *upstream* bytes, so usage
                     // scraping keeps working when a transform is active but
                     // observed nothing itself.
@@ -3942,6 +4026,7 @@ where
 
 /// What one poll of the upstream body produced.
 enum NextChunk {
+    Stall,
     /// The keepalive interval elapsed with the upstream still silent.
     Idle,
     Chunk(reqwest::Result<Bytes>),
@@ -3954,18 +4039,33 @@ enum NextChunk {
 /// Cancelling the `next()` future on timeout loses nothing: `Stream::poll_next`
 /// only yields an item by returning `Ready`, so a future dropped while `Pending`
 /// has consumed nothing. Without `keepalive` this is a plain `next().await`.
-async fn next_chunk<S>(inner: &mut S, keepalive: Option<Duration>) -> NextChunk
+async fn next_chunk<S>(
+    inner: &mut S,
+    keepalive: Option<Duration>,
+    watchdog_timeout: Option<Duration>,
+) -> NextChunk
 where
     S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
-    let Some(interval) = keepalive else {
+    let interval = watchdog_timeout
+        .zip(keepalive)
+        .map_or(watchdog_timeout, |(watchdog, keepalive)| {
+            Some(watchdog.min(keepalive))
+        });
+    let Some(interval) = interval.or(keepalive) else {
         return match inner.next().await {
             Some(item) => NextChunk::Chunk(item),
             None => NextChunk::End,
         };
     };
     match tokio::time::timeout(interval, inner.next()).await {
-        Err(_elapsed) => NextChunk::Idle,
+        Err(_)
+            if watchdog_timeout
+                .is_some_and(|watchdog| watchdog <= keepalive.unwrap_or(watchdog)) =>
+        {
+            NextChunk::Stall
+        }
+        Err(_) => NextChunk::Idle,
         Ok(Some(item)) => NextChunk::Chunk(item),
         Ok(None) => NextChunk::End,
     }
@@ -3981,6 +4081,8 @@ struct StreamState<S> {
     ended: bool,
     started: Instant,
     ttft_ms: Option<u64>,
+    watchdog: Option<StreamWatchdog>,
+    watchdog_model: Option<(String, String, Arc<LocalPool>)>,
     /// Idle gap after which a keepalive comment goes out. `None` on every
     /// non-SSE body and whenever the knob is off — see `pump`.
     keepalive: Option<Duration>,
@@ -4762,6 +4864,8 @@ mod tests {
             started: Instant::now(),
             ttft_ms: None,
             keepalive,
+            watchdog: None,
+            watchdog_model: None,
             upstream_end: UpstreamEnd::Open,
             bytes_sent: 0,
             answer: None,
