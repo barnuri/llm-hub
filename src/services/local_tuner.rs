@@ -58,6 +58,14 @@ impl LocalTuner {
         self.fits.store(Arc::new(fits));
     }
 
+    /// The expected uncached prefill time for `qualified` and `prompt_tokens`, when the fit is confident.
+    #[must_use]
+    pub fn prefill_budget(&self, qualified: &str, prompt_tokens: u64) -> Option<u64> {
+        let fit = self.fits.load().get(qualified).copied()?;
+        fit.confident_at(prompt_tokens)
+            .then(|| fit.estimate_ms(prompt_tokens))
+    }
+
     /// The fit of `qualified`, when the probe measured one.
     #[cfg(test)]
     #[must_use]
