@@ -35,6 +35,7 @@ const DEFAULT_SMOKE_GGUF: &str = "/Users/barnu/models/ornith-1.5-9b.gguf";
 /// Owns one test's registry, model directory and hub. Dropping it stops the hub.
 struct Fixture {
     _dir: tempfile::TempDir,
+    _models: Option<tempfile::TempDir>,
     _hub: HubProcess,
     base: String,
 }
@@ -85,6 +86,7 @@ impl Fixture {
         let (hub, base) = start_hub(vars).await;
         Fixture {
             _dir: dir,
+            _models: None,
             _hub: hub,
             base,
         }
@@ -218,21 +220,27 @@ fn smoke_gguf() -> PathBuf {
 }
 
 /// Starts a hub that serves the smoke GGUF as `ornith-1.5-9b`, ungated by id.
+///
+/// The resolver looks for `<models_dir>/<id>.gguf` first, so the GGUF is linked under the id
+/// in a temp models directory. The directory lives as long as the returned fixture.
 #[cfg(feature = "mistralrs")]
 async fn smoke_fixture() -> Fixture {
     let gguf = smoke_gguf();
-    let dir = gguf.parent().unwrap();
     let file = gguf.file_name().unwrap().to_string_lossy().into_owned();
+    let models = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(&gguf, models.path().join("ornith-1.5-9b.gguf")).unwrap();
     let row = format!("ornith-1.5-9b|org/ornith|{file}|6|8192|Q4_K_M|--reasoning off||mistralrs");
-    Fixture::start(
+    let mut fixture = Fixture::start(
         &row,
-        Some(dir),
+        Some(models.path()),
         &[
             ("LLM_HUB_LOCAL_UNGATED_MODELS", "ornith-1.5-9b"),
             ("LLM_HUB_LOCAL_START_TIMEOUT_SECS", "240"),
         ],
     )
-    .await
+    .await;
+    fixture._models = Some(models);
+    fixture
 }
 
 /// Needs the GGUF and a build with the feature. Run with `--ignored`.
