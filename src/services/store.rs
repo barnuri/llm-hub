@@ -432,6 +432,7 @@ impl Store {
             cost_usd: 0.0,
             error: outcome.error.clone(),
             client: outcome.client.clone(),
+            session_id: outcome.session_id.clone(),
             worker: outcome.worker.clone(),
         };
         match self {
@@ -441,9 +442,9 @@ impl Store {
                     .execute(
                         "INSERT INTO requests (
                             ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker,
+                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, session_id, worker,
                             routed_by, attempt, role
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                         rusqlite::params![
                             db_i64(row.ts_ms),
                             row.model,
@@ -457,6 +458,7 @@ impl Store {
                             db_i64(row.cache_write_tokens),
                             row.error,
                             row.client,
+                            row.session_id,
                             row.worker,
                             outcome.routed_by.as_deref(),
                             outcome.attempt.as_deref(),
@@ -553,7 +555,7 @@ impl Store {
                 let mut stmt = guard
                     .prepare(&format!(
                         "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                                ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker
+                                ttft_ms, cache_read_tokens, cache_write_tokens, error, client, session_id, worker
                          FROM requests WHERE {} ORDER BY id DESC LIMIT ?1",
                         Self::not_keep_warm_sql()
                     ))
@@ -614,7 +616,7 @@ impl Store {
                     .map_err(|e| e.to_string())?;
                 let mut list_sql = format!(
                     "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, worker,
+                            ttft_ms, cache_read_tokens, cache_write_tokens, error, client, session_id, worker,
                             id, {}
                      FROM requests WHERE status >= {ERROR_STATUS_MIN} AND {}",
                     Self::resolved_ms_sql(),
@@ -635,8 +637,8 @@ impl Store {
                 let recent = stmt
                     .query_map(rusqlite::params_from_iter(list_params), |r| {
                         Ok(ErrorEntry {
-                            id: Some(r.get(13)?),
-                            resolved_ms: r.get::<_, Option<i64>>(14)?.map(db_u64),
+                            id: Some(r.get(14)?),
+                            resolved_ms: r.get::<_, Option<i64>>(15)?.map(db_u64),
                             row: map_usage_row(r)?,
                         })
                     })
@@ -1119,7 +1121,7 @@ impl Store {
                 let guard = conn.lock().map_err(|_| "sqlite lock poisoned")?;
                 let mut sql = String::from(
                     "SELECT model, profile, status, latency_ms, tokens_in, tokens_out,
-                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error, client, worker,
+                            ttft_ms, cache_read_tokens, cache_write_tokens, ts_ms, error, client, session_id, worker,
                             routed_by, attempt, role
                      FROM requests WHERE 1=1",
                 );
@@ -1157,10 +1159,11 @@ impl Store {
                             ts_ms: db_u64(r.get::<_, i64>(9).unwrap_or(0)),
                             error: r.get::<_, Option<String>>(10).unwrap_or(None),
                             client: r.get::<_, Option<String>>(11).unwrap_or(None),
-                            worker: r.get::<_, Option<String>>(12).unwrap_or(None),
-                            routed_by: r.get::<_, Option<String>>(13).unwrap_or(None),
-                            attempt: r.get::<_, Option<String>>(14).unwrap_or(None),
-                            role: r.get::<_, Option<String>>(15).unwrap_or(None),
+                            session_id: r.get::<_, Option<String>>(12).unwrap_or(None),
+                            worker: r.get::<_, Option<String>>(13).unwrap_or(None),
+                            routed_by: r.get::<_, Option<String>>(14).unwrap_or(None),
+                            attempt: r.get::<_, Option<String>>(15).unwrap_or(None),
+                            role: r.get::<_, Option<String>>(16).unwrap_or(None),
                         })
                     })
                     .map_err(|e| e.to_string())?
@@ -1198,6 +1201,7 @@ impl Store {
                         cache_write_tokens: row.cache_write_tokens,
                         ts_ms: row.ts_ms,
                         error: row.error.clone(),
+                        session_id: row.session_id.clone(),
                         client: row.client.clone(),
                         worker: row.worker.clone(),
                         routed_by: None,
@@ -2472,6 +2476,10 @@ fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
     )?;
     add("error", "ALTER TABLE requests ADD COLUMN error TEXT")?;
     add("client", "ALTER TABLE requests ADD COLUMN client TEXT")?;
+    add(
+        "session_id",
+        "ALTER TABLE requests ADD COLUMN session_id TEXT",
+    )?;
     add("worker", "ALTER TABLE requests ADD COLUMN worker TEXT")?;
     add(
         "routed_by",
@@ -2532,7 +2540,8 @@ fn map_usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRow> {
         cost_usd: 0.0,
         error: r.get::<_, Option<String>>(10).unwrap_or(None),
         client: r.get::<_, Option<String>>(11).unwrap_or(None),
-        worker: r.get::<_, Option<String>>(12).unwrap_or(None),
+        session_id: r.get::<_, Option<String>>(12).unwrap_or(None),
+        worker: r.get::<_, Option<String>>(13).unwrap_or(None),
     })
 }
 
@@ -2554,6 +2563,7 @@ mod tests {
             cache_write_tokens: 1,
             ts_ms: 0,
             error: None,
+            session_id: None,
             client: None,
             worker: None,
             routed_by: None,
@@ -3064,6 +3074,32 @@ mod tests {
             };
             let read = store.filtered_outcomes(&filter).unwrap();
             assert_eq!(read[0].worker.as_deref(), Some("salted-worker"));
+        }
+    }
+
+    #[test]
+    fn session_id_round_trips_through_each_store() {
+        for kind in ["sqlite", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session");
+            let store = Store::open(kind, Some(path.to_str().unwrap())).unwrap();
+            let mut outcome = sample_outcome();
+            outcome.session_id = Some("ses_usage_1".into());
+            store.record(&outcome).unwrap();
+
+            assert_eq!(
+                store.usage().unwrap().recent[0].session_id.as_deref(),
+                Some("ses_usage_1")
+            );
+            let filter = StatsFilter {
+                since_ms: None,
+                profile: None,
+                model: None,
+                routed_by_prefix: None,
+                range_label: String::new(),
+            };
+            let read = store.filtered_outcomes(&filter).unwrap();
+            assert_eq!(read[0].session_id.as_deref(), Some("ses_usage_1"));
         }
     }
 
@@ -4090,6 +4126,7 @@ mod tier_role_tests {
             cache_write_tokens: 0,
             ts_ms: 0,
             error: None,
+            session_id: None,
             client: None,
             worker: None,
             routed_by: routed_by.map(Into::into),

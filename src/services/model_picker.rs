@@ -157,6 +157,7 @@ mod tests {
             cache_write_tokens: 0,
             error: None,
             client: None,
+            session_id: None,
             worker: None,
             routed_by: None,
             attempt: None,

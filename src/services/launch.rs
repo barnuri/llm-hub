@@ -148,6 +148,9 @@ async fn build_spec(
         }
         Harness::Opencode => {
             let args = header_transport_model(args, smart_auto, None)?;
+            if let Err(error) = OpencodeLauncher::write_plugin(&lookup) {
+                eprintln!("warning: could not install OpenCode session plugin: {error}");
+            }
             OpencodeLauncher::spec(
                 endpoint,
                 args,
