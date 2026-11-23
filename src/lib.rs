@@ -559,6 +559,7 @@ fn api_router(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(models::list_models))
         .route("/v1/models/{*id}", get(routes::proxy::get_model_by_id))
         .routes(routes!(admin::list_profiles, admin::upsert_profile))
+        .routes(routes!(admin::set_local_model_engine))
         .routes(routes!(admin::delete_profile))
         .routes(routes!(admin::test_profile))
         .routes(routes!(claude_code::settings))
@@ -661,7 +662,7 @@ fn open_store(config: &HubConfig) -> Result<Option<Store>, String> {
 mod tests {
     use std::sync::Arc;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::services::copilot_auto::AutoTurn;
@@ -701,6 +702,61 @@ mod tests {
         let router = build_router(state.clone());
         tokio::spawn(async move { axum::serve(listener, router).await });
         (base, state)
+    }
+
+    #[tokio::test]
+    async fn local_engine_route_updates_the_registry_and_model_list_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("registry.txt");
+        std::fs::write(&registry, "m|org/m|m.gguf|1|4096||||llama\n").unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("m.gguf"), vec![0_u8; 8]).unwrap();
+        let vars: HashMap<String, String> = [
+            ("LLM_HUB_PROFILES", "local"),
+            ("LLM_HUB_LOCAL_KIND", "local"),
+            ("LLM_HUB_LOCAL_REGISTRY", registry.to_str().unwrap()),
+            ("LLM_HUB_LOCAL_MODELS_DIR", models.to_str().unwrap()),
+            ("LLM_HUB_LOCAL_ALLOW_UNGATED", "true"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let state = AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            None,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router = build_router(state.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let client = reqwest::Client::new();
+
+        let put = client
+            .put(format!("{base}/api/local/models/local/m/engine"))
+            .json(&json!({"engine":"mistralrs"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), reqwest::StatusCode::OK);
+        assert_eq!(put.json::<Value>().await.unwrap()["engine"], "mistralrs");
+
+        let list = client
+            .get(format!("{base}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        let body = list.json::<Value>().await.unwrap();
+        let local = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == "local/m")
+            .unwrap();
+        assert_eq!(local["engine"], "mistralrs");
     }
 
     #[tokio::test]
