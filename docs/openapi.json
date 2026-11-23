@@ -1474,6 +1474,98 @@
         }
       }
     },
+    "/api/local/models/{profile}/{model}/engine": {
+      "put": {
+        "tags": [
+          "models"
+        ],
+        "summary": "Set a local model engine",
+        "operationId": "set_local_model_engine",
+        "parameters": [
+          {
+            "name": "profile",
+            "in": "path",
+            "description": "Local profile name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "model",
+            "in": "path",
+            "description": "Registry model id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Engine selection",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetLocalEngineInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The new engine",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid engine or mistralrs gate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid hub key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown local profile or model.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Registry write failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/media-fallback": {
       "post": {
         "tags": [
@@ -3355,7 +3447,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Merged model list with <profile>/<model> ids",
+            "description": "Merged model list with <profile>/<model> ids. Local entries include an `engine` field: `llama` or `mistralrs`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4778,6 +4870,18 @@
           "phase": {
             "type": "string",
             "description": "`http_request`, `request`, `attempt`, `response` or `http_response`."
+          }
+        }
+      },
+      "SetLocalEngineInput": {
+        "type": "object",
+        "required": [
+          "engine"
+        ],
+        "properties": {
+          "engine": {
+            "type": "string",
+            "description": "The engine name: `llama` or `mistralrs`."
           }
         }
       }

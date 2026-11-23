@@ -59,7 +59,7 @@ pub struct ProfilesQuery {
     pub profiles: Option<String>,
 }
 
-#[utoipa::path(get, path = "/v1/models", tag = "models", summary = "List models", params(ProfilesQuery), responses((status = 200, description = "Merged model list with <profile>/<model> ids", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
+#[utoipa::path(get, path = "/v1/models", tag = "models", summary = "List models", params(ProfilesQuery), responses((status = 200, description = "Merged model list with <profile>/<model> ids. Local entries include an `engine` field: `llama` or `mistralrs`.", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn list_models(
     State(state): State<AppState>,
     Query(query): Query<ProfilesQuery>,
@@ -246,7 +246,14 @@ fn local_models(state: &AppState, profile: &ProfileConfig) -> ProfileListing {
     let rows = state.local_pool().rows(&profile.name).unwrap_or_default();
     let items: Vec<Value> = rows
         .iter()
-        .map(|row| json!({ "id": row.id, "object": "model", "context_length": row.ctx }))
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "object": "model",
+                "context_length": row.ctx,
+                "engine": row.engine.as_str()
+            })
+        })
         .collect();
     let items: Vec<&Value> = items.iter().collect();
     describe_and_rewrite(profile, &items, None)

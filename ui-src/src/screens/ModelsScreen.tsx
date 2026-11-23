@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { CopilotPricesPanel } from "../components/CopilotPricesPanel";
 import { KeepWarmPanel } from "../components/KeepWarmPanel";
+import { LocalModelEngineControl } from "../components/LocalModelEngineControl";
 import { MediaFallbackPanel } from "../components/MediaFallbackPanel";
 import { MixTable, type MixRow } from "../components/MixTable";
 import { Panel } from "../components/Panel";
@@ -181,6 +182,7 @@ export function ModelsScreen({ models, profiles, meta, onCopy, onSaved, onToast 
                   <tr>
                     <th>Model id</th>
                     <th className="models-profile-col">Profile</th>
+                    <th className="models-engine-col">Engine</th>
                     <PriceHeader
                       sort={priceSort}
                       onSort={(next) => setQueryParam("sort", next === "none" ? null : next)}
@@ -191,7 +193,7 @@ export function ModelsScreen({ models, profiles, meta, onCopy, onSaved, onToast 
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map(({ id, auto_tier, description, llm_hub_price }) => {
+                  {filtered.map(({ id, auto_tier, description, llm_hub_price, engine }) => {
                     const profile = profileOf(id);
                     const copied = copiedId === id;
                     const longContext = longContextLabel(llm_hub_price);
@@ -206,6 +208,18 @@ export function ModelsScreen({ models, profiles, meta, onCopy, onSaved, onToast 
                           {auto_tier && description ? <p className="model-description dim">{description}</p> : null}
                         </td>
                         <td className="dim">{labelFor(profile)}</td>
+                        <td className="models-engine">
+                          {engine ? (
+                            <LocalModelEngineControl
+                              profile={profile}
+                              model={id.slice(profile.length + 1)}
+                              engine={engine}
+                              onToast={onToast}
+                            />
+                          ) : (
+                            <span className="dim">—</span>
+                          )}
+                        </td>
                         <td className="num price">
                           {formatPrice(llm_hub_price)}
                           {longContext !== undefined ? (

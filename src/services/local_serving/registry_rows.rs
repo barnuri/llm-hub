@@ -18,6 +18,27 @@ pub enum Engine {
     Mistralrs,
 }
 
+impl Engine {
+    /// The registry and API name of this engine.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Llama => "llama",
+            Self::Mistralrs => "mistralrs",
+        }
+    }
+
+    /// Parses an engine name from an API request or registry value.
+    pub fn from_name(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "llama" => Ok(Self::Llama),
+            "mistralrs" => Ok(Self::Mistralrs),
+            other => Err(format!(
+                "unknown engine {other:?}; expected llama or mistralrs"
+            )),
+        }
+    }
+}
+
 /// One model row of the registry, with its columns trimmed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegistryRow {
@@ -91,6 +112,61 @@ pub fn read(path: &Path) -> std::io::Result<Vec<RegistryRow>> {
         tracing::warn!(registry = %path.display(), "{warning}");
     }
     Ok(parsed.rows)
+}
+
+/// Sets column 9 of model `id` and writes the registry through an atomic rename.
+///
+/// # Errors
+///
+/// Returns an error when the registry cannot be read or written, or the model row is unknown.
+pub fn set_engine(path: &Path, id: &str, engine: Engine) -> Result<(), String> {
+    let target =
+        std::fs::canonicalize(path).map_err(|err| format!("cannot read registry: {err}"))?;
+    let original =
+        std::fs::read_to_string(&target).map_err(|err| format!("cannot read registry: {err}"))?;
+    let permissions = std::fs::metadata(&target)
+        .map_err(|err| format!("cannot inspect registry: {err}"))?
+        .permissions();
+    let mut out = String::with_capacity(original.len() + 16);
+    let mut found = false;
+    for line in original.split_inclusive('\n') {
+        let (body, ending) = split_ending(line);
+        if !found && row_id(body) == Some(id) {
+            let cols: Vec<&str> = body.split('|').collect();
+            if cols.len() < MIN_COLS {
+                return Err(format!(
+                    "model {id}: registry row has {} columns, expected at least {MIN_COLS}",
+                    cols.len()
+                ));
+            }
+            let mut edited = cols;
+            if edited.len() < 9 {
+                edited.resize(9, "");
+            }
+            edited[8] = engine.as_str();
+            out.push_str(&edited.join("|"));
+            found = true;
+        } else {
+            out.push_str(body);
+        }
+        out.push_str(ending);
+    }
+    if !found {
+        return Err(format!("unknown model {id:?}"));
+    }
+    if out != original {
+        crate::utils::atomic_write::write_atomically(&target, out.as_bytes())
+            .map_err(|err| format!("cannot write registry: {err}"))?;
+        std::fs::set_permissions(&target, permissions)
+            .map_err(|err| format!("cannot preserve registry permissions: {err}"))?;
+    }
+    Ok(())
+}
+
+fn split_ending(line: &str) -> (&str, &str) {
+    let body = line.strip_suffix('\n').unwrap_or(line);
+    let body = body.strip_suffix('\r').unwrap_or(body);
+    (body, &line[body.len()..])
 }
 
 /// Finds the model file of `row`: `<models_dir>/<id>.gguf`, else the first snapshot in
@@ -231,6 +307,36 @@ mod tests {
         assert_eq!(parsed.rows[3].engine, Engine::Mistralrs);
         assert_eq!(parsed.rows[3].bin_override, None);
         assert_eq!(parsed.rows[4].engine, Engine::Llama);
+    }
+
+    #[test]
+    fn set_engine_updates_only_column_nine_and_keeps_other_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.registry");
+        std::fs::write(
+            &path,
+            "# keep this\na|org/a|a.gguf|4.3|8192|Q4_K_M|--jinja|~/llama|llama\r\nb|org/b|b.gguf|1|4096|||llama-server|llama\n",
+        )
+        .unwrap();
+
+        set_engine(&path, "a", Engine::Mistralrs).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "# keep this\na|org/a|a.gguf|4.3|8192|Q4_K_M|--jinja|~/llama|mistralrs\r\nb|org/b|b.gguf|1|4096|||llama-server|llama\n"
+        );
+    }
+
+    #[test]
+    fn set_engine_rejects_an_unknown_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.registry");
+        std::fs::write(&path, "a|org/a|a.gguf|1|4096\n").unwrap();
+
+        let err = set_engine(&path, "missing", Engine::Llama).unwrap_err();
+
+        assert_eq!(err, "unknown model \"missing\"");
     }
 
     #[test]

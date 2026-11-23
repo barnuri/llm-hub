@@ -104,6 +104,51 @@ pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetLocalEngineInput {
+    /// The engine name: `llama` or `mistralrs`.
+    pub engine: String,
+}
+
+#[utoipa::path(put, path = "/api/local/models/{profile}/{model}/engine", tag = "models", summary = "Set a local model engine", params(("profile" = String, Path, description = "Local profile name"), ("model" = String, Path, description = "Registry model id")), request_body(content = SetLocalEngineInput, description = "Engine selection", content_type = "application/json"), responses((status = 200, description = "The new engine", body = Object), (status = 400, description = "Invalid engine or mistralrs gate.", body = ErrorBody), (status = 404, description = "Unknown local profile or model.", body = ErrorBody), (status = 500, description = "Registry write failed.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
+pub async fn set_local_model_engine(
+    State(state): State<AppState>,
+    UrlPath((profile, model)): UrlPath<(String, String)>,
+    Json(input): Json<SetLocalEngineInput>,
+) -> Result<Json<Value>, AppError> {
+    let engine = registry_rows::Engine::from_name(&input.engine).map_err(AppError::BadRequest)?;
+    let config = state.config();
+    let profile_config = config
+        .profile(&profile)
+        .ok_or_else(|| AppError::NotFound(format!("unknown profile {profile:?}")))?;
+    let local = profile_config
+        .local
+        .as_ref()
+        .ok_or_else(|| AppError::NotFound(format!("profile {profile:?} is not local")))?;
+    let rows = registry_rows::read(&local.registry)
+        .map_err(|err| AppError::Internal(format!("cannot read local model registry: {err}")))?;
+    let row = rows
+        .iter()
+        .find(|row| row.id == model)
+        .ok_or_else(|| AppError::NotFound(format!("unknown model {profile}/{model}")))?;
+    if engine == registry_rows::Engine::Mistralrs {
+        let model_path = registry_rows::resolve_model_file(row, &local.models_dir, &local.hf_cache)
+            .map_err(AppError::BadRequest)?;
+        crate::services::local_serving::check_gate(local, &model, &model_path)
+            .map_err(AppError::BadRequest)?;
+    }
+    registry_rows::set_engine(&local.registry, &model, engine).map_err(AppError::Internal)?;
+    state.local_pool().restart(&profile, &model).await;
+    state.local_pool().reload_now();
+    state.clear_model_cache();
+    Ok(Json(json!({
+        "ok": true,
+        "profile": profile,
+        "model": model,
+        "engine": engine.as_str()
+    })))
+}
+
 #[utoipa::path(post, path = "/api/profiles", tag = "profiles", summary = "Create or update a profile", request_body(content = ProfileInput, description = "Profile fields. An omitted or empty api_key keeps the stored key.", content_type = "application/json"), responses((status = 200, description = "The saved profile", body = Object), (status = 400, description = "Invalid request.", body = ErrorBody), (status = 403, description = "Config is read-only (LLM_HUB_CONFIG_READONLY=true).", body = ErrorBody), (status = 500, description = "Internal error.", body = ErrorBody), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn upsert_profile(
     State(state): State<AppState>,
