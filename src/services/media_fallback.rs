@@ -131,6 +131,9 @@ impl Converter<'_> {
 
     fn plan(&self, item: &MediaItem) -> Plan {
         let kind = item.kind;
+        if !self.config.enabled {
+            return Plan::Ready(skipped(kind));
+        }
         match (&item.source, kind) {
             (MediaSource::Url(url), MediaKind::Image | MediaKind::Document) => {
                 Plan::Ready(format!("[{}: {url}]", kind.as_str()))
@@ -162,7 +165,7 @@ impl Converter<'_> {
                     model: model.clone(),
                     data_uri: format!("data:{media_type};base64,{data}"),
                 },
-                None => return Plan::Ready(omitted(kind, "no vision model is set")),
+                None => return Plan::Ready(self.unconverted(kind, "no vision model is set")),
             },
             MediaKind::Audio => match &self.config.stt_model {
                 Some(model) => Job::Transcribe {
@@ -170,7 +173,7 @@ impl Converter<'_> {
                     data: data.to_owned(),
                     format: media_type.trim_start_matches("audio/").to_owned(),
                 },
-                None => return Plan::Ready(omitted(kind, "no speech model is set")),
+                None => return Plan::Ready(self.unconverted(kind, "no speech model is set")),
             },
             MediaKind::Document if media_type.starts_with("text/") => {
                 return Plan::Ready(match decode_text(data) {
@@ -188,6 +191,15 @@ impl Converter<'_> {
         Plan::Convert {
             key: media_key(kind, &job.model(), data),
             job,
+        }
+    }
+
+    /// The stand-in of a part no model is set to convert: a skip reminder when skipping is on.
+    fn unconverted(&self, kind: MediaKind, reason: &str) -> String {
+        if self.config.skip {
+            skipped(kind)
+        } else {
+            omitted(kind, reason)
         }
     }
 
@@ -344,6 +356,15 @@ fn converted(item: &MediaItem, text: &str) -> String {
         (MediaKind::Document, Some(name)) => format!("[document {name}: {text}]"),
         (MediaKind::Document, None) => format!("[document: {text}]"),
     }
+}
+
+/// The system reminder that stands in for a part the hub dropped without a model call.
+fn skipped(kind: MediaKind) -> String {
+    let kind = kind.as_str();
+    format!(
+        "<system-reminder>The user's {kind} was removed here because this model cannot read {kind} input. \
+Say so if the {kind} matters, and ask the user to describe it.</system-reminder>"
+    )
 }
 
 /// The placeholder of a part that was not converted.
@@ -703,6 +724,108 @@ mod tests {
 
         assert_eq!(parts[0]["text"], "[image omitted: no vision model is set]");
         assert_eq!(parts[1]["text"], "[audio omitted: no speech model is set]");
+    }
+
+    #[tokio::test]
+    async fn the_caption_call_carries_only_the_image_and_never_the_chat() {
+        let server = MockServer::start().await;
+        mount_caption(&server, "a cat", 1).await;
+        let state = state_with(&server, &[], None);
+
+        converted_parts(&state, json!([image(PNG)])).await;
+
+        let calls = server.received_requests().await.unwrap();
+        let sent: Value = serde_json::from_slice(&calls[0].body).unwrap();
+        let messages = sent["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0]["content"],
+            json!([
+                {"type": "text", "text": media_calls::CAPTION_PROMPT},
+                image(PNG)
+            ])
+        );
+        assert!(!calls[0].body.windows(4).any(|window| window == b"look"));
+    }
+
+    #[tokio::test]
+    async fn skip_alone_drops_media_with_a_reminder_and_no_model_call() {
+        let server = MockServer::start().await;
+        let state = state_with(
+            &server,
+            &[("MEDIA_FALLBACK", "false"), ("MEDIA_SKIP", "true")],
+            None,
+        );
+
+        let parts = converted_parts(
+            &state,
+            json!([
+                image(PNG),
+                {"type": "input_audio", "input_audio": {"data": "AAEC", "format": "mp3"}}
+            ]),
+        )
+        .await;
+
+        assert_eq!(parts[0]["text"], skipped(MediaKind::Image));
+        assert_eq!(parts[1]["text"], skipped(MediaKind::Audio));
+        assert!(
+            parts[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("<system-reminder>")
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn skip_with_conversion_drops_only_what_no_model_converts() {
+        let server = MockServer::start().await;
+        mount_caption(&server, "a cat", 1).await;
+        let state = state_with(
+            &server,
+            &[("MEDIA_SKIP", "true"), ("MEDIA_FALLBACK_STT_MODEL", "")],
+            None,
+        );
+
+        let parts = converted_parts(
+            &state,
+            json!([
+                image(PNG),
+                {"type": "input_audio", "input_audio": {"data": "AAEC", "format": "mp3"}}
+            ]),
+        )
+        .await;
+
+        assert_eq!(parts[0]["text"], "[image: a cat]");
+        assert_eq!(parts[1]["text"], skipped(MediaKind::Audio));
+    }
+
+    #[tokio::test]
+    async fn skip_alone_lets_a_refusing_model_serve_an_image_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/local/chat/completions"))
+            .respond_with(completion("ok"))
+            .mount(&server)
+            .await;
+        let state = state_with(
+            &server,
+            &[
+                ("MEDIA_FALLBACK", "false"),
+                ("MEDIA_SKIP", "true"),
+                ("MEDIA_FALLBACK_TEXT_ONLY", "local/*"),
+            ],
+            None,
+        );
+
+        let (status, _) = send(&state, &chat_body(json!([image(PNG)]))).await;
+
+        assert_eq!(status, 200);
+        let bodies = local_bodies(&server).await;
+        assert_eq!(
+            bodies[0]["messages"][1]["content"][0]["text"],
+            skipped(MediaKind::Image)
+        );
     }
 
     #[tokio::test]

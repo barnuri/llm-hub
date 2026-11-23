@@ -302,7 +302,7 @@ pub(crate) async fn attempt_loop(
     };
     let chain = servable_chain(state, &config, chain, &needs)?;
     // Media fallback scans the parsed body once per request, and only when it is on.
-    let media_fallback = config.media_fallback.enabled
+    let media_fallback = config.media_fallback.active()
         && media_fallback::request_has_media(needs.input.0, needs.input.1);
 
     let client_path = bare_path(path_and_query);
@@ -1334,7 +1334,7 @@ fn refusal(
     let descriptor = snapshot.for_model(&model_id.profile, &model_id.model);
     let upstream = upstream_key(state, model_id);
     // With media fallback on, the attempt turns images into text, so the model may still serve.
-    if !config.media_fallback.enabled
+    if !config.media_fallback.active()
         && refuses_images(state, model_id)
         && request_has_image(needs.input.0, needs.input.1)
     {

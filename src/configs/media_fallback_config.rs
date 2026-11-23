@@ -11,6 +11,9 @@ use crate::schemas::model_id::ModelId;
 pub struct MediaFallbackConfig {
     /// `LLM_HUB_MEDIA_FALLBACK`: convert media parts to text for text-only models.
     pub enabled: bool,
+    /// `LLM_HUB_MEDIA_SKIP`: drop media parts a text-only model cannot read and leave a system
+    /// reminder in their place. With conversion on too, only the parts no model converts are dropped.
+    pub skip: bool,
     /// `LLM_HUB_MEDIA_FALLBACK_VISION_MODEL`: the model that captions images. `None` skips images.
     pub vision_model: Option<ModelId>,
     /// `LLM_HUB_MEDIA_FALLBACK_STT_MODEL`: the model that transcribes audio. `None` skips audio.
@@ -29,6 +32,7 @@ impl Default for MediaFallbackConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            skip: false,
             vision_model: ModelId::parse(DEFAULT_MEDIA_FALLBACK_VISION_MODEL),
             stt_model: None,
             text_only: Vec::new(),
@@ -40,6 +44,12 @@ impl Default for MediaFallbackConfig {
 }
 
 impl MediaFallbackConfig {
+    /// Whether the hub touches media parts at all: to convert them, to drop them, or both.
+    #[must_use]
+    pub fn active(&self) -> bool {
+        self.enabled || self.skip
+    }
+
     /// Reads the settings through `get`, which takes a key without the `LLM_HUB_` prefix.
     ///
     /// # Errors
@@ -65,6 +75,7 @@ impl MediaFallbackConfig {
         let to_usize = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
         Ok(Self {
             enabled: get("MEDIA_FALLBACK").is_some_and(|v| is_truthy(&v)),
+            skip: get("MEDIA_SKIP").is_some_and(|v| is_truthy(&v)),
             vision_model: model("MEDIA_FALLBACK_VISION_MODEL", defaults.vision_model)?,
             stt_model: model("MEDIA_FALLBACK_STT_MODEL", None)?,
             text_only: get("MEDIA_FALLBACK_TEXT_ONLY")
@@ -109,6 +120,8 @@ mod tests {
         let config = parse(&[]).unwrap();
         assert_eq!(config, MediaFallbackConfig::default());
         assert!(!config.enabled);
+        assert!(!config.skip);
+        assert!(!config.active());
         assert_eq!(
             config.vision_model.unwrap().qualified(),
             DEFAULT_MEDIA_FALLBACK_VISION_MODEL
@@ -121,6 +134,7 @@ mod tests {
     fn every_key_overrides_its_default() {
         let config = parse(&[
             ("MEDIA_FALLBACK", "true"),
+            ("MEDIA_SKIP", "true"),
             ("MEDIA_FALLBACK_VISION_MODEL", "local/vision"),
             ("MEDIA_FALLBACK_STT_MODEL", "whisper/large"),
             ("MEDIA_FALLBACK_TEXT_ONLY", "local/*, ,other/m"),
@@ -130,6 +144,7 @@ mod tests {
         ])
         .unwrap();
         assert!(config.enabled);
+        assert!(config.skip);
         assert_eq!(config.vision_model.unwrap().qualified(), "local/vision");
         assert_eq!(config.stt_model.unwrap().qualified(), "whisper/large");
         assert_eq!(config.text_only, ["local/*", "other/m"]);
