@@ -16,12 +16,15 @@ export interface HubModelPrice extends HubPriceRates {
   readonly long_context?: HubLongContextPrice;
 }
 
+export type LocalEngine = "llama" | "mistralrs";
+
 export interface HubModel {
   readonly id: string;
   readonly display_name?: string;
   readonly description?: string;
   readonly auto_tier?: AutoTier;
   readonly llm_hub_price?: HubModelPrice;
+  readonly engine?: LocalEngine;
 }
 
 export interface ProfileRow {

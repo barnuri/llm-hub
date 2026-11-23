@@ -95,6 +95,26 @@
   width: 140px;
 }
 
+.models-engine-col {
+  width: 190px;
+}
+
+.local-engine-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.models-engine-select {
+  min-width: 112px;
+}
+
+.models-engine-error {
+  flex-basis: 100%;
+  margin: 2px 0 0;
+}
+
 .models-empty {
   margin: 0;
   padding: 24px 0;
