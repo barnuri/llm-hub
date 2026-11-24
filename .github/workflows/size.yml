@@ -3,7 +3,7 @@ name: size
 on:
   pull_request:
     branches: [master]
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened, edited, labeled]
 
 permissions:
   contents: read
@@ -23,8 +23,12 @@ jobs:
       - id: changes
         env:
           BASE_REF: ${{ github.base_ref }}
+          FORCE: ${{ contains(github.event.pull_request.labels.*.name, 'check-size') }}
         run: |
-          if git diff --name-only "origin/$BASE_REF...HEAD" | grep -qE '^(src/|ui/|build.rs|Cargo\.(toml|lock)|rust-toolchain.toml|scripts/binary-size.sh|\.github/workflows/size.yml)'; then
+          # The release build (fat LTO, one codegen unit) takes 5-7 minutes. Source-only changes rarely move the size, so
+          # the check runs when the dependencies, the embedded UI, the build script or the toolchain change, or when the
+          # PR has the `check-size` label.
+          if [ "$FORCE" = "true" ] || git diff --name-only "origin/$BASE_REF...HEAD" | grep -qE '^(ui/|build.rs|Cargo\.(toml|lock)|rust-toolchain.toml|scripts/binary-size.sh|\.github/workflows/size.yml)'; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"
