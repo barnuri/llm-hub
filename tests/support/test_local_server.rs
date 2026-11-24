@@ -117,7 +117,7 @@ fn handle(mut stream: TcpStream, model: Option<&str>) {
 
     if path == "/v1/chat/completions" {
         if model.is_some_and(|model| model.contains("slow")) {
-            thread::sleep(Duration::from_secs(3));
+            hold_slow_request();
         }
         if body_text.contains("\"stream\":true") {
             let stream_body = b"data: {\"choices\":[{\"delta\":{\"content\":\"local\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" reply\"}}]}\n\ndata: [DONE]\n\n";
@@ -136,5 +136,19 @@ fn handle(mut stream: TcpStream, model: Option<&str>) {
         }
     } else {
         write_response(&mut stream, "404 Not Found", None, b"");
+    }
+}
+
+/// Holds a request for a `slow` model: until the file named by `SLOW_RELEASE_FILE` exists (at most
+/// 30 s), or for 3 s when it is unset.
+fn hold_slow_request() {
+    let Ok(release) = std::env::var("SLOW_RELEASE_FILE") else {
+        thread::sleep(Duration::from_secs(3));
+        return;
+    };
+    let release = std::path::PathBuf::from(release);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !release.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
     }
 }

@@ -49,6 +49,7 @@ pub mod model_limits;
 pub(crate) mod model_picker;
 pub mod multipart_model;
 pub mod notifications;
+pub mod parent_watch;
 pub mod pricing;
 pub mod process_gh_cli;
 pub mod profile_usage;

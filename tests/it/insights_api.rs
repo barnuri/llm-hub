@@ -8,65 +8,29 @@
 )]
 
 use std::collections::HashMap;
-use std::process::{Child, Command};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+
+use crate::hub::{HubProcess, start_hub_in};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const GOOD_CALLS: usize = 5;
 const BAD_CALLS: usize = 3;
 
-struct HubProcess(Child);
-
-impl Drop for HubProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
-    let port = free_port();
-    let binary = env!("CARGO_BIN_EXE_llm-hub");
     let dir = tempfile::tempdir().unwrap().keep();
-    let mut command = Command::new(binary);
-    command
-        .arg("serve")
-        .current_dir(&dir)
-        .env("LLM_HUB_PORT", port.to_string())
-        .env("LLM_HUB_AUTO_UPDATE", "0")
-        .env("LLM_HUB_NOTIFY_DESKTOP", "false")
-        .env("LLM_HUB_PERSISTENT", "true")
-        .env("LLM_HUB_STORE", "sqlite")
-        .env("LLM_HUB_STORE_PATH", dir.join("hub.db"));
-    for (key, value) in vars {
-        command.env(key, value);
-    }
-    let child = command.spawn().expect("hub starts");
-    let base = format!("http://127.0.0.1:{port}");
-    wait_ready(&base).await;
-    (HubProcess(child), base)
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-async fn wait_ready(base: &str) {
-    let client = reqwest::Client::new();
-    for _ in 0..500 {
-        if client.get(format!("{base}/healthz")).send().await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("hub did not become ready");
+    let mut all = HashMap::from([
+        ("LLM_HUB_PERSISTENT".to_owned(), "true".to_owned()),
+        ("LLM_HUB_STORE".to_owned(), "sqlite".to_owned()),
+        (
+            "LLM_HUB_STORE_PATH".to_owned(),
+            dir.join("hub.db").display().to_string(),
+        ),
+    ]);
+    all.extend(vars);
+    start_hub_in(&dir, all, &[]).await
 }
 
 async fn mock_upstream() -> MockServer {

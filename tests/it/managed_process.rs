@@ -10,11 +10,12 @@
 use std::collections::HashMap;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use crate::hub::{self, free_port};
 
 const AUDIO_BOUNDARY: &str = "ManagedBoundary1";
 
@@ -49,70 +50,19 @@ class Server(http.server.ThreadingHTTPServer):
 Server(("127.0.0.1", port), Handler).serve_forever()
 "#;
 
-/// Stops the hub with SIGTERM so its graceful shutdown path runs. Windows has
-/// no SIGTERM, so there the hub is killed outright, which its job object must survive.
-struct HubProcess(Child);
+/// Stops the hub gracefully (it closes the hub's stdin) so its shutdown path stops the managed
+/// processes, then kills it if it is still running.
+struct HubProcess(hub::HubProcess);
 
 impl Drop for HubProcess {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            let _ = Command::new("kill")
-                .args(["-TERM", &self.0.id().to_string()])
-                .status();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if let Ok(Some(_)) = self.0.try_wait() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        self.0.stop_gracefully(Duration::from_secs(10));
     }
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 async fn start_hub(dir: &Path, vars: HashMap<String, String>) -> (HubProcess, String) {
-    let port = free_port();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_llm-hub"));
-    command
-        .arg("serve")
-        .current_dir(dir)
-        .env("LLM_HUB_PORT", port.to_string())
-        .env("LLM_HUB_AUTO_UPDATE", "0")
-        .env("LLM_HUB_NOTIFY_DESKTOP", "false");
-    for (key, value) in vars {
-        command.env(key, value);
-    }
-    let mut child = command.spawn().expect("hub starts");
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
-    let mut ready = false;
-    for _ in 0..3000 {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "hub exited before it became ready"
-        );
-        if let Ok(response) = client.get(format!("{base}/healthz")).send().await
-            && response.status().is_success()
-            && response.text().await.is_ok_and(|body| body == "ok")
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(ready, "hub did not become ready");
-    (HubProcess(child), base)
+    let (hub, base) = hub::start_hub_in(dir, vars, &[]).await;
+    (HubProcess(hub), base)
 }
 
 fn managed_profile(
@@ -297,7 +247,7 @@ async fn idle_process_is_stopped_and_restarted_on_next_request() {
     let (command, spawn_log) = test_server_command(dir.path(), server_port);
     let (hub, base) = start_hub(
         dir.path(),
-        managed_profile(server_port, &command, &[("IDLE_SECS", "1")]),
+        managed_profile(server_port, &command, &[("IDLE_MS", "200")]),
     )
     .await;
 
@@ -322,7 +272,7 @@ async fn start_timeout_fails_the_attempt_and_names_profile_and_log() {
         managed_profile(
             server_port,
             &format!(r#"{PYTHON} -c "import time; time.sleep(30)""#),
-            &[("START_TIMEOUT_SECS", "1")],
+            &[("START_TIMEOUT_MS", "300")],
         ),
     )
     .await;
@@ -334,7 +284,7 @@ async fn start_timeout_fails_the_attempt_and_names_profile_and_log() {
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("profile whisper"), "{message}");
     assert!(message.contains("whisper.log"), "{message}");
-    assert!(message.contains("within 1s"), "{message}");
+    assert!(message.contains("within 300ms"), "{message}");
     drop(hub);
 }
 
