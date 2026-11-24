@@ -98,7 +98,10 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml') }}
           shared-key: test-windows
           cache-on-failure: true
-      - run: cargo nextest run --all-targets --no-fail-fast
+      # Windows starts a process slowly (about 0.07 s per test, 177 s for 2407 tests). The ~2400 unit tests run in one
+      # process (9 s, threads in parallel); the integration tests keep nextest's process per test.
+      - run: cargo test --lib
+      - run: cargo nextest run --all-targets --no-fail-fast -E "not kind(lib)"
 
   test-macos:
     needs: changes
