@@ -230,7 +230,7 @@ fn free_port() -> u16 {
 
 /// True once `/healthz` answers `ok` while `hub` still runs.
 async fn wait_ready(client: &reqwest::Client, base: &str, hub: &mut Child) -> bool {
-    for _ in 0..300 {
+    for _ in 0..3000 {
         if hub.try_wait().unwrap().is_some() {
             return false;
         }
@@ -239,7 +239,7 @@ async fn wait_ready(client: &reqwest::Client, base: &str, hub: &mut Child) -> bo
         {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("hub did not become ready within 30 s");
 }
@@ -287,7 +287,7 @@ async fn eventually(timeout: Duration, mut check: impl FnMut() -> bool) -> bool 
         if check() {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     check()
 }
