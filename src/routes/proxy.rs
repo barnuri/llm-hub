@@ -9495,7 +9495,7 @@ mod tests {
         async fn a_full_memory_budget_answers_503_and_a_failed_start_names_its_reason() {
             let fx = Fixture::new(
                 &[("a", 4.0), ("b", 4.0), ("c", 4.0)],
-                &[("MEMORY_GB", "10"), ("START_TIMEOUT_SECS", "5")],
+                &[("MEMORY_GB", "10"), ("START_TIMEOUT_SECS", "1")],
             );
             let held = (fx.lease("a").await, fx.lease("b").await);
 

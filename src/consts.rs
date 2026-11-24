@@ -24,7 +24,11 @@ pub const DEFAULT_MANAGED_START_TIMEOUT_SECS: u64 = 120;
 pub const MANAGED_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 pub const MANAGED_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a managed process gets to exit after SIGTERM before it is killed.
+#[cfg(not(test))]
 pub const MANAGED_STOP_GRACE: Duration = Duration::from_secs(5);
+/// Unit tests wait for this to kill a child that ignores SIGTERM, so it is short there (the integration tests run the real binary).
+#[cfg(test)]
+pub const MANAGED_STOP_GRACE: Duration = Duration::from_millis(500);
 /// `LLM_HUB_<P>_KIND` value of a profile whose registry models the hub serves itself.
 pub const LOCAL_PROFILE_KIND: &str = "local";
 /// Base URL a `KIND=local` profile gets when it sets none, so it counts as a local profile.

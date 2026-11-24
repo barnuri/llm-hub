@@ -117,7 +117,7 @@ fn handle(mut stream: TcpStream, model: Option<&str>) {
 
     if path == "/v1/chat/completions" {
         if model.is_some_and(|model| model.contains("slow")) {
-            thread::sleep(Duration::from_secs(6));
+            thread::sleep(Duration::from_secs(3));
         }
         if body_text.contains("\"stream\":true") {
             let stream_body = b"data: {\"choices\":[{\"delta\":{\"content\":\"local\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" reply\"}}]}\n\ndata: [DONE]\n\n";
