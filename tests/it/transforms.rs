@@ -8,50 +8,11 @@
 )]
 
 use std::collections::HashMap;
-use std::process::{Child, Command};
-use std::time::Duration;
+
+use crate::hub::{HubProcess, start_hub};
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
-
-struct HubProcess(Child);
-
-impl Drop for HubProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let binary = env!("CARGO_BIN_EXE_llm-hub");
-    let dir = tempfile::tempdir().unwrap().keep();
-    let mut command = Command::new(binary);
-    command
-        .arg("serve")
-        .current_dir(&dir)
-        .env("LLM_HUB_PORT", port.to_string())
-        .env("LLM_HUB_AUTO_UPDATE", "0")
-        .env("LLM_HUB_NOTIFY_DESKTOP", "false");
-    for (key, value) in vars {
-        command.env(key, value);
-    }
-    let child = command.spawn().expect("hub starts");
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
-    for _ in 0..500 {
-        if client.get(format!("{base}/healthz")).send().await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    (HubProcess(child), base)
-}
 
 /// A hub with one profile pointed at `upstream`, plus any extra env.
 async fn hub_for(upstream: &MockServer, extra: &[(&str, &str)]) -> (HubProcess, String) {
