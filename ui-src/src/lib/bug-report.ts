@@ -47,8 +47,16 @@ function httpUrl(raw: string): string | null {
   }
 }
 
+/** The repository page: `https://<host>/<owner>/<repo>` from `repository`, else a valid homepage. Null when neither resolves. */
+export function repoUrl(meta: RepoMeta): string | null {
+  const raw = typeof meta.repository === "string" ? meta.repository : (meta.repository?.url ?? null);
+  const ref = raw ? parseRepoRef(raw) : null;
+  if (ref) return `https://${ref.host}/${ref.owner}/${ref.name}`;
+  return meta.homepage ? httpUrl(meta.homepage) : null;
+}
+
 /**
- * The bug link target. A GitHub repository gives `<repo>/issues/new`. Any other resolvable
+ * The bug link target. A GitHub repository gives `<repo>/issues`, the list of open issues. Any other resolvable
  * repository, or a valid homepage without a new-issue URL, gives the repository homepage.
  * Returns null when no metadata resolves to a URL.
  */
@@ -56,7 +64,7 @@ export function bugReportUrl(meta: RepoMeta): string | null {
   const raw = typeof meta.repository === "string" ? meta.repository : (meta.repository?.url ?? null);
   const ref = raw ? parseRepoRef(raw) : null;
   const repoUrl = ref ? `https://${ref.host}/${ref.owner}/${ref.name}` : null;
-  if (ref && repoUrl && ref.host === "github.com") return `${repoUrl}/issues/new`;
+  if (ref && repoUrl && ref.host === "github.com") return `${repoUrl}/issues`;
   const homepage = meta.homepage ? httpUrl(meta.homepage) : null;
   return homepage ?? repoUrl;
 }

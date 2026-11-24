@@ -1,26 +1,26 @@
 import { describe, expect, test } from "bun:test";
-import { bugReportUrl, parseRepoRef } from "./bug-report";
+import { bugReportUrl, parseRepoRef, repoUrl } from "./bug-report";
 
-const ISSUES = "https://github.com/barnuri/llm-hub/issues/new";
+const ISSUES = "https://github.com/barnuri/llm-hub/issues";
 
 describe("bugReportUrl derivation", () => {
-  test("https repository URL with .git gives the new-issue URL", () => {
+  test("https repository URL with .git gives the issues URL", () => {
     expect(bugReportUrl({ repository: "https://github.com/barnuri/llm-hub.git" })).toBe(ISSUES);
   });
 
-  test("git+https object form gives the new-issue URL", () => {
+  test("git+https object form gives the issues URL", () => {
     expect(bugReportUrl({ repository: { type: "git", url: "git+https://github.com/barnuri/llm-hub.git" } })).toBe(ISSUES);
   });
 
-  test("scp-style ssh remote gives the new-issue URL", () => {
+  test("scp-style ssh remote gives the issues URL", () => {
     expect(bugReportUrl({ repository: "git@github.com:barnuri/llm-hub.git" })).toBe(ISSUES);
   });
 
-  test("github: shorthand gives the new-issue URL", () => {
+  test("github: shorthand gives the issues URL", () => {
     expect(bugReportUrl({ repository: "github:barnuri/llm-hub" })).toBe(ISSUES);
   });
 
-  test("GitHub repo ignores homepage and still targets new issue", () => {
+  test("GitHub repo ignores homepage and still targets the issues list", () => {
     expect(bugReportUrl({ repository: "https://github.com/barnuri/llm-hub", homepage: "https://example.com/docs" })).toBe(ISSUES);
   });
 });
@@ -61,5 +61,16 @@ describe("parseRepoRef", () => {
 
   test("returns null without an owner and a name", () => {
     expect(parseRepoRef("https://github.com/barnuri")).toBeNull();
+  });
+});
+
+describe("repoUrl", () => {
+  test("a GitHub repository gives its page", () => {
+    expect(repoUrl({ repository: "https://github.com/barnuri/llm-hub.git" })).toBe("https://github.com/barnuri/llm-hub");
+  });
+
+  test("homepage alone is used, and nothing gives null", () => {
+    expect(repoUrl({ homepage: "https://acme.example/tool" })).toBe("https://acme.example/tool");
+    expect(repoUrl({})).toBeNull();
   });
 });
