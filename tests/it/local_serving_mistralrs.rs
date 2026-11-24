@@ -11,8 +11,7 @@
     reason = "Integration tests fail by panicking"
 )]
 
-#[path = "support/hub.rs"]
-mod hub;
+use crate::hub;
 
 use std::collections::HashMap;
 use std::path::Path;
