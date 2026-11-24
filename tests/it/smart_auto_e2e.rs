@@ -19,8 +19,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-#[path = "support/hub.rs"]
-mod hub;
+use crate::hub;
 
 use hub::{BodyHas, BodyLacks, HubProcess, completion, start_hub};
 

@@ -14,8 +14,7 @@ use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "support/hub.rs"]
-mod hub;
+use crate::hub;
 
 use hub::{HubProcess, start_hub};
 

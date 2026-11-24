@@ -9,8 +9,7 @@
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-#[path = "support/hub.rs"]
-mod hub;
+use crate::hub;
 
 use hub::{BodyHas, BodyLacks, completion, start_alpha_beta_hub};
 
