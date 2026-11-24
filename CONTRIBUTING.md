@@ -11,7 +11,7 @@ git clone https://github.com/barnuri/llm-hub && cd llm-hub
 npm run build:ui        # builds ui-src/ into ui/, which the binary embeds
 cargo test
 cargo run               # foreground on ./.env, port 8410
-git config core.hooksPath .githooks   # lint before each commit, full check before each push
+
 ```
 
 `scripts/check.sh` runs the same checks as CI: format, clippy, and the tests with the coverage
