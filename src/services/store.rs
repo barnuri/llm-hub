@@ -254,6 +254,10 @@ impl Store {
     fn open_sqlite(path: &str) -> Result<Store, String> {
         let conn =
             Connection::open(path).map_err(|e| format!("cannot open sqlite at {path}: {e}"))?;
+        // WAL with NORMAL syncing: a commit no longer waits for an fsync (about 1 s of fsyncs per open on a Mac). A crash can lose the last
+        // few request rows, never corrupt the file; this store holds statistics and learned limits, not accounts.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .map_err(|e| format!("cannot set sqlite pragmas at {path}: {e}"))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
