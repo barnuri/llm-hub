@@ -432,16 +432,12 @@ mod tests {
     }
 
     fn request_body(pad: usize) -> Bytes {
+        // Built by hand: `json!` would escape an 8 MiB string one character at a time in a debug build (about 1 s per body).
+        // "x" needs no escaping, so the bytes are the same as the serialized object.
         let system = "x".repeat(pad);
-        Bytes::from(
-            json!({
-                "model": "claude-haiku-5-5",
-                "max_tokens": 1024,
-                "stream": true,
-                "system": system,
-            })
-            .to_string(),
-        )
+        Bytes::from(format!(
+            r#"{{"max_tokens":1024,"model":"claude-haiku-5-5","stream":true,"system":"{system}"}}"#
+        ))
     }
 
     fn keys(registry: &KeepWarm) -> Vec<StreamKey> {

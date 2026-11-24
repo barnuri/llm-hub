@@ -1439,7 +1439,7 @@ mod tests {
     async fn a_start_fails_when_no_lease_is_released_within_the_start_timeout() {
         let fx = Fixture::new(
             &[("a", 4.0), ("b", 4.0), ("c", 4.0)],
-            &[("MEMORY_GB", "10"), ("START_TIMEOUT_SECS", "2")],
+            &[("MEMORY_GB", "10"), ("START_TIMEOUT_SECS", "1")],
         );
         let a = fx.acquire("a").await.unwrap();
         let b = fx.acquire("b").await.unwrap();

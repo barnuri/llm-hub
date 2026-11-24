@@ -24,7 +24,7 @@ const PYTHON: &str = "python";
 const PYTHON: &str = "python3";
 
 const TEST_SERVER: &str = r#"
-import http.server, os, sys, threading, time
+import http.server, os, socketserver, sys, threading, time
 port, spawn_log = int(sys.argv[1]), sys.argv[2]
 with open(spawn_log, "a") as f:
     f.write("spawn\n")
@@ -41,7 +41,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
     def log_message(self, *args):
         pass
-http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+class Server(http.server.ThreadingHTTPServer):
+    # HTTPServer.server_bind calls socket.getfqdn(host): a reverse DNS lookup that took 30+ s on macOS CI runners.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
+Server(("127.0.0.1", port), Handler).serve_forever()
 "#;
 
 /// Stops the hub with SIGTERM so its graceful shutdown path runs. Windows has

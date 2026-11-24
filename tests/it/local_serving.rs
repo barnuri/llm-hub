@@ -379,11 +379,11 @@ async fn no_room_when_every_candidate_serves_a_request_answers_503() {
         &[("slow-a", 4.0), ("slow-b", 4.0), ("c", 4.0)],
         &[
             ("LLM_HUB_LOCAL_MEMORY_GB", "10"),
-            ("LLM_HUB_LOCAL_START_TIMEOUT_SECS", "2"),
+            ("LLM_HUB_LOCAL_START_TIMEOUT_SECS", "1"),
         ],
     )
     .await;
-    // Both slow requests hold their model for 6 s, so no model is idle when `c` starts.
+    // Both slow requests hold their model for 3 s, so no model is idle when `c` starts.
     let busy: Vec<_> = ["slow-a", "slow-b"]
         .into_iter()
         .map(|id| {

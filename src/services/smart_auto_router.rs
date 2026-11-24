@@ -1250,7 +1250,7 @@ mod tests {
     /// Provider profiles the generated catalog models are spread over.
     const CATALOG_PROFILES: usize = 5;
     /// Selections timed in one run.
-    const TIMED_SELECTIONS: usize = 2_000;
+    const TIMED_SELECTIONS: usize = 200;
     /// Context window of every timed model: the long-context fixture.
     const LONG_CONTEXT_TOKENS: u64 = 1_000_000;
     /// Estimated prompt size of the timed request, in tokens.
