@@ -163,7 +163,7 @@ async fn wait_until_not_listening(port: u16, within: Duration) -> bool {
         if !is_listening(port) {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     false
 }
@@ -268,7 +268,7 @@ async fn never_idle_process_is_started_at_boot() {
         if is_listening(server_port) && profile_status(&base).await["running"] == true {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     assert!(
@@ -280,7 +280,7 @@ async fn never_idle_process_is_started_at_boot() {
     // The start holds its lock until its next readiness poll, so wait for it.
     let deadline = Instant::now() + Duration::from_secs(5);
     while profile_status(&base).await["running"] != true && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(profile_status(&base).await["running"], true);
 }

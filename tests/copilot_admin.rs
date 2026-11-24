@@ -49,11 +49,11 @@ async fn start_copilot_hub(dir: &Path) -> (HubProcess, String) {
         .expect("hub starts");
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    for _ in 0..50 {
+    for _ in 0..500 {
         if client.get(format!("{base}/healthz")).send().await.is_ok() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     (HubProcess(child), base)
 }

@@ -60,11 +60,11 @@ fn free_port() -> u16 {
 
 async fn wait_ready(base: &str) {
     let client = reqwest::Client::new();
-    for _ in 0..50 {
+    for _ in 0..500 {
         if client.get(format!("{base}/healthz")).send().await.is_ok() {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("hub did not become ready");
 }
@@ -103,7 +103,7 @@ async fn call_model(client: &reqwest::Client, base: &str, model: &str) {
 
 /// Stats are written by a background task, so poll until every call landed.
 async fn insights_when_recorded(client: &reqwest::Client, url: &str, calls: u64) -> Value {
-    for _ in 0..50 {
+    for _ in 0..500 {
         let body: Value = client.get(url).send().await.unwrap().json().await.unwrap();
         let recorded: u64 = body["models"].as_array().map_or(0, |models| {
             models.iter().filter_map(|m| m["requests"].as_u64()).sum()
@@ -111,7 +111,7 @@ async fn insights_when_recorded(client: &reqwest::Client, url: &str, calls: u64)
         if recorded >= calls {
             return body;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("insights never showed {calls} calls");
 }
