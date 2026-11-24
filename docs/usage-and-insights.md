@@ -56,3 +56,19 @@ Prices for the cost estimate come from the `*_USD_PER_1M` and `MODEL_PRICES` var
 
 The Copilot quota and Copilot Auto decisions have their own pages:
 [Usage API](github-copilot.md#usage-api) and [Seeing the pick](copilot-auto.md#seeing-the-pick).
+
+## Measuring a prompt-cache change
+
+`scripts/cache-savings.mjs` compares the request log before and after a deploy time. It prices
+each request with the hub's own `/v1/models` price cards, long-context tier included, and splits
+keep-warm pings from user requests.
+
+```sh
+node scripts/cache-savings.mjs --cutover 2026-11-24T15:00:00Z --hours 24 --db llm-hub.db
+```
+
+- The before and after windows have the same length. Savings are per 1k user requests, so a
+  change in traffic does not count as a saving.
+- A switch is a request whose model differs from the last model of the same worker. Requests with
+  no worker are not counted as switches.
+- `--prices` takes a URL or a saved `/v1/models` file. `--json` prints the raw numbers.
