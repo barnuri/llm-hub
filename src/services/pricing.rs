@@ -105,6 +105,12 @@ impl PricingBook {
         self.price_card(model_key).base
     }
 
+    /// The full price card of `model_key`, with its long-context tier when one is published.
+    #[must_use]
+    pub fn price_card_for(&self, model_key: &str) -> PriceCard {
+        self.price_card(model_key)
+    }
+
     fn price_card(&self, model_key: &str) -> PriceCard {
         if let Some(rates) = self.by_model.get(model_key) {
             return PriceCard::flat(*rates);

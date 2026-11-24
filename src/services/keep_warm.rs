@@ -1,6 +1,6 @@
 #[cfg(test)]
 use axum::http::HeaderValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,13 @@ pub(crate) use lease::KeepWarmLease;
 pub(crate) use ping_plan::PingPlan;
 pub(crate) use warm_request::WarmRequest;
 
+/// Idle gaps kept per model for the stop rule.
+const KEEP_WARM_MAX_GAPS: usize = 64;
+/// Gaps a model needs before the stop rule applies.
+const KEEP_WARM_MIN_GAPS: usize = 8;
+/// A cache miss costs about nine reads: input at 1.0 against a read at 0.1.
+const KEEP_WARM_MISS_TO_PING_RATIO: f64 = 9.0;
+
 type StreamKey = (String, String);
 
 /// Keeps the last request body of each idle stream on a profile that caches prompts, so a ping
@@ -45,6 +52,8 @@ struct State {
     bucket: TokenBucket,
     pings: u64,
     ping_cost_usd: f64,
+    /// Recent idle gaps between user requests of one stream, per model, newest last.
+    gaps: HashMap<String, VecDeque<Duration>>,
 }
 
 struct Stream {
@@ -112,6 +121,42 @@ impl Stream {
 }
 
 impl State {
+    /// Records the idle gap that ended when a user request returned to a kept stream.
+    fn record_gap(&mut self, model: &str, gap: Duration) {
+        let gaps = self.gaps.entry(model.to_string()).or_default();
+        if gaps.len() >= KEEP_WARM_MAX_GAPS {
+            gaps.pop_front();
+        }
+        gaps.push_back(gap);
+    }
+
+    /// Whether the next ping is worth it. After `idle` quiet time, a ping pays when the chance
+    /// that the user returns before the following ping, times the miss cost, beats the ping cost.
+    /// A model with too few recorded gaps always pays.
+    fn ping_pays(&self, model: &str, idle: Duration) -> bool {
+        let Some(gaps) = self
+            .gaps
+            .get(model)
+            .filter(|g| g.len() >= KEEP_WARM_MIN_GAPS)
+        else {
+            return true;
+        };
+        let later = gaps.iter().filter(|gap| **gap > idle).count();
+        if later == 0 {
+            return false;
+        }
+        let soon = gaps
+            .iter()
+            .filter(|gap| **gap > idle && **gap <= idle + KEEP_WARM_PING_INTERVAL)
+            .count();
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "Gap counts stay below the ring size"
+        )]
+        let chance = soon as f64 / later as f64;
+        chance * KEEP_WARM_MISS_TO_PING_RATIO > 1.0
+    }
+
     fn take(&mut self, key: &StreamKey) -> Option<Stream> {
         let stream = self.streams.remove(key)?;
         self.total_bytes -= stream.body.len();
@@ -204,6 +249,11 @@ impl KeepWarm {
             return;
         };
         let previous = state.take(&key);
+        if let Some(old) = &previous
+            && let Some(gap) = started.checked_duration_since(old.last_user)
+        {
+            state.record_gap(&model_id.qualified(), gap);
+        }
         let (last_user, last_ping, ping_in_flight) =
             previous.map_or((started, None, false), |old| {
                 (
@@ -276,6 +326,21 @@ impl KeepWarm {
             .map(|(key, _)| key.clone())
             .collect();
         for key in &expired {
+            state.take(key);
+        }
+        let unprofitable: Vec<StreamKey> = state
+            .streams
+            .iter()
+            .filter(|(key, stream)| {
+                stream.is_due(now, state.is_busy(&key.0))
+                    && !state.ping_pays(
+                        &stream.model_id.qualified(),
+                        now.saturating_duration_since(stream.last_user),
+                    )
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &unprofitable {
             state.take(key);
         }
         let mut due: Vec<(Instant, StreamKey)> = state
@@ -369,6 +434,7 @@ impl KeepWarm {
         let mut state = self.lock();
         state.streams.clear();
         state.total_bytes = 0;
+        state.gaps.clear();
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -499,6 +565,64 @@ mod tests {
         registry.retain_profiles(|profile| profile != "groq");
 
         assert_eq!(keys(&registry), vec![key("w", "kept")]);
+    }
+
+    fn gap_stream(registry: &KeepWarm, t0: Instant, gaps: &[u64]) -> Instant {
+        // Each touch comes `gap` seconds after the last one, so the registry records that gap.
+        let mut at = t0;
+        registry.touch(key("w", "s"), &request_body(10), &model(), at, 4096, None);
+        for gap in gaps {
+            at += Duration::from_secs(*gap);
+            registry.touch(key("w", "s"), &request_body(10), &model(), at, 4096, None);
+        }
+        at
+    }
+
+    #[test]
+    fn a_stream_with_a_returning_gap_history_keeps_pinging() {
+        let registry = Arc::new(KeepWarm::default());
+        let last = gap_stream(&registry, Instant::now(), &[300; 8]);
+        // Every past gap ended within the next ping interval of 5 minutes of idle time.
+        assert_eq!(
+            registry
+                .take_due(last + Duration::from_mins(4), IDLE_CAP)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_stream_idle_past_every_past_gap_stops_pinging() {
+        let registry = Arc::new(KeepWarm::default());
+        let last = gap_stream(&registry, Instant::now(), &[60; 8]);
+        // The user always came back within a minute, and 4 minutes have passed.
+        let plans = registry.take_due(last + Duration::from_mins(4), IDLE_CAP);
+        assert!(plans.is_empty());
+        assert!(keys(&registry).is_empty());
+    }
+
+    #[test]
+    fn a_stream_with_few_gaps_keeps_pinging_until_the_cap() {
+        let registry = Arc::new(KeepWarm::default());
+        let last = gap_stream(&registry, Instant::now(), &[60; 3]);
+        assert_eq!(
+            registry
+                .take_due(last + Duration::from_mins(4), IDLE_CAP)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_gap_history_is_bounded_and_cleared_with_the_streams() {
+        let registry = Arc::new(KeepWarm::default());
+        gap_stream(&registry, Instant::now(), &[10; 100]);
+        assert_eq!(
+            registry.lock().gaps.values().next().map(VecDeque::len),
+            Some(KEEP_WARM_MAX_GAPS)
+        );
+        registry.clear();
+        assert!(registry.lock().gaps.is_empty());
     }
 
     #[test]

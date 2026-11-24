@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::configs::TokenRates;
 use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::model_context::strip_1m_suffix;
@@ -33,6 +34,39 @@ struct PinEntry {
     switch_turns: VecDeque<usize>,
     last_used: Instant,
     sequence: u64,
+    /// Cached prompt tokens (read plus write) of the last answer, the prefix a switch rewrites.
+    last_prefix_tokens: u64,
+}
+
+/// The prices a step-down weighs: the pinned and the cheap model's rates, and the turn's prompt.
+#[derive(Debug, Clone, Copy)]
+pub struct StepDownCost {
+    pub pinned: TokenRates,
+    pub cheap: TokenRates,
+    /// Blended USD per million tokens of each model, from the price book.
+    pub pinned_blended: f64,
+    pub cheap_blended: f64,
+    pub turn_tokens: u64,
+}
+
+impl StepDownCost {
+    /// Whether rewriting `prefix` cached tokens on the cheap model costs more than the turn saves.
+    #[must_use]
+    pub fn rewrite_exceeds_savings(&self, prefix: u64) -> bool {
+        let cheap = self.cheap.with_cache_defaults();
+        let pinned = self.pinned.with_cache_defaults();
+        let rewrite = Self::usd(prefix, cheap.cache_write_per_1m - pinned.cache_read_per_1m);
+        let savings = Self::usd(self.turn_tokens, self.pinned_blended - self.cheap_blended);
+        rewrite > savings
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "Token counts stay far below 2^53"
+    )]
+    fn usd(tokens: u64, usd_per_1m: f64) -> f64 {
+        tokens as f64 * usd_per_1m / 1_000_000.0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -161,15 +195,25 @@ impl SmartAutoAffinity {
         dwelled && recent_switches < Self::SOFT_SWITCH_BUDGET
     }
 
-    /// Whether a step-down to the cheap model is allowed at user turn `turn`. A warm cache and
-    /// the dwell do not block it, because a premium tool loop costs more than one cache rewrite.
-    /// Only the switch budget does.
+    /// Whether a step-down to the cheap model is allowed at user turn `turn`. The switch budget
+    /// blocks it, and so does a warm prefix whose rewrite on the cheap model costs more than `cost`
+    /// saves. Without `cost` (no known prices), only the budget applies.
     #[must_use]
-    pub fn step_down_allowed(&self, key: &AffinityKey, turn: usize, now: Instant) -> bool {
+    pub fn step_down_allowed(
+        &self,
+        key: &AffinityKey,
+        turn: usize,
+        cost: Option<StepDownCost>,
+        now: Instant,
+    ) -> bool {
         let mut table = self.lock();
         let Some(entry) = table.live_entry(key, now) else {
             return true;
         };
+        let warm = now.saturating_duration_since(entry.last_used) <= Self::CACHE_WARM_WINDOW;
+        if warm && cost.is_some_and(|cost| cost.rewrite_exceeds_savings(entry.last_prefix_tokens)) {
+            return false;
+        }
         let recent_switches = entry
             .switch_turns
             .iter()
@@ -200,6 +244,7 @@ impl SmartAutoAffinity {
             switch_turns: VecDeque::new(),
             last_used: now,
             sequence,
+            last_prefix_tokens: 0,
         });
         entry.last_used = now;
         entry.sequence = sequence;
@@ -229,6 +274,13 @@ impl SmartAutoAffinity {
         table.compact();
         table.evict_over_capacity(key);
         true
+    }
+
+    /// Records the cached prompt tokens of the answer just committed under `key`.
+    pub fn record_prefix(&self, key: &AffinityKey, tokens: u64) {
+        if let Some(entry) = self.lock().entries.get_mut(key) {
+            entry.last_prefix_tokens = tokens;
+        }
     }
 
     /// Marks the live pin under `key` as chosen by a user directive, when it pins `model`.
@@ -423,6 +475,56 @@ mod tests {
         fn refs(&self) -> Vec<&ModelDescriptor> {
             self.0.iter().collect()
         }
+    }
+
+    fn rates(read: f64, write: f64) -> TokenRates {
+        TokenRates {
+            input_per_1m: 1.0,
+            output_per_1m: 1.0,
+            cache_read_per_1m: read,
+            cache_write_per_1m: write,
+        }
+    }
+
+    fn cost(turn_tokens: u64) -> StepDownCost {
+        StepDownCost {
+            pinned: rates(0.2, 5.0),
+            cheap: rates(0.1, 2.0),
+            pinned_blended: 5.0,
+            cheap_blended: 1.0,
+            turn_tokens,
+        }
+    }
+
+    #[test]
+    fn rewrite_cost_weighs_the_prefix_against_the_turn_savings() {
+        // Rewrite: 100k x (2.0 - 0.2) = $0.18. Savings: turn x (5 - 1).
+        assert!(cost(10_000).rewrite_exceeds_savings(100_000));
+        assert!(!cost(100_000).rewrite_exceeds_savings(100_000));
+        assert!(!cost(0).rewrite_exceeds_savings(0));
+    }
+
+    #[test]
+    fn a_warm_costly_prefix_blocks_a_step_down_until_it_cools() {
+        let store = SmartAutoAffinity::new();
+        let key = key_for("s-prefix", None);
+        let now = Instant::now();
+        assert!(store.step_down_allowed(&key, 1, Some(cost(10_000)), now));
+        store.commit(&key, OPUS, WorkRole::Planning, false, 1, now);
+        assert!(store.step_down_allowed(&key, 2, Some(cost(10_000)), now));
+        store.record_prefix(&key, 100_000);
+        assert!(!store.step_down_allowed(&key, 2, Some(cost(10_000)), now));
+        assert!(store.step_down_allowed(&key, 2, None, now));
+        let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
+        assert!(store.step_down_allowed(&key, 2, Some(cost(10_000)), cold));
+    }
+
+    #[test]
+    fn record_prefix_ignores_an_unknown_key() {
+        let store = SmartAutoAffinity::new();
+        let key = key_for("s-none", None);
+        store.record_prefix(&key, 100_000);
+        assert!(store.step_down_allowed(&key, 1, Some(cost(10_000)), Instant::now()));
     }
 
     #[test]

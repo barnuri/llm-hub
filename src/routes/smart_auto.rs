@@ -557,7 +557,7 @@ fn resolve_dry_run(state: &AppState, mut body: ResolveBody) -> Result<ResolveRep
     {
         pool.retain(|descriptor| profiles.allows(&descriptor.qualified_id));
     }
-    let live = SmartAutoLive::collect(state, endpoint, &pool, now);
+    let live = SmartAutoLive::collect(state, endpoint, &pool, 0, now);
     let sits_out = |descriptor: &&ModelDescriptor| {
         live.unavailable
             .contains(strip_1m_suffix(&descriptor.qualified_id))

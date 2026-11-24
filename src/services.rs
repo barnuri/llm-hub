@@ -53,6 +53,7 @@ pub mod parent_watch;
 pub mod pricing;
 pub mod process_gh_cli;
 pub mod profile_usage;
+pub mod prompt_cache;
 pub mod prompt_shape_reader;
 pub mod quota_snapshots;
 pub mod rate_limit;
