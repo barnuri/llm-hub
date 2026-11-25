@@ -18,11 +18,13 @@ pub struct LocalServingConfig {
     pub registry: PathBuf,
     /// `LLM_HUB_<P>_MEMORY_GB`. `None` leaves the budget to the runtime default.
     pub memory_gb: Option<f64>,
-    /// `LLM_HUB_<P>_IDLE_SECS`. `None` when it is `0`: a model is never stopped for being idle.
+    /// `LLM_HUB_<P>_IDLE_MS`, else `LLM_HUB_<P>_IDLE_SECS`. `None` when it is `0`: a model is never
+    /// stopped for being idle.
     pub idle_timeout: Option<Duration>,
     /// `LLM_HUB_<P>_MODEL_TTL_SECS` as `id=secs,...`: per-model idle timeouts, `0` means never.
     pub model_idle_timeouts: HashMap<String, Option<Duration>>,
-    /// `LLM_HUB_<P>_START_TIMEOUT_SECS`: how long a model gets to become healthy.
+    /// `LLM_HUB_<P>_START_TIMEOUT_MS`, else `LLM_HUB_<P>_START_TIMEOUT_SECS`: how long a model gets
+    /// to become healthy.
     pub start_timeout: Duration,
     /// `LLM_HUB_<P>_LLAMA_BIN`, else `~/.local/bin/llama` when executable, else `llama` on PATH.
     pub llama_bin: PathBuf,
@@ -80,20 +82,19 @@ impl LocalServingConfig {
                     "LLM_HUB_{upper}_KIND=local needs LLM_HUB_{upper}_REGISTRY or LLM_HUB_{upper}_TUNER_REGISTRY"
                 )
             })?;
-        let idle_secs =
-            ManagedCommand::parse_secs(upper, "IDLE_SECS", get, DEFAULT_LOCAL_IDLE_SECS)?;
-        let start_secs = ManagedCommand::parse_secs(
+        let idle = ManagedCommand::parse_duration(upper, "IDLE", get, DEFAULT_LOCAL_IDLE_SECS)?;
+        let start_timeout = ManagedCommand::parse_duration(
             upper,
-            "START_TIMEOUT_SECS",
+            "START_TIMEOUT",
             get,
             DEFAULT_LOCAL_START_TIMEOUT_SECS,
         )?;
         Ok(Some(Self {
             registry,
             memory_gb: Self::memory_gb(upper, present("MEMORY_GB"))?,
-            idle_timeout: idle_timeout(idle_secs),
+            idle_timeout: (!idle.is_zero()).then_some(idle),
             model_idle_timeouts: Self::model_idle_timeouts(upper, present("MODEL_TTL_SECS"))?,
-            start_timeout: Duration::from_secs(start_secs),
+            start_timeout,
             llama_bin: present("LLAMA_BIN").map_or_else(|| Self::default_llama_bin(home), expand),
             models_dir: expand(
                 present("MODELS_DIR").unwrap_or_else(|| DEFAULT_LOCAL_MODELS_DIR.into()),
@@ -327,6 +328,26 @@ mod tests {
     }
 
     #[test]
+    fn ms_keys_win_over_secs_keys() {
+        let config = parse(&[
+            ("IDLE_SECS", "60"),
+            ("IDLE_MS", "150"),
+            ("START_TIMEOUT_SECS", "30"),
+            ("START_TIMEOUT_MS", "250"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.idle_timeout, Some(Duration::from_millis(150)));
+        assert_eq!(config.start_timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn idle_ms_zero_never_stops() {
+        let config = parse(&[("IDLE_MS", "0")]).unwrap().unwrap();
+        assert_eq!(config.idle_timeout, None);
+    }
+
+    #[test]
     fn registry_falls_back_to_the_tuner_registry() {
         let tuner = PathBuf::from("/tuner/registry.txt");
         let config = parse_with(&[("KIND", "local")], Some(HOME), Some(&tuner))
@@ -358,6 +379,8 @@ mod tests {
             ("MEMORY_GB", "inf"),
             ("IDLE_SECS", "soon"),
             ("START_TIMEOUT_SECS", "-1"),
+            ("IDLE_MS", "soon"),
+            ("START_TIMEOUT_MS", "1.5"),
             ("MODEL_TTL_SECS", "big"),
             ("MODEL_TTL_SECS", "=60"),
             ("MODEL_TTL_SECS", "big=soon"),

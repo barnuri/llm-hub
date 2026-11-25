@@ -31,7 +31,7 @@ Every change to `src/` comes with unit tests in the same change. The `coverage` 
 
 ## Checks before you report done
 
-Run `scripts/check.sh` before you report a change as done, and fix every failure. It runs what CI runs: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and the tests with the 80% per-file coverage gate. `scripts/check.sh fast` runs only format and lint. `git config core.hooksPath .githooks` runs `fast` before each commit and the full check before each push.
+Run `scripts/check.sh` before you report a change as done, and fix every failure. It runs what CI runs: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and the tests with the 80% per-file coverage gate. `scripts/check.sh fast` runs only format and lint. There are no git hooks: the GitHub checks on the PR are the gate.
 
 Clippy enforces these rules, so do not spend review on them. The `[lints]` table in `Cargo.toml` and `clippy.toml` hold the full list:
 

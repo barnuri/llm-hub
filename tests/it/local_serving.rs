@@ -10,13 +10,15 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
+
+use crate::hub::{self, HubProcess};
 
 /// Owns one test's hub, temp dir, fake server and spawn log. Dropping it stops every child.
 struct Fixture {
     dir: tempfile::TempDir,
-    hub: Option<Child>,
+    hub: Option<HubProcess>,
     base: String,
     client: reqwest::Client,
 }
@@ -24,7 +26,7 @@ struct Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         if let Some(mut hub) = self.hub.take() {
-            terminate_hub(&mut hub);
+            hub.stop_gracefully(Duration::from_secs(10));
         }
         for pid in self.spawned_pids() {
             kill_if_alive(pid);
@@ -84,6 +86,10 @@ impl Fixture {
                 "20".to_owned(),
             ),
             ("SPAWN_LOG".to_owned(), path_str(&root.join("spawns.txt"))),
+            (
+                "SLOW_RELEASE_FILE".to_owned(),
+                path_str(&root.join("release-slow")),
+            ),
         ]);
         let fixture = Fixture {
             dir,
@@ -98,29 +104,9 @@ impl Fixture {
     }
 
     async fn launch(&mut self, vars: &HashMap<String, String>) {
-        for _ in 0..5 {
-            let port = free_port();
-            let mut command = Command::new(env!("CARGO_BIN_EXE_llm-hub"));
-            command
-                .arg("serve")
-                .current_dir(self.dir.path())
-                .env("LLM_HUB_PORT", port.to_string())
-                .env("LLM_HUB_AUTO_UPDATE", "0")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            for (key, value) in vars {
-                command.env(key, value);
-            }
-            let mut hub = command.spawn().expect("hub starts");
-            let base = format!("http://127.0.0.1:{port}");
-            if wait_ready(&self.client, &base, &mut hub).await {
-                self.hub = Some(hub);
-                self.base = base;
-                return;
-            }
-        }
-        panic!("hub did not start on 5 ports");
+        let (hub, base) = hub::start_hub_in(self.dir.path(), vars.clone(), &[]).await;
+        self.hub = Some(hub);
+        self.base = base;
     }
 
     /// Stops the hub with SIGTERM, so its graceful shutdown stops the children.
@@ -220,44 +206,18 @@ fn path_str(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-/// True once `/healthz` answers `ok` while `hub` still runs.
-async fn wait_ready(client: &reqwest::Client, base: &str, hub: &mut Child) -> bool {
-    for _ in 0..300 {
-        if hub.try_wait().unwrap().is_some() {
-            return false;
-        }
-        if let Ok(response) = client.get(format!("{base}/healthz")).send().await
-            && response.status().is_success()
-        {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("hub did not become ready within 30 s");
-}
-
-/// Sends SIGTERM to the hub and waits up to 10 s for its graceful shutdown, then kills it.
-fn terminate_hub(hub: &mut Child) {
+/// Sends SIGTERM to the hub and waits up to 10 s for its graceful shutdown. Dropping `hub` kills it.
+fn terminate_hub(hub: &mut HubProcess) {
     let _ = Command::new("kill")
         .args(["-TERM", &hub.id().to_string()])
         .status();
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if let Ok(Some(_)) = hub.try_wait() {
+        if let Ok(Some(_)) = hub.0.try_wait() {
             return;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(5));
     }
-    let _ = hub.kill();
-    let _ = hub.wait();
 }
 
 fn is_alive(pid: u32) -> bool {
@@ -287,7 +247,7 @@ async fn eventually(timeout: Duration, mut check: impl FnMut() -> bool) -> bool 
         if check() {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     check()
 }
@@ -340,12 +300,12 @@ async fn a_registry_edit_adds_a_model_without_restart() {
     fx.write_registry(&[("a", 1.0), ("b", 1.0)]);
 
     let mut status = reqwest::StatusCode::NOT_FOUND;
-    for _ in 0..50 {
+    for _ in 0..500 {
         status = fx.chat("b").await;
         if status.is_success() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
         status.is_success(),
@@ -379,11 +339,11 @@ async fn no_room_when_every_candidate_serves_a_request_answers_503() {
         &[("slow-a", 4.0), ("slow-b", 4.0), ("c", 4.0)],
         &[
             ("LLM_HUB_LOCAL_MEMORY_GB", "10"),
-            ("LLM_HUB_LOCAL_START_TIMEOUT_SECS", "2"),
+            ("LLM_HUB_LOCAL_START_TIMEOUT_MS", "1000"),
         ],
     )
     .await;
-    // Both slow requests hold their model for 6 s, so no model is idle when `c` starts.
+    // Both slow requests hold their model until the release file exists, so no model is idle when `c` starts.
     let busy: Vec<_> = ["slow-a", "slow-b"]
         .into_iter()
         .map(|id| {
@@ -408,14 +368,15 @@ async fn no_room_when_every_candidate_serves_a_request_answers_503() {
 
     assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(fx.spawn_count("c"), 0);
+    std::fs::write(fx.dir.path().join("release-slow"), "").unwrap();
     for task in busy {
         task.abort();
     }
 }
 
 #[tokio::test]
-async fn idle_secs_one_stops_the_model_after_its_last_request() {
-    let fx = Fixture::start(&[("a", 1.0)], &[("LLM_HUB_LOCAL_IDLE_SECS", "1")]).await;
+async fn a_short_idle_timeout_stops_the_model_after_its_last_request() {
+    let fx = Fixture::start(&[("a", 1.0)], &[("LLM_HUB_LOCAL_IDLE_MS", "100")]).await;
     assert!(fx.chat("a").await.is_success());
     let pid = fx.pid_of("a");
     assert!(is_alive(pid));

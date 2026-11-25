@@ -10,8 +10,30 @@ use std::time::{Duration, Instant};
 
 use wiremock::{Match, MockServer, Request, ResponseTemplate};
 
-/// Kills the hub process when the test ends.
-pub struct HubProcess(Child);
+/// Kills the hub process when the test ends. The hub also exits by itself when the test process
+/// dies first: [`hub_command`] gives it a stdin pipe that closes with this process.
+pub struct HubProcess(pub Child);
+
+impl HubProcess {
+    /// The hub's process id.
+    pub fn id(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// Closes the hub's stdin, so it shuts down gracefully and stops its children, and waits up to
+    /// `within` for it to exit. Works the same on every platform. Returns whether it exited in time.
+    pub fn stop_gracefully(&mut self, within: Duration) -> bool {
+        drop(self.0.stdin.take());
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = self.0.try_wait() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+}
 
 impl Drop for HubProcess {
     fn drop(&mut self) {
@@ -20,21 +42,43 @@ impl Drop for HubProcess {
     }
 }
 
+/// `llm-hub serve` on `port` in `dir`, with auto-update and desktop popups off and the
+/// parent-death guard on: the hub stops when its stdin pipe closes, which happens when the test
+/// process exits for any reason. Keep the `Child` (it owns the pipe) for as long as the hub must run.
+pub fn hub_command(dir: &std::path::Path, port: u16) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_llm-hub"));
+    command
+        .arg("serve")
+        .current_dir(dir)
+        .env("LLM_HUB_PORT", port.to_string())
+        .env("LLM_HUB_AUTO_UPDATE", "0")
+        .env("LLM_HUB_NOTIFY_DESKTOP", "false")
+        .env("LLM_HUB_EXIT_ON_STDIN_EOF", "1")
+        .stdin(Stdio::piped());
+    command
+}
+
 /// Starts the hub with `vars` set and returns it with its base URL once it logs its own bind.
 /// A hub that exits before it is ready lost its port to another listener, so the next port is tried.
 pub async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
+    let dir = tempfile::tempdir().unwrap().keep();
+    start_hub_in(&dir, vars, &[]).await
+}
+
+/// [`start_hub`] with `dir` as the working directory and the `removed` variables taken out of the
+/// inherited environment.
+pub async fn start_hub_in(
+    dir: &std::path::Path,
+    vars: HashMap<String, String>,
+    removed: &[&str],
+) -> (HubProcess, String) {
     for _ in 0..START_ATTEMPTS {
         let port = free_port();
-        let dir = tempfile::tempdir().unwrap().keep();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_llm-hub"));
-        command
-            .arg("serve")
-            .current_dir(&dir)
-            .env("LLM_HUB_PORT", port.to_string())
-            .env("LLM_HUB_AUTO_UPDATE", "0")
-            .env("LLM_HUB_NOTIFY_DESKTOP", "false")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut command = hub_command(dir, port);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        for key in removed {
+            command.env_remove(key);
+        }
         for (key, value) in &vars {
             command.env(key, value);
         }

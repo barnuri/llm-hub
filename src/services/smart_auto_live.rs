@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use crate::configs::TokenRates;
+use crate::configs::{PriceCard, TokenRates};
 use crate::dependencies::state::AppState;
 use crate::schemas::live_signals::{LiveSignals, ModelSignal};
 use crate::schemas::model_context::strip_1m_suffix;
@@ -34,16 +34,19 @@ impl SmartAutoLive {
     const COST_BOUNDS_USD: [f64; 10] = [0.10, 0.50, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0, 100.0];
     const COST_FREE: u8 = 10;
 
-    /// The signals of every model in `pool` on `endpoint`.
+    /// The signals of every model in `pool` on `endpoint`. A prompt of `prompt_tokens` above a
+    /// model's long-context threshold is scored at the tier rates.
     #[must_use]
     pub fn collect(
         state: &AppState,
         endpoint: &str,
         pool: &[&ModelDescriptor],
+        prompt_tokens: u64,
         now: Instant,
     ) -> CollectedSignals {
         let health = state.model_health().view(endpoint, now);
         let costs = state.model_costs();
+        let prices = state.model_prices();
         let mut quotas: HashMap<&str, Option<f64>> = HashMap::new();
         let mut by_model = HashMap::with_capacity(pool.len());
         let mut unavailable = health.cooled;
@@ -58,7 +61,10 @@ impl SmartAutoLive {
             by_model.insert(
                 id.to_owned(),
                 ModelSignal {
-                    cost: costs.get(id).copied(),
+                    cost: Self::prompt_cost(prices.get(id), costs.get(id).copied(), prompt_tokens),
+                    rates: prices
+                        .get(id)
+                        .map(|card| card.rates_for_prompt(prompt_tokens)),
                     speed: health.speeds.get(id).copied(),
                     error_rate: health.error_rates.get(id).copied(),
                     quota_remaining_pct: quota,
@@ -96,9 +102,32 @@ impl SmartAutoLive {
         scores
     }
 
+    /// The price card of every model, keyed by id without `[1m]`.
+    #[must_use]
+    pub fn price_cards<'a>(
+        book: &PricingBook,
+        model_ids: impl Iterator<Item = &'a str>,
+    ) -> HashMap<String, PriceCard> {
+        model_ids
+            .map(|raw| {
+                let id = strip_1m_suffix(raw);
+                (id.to_owned(), book.price_card_for(id))
+            })
+            .collect()
+    }
+
+    /// The cost score at `prompt_tokens`: the tier's score above its threshold, else `base`.
+    fn prompt_cost(card: Option<&PriceCard>, base: Option<u8>, prompt_tokens: u64) -> Option<u8> {
+        card.and_then(|card| card.tier_for_prompt(prompt_tokens))
+            .map_or(base, |tier| {
+                Some(Self::cost_score(Self::blended_usd_per_1m(&tier.rates)))
+            })
+    }
+
     /// USD per million tokens of an agent turn. A model with no cache-read price reads cache at
     /// its input price.
-    fn blended_usd_per_1m(rates: &TokenRates) -> f64 {
+    #[must_use]
+    pub fn blended_usd_per_1m(rates: &TokenRates) -> f64 {
         let cached = if rates.cache_read_per_1m > 0.0 {
             rates.cache_read_per_1m
         } else {
@@ -224,7 +253,7 @@ mod tests {
         }
         let pool_refs: Vec<&ModelDescriptor> = pool.iter().collect();
 
-        let collected = SmartAutoLive::collect(&state, ENDPOINT, &pool_refs, now);
+        let collected = SmartAutoLive::collect(&state, ENDPOINT, &pool_refs, 0, now);
 
         assert_eq!(
             collected.unavailable,
@@ -256,7 +285,7 @@ mod tests {
         );
         let pool_refs: Vec<&ModelDescriptor> = pool.iter().collect();
 
-        let collected = SmartAutoLive::collect(&state, ENDPOINT, &pool_refs, now);
+        let collected = SmartAutoLive::collect(&state, ENDPOINT, &pool_refs, 0, now);
 
         assert_eq!(
             collected.unavailable,
@@ -274,7 +303,7 @@ mod tests {
             .record_failure("home/m", "/v1/messages", FailureKind::Transport, now);
         let pool_refs: Vec<&ModelDescriptor> = pool.iter().collect();
 
-        let collected = SmartAutoLive::collect(&state, ENDPOINT, &pool_refs, now);
+        let collected = SmartAutoLive::collect(&state, ENDPOINT, &pool_refs, 0, now);
 
         assert!(collected.unavailable.is_empty());
         assert_eq!(collected.signals.get("home/m").error_rate, None);
@@ -354,6 +383,62 @@ mod tests {
         // (8 x 0.5 + 5 + 25) / 10 = 3.4 against (8 x 5 + 5 + 25) / 10 = 7.0.
         assert_eq!(scores["acme/cached"], 6);
         assert_eq!(scores["acme/uncached"], 5);
+    }
+
+    #[test]
+    fn a_long_prompt_is_scored_at_the_long_context_tier() {
+        let base = TokenRates {
+            input_per_1m: 0.1,
+            output_per_1m: 0.5,
+            cache_read_per_1m: 0.01,
+            cache_write_per_1m: 0.125,
+        };
+        let long = TokenRates {
+            input_per_1m: 5.0,
+            output_per_1m: 25.0,
+            cache_read_per_1m: 0.5,
+            cache_write_per_1m: 6.25,
+        };
+        let card = PriceCard {
+            base,
+            long_context: Some(crate::configs::LongContextTier {
+                threshold_tokens: 100_000,
+                rates: long,
+            }),
+        };
+        let base_score = Some(SmartAutoLive::cost_score(
+            SmartAutoLive::blended_usd_per_1m(&base),
+        ));
+        assert_eq!(
+            SmartAutoLive::prompt_cost(Some(&card), base_score, 100_000),
+            base_score
+        );
+        // (8 x 0.5 + 5 + 25) / 10 = 3.4 scores 6.
+        assert_eq!(
+            SmartAutoLive::prompt_cost(Some(&card), base_score, 100_001),
+            Some(6)
+        );
+        assert_eq!(SmartAutoLive::prompt_cost(None, Some(4), 200_000), Some(4));
+    }
+
+    #[test]
+    fn price_cards_key_every_model_without_its_1m_suffix() {
+        let cards =
+            SmartAutoLive::price_cards(&book(), ["acme/cheap", "acme/dear[1m]"].into_iter());
+        assert_eq!(cards.len(), 2);
+        assert!((cards["acme/dear"].base.output_per_1m - 75.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn collect_carries_the_rates_for_the_prompt_size() {
+        let server = quota_server().await;
+        let state = state(&format!("{}/v1", server.uri()));
+        let pool = descriptors(&["remote/m"]);
+        state.set_model_descriptors(pool.clone());
+        let pool_refs: Vec<&ModelDescriptor> = pool.iter().collect();
+        let collected = SmartAutoLive::collect(&state, ENDPOINT, &pool_refs, 0, Instant::now());
+        let expected = state.pricing_book().rates_for("remote/m");
+        assert_eq!(collected.signals.get("remote/m").rates, Some(expected));
     }
 
     #[test]

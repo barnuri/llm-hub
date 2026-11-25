@@ -80,6 +80,7 @@ use crate::services::local_serving::watchdog::{StreamWatchdog, stall_event};
 use crate::services::media_fallback;
 use crate::services::model_health::FailureKind;
 use crate::services::multipart_model;
+use crate::services::prompt_cache::CacheHint;
 use crate::services::rate_limit::{CooldownHint, CooldownScope, reset_after};
 use crate::services::request_images::request_has_image;
 use crate::services::responses_chat::{self, ChatStream};
@@ -875,6 +876,8 @@ struct SmartAutoCommit {
     turn: usize,
     /// The pin is a user directive's, which role changes do not move.
     user_pin: bool,
+    /// Cached prompt tokens (read plus write) of the answer, set once its usage is known.
+    prefix_tokens: u64,
 }
 
 impl SmartAutoCommit {
@@ -888,6 +891,9 @@ impl SmartAutoCommit {
             self.turn,
             Instant::now(),
         );
+        state
+            .smart_auto_affinity()
+            .record_prefix(&self.key, self.prefix_tokens);
         if self.user_pin {
             state
                 .smart_auto_affinity()
@@ -932,6 +938,7 @@ impl SmartAutoPlan {
             role: self.role,
             plan_backed: self.plan_backed,
             turn: self.turn,
+            prefix_tokens: 0,
         })
     }
 }
@@ -985,7 +992,13 @@ fn resolve_hub(
     }
     // Models that just failed, or whose quota is used up, sit out. When that would leave nothing,
     // the pool stays whole: a model that may fail beats a certain 400.
-    let live = SmartAutoLive::collect(state, endpoint, &pool, Instant::now());
+    let live = SmartAutoLive::collect(
+        state,
+        endpoint,
+        &pool,
+        signals.estimated_prompt_tokens,
+        Instant::now(),
+    );
     let sits_out = |descriptor: &&ModelDescriptor| {
         live.unavailable
             .contains(strip_1m_suffix(&descriptor.qualified_id))
@@ -1754,14 +1767,14 @@ impl<'a> AttemptBodies<'a> {
             .as_ref()
             .filter(|_| native.is_none() && serves_only_responses(state, &sent_id));
         if let Some((anthropic_body, _)) = bridged {
-            return Ok(self.responses_attempt(anthropic_body, &sent_id, model_id));
+            return Ok(self.responses_attempt(anthropic_body, state, &sent_id, model_id));
         }
         if let Some(chat) = self
             .json_body
             .as_ref()
             .filter(|_| self.bridges_chat_completions(state, &sent_id))
         {
-            return self.chat_responses_attempt(chat, &sent_id, model_id);
+            return self.chat_responses_attempt(chat, state, &sent_id, model_id);
         }
         let path = native_count_tokens_path(self.upstream_path, catalog.as_ref())
             .unwrap_or(UpstreamPath::Strip(self.upstream_path));
@@ -1783,6 +1796,7 @@ impl<'a> AttemptBodies<'a> {
                     self.original,
                     &sent_id,
                     &state.unsupported_body_fields(&model_id.profile),
+                    Some(&CacheHint::Anthropic),
                 ),
                 // An "Extra inputs" 400 is read to learn the rejected field.
                 force_identity_encoding: true,
@@ -1799,6 +1813,7 @@ impl<'a> AttemptBodies<'a> {
                     self.original,
                     self.boundary.as_deref(),
                     &sent_id,
+                    self.cache_hint(state, &sent_id).as_ref(),
                 ),
                 // A rewrite reads the body, so it must arrive uncompressed.
                 force_identity_encoding: self.force_identity_encoding
@@ -1810,6 +1825,34 @@ impl<'a> AttemptBodies<'a> {
             },
         };
         Ok(attempt)
+    }
+
+    /// The `prompt_cache_key` hint: the caller's session id, for Copilot or any upstream that is not this machine.
+    fn prompt_key_hint(&self, state: &AppState, sent_id: &ModelId) -> Option<CacheHint> {
+        let remote = state
+            .config()
+            .profile(&sent_id.profile)
+            .is_some_and(|profile| profile.copilot.is_some() || !profile.is_local());
+        remote
+            .then(|| claude_code_session_id(&self.headers))
+            .flatten()
+            .map(CacheHint::PromptKey)
+    }
+
+    /// The cache hint for a request sent as it came: breakpoints for Messages, Copilot's marker for
+    /// Claude on chat completions, a cache key for any other chat or Responses request.
+    fn cache_hint(&self, state: &AppState, sent_id: &ModelId) -> Option<CacheHint> {
+        let path = bare_path(self.upstream_path);
+        if path.ends_with(MESSAGES_ENDPOINT) {
+            return Some(CacheHint::Anthropic);
+        }
+        let claude = sent_id.model.starts_with("claude");
+        if path.ends_with(CHAT_ENDPOINT) && claude {
+            return is_copilot_profile(state, sent_id).then_some(CacheHint::CopilotChat);
+        }
+        (path.ends_with(CHAT_ENDPOINT) || path.ends_with(RESPONSES_ENDPOINT))
+            .then(|| self.prompt_key_hint(state, sent_id))
+            .flatten()
     }
 
     /// True for a chat-completions request to a Copilot model that serves only `/responses`.
@@ -1824,6 +1867,7 @@ impl<'a> AttemptBodies<'a> {
     fn chat_responses_attempt(
         &self,
         chat: &Value,
+        state: &AppState,
         sent_id: &ModelId,
         model_id: &ModelId,
     ) -> Result<Attempt<'_>, String> {
@@ -1835,7 +1879,13 @@ impl<'a> AttemptBodies<'a> {
         Ok(Attempt {
             path: UpstreamPath::Verbatim(RESPONSES_ENDPOINT),
             headers: &self.headers,
-            body: json_for_attempt(&responses_body, self.original, sent_id, &[]),
+            body: json_for_attempt(
+                &responses_body,
+                self.original,
+                sent_id,
+                &[],
+                self.prompt_key_hint(state, sent_id).as_ref(),
+            ),
             force_identity_encoding: true,
             route: RouteKind::OpenAi,
             plan: &self.passthrough_plan,
@@ -1853,6 +1903,7 @@ impl<'a> AttemptBodies<'a> {
     fn responses_attempt(
         &self,
         anthropic_body: &Value,
+        state: &AppState,
         sent_id: &ModelId,
         model_id: &ModelId,
     ) -> Attempt<'_> {
@@ -1860,7 +1911,13 @@ impl<'a> AttemptBodies<'a> {
         Attempt {
             path: UpstreamPath::Verbatim(RESPONSES_ENDPOINT),
             headers: &self.headers,
-            body: json_for_attempt(&responses_body, self.original, sent_id, &[]),
+            body: json_for_attempt(
+                &responses_body,
+                self.original,
+                sent_id,
+                &[],
+                self.prompt_key_hint(state, sent_id).as_ref(),
+            ),
             force_identity_encoding: true,
             route: RouteKind::OpenAi,
             plan: &self.passthrough_plan,
@@ -2324,7 +2381,9 @@ async fn review_deliver(
         attempt,
         role,
     };
-    if let Some(commit) = commit {
+    if let Some(mut commit) = commit {
+        commit.prefix_tokens =
+            reviewed_outcome.cache_read_tokens + reviewed_outcome.cache_write_tokens;
         commit.apply(state);
     }
     if let Some(attempt) = selection.as_ref().and_then(|event| event.attempt.clone()) {
@@ -2516,6 +2575,7 @@ fn body_for_attempt(
     original: &Bytes,
     multipart_boundary: Option<&str>,
     model_id: &ModelId,
+    hint: Option<&CacheHint>,
 ) -> Bytes {
     if let Some(boundary) = multipart_boundary {
         return multipart_model::with_model_field(original, boundary, &model_id.model)
@@ -2524,7 +2584,7 @@ fn body_for_attempt(
     let Some(json) = json_body else {
         return original.clone();
     };
-    json_for_attempt(json, original, model_id, &[])
+    json_for_attempt(json, original, model_id, &[], hint)
 }
 
 /// `json` sent to `model_id`, without the `rejected` fields.
@@ -2533,8 +2593,12 @@ fn json_for_attempt(
     original: &Bytes,
     model_id: &ModelId,
     rejected: &[BodyField],
+    hint: Option<&CacheHint>,
 ) -> Bytes {
     let mut attempt = json.clone();
+    if let Some(hint) = hint {
+        hint.apply(&mut attempt);
+    }
     if let Some(obj) = attempt.as_object_mut() {
         obj.insert("model".into(), Value::String(model_id.model.clone()));
     }
@@ -3859,9 +3923,10 @@ fn build_response(
             upstream: &path,
         };
         log_failure(&outcome, logs, summary.bytes_sent, summary.upstream_end);
-        if let Some(commit) = commit
+        if let Some(mut commit) = commit
             .filter(|_| summary.upstream_end == UpstreamEnd::Complete && outcome.error.is_none())
         {
+            commit.prefix_tokens = outcome.cache_read_tokens + outcome.cache_write_tokens;
             commit.apply(&state_for_stats);
         }
         if let Some(lease) = keep_warm
@@ -4332,7 +4397,8 @@ async fn build_anthropic_response(
         }
         state_for_stats.record_outcome(&outcome, request_state.as_ref());
         state_for_stats.publish_live(&outcome);
-        if let Some(commit) = commit.filter(|_| outcome.error.is_none()) {
+        if let Some(mut commit) = commit.filter(|_| outcome.error.is_none()) {
+            commit.prefix_tokens = outcome.cache_read_tokens + outcome.cache_write_tokens;
             commit.apply(&state_for_stats);
         }
         record_request(&state_for_stats, &outcome, prompt_body).await;
@@ -5450,6 +5516,9 @@ mod tests {
             expected["model"] = json!(NATIVE_UPSTREAM_ID);
             expected["thinking"] = json!({"type": "adaptive"});
             expected["output_config"] = json!({"effort": "low"});
+            expected["messages"] = json!([{"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+            ]}]);
             assert_eq!(sent_json(&sent[0]), expected);
             assert_eq!(
                 sent[0].headers.get(HEADER_ANTHROPIC_VERSION).unwrap(),
@@ -5725,6 +5794,9 @@ mod tests {
             expected["max_tokens"] = json!(1);
             expected["thinking"] = json!({"type": "adaptive"});
             expected["output_config"] = json!({"effort": "low"});
+            expected["messages"] = json!([{"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+            ]}]);
             assert_eq!(sent_json(&sent[1]), expected);
             assert_eq!(copilot.state.keep_warm().ping_totals().0, 1);
             let keep_warm_rows = count_until(
@@ -7392,6 +7464,90 @@ mod tests {
                 Some("identity")
             );
             assert!(requests_to(&copilot, UPSTREAM_CHAT_PATH).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn claude_on_chat_completions_gets_copilot_breakpoints_and_the_same_prompt() {
+            let copilot = copilot().await;
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(chat_completion())
+                .mount(&copilot.upstream)
+                .await;
+            let body = json!({
+                "model": format!("{PROFILE}/{NATIVE_ID}"),
+                "messages": [
+                    {"role": "system", "content": "be terse"},
+                    {"role": "user", "content": "one"},
+                    {"role": "assistant", "content": "two"},
+                    {"role": "user", "content": "three"},
+                ],
+            });
+
+            send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
+
+            let sent = sent_json(&requests_to(&copilot, UPSTREAM_CHAT_PATH).await[0]);
+            let marked: Vec<bool> = sent["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m.get("copilot_cache_control").is_some())
+                .collect();
+            assert_eq!(marked, [true, false, true, true]);
+            assert_eq!(sent["messages"][3]["content"], "three");
+            assert!(sent.get("prompt_cache_key").is_none());
+        }
+
+        #[tokio::test]
+        async fn responses_bridge_sends_the_session_as_prompt_cache_key() {
+            let copilot = copilot().await;
+            list_responses_only_model(&copilot);
+            mount_responses_reply(&copilot, &responses_text_reply("bridged")).await;
+            let body = json!({
+                "model": format!("{PROFILE}/{RESPONSES_ONLY_ID}"),
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+
+            send(
+                &copilot,
+                &with_session("ses-cache-1"),
+                &body,
+                RouteKind::OpenAi,
+            )
+            .await;
+            send(&copilot, &client_headers(), &body, RouteKind::OpenAi).await;
+
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
+            assert_eq!(sent_json(&sent[0])["prompt_cache_key"], "ses-cache-1");
+            assert!(sent_json(&sent[1]).get("prompt_cache_key").is_none());
+        }
+
+        #[tokio::test]
+        async fn a_client_prompt_cache_key_is_kept_on_a_passthrough_responses_request() {
+            let copilot = copilot().await;
+            mount_responses_reply(&copilot, &responses_text_reply("ok")).await;
+            let body = json!({
+                "model": format!("{PROFILE}/{RESPONSES_ONLY_ID}"),
+                "input": "hi",
+                "prompt_cache_key": "client-key",
+            });
+            let mut headers = with_session("ses-cache-2");
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+            let response = attempt_loop(
+                &copilot.state,
+                Method::POST,
+                "/v1/responses",
+                &headers,
+                Bytes::from(body.to_string()),
+                RouteKind::OpenAi,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), 200);
+            let sent = requests_to(&copilot, RESPONSES_ENDPOINT).await;
+            assert_eq!(sent_json(&sent[0])["prompt_cache_key"], "client-key");
         }
 
         #[tokio::test]
@@ -9495,7 +9651,7 @@ mod tests {
         async fn a_full_memory_budget_answers_503_and_a_failed_start_names_its_reason() {
             let fx = Fixture::new(
                 &[("a", 4.0), ("b", 4.0), ("c", 4.0)],
-                &[("MEMORY_GB", "10"), ("START_TIMEOUT_SECS", "5")],
+                &[("MEMORY_GB", "10"), ("START_TIMEOUT_SECS", "1")],
             );
             let held = (fx.lease("a").await, fx.lease("b").await);
 

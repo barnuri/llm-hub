@@ -1,3 +1,0 @@
-#!/bin/sh
-# Format and lint before every commit.
-exec "$(git rev-parse --show-toplevel)/scripts/check.sh" fast

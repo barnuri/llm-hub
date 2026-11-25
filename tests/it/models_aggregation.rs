@@ -12,8 +12,7 @@ use std::collections::HashMap;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "support/hub.rs"]
-mod hub;
+use crate::hub;
 
 use hub::{free_port, start_hub};
 

@@ -148,6 +148,7 @@ async fn serve(hub: Hub) {
             tokio::select! {
                 () = wait_for_shutdown_signal() => {}
                 () = restart_notify.notified() => {}
+                () = services::parent_watch::wait_for_parent_exit(&vars) => {}
             }
         })
         .await
