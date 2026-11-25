@@ -74,7 +74,9 @@ use crate::services::fallback::{
 };
 use crate::services::first_event::{FirstEventCheck, first_event};
 use crate::services::harness::client_signature;
-use crate::services::keep_warm::{ApiShape, KeepWarm, KeepWarmLease, PingPlan, PingTarget};
+use crate::services::keep_warm::{
+    ApiShape, KeepWarm, KeepWarmLease, PingPlan, PingTarget, SkipEvent, SkipReason,
+};
 use crate::services::local_serving::pool::{Lease, LocalPool};
 use crate::services::local_serving::watchdog::{StreamWatchdog, stall_event};
 use crate::services::media_fallback;
@@ -568,6 +570,10 @@ pub(crate) async fn attempt_loop(
                     });
                     let mut out = match reviewing.filter(|_| succeeded) {
                         Some(plan) => {
+                            let mut stream_lease = stream_lease;
+                            if let Some(lease) = stream_lease.as_mut() {
+                                lease.not_kept(SkipReason::NotKeptReviewPath);
+                            }
                             review_deliver(
                                 state,
                                 response,
@@ -2903,7 +2909,13 @@ fn keep_warm_lease(
     model_id: &ModelId,
     worker: Option<&str>,
 ) -> Option<KeepWarmLease> {
-    let worker = worker?;
+    let Some(worker) = worker else {
+        state.keep_warm().note(
+            SkipEvent::new(SkipReason::NotKeptNoWorker, "", None, model_id)
+                .bytes(attempt.body.len()),
+        );
+        return None;
+    };
     keep_warm_allowed(&state.config(), &model_id.profile, attempt.path.as_str())
         .then(|| state.keep_warm().begin(worker))
 }
@@ -3958,17 +3970,22 @@ fn build_response(
             commit.prefix_tokens = outcome.cache_read_tokens + outcome.cache_write_tokens;
             commit.apply(&state_for_stats);
         }
-        if let Some(lease) = keep_warm
-            .filter(|_| summary.upstream_end == UpstreamEnd::Complete && outcome.error.is_none())
-        {
-            // A model whose cache-read discount cannot pay for the pings gets none: report no
-            // cached tokens, which drops the stream.
-            let pays = KeepWarm::pays_off(
-                state_for_stats.pricing_book().rates_for(&outcome.model_key),
-                state_for_stats.config().keep_warm.idle_cap,
-            );
-            let cached = outcome.cache_read_tokens + outcome.cache_write_tokens;
-            lease.complete(if pays { cached } else { 0 });
+        if let Some(mut lease) = keep_warm {
+            let complete = summary.upstream_end == UpstreamEnd::Complete && outcome.error.is_none();
+            if complete {
+                let pays = KeepWarm::pays_off(
+                    state_for_stats.pricing_book().rates_for(&outcome.model_key),
+                    state_for_stats.config().keep_warm.idle_cap,
+                );
+                let cached = outcome.cache_read_tokens + outcome.cache_write_tokens;
+                if pays {
+                    lease.complete(cached);
+                } else {
+                    lease.complete_unpaid(cached);
+                }
+            } else {
+                lease.not_kept(SkipReason::NotKeptIncompleteStream);
+            }
         }
         if let Some(attempt) = capture_answer {
             save_answer(&state_for_stats, &attempt, &answer);

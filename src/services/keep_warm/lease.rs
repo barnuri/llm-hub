@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use super::{KeepWarm, PingTarget};
+use super::{KeepWarm, PingTarget, SkipEvent, SkipReason};
 use crate::schemas::model_id::ModelId;
 
 /// One user request in flight for a worker. Dropping it ends the request.
@@ -49,25 +49,73 @@ impl KeepWarmLease {
     /// Keeps the recorded stream when the response cached enough prompt tokens. The stream key is
     /// read on a blocking thread, so the response path does no parsing.
     pub(crate) fn complete(mut self, cached_tokens: u64) {
+        self.settle(Settle::Keep(cached_tokens));
+    }
+
+    /// Drops the recorded stream, as a completion with no cached tokens did, and logs it as
+    /// unpaid: the model's cache discount cannot pay for the pings.
+    pub(crate) fn complete_unpaid(mut self, cached_tokens: u64) {
+        self.settle(Settle::Unpaid(cached_tokens));
+    }
+
+    /// Logs that the recorded stream is not kept. The lease stays, so the worker stays busy
+    /// until it drops.
+    pub(crate) fn not_kept(&mut self, reason: SkipReason) {
+        self.settle(Settle::Skip(reason));
+    }
+
+    fn settle(&mut self, settle: Settle) {
         let Some(recorded) = self.recorded.take() else {
             return;
         };
         let registry = Arc::clone(&self.registry);
         let worker = self.worker.clone();
         tokio::task::spawn_blocking(move || {
-            let Some(stream_key) = recorded.target.shape.stream_key(&recorded.body) else {
+            let Recorded {
+                body,
+                model_id,
+                started,
+                target,
+            } = recorded;
+            let Some(stream_key) = target.shape.stream_key(&body) else {
+                let event =
+                    SkipEvent::new(SkipReason::NotKeptNoStreamKey, &worker, None, &model_id)
+                        .bytes(body.len());
+                registry.note(event);
                 return;
             };
-            registry.touch_with(
-                (worker, stream_key),
-                &recorded.body,
-                &recorded.model_id,
-                recorded.started,
-                cached_tokens,
-                recorded.target,
-            );
+            let event = |reason| {
+                SkipEvent::new(reason, &worker, Some(&stream_key), &model_id).bytes(body.len())
+            };
+            match settle {
+                Settle::Keep(cached_tokens) => {
+                    registry.touch_with(
+                        (worker.clone(), stream_key.clone()),
+                        &body,
+                        &model_id,
+                        started,
+                        cached_tokens,
+                        target,
+                    );
+                }
+                Settle::Unpaid(cached_tokens) => {
+                    let unpaid = event(SkipReason::NotKeptUnpaid).tokens(cached_tokens);
+                    registry.forget(&(worker.clone(), stream_key.clone()), unpaid);
+                }
+                Settle::Skip(reason) => registry.note(event(reason)),
+            }
         });
     }
+}
+
+/// What happens to a recorded stream when its response ends.
+enum Settle {
+    /// Keep it, or drop it when it cached too few tokens.
+    Keep(u64),
+    /// Drop it: pings cannot pay for themselves.
+    Unpaid(u64),
+    /// Leave any kept stream as it is and log the reason.
+    Skip(SkipReason),
 }
 
 impl Drop for KeepWarmLease {
