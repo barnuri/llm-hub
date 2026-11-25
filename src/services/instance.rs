@@ -15,9 +15,9 @@ use tokio::net::{TcpListener, TcpSocket};
 /// Env var that marks a successor and carries the PID of the process it replaces.
 pub const HANDOVER_VAR: &str = "LLM_HUB_HANDOVER_FROM";
 /// How long the old process waits for the successor to listen before it keeps serving.
-const READY_TIMEOUT: Duration = Duration::from_secs(60);
+const READY_TIMEOUT: Duration = Duration::from_mins(1);
 /// How long a successor waits for the old process to exit before it starts local models.
-const OLD_EXIT_TIMEOUT: Duration = Duration::from_secs(120);
+const OLD_EXIT_TIMEOUT: Duration = Duration::from_mins(2);
 const POLL: Duration = Duration::from_millis(200);
 
 static BIND: OnceLock<String> = OnceLock::new();
