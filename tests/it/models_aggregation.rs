@@ -50,7 +50,7 @@ async fn aggregates_partially_when_one_upstream_is_down() {
         .await;
 
     let dead_port = free_port();
-    let (hub, base) = start_process_hub(HashMap::from([
+    let (hub, base) = start_hub(HashMap::from([
         ("LLM_HUB_PROFILES".into(), "a,b,dead,disabled".into()),
         ("LLM_HUB_A_BASE_URL".into(), alive_a.uri()),
         ("LLM_HUB_B_BASE_URL".into(), alive_b.uri()),
@@ -137,7 +137,7 @@ async fn copilot_entries_add_output_and_limit_provenance_beside_the_old_fields()
     ]))
     .await;
     let dead_port = free_port();
-    let (hub, base) = start_hub(HashMap::from([
+    let (hub, base) = start_process_hub(HashMap::from([
         ("LLM_HUB_PROFILES".into(), "copilot".into()),
         (
             "LLM_HUB_COPILOT_BASE_URL".into(),
