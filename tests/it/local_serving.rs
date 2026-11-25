@@ -339,7 +339,7 @@ async fn no_room_when_every_candidate_serves_a_request_answers_503() {
         &[("slow-a", 4.0), ("slow-b", 4.0), ("c", 4.0)],
         &[
             ("LLM_HUB_LOCAL_MEMORY_GB", "10"),
-            ("LLM_HUB_LOCAL_START_TIMEOUT_MS", "5000"),
+            ("LLM_HUB_LOCAL_START_TIMEOUT_MS", "500"),
         ],
     )
     .await;
