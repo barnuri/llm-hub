@@ -247,7 +247,7 @@ async fn idle_process_is_stopped_and_restarted_on_next_request() {
     let (command, spawn_log) = test_server_command(dir.path(), server_port);
     let (hub, base) = start_hub(
         dir.path(),
-        managed_profile(server_port, &command, &[("IDLE_MS", "200")]),
+        managed_profile(server_port, &command, &[("IDLE_MS", "100")]),
     )
     .await;
 

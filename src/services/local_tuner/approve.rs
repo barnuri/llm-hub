@@ -114,6 +114,8 @@ pub async fn approve(state: &AppState, id: &str) -> Result<Notification, Approve
                     .is_some_and(crate::configs::ProfileConfig::is_local)
                 && state.local_pool().rows(&profile_name).is_some()
             {
+                // The registry edit is on disk; reload so the restart reads the new flags.
+                state.local_pool().reload_now();
                 let restart = state
                     .local_pool()
                     .restart_when_idle(&profile_name, &model, Duration::from_secs(30))
@@ -399,7 +401,7 @@ mod tests {
     async fn a_dropped_approve_still_finishes_the_apply() {
         let (dir, path) = registry_file(ROW);
         let marker = dir.path().join("done");
-        let command = format!("sh -c 'sleep 1; touch {}'", marker.display());
+        let command = format!("sh -c 'sleep 0.3; touch {}'", marker.display());
         let state = state(&[
             ("LLM_HUB_LOCAL_TUNER_REGISTRY", path.as_str()),
             ("LLM_HUB_LOCAL_TUNER_APPLY_COMMAND", command.as_str()),

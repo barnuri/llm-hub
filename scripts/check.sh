@@ -38,4 +38,5 @@ if [ -n "$below" ]; then
   echo "$below"
   exit 1
 fi
+bun scripts/test-speed.ts
 echo "All checks passed."

@@ -315,7 +315,7 @@ mod tests {
 
         assert_eq!(ids(&first), ids(&second));
         let id = format!("budget:a:spend_usd:{}:85", budget::period_of(now));
-        assert_eq!(delivered(&recorder, 2).await, vec![id]);
+        assert_eq!(delivered(&recorder, 1).await, vec![id]);
         assert_eq!(state.notifier().list().len(), 1);
     }
 

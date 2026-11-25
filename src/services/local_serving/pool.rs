@@ -592,10 +592,6 @@ impl LocalPool {
     }
 
     /// Reloads every local registry now, as the 2 s watcher does when a file changes.
-    #[allow(
-        dead_code,
-        reason = "the registry watcher reloads through `poll_registries`; only tests call this"
-    )]
     pub fn reload_now(&self) {
         for profile in self.profiles.load().values() {
             self.reload_profile(profile);
@@ -744,7 +740,7 @@ impl LocalPool {
                     format!("the process exited with {status} before /health answered")
                 }
                 NotReady::TimedOut => {
-                    format!("{url} did not answer 200 within {}s", timeout.as_secs())
+                    format!("{url} did not answer 200 within {} ms", timeout.as_millis())
                 }
             })
     }
@@ -1383,12 +1379,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_model_that_never_gets_healthy_times_out() {
-        let fx = Fixture::new(&[("unready", 1.0)], &[("START_TIMEOUT_SECS", "1")]);
+        let fx = Fixture::new(&[("unready", 1.0)], &[("START_TIMEOUT_MS", "200")]);
 
         let err = fx.acquire("unready").await.err().unwrap();
 
         assert!(
-            err.contains("/health did not answer 200 within 1s"),
+            err.contains("/health did not answer 200 within 200 ms"),
             "{err}"
         );
         assert_eq!(fx.model("unready").state, LocalModelState::Failed);
@@ -1492,7 +1488,7 @@ mod tests {
     async fn a_start_fails_when_no_lease_is_released_within_the_start_timeout() {
         let fx = Fixture::new(
             &[("a", 4.0), ("b", 4.0), ("c", 4.0)],
-            &[("MEMORY_GB", "10"), ("START_TIMEOUT_SECS", "1")],
+            &[("MEMORY_GB", "10"), ("START_TIMEOUT_MS", "200")],
         );
         let a = fx.acquire("a").await.unwrap();
         let b = fx.acquire("b").await.unwrap();

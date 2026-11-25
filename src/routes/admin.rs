@@ -5,6 +5,8 @@ use utoipa::ToSchema;
 
 use axum::Json;
 use axum::extract::{Path as UrlPath, Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -554,12 +556,28 @@ fn running_local_models(state: &AppState, profile: &str) -> Vec<String> {
         .collect()
 }
 
-/// Triggers a graceful restart: supervised installs are restarted by their
-/// supervisor; standalone runs respawn themselves after the server drains.
-#[utoipa::path(post, path = "/api/restart", tag = "system", summary = "Restart the hub", responses((status = 200, description = "Restart requested", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
-pub async fn restart_server(State(state): State<AppState>) -> Json<Value> {
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RestartQuery {
+    /// Restart even while inference requests are in flight. Those requests are cut.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Starts a successor hub and stops this one once the successor serves. Refuses with 409 while
+/// inference requests are in flight, so open chats are not cut.
+#[utoipa::path(post, path = "/api/restart", tag = "system", summary = "Restart the hub", params(RestartQuery), responses((status = 200, description = "Restart requested", body = Object), (status = 409, description = "Inference requests are in flight; retry when idle or pass force=true.", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
+pub async fn restart_server(
+    State(state): State<AppState>,
+    Query(query): Query<RestartQuery>,
+) -> Response {
+    let active = crate::services::restart::active_inference();
+    if active > 0 && !query.force {
+        let body = json!({ "ok": false, "restarting": false, "active_inference": active });
+        return (StatusCode::CONFLICT, Json(body)).into_response();
+    }
     crate::services::restart::request_restart(state.restart_notify());
-    Json(json!({ "ok": true, "restarting": true }))
+    Json(json!({ "ok": true, "restarting": true, "active_inference": active })).into_response()
 }
 
 #[derive(Debug, Deserialize, Default, IntoParams)]

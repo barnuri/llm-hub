@@ -18,11 +18,15 @@ impl OpencodeShared {
     /// `None` when `program api get /api/provider` fails, times out or lists no such provider.
     #[must_use]
     pub fn provider_for(program: &str, v1_url: &str) -> Option<String> {
-        let body = Self::query(program)?;
+        Self::provider_within(program, v1_url, Self::TIMEOUT)
+    }
+
+    fn provider_within(program: &str, v1_url: &str, timeout: Duration) -> Option<String> {
+        let body = Self::query(program, timeout)?;
         Self::pick_provider(&body, v1_url)
     }
 
-    fn query(program: &str) -> Option<String> {
+    fn query(program: &str, timeout: Duration) -> Option<String> {
         let mut child = Command::new(program)
             .args(["api", "get", "/api/provider"])
             .stdin(Stdio::null())
@@ -30,7 +34,7 @@ impl OpencodeShared {
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
-        let deadline = Instant::now() + Self::TIMEOUT;
+        let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(status) = child.try_wait().ok()? {
                 break status;
@@ -154,9 +158,13 @@ mod tests {
         let start = Instant::now();
 
         assert_eq!(
-            OpencodeShared::provider_for(&program, "http://localhost:8888/v1"),
+            OpencodeShared::provider_within(
+                &program,
+                "http://localhost:8888/v1",
+                Duration::from_millis(200)
+            ),
             None
         );
-        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

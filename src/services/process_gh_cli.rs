@@ -262,14 +262,14 @@ pub(crate) mod tests {
                 gh.to_str().unwrap(),
                 "github.com",
                 None,
-                Duration::from_secs(1),
+                Duration::from_millis(300),
             )
             .await;
 
             let GhOutcome::Failed(reason) = outcome else {
                 panic!("expected Failed, got {outcome:?}");
             };
-            assert!(reason.contains("did not finish within 1000 ms"), "{reason}");
+            assert!(reason.contains("did not finish within 300 ms"), "{reason}");
             // On a loaded machine the timeout can kill the script before it writes its pid.
             if let Ok(pid) = std::fs::read_to_string(&pid_file) {
                 assert!(!process_alive(pid.trim()).await, "gh {pid} still running");
