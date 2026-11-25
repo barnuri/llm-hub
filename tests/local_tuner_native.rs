@@ -115,6 +115,7 @@ async fn approved_stream_stall_restarts_only_its_model() {
         ("LLM_HUB_LOCAL_MODELS_DIR", dir.path().display().to_string()),
         ("LLM_HUB_LOCAL_LLAMA_BIN", bin.display().to_string()),
         ("LLM_HUB_LOCAL_START_TIMEOUT_SECS", "5".to_owned()),
+        ("LLM_HUB_PERSISTENT", "true".to_owned()),
         ("LLM_HUB_STORE_PATH", store.display().to_string()),
         ("LLM_HUB_PORT", port.to_string()),
         ("LLM_HUB_AUTO_UPDATE", "0".to_owned()),
