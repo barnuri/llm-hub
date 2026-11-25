@@ -191,3 +191,4 @@ counts as unset.
 |---|---|---|
 | `LLM_HUB_URL` | `http://localhost:8888` | Hub address. |
 | `LLM_HUB_API_KEY` | `llm-hub` | Key the harness sends to the hub. |
+| `LLM_HUB_OPENCODE_CONTEXT_CAPS` | unset | Comma-separated `<model id>=<tokens>` context caps for `llm-hub opencode`. Invalid entries fail config load. Repeatable `--context-cap` flags win per model. Caps also limit output to `context / 4` when needed. Shared OpenCode service provider config does not receive launcher caps. |

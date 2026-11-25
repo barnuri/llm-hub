@@ -1,6 +1,6 @@
 #[cfg(test)]
 use axum::http::HeaderValue;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -19,12 +19,15 @@ use crate::schemas::model_id::ModelId;
 mod api_shape;
 mod lease;
 mod ping_plan;
+mod skip;
 mod warm_request;
 
 pub(crate) use api_shape::{ApiShape, PingTarget};
 
 pub(crate) use lease::KeepWarmLease;
 pub(crate) use ping_plan::PingPlan;
+use skip::SkipLog;
+pub(crate) use skip::{SkipEvent, SkipReason};
 pub(crate) use warm_request::WarmRequest;
 
 /// Idle gaps kept per model for the stop rule.
@@ -54,6 +57,8 @@ struct State {
     ping_cost_usd: f64,
     /// Recent idle gaps between user requests of one stream, per model, newest last.
     gaps: HashMap<String, VecDeque<Duration>>,
+    /// Streams not kept, dropped or held back, counted since startup.
+    skips: SkipLog,
 }
 
 struct Stream {
@@ -67,6 +72,10 @@ struct Stream {
     ping_in_flight: bool,
     /// LRU clock value of the last touch or ping.
     used: u64,
+    /// Prompt tokens the last user response cached, for the skip log.
+    cached_tokens: u64,
+    /// Why a due ping is held back, and since when. Only the change is logged.
+    held: Option<(SkipReason, Instant)>,
 }
 
 impl Stream {
@@ -118,6 +127,27 @@ impl Stream {
             && !self.ping_in_flight
             && now.saturating_duration_since(self.last_touch()) >= KEEP_WARM_PING_INTERVAL
     }
+
+    /// Why a stream quiet for the ping interval still gets no ping, or `None` when it is not
+    /// quiet yet or nothing holds it back.
+    fn hold_reason(&self, now: Instant, worker_busy: bool) -> Option<SkipReason> {
+        if now.saturating_duration_since(self.last_touch()) < KEEP_WARM_PING_INTERVAL {
+            return None;
+        }
+        if worker_busy {
+            Some(SkipReason::HeldBusyWorker)
+        } else if self.ping_in_flight {
+            Some(SkipReason::HeldPingInFlight)
+        } else {
+            None
+        }
+    }
+
+    fn skip_event(&self, reason: SkipReason, key: &StreamKey) -> SkipEvent {
+        SkipEvent::new(reason, &key.0, Some(&key.1), &self.model_id)
+            .tokens(self.cached_tokens)
+            .bytes(self.body.len())
+    }
 }
 
 impl State {
@@ -168,6 +198,44 @@ impl State {
         self.clock
     }
 
+    /// Drops a kept stream and logs why. `now` adds its idle time since the last user request.
+    fn drop_stream(&mut self, key: &StreamKey, reason: SkipReason, now: Option<Instant>) {
+        let Some(stream) = self.take(key) else {
+            return;
+        };
+        let mut event = stream.skip_event(reason, key);
+        if let Some(now) = now {
+            event = event.idle(now.saturating_duration_since(stream.last_user));
+        }
+        self.skips.note(event);
+    }
+
+    /// Logs once when a stream starts or stops being held back. `limited` are the due streams the
+    /// ping budget ran out for.
+    fn update_holds(&mut self, now: Instant, limited: &[StreamKey]) {
+        for (key, stream) in &mut self.streams {
+            let busy = self.in_flight.get(&key.0).is_some_and(|count| *count > 0);
+            let held = if limited.contains(key) {
+                Some(SkipReason::HeldRateLimit)
+            } else {
+                stream.hold_reason(now, busy)
+            };
+            if stream.held.map(|(reason, _)| reason) == held {
+                continue;
+            }
+            if let Some((reason, since)) = stream.held {
+                let event = stream
+                    .skip_event(reason, key)
+                    .released(now.saturating_duration_since(since));
+                self.skips.note(event);
+            }
+            stream.held = held.map(|reason| (reason, now));
+            if let Some(reason) = held {
+                self.skips.note(stream.skip_event(reason, key));
+            }
+        }
+    }
+
     /// Drops least recently used streams until both the stream and byte bounds hold.
     fn evict_to_bounds(&mut self) {
         while self.streams.len() > KEEP_WARM_MAX_STREAMS
@@ -181,7 +249,7 @@ impl State {
             else {
                 return;
             };
-            self.take(&oldest);
+            self.drop_stream(&oldest, SkipReason::EvictedLru, None);
         }
     }
 }
@@ -239,13 +307,26 @@ impl KeepWarm {
         cached_tokens: u64,
         target: PingTarget,
     ) {
-        let ping_body = (cached_tokens >= KEEP_WARM_MIN_CACHED_TOKENS
-            && body.len() <= KEEP_WARM_MAX_BODY_BYTES)
+        let refused = if cached_tokens < KEEP_WARM_MIN_CACHED_TOKENS {
+            Some(SkipReason::NotKeptLowCache)
+        } else if body.len() > KEEP_WARM_MAX_BODY_BYTES {
+            Some(SkipReason::NotKeptBodyCap)
+        } else {
+            None
+        };
+        let ping_body = refused
+            .is_none()
             .then(|| target.shape.ping_body(body))
             .flatten();
         let mut state = self.lock();
         let Some(ping_body) = ping_body else {
             state.take(&key);
+            let reason = refused.unwrap_or(SkipReason::NotKeptPingBody);
+            let event = SkipEvent::new(reason, &key.0, Some(&key.1), model_id)
+                .tokens(cached_tokens)
+                .bytes(body.len());
+            state.skips.note(event);
+            Self::flush(state);
             return;
         };
         let previous = state.take(&key);
@@ -254,12 +335,13 @@ impl KeepWarm {
         {
             state.record_gap(&model_id.qualified(), gap);
         }
-        let (last_user, last_ping, ping_in_flight) =
-            previous.map_or((started, None, false), |old| {
+        let (last_user, last_ping, ping_in_flight, held) =
+            previous.map_or((started, None, false, None), |old| {
                 (
                     old.last_user.max(started),
                     old.last_ping,
                     old.ping_in_flight,
+                    old.held,
                 )
             });
         let used = state.next_clock();
@@ -274,9 +356,36 @@ impl KeepWarm {
                 last_ping,
                 ping_in_flight,
                 used,
+                cached_tokens,
+                held,
             },
         );
         state.evict_to_bounds();
+        Self::flush(state);
+    }
+
+    /// Counts and logs a stream the proxy did not keep. A kept stream with the same key stays.
+    pub(crate) fn note(&self, event: SkipEvent) {
+        let mut state = self.lock();
+        state.skips.note(event);
+        Self::flush(state);
+    }
+
+    /// Drops the kept stream at `key`, as a touch with no cached tokens did, and logs `event`.
+    pub(crate) fn forget(&self, key: &StreamKey, event: SkipEvent) {
+        let mut state = self.lock();
+        state.take(key);
+        state.skips.note(event);
+        Self::flush(state);
+    }
+
+    /// Releases the lock, then logs the queued skip events, so a log write never holds up a request.
+    fn flush(mut state: MutexGuard<'_, State>) {
+        let events = state.skips.take_pending();
+        drop(state);
+        for event in &events {
+            event.log();
+        }
     }
 
     /// The ping body for an accepted Messages request: the same body with `stream` false and `max_tokens` 1.
@@ -310,8 +419,9 @@ impl KeepWarm {
             .map(|(key, _)| key.clone())
             .collect();
         for key in &dropped {
-            state.take(key);
+            state.drop_stream(key, SkipReason::DroppedProfileOff, None);
         }
+        Self::flush(state);
     }
 
     /// Takes the streams due at `now`, most overdue first, within the global ping budget. A stream
@@ -326,7 +436,7 @@ impl KeepWarm {
             .map(|(key, _)| key.clone())
             .collect();
         for key in &expired {
-            state.take(key);
+            state.drop_stream(key, SkipReason::ExpiredIdleCap, Some(now));
         }
         let unprofitable: Vec<StreamKey> = state
             .streams
@@ -341,7 +451,7 @@ impl KeepWarm {
             .map(|(key, _)| key.clone())
             .collect();
         for key in &unprofitable {
-            state.take(key);
+            state.drop_stream(key, SkipReason::DroppedUnlikelyReturn, Some(now));
         }
         let mut due: Vec<(Instant, StreamKey)> = state
             .streams
@@ -351,9 +461,11 @@ impl KeepWarm {
             .collect();
         due.sort_by_key(|(touched, _)| *touched);
         let mut plans = Vec::new();
+        let mut limited = Vec::new();
         for (_, key) in due {
-            if !state.bucket.take() {
-                break;
+            if !limited.is_empty() || !state.bucket.take() {
+                limited.push(key);
+                continue;
             }
             let used = state.next_clock();
             let Some(stream) = state.streams.get_mut(&key) else {
@@ -370,6 +482,8 @@ impl KeepWarm {
                 target: stream.target.clone(),
             });
         }
+        state.update_holds(now, &limited);
+        Self::flush(state);
         plans
     }
 
@@ -380,7 +494,8 @@ impl KeepWarm {
         state.pings += 1;
         state.ping_cost_usd += cost_usd;
         if !ok {
-            state.take(&key);
+            state.drop_stream(&key, SkipReason::DroppedPingFailed, None);
+            Self::flush(state);
             return;
         }
         if let Some(stream) = state.streams.get_mut(&key) {
@@ -429,12 +544,21 @@ impl KeepWarm {
         (state.pings, state.ping_cost_usd)
     }
 
+    /// Streams not kept, dropped or held back since startup, per reason name. Nothing here is persisted.
+    pub fn skip_counts(&self) -> BTreeMap<String, u64> {
+        self.lock().skips.counts()
+    }
+
     /// Drops every kept stream, for when keep-warm is switched off.
     pub fn clear(&self) {
         let mut state = self.lock();
-        state.streams.clear();
+        let keys: Vec<StreamKey> = state.streams.keys().cloned().collect();
+        for key in &keys {
+            state.drop_stream(key, SkipReason::DroppedKeepWarmOff, None);
+        }
         state.total_bytes = 0;
         state.gaps.clear();
+        Self::flush(state);
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {

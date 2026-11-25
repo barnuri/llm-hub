@@ -19,6 +19,7 @@ use self::hub_endpoint::HubEndpoint;
 use self::opencode_launcher::OpencodeLauncher;
 use self::opencode_shared::OpencodeShared;
 use self::pi_launcher::PiLauncher;
+use crate::configs::OpencodeContextCaps;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::hub_model::HubModel;
 use crate::schemas::launch::launch_args::LaunchArgs;
@@ -32,6 +33,8 @@ pub struct LaunchCommand {
     pub harness: Harness,
     pub profiles: ProfileFilter,
     pub smart_auto: SmartAutoFlags,
+    /// `--context-cap` flags after `opencode`; other harnesses pass the flag through.
+    pub context_caps: OpencodeContextCaps,
     pub args: Vec<String>,
 }
 
@@ -62,10 +65,16 @@ impl LaunchCommand {
         args.remove(0);
         profiles.merge(ProfileFilter::take_flags(&mut args)?);
         smart_auto.take_flags(&mut args)?;
+        let context_caps = if harness == Harness::Opencode {
+            OpencodeContextCaps::take_flags(&mut args)?
+        } else {
+            OpencodeContextCaps::default()
+        };
         Ok(Some(Self {
             harness,
             profiles,
             smart_auto,
+            context_caps,
             args,
         }))
     }
@@ -106,6 +115,7 @@ async fn prepare(
         harness,
         profiles,
         smart_auto,
+        context_caps,
         args,
     } = command;
     let endpoint = HubEndpoint::from_lookup(&lookup);
@@ -116,6 +126,7 @@ async fn prepare(
         &client,
         LaunchArgs::parse(args),
         &smart_auto,
+        context_caps,
         &lookup,
     )
     .await
@@ -126,6 +137,7 @@ async fn build_spec(
     client: &HubClient,
     args: LaunchArgs,
     smart_auto: &SmartAutoFlags,
+    flag_caps: OpencodeContextCaps,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<LaunchSpec, String> {
     let endpoint = client.endpoint();
@@ -150,6 +162,8 @@ async fn build_spec(
         }
         Harness::Opencode => {
             let args = header_transport_model(args, smart_auto, None)?;
+            let mut caps = OpencodeContextCaps::from_lookup(&lookup)?;
+            caps.override_with(flag_caps);
             if let Err(error) = OpencodeLauncher::write_plugin(&lookup) {
                 eprintln!("warning: could not install OpenCode session plugin: {error}");
             }
@@ -170,6 +184,7 @@ async fn build_spec(
                 &client.models().await,
                 client.profiles(),
                 smart_auto,
+                &caps,
             )
         }
         Harness::CopilotCli => {
@@ -359,6 +374,18 @@ mod tests {
         assert_eq!(command.profiles.to_list(), "copilot");
         assert_eq!(command.smart_auto.tier(), Some(SmartAutoTier::Fast));
         assert_eq!(command.args, ["m"]);
+    }
+
+    #[test]
+    fn context_cap_flags_are_taken_only_for_opencode() {
+        let opencode = parsed(&["opencode", "m", "--context-cap", "m=1000", "-c"]);
+        let claude = parsed(&["claude", "m", "--context-cap=m=1000"]);
+
+        assert_eq!(opencode.args, ["m", "-c"]);
+        assert_eq!(opencode.context_caps.limits("m", 5000, 10), (1000, 10));
+        assert_eq!(claude.args, ["m", "--context-cap=m=1000"]);
+        assert_eq!(claude.context_caps, OpencodeContextCaps::default());
+        assert!(parse(&["opencode", "--context-cap=m=0"]).is_err());
     }
 
     #[test]
@@ -594,6 +621,7 @@ mod tests {
             &client_for(&server),
             LaunchArgs::from_strs(&["-p"]),
             &fast,
+            OpencodeContextCaps::default(),
             lookup_of(&[("ANTHROPIC_CUSTOM_HEADERS", "X-Own: 1")]),
         )
         .await
@@ -622,6 +650,7 @@ mod tests {
             &client_for(&server),
             LaunchArgs::from_strs(&[]),
             &fast,
+            OpencodeContextCaps::default(),
             lookup_of(&[("ANTHROPIC_MODEL", "copilot/m")]),
         )
         .await;
@@ -638,6 +667,7 @@ mod tests {
             &client_for(&server),
             LaunchArgs::from_strs(&["copilot/m"]),
             &SmartAutoFlags::default(),
+            OpencodeContextCaps::default(),
             lookup_of(&[]),
         )
         .await
@@ -665,6 +695,7 @@ mod tests {
             &client_for(&server),
             LaunchArgs::from_strs(&[]),
             &SmartAutoFlags::default(),
+            OpencodeContextCaps::default(),
             lookup_of(&[]),
         )
         .await
@@ -682,6 +713,7 @@ mod tests {
             &client_for(&server),
             LaunchArgs::from_strs(&["copilot/m"]),
             &flags_of(&["--smart-auto-tier=fast"]),
+            OpencodeContextCaps::default(),
             lookup_of(&[]),
         )
         .await;
@@ -698,6 +730,7 @@ mod tests {
             &client_for(&server),
             LaunchArgs::from_strs(&[]),
             &SmartAutoFlags::default(),
+            OpencodeContextCaps::default(),
             lookup_of(&[]),
         )
         .await
@@ -707,6 +740,64 @@ mod tests {
         assert_eq!(spec.program(), "opencode");
         assert!(config.contains("copilot/m"));
         assert!(config.contains("hub/smart-auto-balance"));
+    }
+
+    #[tokio::test]
+    async fn opencode_caps_come_from_the_setting_and_flags_win() {
+        let server = hub().await;
+        let caps = |flags: &[&str]| {
+            let mut args = flags.iter().map(ToString::to_string).collect();
+            OpencodeContextCaps::take_flags(&mut args).unwrap()
+        };
+        let limit_with = |flag_caps: OpencodeContextCaps| {
+            let client = client_for(&server);
+            async move {
+                let spec = build_spec(
+                    Harness::Opencode,
+                    &client,
+                    LaunchArgs::from_strs(&[]),
+                    &SmartAutoFlags::default(),
+                    flag_caps,
+                    lookup_of(&[("LLM_HUB_OPENCODE_CONTEXT_CAPS", "copilot/m=64000")]),
+                )
+                .await
+                .unwrap();
+                let config: serde_json::Value =
+                    serde_json::from_str(spec.env_value("OPENCODE_CONFIG_CONTENT").unwrap())
+                        .unwrap();
+                config["provider"]["llm-hub"]["models"]["copilot/m"]["limit"].clone()
+            }
+        };
+
+        assert_eq!(
+            limit_with(OpencodeContextCaps::default()).await,
+            json!({"context": 64_000, "output": 32_000})
+        );
+        assert_eq!(
+            limit_with(caps(&["--context-cap=copilot/m=32000"])).await,
+            json!({"context": 32_000, "output": 32_000})
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_opencode_cap_setting_stops_the_launch() {
+        let server = hub().await;
+
+        let result = build_spec(
+            Harness::Opencode,
+            &client_for(&server),
+            LaunchArgs::from_strs(&[]),
+            &SmartAutoFlags::default(),
+            OpencodeContextCaps::default(),
+            lookup_of(&[("LLM_HUB_OPENCODE_CONTEXT_CAPS", "copilot/m")]),
+        )
+        .await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .starts_with("LLM_HUB_OPENCODE_CONTEXT_CAPS entry")
+        );
     }
 
     #[cfg(unix)]
@@ -729,6 +820,7 @@ mod tests {
             &client_for(&server),
             LaunchArgs::from_strs(&[]),
             &SmartAutoFlags::default(),
+            OpencodeContextCaps::default(),
             lookup_of(&[("LLM_HUB_OPENCODE_BIN", &bin)]),
         )
         .await
@@ -749,6 +841,7 @@ mod tests {
             &client_for(&server),
             LaunchArgs::from_strs(&["copilot/m"]),
             &SmartAutoFlags::default(),
+            OpencodeContextCaps::default(),
             lookup_of(&[("XDG_CACHE_HOME", &cache_path)]),
         )
         .await
@@ -770,6 +863,7 @@ mod tests {
             &client_for(&server),
             LaunchArgs::from_strs(&[]),
             &SmartAutoFlags::default(),
+            OpencodeContextCaps::default(),
             lookup_of(&[]),
         )
         .await;

@@ -1,6 +1,8 @@
 use axum::http::HeaderMap;
 use serde_json::Value;
 
+use crate::utils::cli_flag::take_flag_value;
+
 /// The profiles a model list is limited to. Empty means every profile.
 /// Agent commands take it as `--profiles a,b`, and the hub reads it from the
 /// `x-llm-hub-profiles` header or the `?profiles=` query.
@@ -147,27 +149,7 @@ impl ProfileFilter {
 
     /// The value of the flag at `args[index]`, removed from `args`, if one is there.
     fn take_flag_at(args: &mut Vec<String>, index: usize) -> Result<Option<String>, String> {
-        let Some(arg) = args.get(index) else {
-            return Ok(None);
-        };
-        if let Some(value) = arg
-            .strip_prefix(Self::FLAG)
-            .and_then(|rest| rest.strip_prefix('='))
-        {
-            let value = value.to_string();
-            args.remove(index);
-            return Ok(Some(value));
-        }
-        if arg != Self::FLAG {
-            return Ok(None);
-        }
-        let value = args
-            .get(index + 1)
-            .filter(|value| !value.starts_with('-'))
-            .cloned()
-            .ok_or_else(|| format!("{} needs a value, e.g. {} copilot", Self::FLAG, Self::FLAG))?;
-        args.drain(index..=index + 1);
-        Ok(Some(value))
+        take_flag_value(args, index, Self::FLAG, "copilot")
     }
 }
 
