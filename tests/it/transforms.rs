@@ -9,13 +9,13 @@
 
 use std::collections::HashMap;
 
-use crate::hub::{HubProcess, start_hub};
+use crate::hub::{InProcessHub, start_hub};
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// A hub with one profile pointed at `upstream`, plus any extra env.
-async fn hub_for(upstream: &MockServer, extra: &[(&str, &str)]) -> (HubProcess, String) {
+async fn hub_for(upstream: &MockServer, extra: &[(&str, &str)]) -> (InProcessHub, String) {
     let mut vars = HashMap::from([
         ("LLM_HUB_PROFILES".to_string(), "up".to_string()),
         ("LLM_HUB_UP_BASE_URL".to_string(), upstream.uri()),

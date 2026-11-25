@@ -1,4 +1,6 @@
-//! Starts the llm-hub binary for integration tests on a free local port.
+//! Starts a hub for integration tests on a free local port. [`start_hub`] runs it inside the test
+//! process, on its own runtime and thread, so a test pays no process start. [`start_hub_in`] runs the
+//! real binary, for the tests of its working directory, signals, command line and child processes.
 #![allow(dead_code, reason = "Each test file uses only part of this module")]
 
 use std::collections::HashMap;
@@ -54,18 +56,123 @@ pub fn hub_command(dir: &std::path::Path, port: u16) -> Command {
         .env("LLM_HUB_AUTO_UPDATE", "0")
         .env("LLM_HUB_NOTIFY_DESKTOP", "false")
         .env("LLM_HUB_EXIT_ON_STDIN_EOF", "1")
+        .env("LLM_HUB_MANAGED_IDLE_CHECK_INTERVAL_MS", "50")
+        .env("LLM_HUB_ENV_WATCH_INTERVAL_MS", "100")
+        .env("LLM_HUB_REGISTRY_POLL_INTERVAL_MS", "50")
+        .env("LLM_HUB_MANAGED_STOP_GRACE_MS", "300")
         .stdin(Stdio::piped());
+    // A developer's own hub settings must not leak into a test hub.
+    for (key, _) in std::env::vars() {
+        if key.starts_with("LLM_HUB_") {
+            command.env_remove(key);
+        }
+    }
     command
 }
 
-/// Starts the hub with `vars` set and returns it with its base URL once it logs its own bind.
-/// A hub that exits before it is ready lost its port to another listener, so the next port is tried.
-pub async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
+/// A hub that runs inside the test process, on its own thread and runtime, so it outlives the
+/// runtime of the test that started it. It sees only its variables, never the process environment.
+/// Dropping it asks it to stop. The thread ends with the process when a connection keeps it open.
+pub struct InProcessHub {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for InProcessHub {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+/// Starts an in-process hub in a new temporary folder with `vars` set. Returns it with its base URL.
+pub async fn start_hub(vars: HashMap<String, String>) -> (InProcessHub, String) {
+    let dir = tempfile::tempdir().unwrap().keep();
+    start_hub_with_dir(&dir, vars).await
+}
+
+/// [`start_hub`] with `dir` as the hub's `.env`, logs and rules folder.
+pub async fn start_hub_with_dir(
+    dir: &std::path::Path,
+    mut vars: HashMap<String, String>,
+) -> (InProcessHub, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    for (key, value) in [
+        ("LLM_HUB_AUTO_UPDATE", "0"),
+        ("LLM_HUB_NOTIFY_DESKTOP", "false"),
+        ("LLM_HUB_MANAGED_IDLE_CHECK_INTERVAL_MS", "50"),
+        ("LLM_HUB_ENV_WATCH_INTERVAL_MS", "100"),
+        ("LLM_HUB_REGISTRY_POLL_INTERVAL_MS", "50"),
+        ("LLM_HUB_MANAGED_STOP_GRACE_MS", "300"),
+    ] {
+        vars.entry(key.to_owned())
+            .or_insert_with(|| value.to_owned());
+    }
+    vars.insert("LLM_HUB_PORT".to_owned(), port.to_string());
+    let runtime = llm_hub::HubRuntime::in_dir(dir, vars);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
+    std::thread::Builder::new()
+        .name("test-hub".to_owned())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let served = rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                llm_hub::Hub::new()
+                    .serve_on(listener, runtime, async {
+                        let _ = stopped.await;
+                    })
+                    .await
+            });
+            rt.shutdown_background();
+            if let Err(error) = served {
+                eprintln!("test hub failed: {error}");
+            }
+        })
+        .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    wait_healthy(&base).await;
+    (
+        InProcessHub {
+            shutdown: Some(shutdown),
+        },
+        base,
+    )
+}
+
+/// Waits until `/healthz` answers `ok`. The listener is bound before the hub starts, so an
+/// answer can only come from this hub.
+async fn wait_healthy(base: &str) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let deadline = Instant::now() + READY_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Ok(response) = client.get(format!("{base}/healthz")).send().await
+            && response.status().is_success()
+            && response.text().await.is_ok_and(|text| text == "ok")
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("hub did not become ready within {READY_TIMEOUT:?}");
+}
+
+/// Starts the real binary in a new temporary folder with `vars` set, for a test that needs a real
+/// process: the working directory, signals, the command line or child processes.
+pub async fn start_process_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
     let dir = tempfile::tempdir().unwrap().keep();
     start_hub_in(&dir, vars, &[]).await
 }
 
-/// [`start_hub`] with `dir` as the working directory and the `removed` variables taken out of the
+/// [`start_process_hub`] with `dir` as the working directory and the `removed` variables taken out of the
 /// inherited environment.
 pub async fn start_hub_in(
     dir: &std::path::Path,
@@ -175,7 +282,7 @@ pub fn completion(text: &str) -> ResponseTemplate {
 }
 
 /// A hub with profiles `alpha` and `beta`, after its first model refresh, so the Smart Auto pool holds both.
-pub async fn start_alpha_beta_hub(alpha: &MockServer, beta: &MockServer) -> (HubProcess, String) {
+pub async fn start_alpha_beta_hub(alpha: &MockServer, beta: &MockServer) -> (InProcessHub, String) {
     start_alpha_beta_hub_with(alpha, beta, HashMap::new()).await
 }
 
@@ -184,7 +291,7 @@ pub async fn start_alpha_beta_hub_with(
     alpha: &MockServer,
     beta: &MockServer,
     extra: HashMap<String, String>,
-) -> (HubProcess, String) {
+) -> (InProcessHub, String) {
     let mut vars = HashMap::from([
         ("LLM_HUB_PROFILES".into(), "alpha,beta".into()),
         ("LLM_HUB_ALPHA_BASE_URL".into(), alpha.uri()),

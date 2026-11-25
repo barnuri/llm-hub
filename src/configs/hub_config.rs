@@ -97,6 +97,8 @@ pub struct HubConfig {
     pub notify: NotifyConfig,
     /// `LLM_HUB_BUDGET_MONTHLY_USD`: the hub-wide monthly spend budget in USD. `None` sets none.
     pub budget_monthly_usd: Option<f64>,
+    /// Background intervals and waits, from the `LLM_HUB_*_MS` timing variables.
+    pub timings: crate::configs::HubTimings,
 }
 
 impl HubConfig {
@@ -301,6 +303,7 @@ impl HubConfig {
             local_tuner_enabled: get("LOCAL_TUNER").is_some_and(|v| is_truthy(&v)),
             notify,
             budget_monthly_usd: parse_budget_usd(get("BUDGET_MONTHLY_USD"), "BUDGET_MONTHLY_USD")?,
+            timings: crate::configs::HubTimings::from_vars(vars)?,
         };
         Ok((config, profile_errors))
     }

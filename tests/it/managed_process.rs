@@ -324,7 +324,7 @@ async fn port_already_served_is_used_without_spawning() {
 async fn admin_api_cannot_set_a_command() {
     let dir = tempfile::tempdir().unwrap();
     let spawn_marker = dir.path().join("pwned");
-    let (hub, base) = start_hub(dir.path(), HashMap::new()).await;
+    let (hub, base) = hub::start_hub_with_dir(dir.path(), HashMap::new()).await;
 
     let response = reqwest::Client::new()
         .post(format!("{base}/api/profiles"))

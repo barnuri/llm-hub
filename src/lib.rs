@@ -7,6 +7,7 @@ mod consts;
 mod dependencies;
 pub mod ext;
 mod hub;
+mod hub_runtime;
 mod routes;
 mod schemas;
 mod services;
@@ -23,12 +24,13 @@ use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub use crate::hub::Hub;
+pub use crate::hub_runtime::HubRuntime;
 pub use crate::services::local_serving::watchdog::{StreamWatchdog, stall_event};
 /// The `axum` and `serde_json` versions llm-hub's API uses, so extensions match them.
 pub use {axum, serde_json};
 
 use crate::configs::HubConfig;
-use crate::consts::{ENV_FILE, LOGS_DIR, VERSION};
+use crate::consts::{LOGS_DIR, VERSION};
 use crate::dependencies::state::AppState;
 use crate::services::extension_loader::{self, EXTENSIONS_FILE_VAR, ExtensionSources};
 use crate::services::launch;
@@ -38,16 +40,7 @@ use crate::services::store::Store;
 /// `from_path_iter` so reloads never mutate global process state.
 #[must_use]
 pub(crate) fn load_env_vars() -> HashMap<String, String> {
-    let mut vars: HashMap<String, String> = HashMap::new();
-    if let Ok(iter) = dotenvy::from_path_iter(ENV_FILE) {
-        for (key, value) in iter.flatten() {
-            vars.insert(key, value);
-        }
-    }
-    for (key, value) in std::env::vars() {
-        vars.insert(key, value);
-    }
-    vars
+    HubRuntime::process().load_vars()
 }
 
 /// Runs a CLI command, ensures an installed service is up, or starts the server.
@@ -81,59 +74,21 @@ async fn serve(hub: Hub) {
         return;
     }
 
-    let vars = load_env_vars();
-    let (config, profile_errors) = match HubConfig::from_map_skipping_invalid_profiles(&vars) {
-        Ok(parsed) => parsed,
+    let built = match build_server(hub, HubRuntime::process()) {
+        Ok(built) => built,
         Err(e) => {
-            eprintln!("config error: {e}");
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
-    for error in profile_errors {
-        tracing::warn!(%error, "skipping profile with invalid configuration");
-    }
-
-    let store = match open_store(&config) {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("store error: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let bind = format!("{}:{}", config.bind, config.port);
-    let auto_update = config.auto_update;
-    let state = match AppState::new(config, store) {
-        Ok(state) => state,
-        Err(e) => {
-            eprintln!("startup error: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    routes::models::restore_catalogs(&state);
-    routes::models::spawn_background_refresh(state.clone());
-    services::copilot_prices::CopilotPrices::spawn_refresh_loop(state.clone());
-    services::keep_warm::KeepWarm::spawn_refresh_loop(state.clone());
-    services::quota_snapshots::QuotaSnapshots::spawn_poll_loop(state.clone());
-    spawn_notifications(&state);
-    services::local_tuner::probe::spawn_probe_loop(state.clone());
-    state.managed().spawn_idle_reaper();
-    state.local_pool().spawn_background();
-    let managed = std::sync::Arc::clone(state.managed());
-    let local_pool = std::sync::Arc::clone(state.local_pool());
-    let restart_notify = state.restart_notify();
-    services::update::spawn_auto_update(auto_update, std::sync::Arc::clone(&restart_notify));
-    services::config_reload::spawn_env_watcher(
-        state.clone(),
-        std::sync::Arc::clone(&restart_notify),
-    );
-    install_extensions(&state, hub.extensions, &vars);
-
-    let mut app = build_router_with(state, hub.routes);
-    for change in hub.router_changes {
-        app = change(app);
-    }
+    let Built {
+        app,
+        bind,
+        vars,
+        managed,
+        local_pool,
+        restart_notify,
+    } = built;
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(listener) => listener,
@@ -166,6 +121,95 @@ async fn serve(hub: Hub) {
         Ok(false) => {}
         Err(e) => eprintln!("restart respawn failed: {e}"),
     }
+}
+
+/// A configured hub that is ready to serve: its router, the address it binds and the handles that
+/// stop its processes.
+struct Built {
+    app: Router,
+    bind: String,
+    vars: HashMap<String, String>,
+    managed: std::sync::Arc<services::managed_process::ProcessManager>,
+    local_pool: std::sync::Arc<services::local_serving::pool::LocalPool>,
+    restart_notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+/// Reads the settings, starts the background loops and builds the router. It never exits the
+/// process: every failure comes back as the message to print.
+fn build_server(hub: Hub, runtime: HubRuntime) -> Result<Built, String> {
+    let vars = runtime.load_vars();
+    let (config, profile_errors) = HubConfig::from_map_skipping_invalid_profiles(&vars)
+        .map_err(|e| format!("config error: {e}"))?;
+    for error in profile_errors {
+        tracing::warn!(%error, "skipping profile with invalid configuration");
+    }
+    let store = open_store(&config).map_err(|e| format!("store error: {e}"))?;
+
+    let bind = format!("{}:{}", config.bind, config.port);
+    let auto_update = config.auto_update;
+    let state =
+        AppState::new_in(config, store, runtime).map_err(|e| format!("startup error: {e}"))?;
+
+    routes::models::restore_catalogs(&state);
+    routes::models::spawn_background_refresh(state.clone());
+    services::copilot_prices::CopilotPrices::spawn_refresh_loop(state.clone());
+    services::keep_warm::KeepWarm::spawn_refresh_loop(state.clone());
+    services::quota_snapshots::QuotaSnapshots::spawn_poll_loop(state.clone());
+    spawn_notifications(&state);
+    services::local_tuner::probe::spawn_probe_loop(state.clone());
+    state.managed().spawn_idle_reaper();
+    state.local_pool().spawn_background();
+    let managed = std::sync::Arc::clone(state.managed());
+    let local_pool = std::sync::Arc::clone(state.local_pool());
+    let restart_notify = state.restart_notify();
+    services::update::spawn_auto_update(auto_update, std::sync::Arc::clone(&restart_notify));
+    services::config_reload::spawn_env_watcher(
+        state.clone(),
+        std::sync::Arc::clone(&restart_notify),
+    );
+    install_extensions(&state, hub.extensions, &vars)?;
+
+    let mut app = build_router_with(state, hub.routes);
+    for change in hub.router_changes {
+        app = change(app);
+    }
+    Ok(Built {
+        app,
+        bind,
+        vars,
+        managed,
+        local_pool,
+        restart_notify,
+    })
+}
+
+/// Serves `hub` on `listener` until `shutdown` resolves, then stops its processes. Unlike
+/// [`Hub::run`], it takes its paths and variables from `runtime`, installs no log subscriber,
+/// handles no signal and never exits the process, so tests can run many hubs in one process.
+async fn serve_on(
+    hub: Hub,
+    runtime: HubRuntime,
+    listener: tokio::net::TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), String> {
+    let Built {
+        app,
+        managed,
+        local_pool,
+        restart_notify,
+        ..
+    } = build_server(hub, runtime)?;
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                () = shutdown => {}
+                () = restart_notify.notified() => {}
+            }
+        })
+        .await;
+    managed.stop_all().await;
+    local_pool.stop_all().await;
+    served.map_err(|e| format!("server error: {e}"))
 }
 
 /// The install setting that remembers the user saw the desktop test popup.
@@ -216,36 +260,42 @@ fn spawn_notifications(state: &AppState) {
     services::notifications::budget_loop::spawn_budget_loop(state.clone());
 }
 
-/// Loads the rules file, sets the running extensions and starts the rules watcher. An invalid
-/// rules file stops startup.
+/// Loads the rules file, sets the running extensions and starts the rules watcher.
+///
+/// # Errors
+/// The message to print when the rules file is invalid, which stops startup.
 fn install_extensions(
     state: &AppState,
     library: Vec<std::sync::Arc<dyn ext::Extension>>,
     vars: &HashMap<String, String>,
-) {
-    let sources = std::sync::Arc::new(ExtensionSources::new(library, rules_dir()));
-    match sources.load_rules(vars) {
-        Ok(rules) => {
-            if let Some((path, rules)) = &rules {
-                tracing::info!(
-                    "loaded {} extension rules from {}",
-                    rules.len(),
-                    path.display()
-                );
-            }
-            state.set_extensions(sources.compose(rules.map(|(_, rules)| rules)));
-        }
-        Err(e) => {
-            eprintln!("extensions error: {e}");
-            std::process::exit(1);
-        }
+) -> Result<(), String> {
+    let runtime = std::sync::Arc::new(state.runtime().clone());
+    let sources = std::sync::Arc::new(ExtensionSources::new(
+        library,
+        runtime.rules_dir().to_path_buf(),
+    ));
+    let rules = sources
+        .load_rules(vars)
+        .map_err(|e| format!("extensions error: {e}"))?;
+    if let Some((path, rules)) = &rules {
+        tracing::info!(
+            "loaded {} extension rules from {}",
+            rules.len(),
+            path.display()
+        );
     }
-    extension_loader::spawn_rules_watcher(state.clone(), sources, load_env_vars);
+    state.set_extensions(sources.compose(rules.map(|(_, rules)| rules)));
+    extension_loader::spawn_rules_watcher(
+        state.clone(),
+        sources,
+        std::sync::Arc::new(move || runtime.load_vars()),
+    );
+    Ok(())
 }
 
 /// The directory llm-hub looks in for a default rules file: the working directory.
 fn rules_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(".")
+    HubRuntime::process().rules_dir().to_path_buf()
 }
 
 /// Console logging always; plus a `./logs/llm-hub.log` file sink when not

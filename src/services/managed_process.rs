@@ -6,13 +6,15 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use tokio::process::{Child, Command};
 
+use crate::configs::HubTimings;
 use crate::configs::{HubConfig, ManagedCommand, ProfileConfig};
-use crate::consts::{MANAGED_IDLE_CHECK_INTERVAL, MANAGED_READY_POLL_INTERVAL, MANAGED_STOP_GRACE};
+use crate::consts::{MANAGED_READY_POLL_INTERVAL, MANAGED_STOP_GRACE};
 
 /// Starts each profile's local server on demand and stops it when idle.
 pub struct ProcessManager {
     entries: DashMap<String, Arc<ManagedEntry>>,
     logs_dir: PathBuf,
+    timings: HubTimings,
 }
 
 /// One profile's process. The async mutex serialises start and stop, so
@@ -27,14 +29,16 @@ struct ManagedEntry {
     backoff_secs: Mutex<u64>,
     // Last observed exit reason (if any) to help operators diagnose failures.
     last_exit_reason: Mutex<Option<String>>,
+    stop_grace: Duration,
 }
 
 impl ProcessManager {
     /// Creates a manager that writes each process's output to `<logs_dir>/<profile>.log`.
-    pub fn new(logs_dir: impl Into<PathBuf>) -> ProcessManager {
+    pub fn new(logs_dir: impl Into<PathBuf>, timings: HubTimings) -> ProcessManager {
         ProcessManager {
             entries: DashMap::new(),
             logs_dir: logs_dir.into(),
+            timings,
         }
     }
 
@@ -163,7 +167,7 @@ impl ProcessManager {
     pub fn spawn_idle_reaper(self: &Arc<Self>) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(MANAGED_IDLE_CHECK_INTERVAL);
+            let mut interval = tokio::time::interval(manager.timings.idle_check_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
@@ -188,20 +192,27 @@ impl ProcessManager {
             }
             if let Some(running) = child.take() {
                 tracing::info!(profile = %entry.profile, "stopping idle managed process");
-                terminate(running).await;
+                terminate_within(running, entry.stop_grace).await;
             }
         }
     }
 
     fn entry_for(&self, profile: &str, command: &ManagedCommand) -> Arc<ManagedEntry> {
-        let mut slot = self
-            .entries
-            .entry(profile.to_string())
-            .or_insert_with(|| Arc::new(ManagedEntry::new(profile, command)));
+        let mut slot = self.entries.entry(profile.to_string()).or_insert_with(|| {
+            Arc::new(ManagedEntry::new(
+                profile,
+                command,
+                self.timings.managed_stop_grace,
+            ))
+        });
         if slot.command != *command {
             let previous = std::mem::replace(
                 slot.value_mut(),
-                Arc::new(ManagedEntry::new(profile, command)),
+                Arc::new(ManagedEntry::new(
+                    profile,
+                    command,
+                    self.timings.managed_stop_grace,
+                )),
             );
             tokio::spawn(async move { previous.stop().await });
         }
@@ -215,7 +226,7 @@ impl ProcessManager {
 }
 
 impl ManagedEntry {
-    fn new(profile: &str, command: &ManagedCommand) -> ManagedEntry {
+    fn new(profile: &str, command: &ManagedCommand, stop_grace: Duration) -> ManagedEntry {
         ManagedEntry {
             profile: profile.to_string(),
             command: command.clone(),
@@ -224,6 +235,7 @@ impl ManagedEntry {
             backoff_until: Mutex::new(None),
             backoff_secs: Mutex::new(5),
             last_exit_reason: Mutex::new(None),
+            stop_grace,
         }
     }
 
@@ -286,7 +298,7 @@ impl ManagedEntry {
     async fn stop(&self) {
         if let Some(running) = self.child.lock().await.take() {
             tracing::info!(profile = %self.profile, "stopping managed process");
-            terminate(running).await;
+            terminate_within(running, self.stop_grace).await;
         }
     }
 }
@@ -432,7 +444,7 @@ pub(crate) fn kill_process_group(pid: u32) {
 #[cfg(not(unix))]
 pub(crate) fn kill_process_group(_pid: u32) {}
 
-async fn terminate_within(mut child: Child, grace: Duration) {
+pub(crate) async fn terminate_within(mut child: Child, grace: Duration) {
     let pid = child.id();
     if request_exit(&child) && tokio::time::timeout(grace, child.wait()).await.is_ok() {
         // The leader is reaped, so `child.id()` is gone. `pid` still names the group that
