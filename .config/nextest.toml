@@ -26,3 +26,10 @@ setup = "test-roots-unix"
 filter = "all()"
 platform = { host = "cfg(windows)" }
 setup = "test-roots-windows"
+
+[profile.ci]
+test-threads = 8
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
