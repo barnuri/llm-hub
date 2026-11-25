@@ -162,11 +162,8 @@ async fn approved_stream_stall_restarts_only_its_model() {
             .unwrap();
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        let log = std::fs::read_to_string(
-            dir.path()
-                .join(format!("logs/local/{model}.log").replace("local/", "")),
-        )
-        .unwrap_or_else(|error| format!("no log: {error}"));
+        let log = std::fs::read_to_string(dir.path().join(format!("logs/{model}.log")))
+            .unwrap_or_else(|error| format!("no log: {error}"));
         assert!(
             status.is_success(),
             "{model} starts: {status} {body}\nmodel log:\n{log}"
