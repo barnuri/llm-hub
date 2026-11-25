@@ -7,6 +7,8 @@ const totalMaxSeconds = Number(process.env.TEST_TOTAL_MAX_S ?? "30");
 const testMaxMilliseconds = Number(process.env.TEST_MAX_MS ?? "1000");
 
 await $`rm -f ${junitPath}`;
+// Build first, so the wall time measures the test run and not the compile.
+await $`cargo nextest run --all-targets --no-run`;
 const wallStartMilliseconds = performance.now();
 const run = Bun.spawn(["cargo", "nextest", "run", "--all-targets", "--profile", "ci"], {
   stdout: "inherit",
