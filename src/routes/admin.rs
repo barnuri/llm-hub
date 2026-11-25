@@ -656,6 +656,7 @@ fn in_memory_keep_warm(state: &AppState, persisted: bool) -> KeepWarmSummary {
     KeepWarmSummary {
         keepwarm_pings: pings,
         keepwarm_cost_usd: cost_usd,
+        keepwarm_skips: state.keep_warm().skip_counts(),
         persisted,
         ..KeepWarmSummary::default()
     }
@@ -669,7 +670,9 @@ async fn stored_keep_warm(
 ) -> Result<KeepWarmSummary, AppError> {
     tokio::task::spawn_blocking(move || {
         let store = state.store().ok_or("persistence is off")?;
-        session_insights::keep_warm_summary(store, since_ms, &book)
+        let mut summary = session_insights::keep_warm_summary(store, since_ms, &book)?;
+        summary.keepwarm_skips.clear();
+        Ok(summary)
     })
     .await
     .map_err(|e| AppError::Internal(format!("keep-warm read task failed: {e}")))?

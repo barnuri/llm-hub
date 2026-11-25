@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 /// Keep-warm pings and the cache writes their reads avoided. Pings are counted in cost, never as requests.
@@ -11,6 +13,9 @@ pub struct KeepWarmSummary {
     pub est_write_saved_usd: f64,
     /// False when the figures come from in-memory counters that reset at restart.
     pub persisted: bool,
+    /// Streams not kept, dropped or held back, by stable reason name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub keepwarm_skips: BTreeMap<String, u64>,
 }
 
 impl KeepWarmSummary {
@@ -19,6 +24,9 @@ impl KeepWarmSummary {
         self.keepwarm_cost_usd += other.keepwarm_cost_usd;
         self.idle_returns_cached += other.idle_returns_cached;
         self.est_write_saved_usd += other.est_write_saved_usd;
+        for (reason, count) in &other.keepwarm_skips {
+            *self.keepwarm_skips.entry(reason.clone()).or_default() += count;
+        }
     }
 }
 
@@ -34,6 +42,7 @@ mod tests {
             idle_returns_cached: 1,
             est_write_saved_usd: 1.25,
             persisted: true,
+            keepwarm_skips: BTreeMap::from([("expired_idle_cap".to_owned(), 2)]),
         };
         let other = KeepWarmSummary {
             keepwarm_pings: 3,
@@ -41,6 +50,10 @@ mod tests {
             idle_returns_cached: 4,
             est_write_saved_usd: 0.75,
             persisted: false,
+            keepwarm_skips: BTreeMap::from([
+                ("expired_idle_cap".to_owned(), 3),
+                ("held_busy_worker".to_owned(), 1),
+            ]),
         };
 
         total.absorb(&other);
@@ -53,8 +66,25 @@ mod tests {
                 idle_returns_cached: 5,
                 est_write_saved_usd: 2.0,
                 persisted: true,
+                keepwarm_skips: BTreeMap::from([
+                    ("expired_idle_cap".to_owned(), 5),
+                    ("held_busy_worker".to_owned(), 1),
+                ]),
             }
         );
+    }
+
+    #[test]
+    fn keepwarm_skips_is_omitted_when_empty_and_included_when_non_empty() {
+        let empty = serde_json::to_value(KeepWarmSummary::default()).unwrap();
+        assert!(empty.get("keepwarm_skips").is_none());
+
+        let non_empty = serde_json::to_value(KeepWarmSummary {
+            keepwarm_skips: BTreeMap::from([("expired_idle_cap".to_owned(), 3)]),
+            ..KeepWarmSummary::default()
+        })
+        .unwrap();
+        assert_eq!(non_empty["keepwarm_skips"]["expired_idle_cap"], 3);
     }
 
     #[test]
