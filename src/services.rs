@@ -63,6 +63,7 @@ pub mod rate_limiter;
 pub mod request_images;
 pub mod responses_chat;
 pub mod responses_item_ids;
+pub mod instance;
 pub mod restart;
 pub mod review_graph;
 pub mod review_orchestrator;
