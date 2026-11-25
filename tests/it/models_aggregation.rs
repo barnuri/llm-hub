@@ -150,12 +150,20 @@ async fn copilot_entries_add_output_and_limit_provenance_beside_the_old_fields()
     ]))
     .await;
 
-    let body: serde_json::Value = reqwest::get(format!("{base}/v1/models"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    // The first model refresh runs in the background, so wait for the Copilot models to be listed.
+    let mut body = serde_json::Value::Null;
+    for _ in 0..500 {
+        body = reqwest::get(format!("{base}/v1/models"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if body.to_string().contains("copilot/gpt-new") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     let entry = |id: &str| {
         body["data"]
             .as_array()

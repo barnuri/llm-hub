@@ -103,7 +103,8 @@ mod tests {
     #[test]
     fn the_process_runtime_merges_the_environment_over_the_file() {
         let loaded = HubRuntime::process().load_vars();
-        assert_eq!(loaded.get("PATH"), std::env::var("PATH").ok().as_ref());
+        let (key, value) = std::env::vars().next().unwrap();
+        assert_eq!(loaded.get(&key), Some(&value));
     }
 
     #[test]
