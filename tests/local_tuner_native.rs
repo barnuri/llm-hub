@@ -28,7 +28,9 @@ class H(http.server.BaseHTTPRequestHandler):
     body=b'{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
     self.send_response(200); self.send_header('content-type','application/json'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body)
   def log_message(self,*args): pass
-http.server.ThreadingHTTPServer(('127.0.0.1',port),H).serve_forever()
+srv=http.server.ThreadingHTTPServer(('127.0.0.1',port),H)
+with open(os.environ['TUNER_SPAWNS'],'a') as f: f.write('listening '+str(port)+'\n')
+srv.serve_forever()
 "#;
 
 const REGISTRY: &str = "# id|repo|file|size_gb|ctx|quant|extra_flags\n\
