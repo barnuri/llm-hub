@@ -59,9 +59,7 @@ async fn start_hub(dir: &Path, vars: &[(String, String)], base: &str) -> Child {
     let mut hub = command.spawn().unwrap();
     let client = reqwest::Client::new();
     for _ in 0..200 {
-        if hub.try_wait().unwrap().is_some() {
-            panic!("hub exited during start");
-        }
+        assert!(hub.try_wait().unwrap().is_none(), "hub exited during start");
         if client.get(format!("{base}/healthz")).send().await.is_ok() {
             return hub;
         }
@@ -91,6 +89,7 @@ fn spawns_of(log: &Path, file: &str) -> Vec<(String, String)> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one scenario reads top to bottom")]
 async fn approved_stream_stall_restarts_only_its_model() {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("fake-llama-server");
@@ -148,7 +147,7 @@ async fn approved_stream_stall_restarts_only_its_model() {
 
     let hub = start_hub(dir.path(), &vars, &base).await;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_mins(1))
         .build()
         .unwrap();
     // Start both models, so each has a running process before the approval.
