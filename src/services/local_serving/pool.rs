@@ -592,10 +592,6 @@ impl LocalPool {
     }
 
     /// Reloads every local registry now, as the 2 s watcher does when a file changes.
-    #[allow(
-        dead_code,
-        reason = "the registry watcher reloads through `poll_registries`; only tests call this"
-    )]
     pub fn reload_now(&self) {
         for profile in self.profiles.load().values() {
             self.reload_profile(profile);
