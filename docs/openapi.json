@@ -2561,6 +2561,17 @@
         ],
         "summary": "Restart the hub",
         "operationId": "restart_server",
+        "parameters": [
+          {
+            "name": "force",
+            "in": "query",
+            "description": "Restart even while inference requests are in flight. Those requests are cut.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Restart requested",
@@ -2578,6 +2589,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Inference requests are in flight; retry when idle or pass force=true.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
                 }
               }
             }

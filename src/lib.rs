@@ -74,6 +74,21 @@ async fn serve(hub: Hub) {
         return;
     }
 
+    if let Some(bind) = configured_bind(&HubRuntime::process()) {
+        services::instance::set_bind(&bind);
+        if services::instance::handover_from().is_none()
+            && let Some(pid) = services::instance::live_server(&bind)
+        {
+            if services::restart::is_supervised() {
+                // The supervisor restarts this process after the live one exits.
+                services::instance::wait_while_served(&bind).await;
+                return;
+            }
+            eprintln!("llm-hub is already running (pid {pid}) on {bind}");
+            std::process::exit(1);
+        }
+    }
+
     let built = match build_server(hub, HubRuntime::process()) {
         Ok(built) => built,
         Err(e) => {
@@ -90,20 +105,23 @@ async fn serve(hub: Hub) {
         restart_notify,
     } = built;
 
-    let listener = match tokio::net::TcpListener::bind(&bind).await {
+    let listener = match services::instance::bind_reuseport(&bind).await {
         Ok(listener) => listener,
         Err(e) => {
             eprintln!("cannot bind {bind}: {e}");
             std::process::exit(1);
         }
     };
+    if let Err(e) = services::instance::write_pid(&bind) {
+        eprintln!("cannot write the pid file for {bind}: {e}");
+    }
     tracing::info!("llm-hub v{VERSION} listening on http://{bind}");
     if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             tokio::select! {
                 () = wait_for_shutdown_signal() => {}
                 () = restart_notify.notified() => {}
-                () = services::parent_watch::wait_for_parent_exit(&vars) => {}
+                () = services::instance::parent_exit(&vars) => {}
             }
         })
         .await
@@ -158,7 +176,17 @@ fn build_server(hub: Hub, runtime: HubRuntime) -> Result<Built, String> {
     spawn_notifications(&state);
     services::local_tuner::probe::spawn_probe_loop(state.clone());
     state.managed().spawn_idle_reaper();
-    state.local_pool().spawn_background();
+    let local_pool_boot = std::sync::Arc::clone(state.local_pool());
+    match services::instance::handover_from() {
+        // The process being replaced still owns its local model processes. Start ours after it exits.
+        Some(old) => {
+            tokio::spawn(async move {
+                services::instance::wait_gone(old).await;
+                local_pool_boot.spawn_background();
+            });
+        }
+        None => local_pool_boot.spawn_background(),
+    }
     let managed = std::sync::Arc::clone(state.managed());
     let local_pool = std::sync::Arc::clone(state.local_pool());
     let restart_notify = state.restart_notify();
@@ -181,6 +209,13 @@ fn build_server(hub: Hub, runtime: HubRuntime) -> Result<Built, String> {
         local_pool,
         restart_notify,
     })
+}
+
+/// The address `runtime` serves, or `None` when its config does not load (startup reports that).
+fn configured_bind(runtime: &HubRuntime) -> Option<String> {
+    let vars = runtime.load_vars();
+    let (config, _) = HubConfig::from_map_skipping_invalid_profiles(&vars).ok()?;
+    Some(format!("{}:{}", config.bind, config.port))
 }
 
 /// Serves `hub` on `listener` until `shutdown` resolves, then stops its processes. Unlike
@@ -690,6 +725,7 @@ fn build_router_with(state: AppState, ext_routes: Option<Router>) -> Router {
         state.clone(),
         services::auth::require_master_key,
     ));
+    let protected = protected.layer(middleware::from_fn(services::restart::track_inference));
 
     let (health, _) = OpenApiRouter::<AppState>::new()
         .routes(routes!(routes::admin::healthz))
