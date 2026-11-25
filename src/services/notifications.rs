@@ -2,6 +2,7 @@
 
 pub mod budget;
 pub mod budget_loop;
+pub mod cache_loop;
 pub mod command_sink;
 pub mod desktop;
 pub mod dispatch;

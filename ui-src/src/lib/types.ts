@@ -145,6 +145,32 @@ export interface TierRoleRow {
   readonly outcomes: Readonly<Record<string, number>>;
 }
 
+export interface CacheCauseStats {
+  readonly cause: "first" | "model_switch" | "prompt_shrank" | "idle_no_ping" | "idle_over_ttl" | "prefix_changed";
+  readonly count: number;
+  readonly tokens: number;
+  readonly usd: number;
+}
+
+export interface CacheTopSession {
+  readonly worker: string;
+  readonly client: string | null;
+  readonly model: string | null;
+  readonly big_misses: number;
+  readonly miss_usd: number;
+  readonly hit_rate_pct: number;
+}
+
+export interface CacheStats {
+  readonly range: "1h" | "1d";
+  readonly hit_rate_pct: number;
+  readonly requests: number;
+  readonly big_misses: number;
+  readonly miss_usd: number;
+  readonly by_cause: readonly CacheCauseStats[];
+  readonly top_sessions: readonly CacheTopSession[];
+}
+
 export interface StatsSnapshot {
   readonly range: string;
   readonly persistent: boolean;

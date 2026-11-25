@@ -258,6 +258,7 @@ fn spawn_notifications(state: &AppState) {
         .notifier()
         .spawn_prune_loop(std::time::Duration::from_mins(1));
     services::notifications::budget_loop::spawn_budget_loop(state.clone());
+    services::notifications::cache_loop::spawn_cache_loop(state.clone());
 }
 
 /// Loads the rules file, sets the running extensions and starts the rules watcher.
@@ -596,7 +597,9 @@ fn run_service_command() {
 /// that attribute does not compile. Raw `.route(...)` calls (wildcards) are checked by a test.
 fn api_router(state: &AppState) -> OpenApiRouter<AppState> {
     use routes::smart_auto;
-    use routes::{admin, anthropic, claude_code, copilot, live, models, profile_usage, sessions};
+    use routes::{
+        admin, anthropic, cache, claude_code, copilot, live, models, profile_usage, sessions,
+    };
 
     let proxied = OpenApiRouter::new()
         .routes(routes!(anthropic::messages))
@@ -638,6 +641,7 @@ fn api_router(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(routes::extensions::set_extension))
         .routes(routes!(routes::extensions::set_rule))
         .routes(routes!(admin::stats))
+        .routes(routes!(cache::list))
         .routes(routes!(admin::usage))
         .routes(routes!(live::stream))
         .routes(routes!(admin::errors))

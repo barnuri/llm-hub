@@ -10,7 +10,7 @@ import { Select } from "../components/Select";
 import { StatsTable } from "../components/StatsTable";
 import { api } from "../lib/api";
 import { formatMs, formatNumber, formatPct, formatTps, formatUsd } from "../lib/format";
-import type { SeriesPoint, StatsOverview, StatsRange, StatsSnapshot } from "../lib/types";
+import type { CacheStats, SeriesPoint, StatsOverview, StatsRange, StatsSnapshot } from "../lib/types";
 import "../styles/screens/stats.css";
 
 interface StatsScreenProps {
@@ -130,6 +130,20 @@ export function StatsScreen({ onError }: StatsScreenProps) {
   const [range, setRange] = useState<StatsRange>("live");
   const [profile, setProfile] = useState("");
   const [model, setModel] = useState("");
+  const [cacheRange, setCacheRange] = useState<"1h" | "1d">("1h");
+  const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api<CacheStats>(`/api/cache?range=${cacheRange}`)
+      .then((body) => {
+        if (!cancelled) setCacheStats(body);
+      })
+      .catch((err) => onError(err instanceof Error ? err.message : String(err)));
+    return () => {
+      cancelled = true;
+    };
+  }, [cacheRange, onError]);
 
   useEffect(() => {
     let cancelled = false;
@@ -213,6 +227,36 @@ export function StatsScreen({ onError }: StatsScreenProps) {
           </Pill>
         </span>
       </div>
+
+      <Panel title="Prompt cache" sub="Successful requests; keep-warm pings excluded">
+        <Segmented
+          label="Prompt cache range"
+          options={[{ value: "1h", label: "1 hour" }, { value: "1d", label: "24 hours" }]}
+          value={cacheRange}
+          onChange={setCacheRange}
+        />
+        <div className="stats-hero">
+          <KpiCard label="Cache hit rate" value={formatPct(cacheStats?.hit_rate_pct ?? 0)} />
+          <KpiCard label="Big misses" value={formatNumber(cacheStats?.big_misses ?? 0)} />
+          <KpiCard label="Est. miss $" value={formatUsd(cacheStats?.miss_usd ?? 0)} />
+        </div>
+        <Panel title="Miss causes">
+          <table className="table">
+            <thead><tr><th>Cause</th><th className="num">Count</th><th className="num">Tokens</th><th className="num">Miss $</th></tr></thead>
+            <tbody>{(cacheStats?.by_cause ?? []).map((row) => (
+              <tr key={row.cause}><td>{row.cause}</td><td className="num">{formatNumber(row.count)}</td><td className="num">{formatNumber(row.tokens)}</td><td className="num">{formatUsd(row.usd)}</td></tr>
+            ))}</tbody>
+          </table>
+        </Panel>
+        <Panel title="Top sessions">
+          <table className="table">
+            <thead><tr><th>Worker</th><th>Client</th><th>Model</th><th className="num">Big misses</th><th className="num">Miss $</th><th className="num">Hit %</th></tr></thead>
+            <tbody>{(cacheStats?.top_sessions ?? []).map((row) => (
+              <tr key={row.worker}><td className="mono">{row.worker}</td><td>{row.client ?? "—"}</td><td>{row.model ?? "—"}</td><td className="num">{formatNumber(row.big_misses)}</td><td className="num">{formatUsd(row.miss_usd)}</td><td className="num">{formatPct(row.hit_rate_pct)}</td></tr>
+            ))}</tbody>
+          </table>
+        </Panel>
+      </Panel>
 
       <p className="dim stats-intro">
         {persistent ? (

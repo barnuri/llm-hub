@@ -118,8 +118,17 @@ See [Notifications](notifications.md). The hub builds the sinks at startup, so a
 | `LLM_HUB_NOTIFY_TIMEOUT_MS` | `10000` | Longest wait for one desktop popup, webhook call or command run. Must be above 0. |
 | `LLM_HUB_NOTIFY_MUTE` | empty | Mute rules: `;` between rules, `field=glob` pairs separated by `,` in a rule. Fields: `source`, `kind`, `rule`, `profile`, `model`, `title`. At most 200 rules and 256 characters per glob. See [Mute and snooze](notifications.md#mute-and-snooze). |
 | `LLM_HUB_NOTIFY_BUDGET_STEPS` | `25,50,75,80,85,95,100` | Budget steps in percent, 1 to 1000, at most 20. See [Budget notifications](notifications.md#budget-notifications). |
+| `LLM_HUB_NOTIFY_CACHE` | `true` | `false` disables prompt-cache watch notifications. The cache panel remains available. |
+| `LLM_HUB_CACHE_MISS_BURST_COUNT` | `3` | Raises a warning for one worker with this many big misses in the last hour. A positive whole number. |
+| `LLM_HUB_CACHE_MISS_BURST_USD` | `5` | Raises a warning for one worker whose estimated missed-cache cost reaches this amount in the last hour. Zero or a positive number. |
+| `LLM_HUB_CACHE_HIT_LOW_PCT` | `80` | Raises a warning when hub-wide hit rate is below this percentage. A number from 0 to 100. |
+| `LLM_HUB_CACHE_HIT_MIN_REQUESTS` | `20` | Successful non-ping requests required before the hub-wide hit-rate rule may alert. A positive whole number. |
 | `LLM_HUB_BUDGET_MONTHLY_USD` | none | Monthly spend budget in USD for all profiles together, against the hub's measured cost. A number above 0. Needs `LLM_HUB_PERSISTENT=true`. |
 | `LLM_HUB_<NAME>_BUDGET_MONTHLY_USD` | none | Monthly spend budget in USD for one profile. A number above 0. Env-only: a profile save on the Profiles page keeps it. |
+
+The Stats page has a Prompt cache panel for the last hour or 24 hours. It shows hit rate, big misses, estimated miss cost, miss causes and top worker sessions. A big miss is a successful non-ping row with at least 100,000 input tokens and cache reads below half of input. It excludes keep-warm pings from every total.
+
+The cache watch runs every five minutes over the last hour. `cache_miss_burst` warns once per worker per hour when that worker reaches the miss count or miss-cost threshold. `cache_hit_low` warns once per hub-wide hour when hit rate is below the percentage with at least the minimum successful requests. Both rules use the existing notification inbox, mutes and desktop/webhook/command sinks.
 
 ## Persistence
 

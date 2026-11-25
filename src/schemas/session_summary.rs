@@ -30,6 +30,10 @@ pub struct SessionSummary {
     pub long_tier_share: f64,
     pub compactions: u64,
     pub idle_cache_write_usd: f64,
+    /// Cache-read share of successful input tokens; keep-warm pings are excluded.
+    pub cache_hit_rate_pct: f64,
+    /// Successful large prompts with less than half their input served from cache.
+    pub big_misses: u64,
     /// Successful requests and cost per `routed_by`, most expensive first.
     pub routed_by_spend: Vec<SessionRoutedBySpend>,
     /// Keep-warm pings and the cache writes their reads avoided, flattened into the summary.

@@ -36,6 +36,8 @@ export interface SessionSummary extends KeepWarmFigures {
   readonly compactions: number;
   /** Part of `cache_write_usd` written after the cache expired. */
   readonly idle_cache_write_usd: number;
+  readonly cache_hit_rate_pct: number;
+  readonly big_misses: number;
   /** Successful requests and cost per `routed_by`, most expensive first. */
   readonly routed_by_spend: readonly SessionRoutedBySpend[];
 }
