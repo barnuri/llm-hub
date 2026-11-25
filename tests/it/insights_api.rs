@@ -1,4 +1,4 @@
-//! `/api/insights` and `/api/insights/pick` over a real hub process with a
+//! `/api/insights` and `/api/insights/pick` over an in-process hub with a
 //! persistent store and a mocked upstream.
 #![allow(
     clippy::unwrap_used,
@@ -12,14 +12,14 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::hub::{HubProcess, start_hub_in};
+use crate::hub::{InProcessHub, start_hub_with_dir};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const GOOD_CALLS: usize = 5;
 const BAD_CALLS: usize = 3;
 
-async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
+async fn start_hub(vars: HashMap<String, String>) -> (InProcessHub, String) {
     let dir = tempfile::tempdir().unwrap().keep();
     let mut all = HashMap::from([
         ("LLM_HUB_PERSISTENT".to_owned(), "true".to_owned()),
@@ -30,7 +30,7 @@ async fn start_hub(vars: HashMap<String, String>) -> (HubProcess, String) {
         ),
     ]);
     all.extend(vars);
-    start_hub_in(&dir, all, &[]).await
+    start_hub_with_dir(&dir, all).await
 }
 
 async fn mock_upstream() -> MockServer {

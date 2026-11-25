@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::configs::{KeepWarmConfig, ProfileConfig, mask_key};
-use crate::consts::{DEFAULT_INSIGHTS_MIN_REQUESTS, DEFAULT_INSIGHTS_RANGE, ENV_FILE, VERSION};
+use crate::consts::{DEFAULT_INSIGHTS_MIN_REQUESTS, DEFAULT_INSIGHTS_RANGE, VERSION};
 use crate::dependencies::state::AppState;
 use crate::ext::ConfigKind;
 use crate::routes::models::send_models_request;
@@ -174,7 +174,7 @@ pub async fn upsert_profile(
     State(state): State<AppState>,
     Json(input): Json<ProfileInput>,
 ) -> Result<Json<Value>, AppError> {
-    upsert_profile_in(&state, input, Path::new(ENV_FILE), reload_config)
+    upsert_profile_in(&state, input, state.runtime().env_file(), reload_config)
 }
 
 fn upsert_profile_in(
@@ -264,7 +264,7 @@ pub async fn set_default_fallbacks(
     State(state): State<AppState>,
     Json(input): Json<FallbacksInput>,
 ) -> Result<Json<Value>, AppError> {
-    set_default_fallbacks_in(&state, &input, Path::new(ENV_FILE), reload_config)
+    set_default_fallbacks_in(&state, &input, state.runtime().env_file(), reload_config)
 }
 
 fn set_default_fallbacks_in(
@@ -299,7 +299,7 @@ pub async fn set_copilot_prices(
     State(state): State<AppState>,
     Json(input): Json<CopilotPricesInput>,
 ) -> Result<Json<Value>, AppError> {
-    set_copilot_prices_in(&state, &input, Path::new(ENV_FILE), reload_config)
+    set_copilot_prices_in(&state, &input, state.runtime().env_file(), reload_config)
 }
 
 fn set_copilot_prices_in(
@@ -334,7 +334,7 @@ pub async fn set_keep_warm(
     State(state): State<AppState>,
     Json(input): Json<KeepWarmInput>,
 ) -> Result<Json<Value>, AppError> {
-    set_keep_warm_in(&state, &input, Path::new(ENV_FILE), reload_config)
+    set_keep_warm_in(&state, &input, state.runtime().env_file(), reload_config)
 }
 
 fn set_keep_warm_in(
@@ -369,7 +369,7 @@ pub async fn set_media_fallback(
     State(state): State<AppState>,
     Json(input): Json<MediaFallbackInput>,
 ) -> Result<Json<Value>, AppError> {
-    set_media_fallback_in(&state, &input, Path::new(ENV_FILE), reload_config)
+    set_media_fallback_in(&state, &input, state.runtime().env_file(), reload_config)
 }
 
 fn set_media_fallback_in(
@@ -419,7 +419,7 @@ pub async fn delete_profile(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
 ) -> Result<Json<Value>, AppError> {
-    delete_profile_in(&state, &name, Path::new(ENV_FILE), reload_config)
+    delete_profile_in(&state, &name, state.runtime().env_file(), reload_config)
 }
 
 fn delete_profile_in(

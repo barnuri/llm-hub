@@ -5,9 +5,10 @@ use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
 
 use crate::configs::HubConfig;
-use crate::consts::{LOGS_DIR, MEDIA_FALLBACK_CACHE_ENTRIES};
+use crate::consts::MEDIA_FALLBACK_CACHE_ENTRIES;
 use crate::ext::builtin::builtins;
 use crate::ext::{CompleteCtx, ExtensionSet};
+use crate::hub_runtime::HubRuntime;
 use crate::schemas::extension_status::ExtensionStatus;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
@@ -122,28 +123,48 @@ struct Inner {
     local_tuner: Arc<LocalTuner>,
     /// The notifications inbox, mutes and sink delivery every source writes through.
     notifier: Arc<Notifier>,
+    /// Where this hub reads its settings and writes its files.
+    runtime: Arc<HubRuntime>,
 }
 
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
 
 impl AppState {
-    pub fn new(config: HubConfig, store: Option<Store>) -> Result<AppState, String> {
-        AppState::with_seams(
+    /// Builds the state with the real keychain and gh, and the paths and variables of `runtime`.
+    pub fn new_in(
+        config: HubConfig,
+        store: Option<Store>,
+        runtime: HubRuntime,
+    ) -> Result<AppState, String> {
+        AppState::with_runtime(
             config,
             store,
             Arc::new(KeyringCredentialStore),
             Arc::new(ProcessGhCli),
+            runtime,
         )
     }
 
-    /// [`Self::new`] with the credential store and gh runner passed in, so
+    /// [`Self::new_in`] with the credential store and gh runner passed in, so
     /// tests never touch the real keychain or gh.
+    #[cfg(test)]
     pub fn with_seams(
         config: HubConfig,
         store: Option<Store>,
         credentials: Arc<dyn CredentialStore>,
         gh: Arc<dyn GhCli>,
+    ) -> Result<AppState, String> {
+        AppState::with_runtime(config, store, credentials, gh, HubRuntime::process())
+    }
+
+    /// [`Self::with_seams`] with the paths and variables of `runtime`.
+    pub fn with_runtime(
+        config: HubConfig,
+        store: Option<Store>,
+        credentials: Arc<dyn CredentialStore>,
+        gh: Arc<dyn GhCli>,
+        runtime: HubRuntime,
     ) -> Result<AppState, String> {
         let clients = build_clients(&config)?;
         let copilot_profiles = config
@@ -182,7 +203,8 @@ impl AppState {
         let extensions = all_extensions
             .filtered(&extension_toggles)
             .with_notifier(Arc::clone(&notifier));
-        let local_pool = Arc::new(LocalPool::new(&config, LOGS_DIR));
+        let timings = config.timings;
+        let local_pool = Arc::new(LocalPool::new(&config, runtime.logs_dir()));
         let state = AppState(Arc::new(Inner {
             config: ArcSwap::from_pointee(config),
             clients: ArcSwap::from_pointee(clients),
@@ -202,7 +224,7 @@ impl AppState {
             copilot_catalogs: DashMap::new(),
             first_refresh: tokio::sync::OnceCell::new(),
             restart_notify: Arc::new(tokio::sync::Notify::new()),
-            managed: Arc::new(ProcessManager::new(LOGS_DIR)),
+            managed: Arc::new(ProcessManager::new(runtime.logs_dir(), timings)),
             local_pool,
             copilot_sessions: CopilotSessionCache::new(Arc::clone(&credentials), Arc::clone(&gh)),
             copilot_auto: CopilotAutoRouter::with_limits(Arc::clone(&model_limits)),
@@ -229,9 +251,15 @@ impl AppState {
             extensions_lock: Mutex::new(()),
             local_tuner: Arc::new(LocalTuner::default()),
             notifier,
+            runtime: Arc::new(runtime),
         }));
         state.refresh_api_key_hashes();
         Ok(state)
+    }
+
+    /// The paths and variables this hub runs with.
+    pub fn runtime(&self) -> &HubRuntime {
+        &self.0.runtime
     }
 
     pub fn config(&self) -> Arc<HubConfig> {

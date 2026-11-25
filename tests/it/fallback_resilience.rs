@@ -16,7 +16,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::hub;
 
-use hub::{HubProcess, start_hub};
+use hub::{InProcessHub, start_hub};
 
 const FALLBACKS: &str = "x-llm-hub-fallbacks";
 
@@ -62,7 +62,7 @@ async fn two_profile_hub(
     first: &MockServer,
     second: &MockServer,
     extra: &[(&str, &str)],
-) -> (HubProcess, String) {
+) -> (InProcessHub, String) {
     let mut vars = HashMap::from([
         ("LLM_HUB_PROFILES".to_owned(), "first,second".to_owned()),
         ("LLM_HUB_FIRST_BASE_URL".to_owned(), first.uri()),
