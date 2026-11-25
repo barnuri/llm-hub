@@ -989,6 +989,8 @@ mod tests {
             tokens_out,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_source: crate::schemas::cache_write_source::CacheWriteSource::default(),
+            uncached_input_tokens: 0,
             cost_usd: 0.0,
             error: None,
             session_id: None,

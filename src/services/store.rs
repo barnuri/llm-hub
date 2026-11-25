@@ -422,6 +422,8 @@ impl Store {
 
     /// Writes the request row and returns its id. The json store keeps no row ids and returns `None`.
     pub fn record(&self, outcome: &RequestOutcome) -> Result<Option<i64>, String> {
+        let (cache_write_source, uncached_input_tokens) =
+            crate::services::stats::cache_write_label(outcome);
         let row = UsageRow {
             ts_ms: now_ms(),
             model: outcome.model_key.clone(),
@@ -433,6 +435,8 @@ impl Store {
             tokens_out: outcome.tokens_out,
             cache_read_tokens: outcome.cache_read_tokens,
             cache_write_tokens: outcome.cache_write_tokens,
+            cache_write_source,
+            uncached_input_tokens,
             cost_usd: 0.0,
             error: outcome.error.clone(),
             client: outcome.client.clone(),
@@ -447,8 +451,8 @@ impl Store {
                         "INSERT INTO requests (
                             ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
                             ttft_ms, cache_read_tokens, cache_write_tokens, error, client, session_id, worker,
-                            routed_by, attempt, role
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                            routed_by, attempt, role, cache_write_source, uncached_input_tokens
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                         rusqlite::params![
                             db_i64(row.ts_ms),
                             row.model,
@@ -466,7 +470,9 @@ impl Store {
                             row.worker,
                             outcome.routed_by.as_deref(),
                             outcome.attempt.as_deref(),
-                            outcome.role.as_deref()
+                            outcome.role.as_deref(),
+                            row.cache_write_source.as_str(),
+                            db_i64(row.uncached_input_tokens)
                         ],
                     )
                     .map_err(|e| e.to_string())?;
@@ -613,7 +619,8 @@ impl Store {
                 let mut stmt = guard
                     .prepare(&format!(
                         "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
-                                ttft_ms, cache_read_tokens, cache_write_tokens, error, client, session_id, worker
+                                ttft_ms, cache_read_tokens, cache_write_tokens, error, client, session_id, worker,
+                                cache_write_source, uncached_input_tokens
                          FROM requests WHERE {} ORDER BY id DESC LIMIT ?1",
                         Self::not_keep_warm_sql()
                     ))
@@ -675,7 +682,7 @@ impl Store {
                 let mut list_sql = format!(
                     "SELECT ts_ms, model, profile, status, latency_ms, tokens_in, tokens_out,
                             ttft_ms, cache_read_tokens, cache_write_tokens, error, client, session_id, worker,
-                            id, {}
+                            cache_write_source, uncached_input_tokens, id, {}
                      FROM requests WHERE status >= {ERROR_STATUS_MIN} AND {}",
                     Self::resolved_ms_sql(),
                     Self::not_keep_warm_sql()
@@ -695,8 +702,8 @@ impl Store {
                 let recent = stmt
                     .query_map(rusqlite::params_from_iter(list_params), |r| {
                         Ok(ErrorEntry {
-                            id: Some(r.get(14)?),
-                            resolved_ms: r.get::<_, Option<i64>>(15)?.map(db_u64),
+                            id: Some(r.get(16)?),
+                            resolved_ms: r.get::<_, Option<i64>>(17)?.map(db_u64),
                             row: map_usage_row(r)?,
                         })
                     })
@@ -2560,6 +2567,14 @@ fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
         "fallback_session",
         "ALTER TABLE requests ADD COLUMN fallback_session TEXT",
     )?;
+    add(
+        "cache_write_source",
+        "ALTER TABLE requests ADD COLUMN cache_write_source TEXT CONSTRAINT ck_requests_cache_write_source CHECK (cache_write_source IS NULL OR cache_write_source IN ('reported', 'uncached_input', 'none'))",
+    )?;
+    add(
+        "uncached_input_tokens",
+        "ALTER TABLE requests ADD COLUMN uncached_input_tokens INTEGER NOT NULL DEFAULT 0",
+    )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_requests_worker ON requests(worker)",
         [],
@@ -2595,6 +2610,18 @@ fn migrate_request_shapes_columns(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_cache_write_source(
+    value: &str,
+) -> Option<crate::schemas::cache_write_source::CacheWriteSource> {
+    use crate::schemas::cache_write_source::CacheWriteSource;
+    match value {
+        "reported" => Some(CacheWriteSource::Reported),
+        "uncached_input" => Some(CacheWriteSource::UncachedInput),
+        "none" => Some(CacheWriteSource::None),
+        _ => None,
+    }
+}
+
 fn map_usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRow> {
     Ok(UsageRow {
         ts_ms: db_u64(r.get::<_, i64>(0)?),
@@ -2607,6 +2634,13 @@ fn map_usage_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRow> {
         ttft_ms: r.get::<_, Option<i64>>(7)?.map(db_u64),
         cache_read_tokens: db_u64(r.get::<_, i64>(8).unwrap_or(0)),
         cache_write_tokens: db_u64(r.get::<_, i64>(9).unwrap_or(0)),
+        cache_write_source: r
+            .get::<_, Option<String>>(14)
+            .unwrap_or(None)
+            .as_deref()
+            .and_then(parse_cache_write_source)
+            .unwrap_or_default(),
+        uncached_input_tokens: db_u64(r.get::<_, i64>(15).unwrap_or(0)),
         cost_usd: 0.0,
         error: r.get::<_, Option<String>>(10).unwrap_or(None),
         client: r.get::<_, Option<String>>(11).unwrap_or(None),
@@ -3685,6 +3719,71 @@ mod tests {
         assert_eq!(store.list_api_keys().unwrap().len(), 1);
         store.delete_api_key("ci").unwrap();
         assert!(store.list_api_keys().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sqlite_rows_persist_real_cache_writes_and_label_the_uncached_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writes.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let reported = RequestOutcome {
+            tokens_in: 1_000,
+            cache_read_tokens: 900,
+            cache_write_tokens: 60,
+            ..sample_outcome()
+        };
+        let unreported = RequestOutcome {
+            tokens_in: 1_000,
+            cache_read_tokens: 900,
+            cache_write_tokens: 0,
+            ..sample_outcome()
+        };
+        store.record(&reported).unwrap();
+        store.record(&unreported).unwrap();
+        let Store::Sqlite(conn) = &store else {
+            panic!("sqlite store expected");
+        };
+        let guard = conn.lock().unwrap();
+        let rows: Vec<(i64, String, i64)> = guard
+            .prepare(
+                "SELECT cache_write_tokens, cache_write_source, uncached_input_tokens
+                 FROM requests ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (60, "reported".to_owned(), 0),
+                (0, "uncached_input".to_owned(), 100),
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlite_migration_adds_the_cache_write_label_columns_to_an_old_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE requests (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER NOT NULL,
+                 model TEXT NOT NULL, profile TEXT NOT NULL, status INTEGER NOT NULL,
+                 latency_ms INTEGER NOT NULL, tokens_in INTEGER NOT NULL, tokens_out INTEGER NOT NULL);",
+            )
+            .unwrap();
+        }
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        store.record(&sample_outcome()).unwrap();
+        let Store::Sqlite(conn) = &store else {
+            panic!("sqlite store expected");
+        };
+        let columns = table_columns(&conn.lock().unwrap(), "requests").unwrap();
+        assert!(columns.iter().any(|c| c == "cache_write_source"));
+        assert!(columns.iter().any(|c| c == "uncached_input_tokens"));
     }
 
     #[test]

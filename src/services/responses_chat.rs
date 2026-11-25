@@ -358,6 +358,7 @@ fn finish_reason(response: &Value, saw_tool_call: bool) -> &'static str {
 }
 
 /// Chat usage from a Responses `usage` object, with cached input as `prompt_tokens_details`.
+/// A reported cache write keeps its Anthropic name, where the stats scraper reads it.
 fn usage(response: &Value) -> Value {
     let field = |pointer: &str| {
         response
@@ -375,6 +376,12 @@ fn usage(response: &Value) -> Value {
     let cached = field("/usage/input_tokens_details/cached_tokens");
     if cached > 0 {
         usage["prompt_tokens_details"] = json!({ "cached_tokens": cached });
+    }
+    let written = response
+        .get("usage")
+        .map_or(0, crate::services::stats::cache_write_in);
+    if written > 0 {
+        usage["cache_creation_input_tokens"] = json!(written);
     }
     usage
 }
@@ -761,6 +768,42 @@ mod tests {
                           "prompt_tokens_details": {"cached_tokens": 6}},
             })
         );
+    }
+
+    #[test]
+    fn a_reported_cache_write_reaches_the_chat_usage() {
+        let reply = json!({
+            "status": "completed",
+            "output": [],
+            "usage": {"input_tokens": 50, "output_tokens": 2,
+                      "input_tokens_details": {"cached_tokens": 10,
+                                               "cache_creation_input_tokens": 30}},
+        });
+        let out: Value = serde_json::from_slice(&to_chat(
+            reply.to_string().as_bytes(),
+            "copilot/gpt-5.5",
+            &NameMap::default(),
+        ))
+        .unwrap();
+        assert_eq!(out["usage"]["cache_creation_input_tokens"], 30);
+        assert_eq!(
+            crate::services::stats::scrape_usage(&serde_json::to_vec(&out).unwrap())
+                .cache_write_tokens,
+            30
+        );
+    }
+
+    #[test]
+    fn a_reply_without_a_cache_write_reports_none() {
+        let reply = json!({"status": "completed", "output": [],
+                           "usage": {"input_tokens": 5, "output_tokens": 1}});
+        let out: Value = serde_json::from_slice(&to_chat(
+            reply.to_string().as_bytes(),
+            "copilot/gpt-5.5",
+            &NameMap::default(),
+        ))
+        .unwrap();
+        assert!(out["usage"].get("cache_creation_input_tokens").is_none());
     }
 
     #[test]

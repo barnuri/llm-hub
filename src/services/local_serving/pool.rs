@@ -779,6 +779,22 @@ impl Lease {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    /// The slot count of a llama.cpp process (`--parallel`, default 1), `None` for any other engine.
+    pub fn llama_slots(&self) -> Option<u64> {
+        self.entry.llama_slots()
+    }
+}
+
+/// The `--parallel` (or `-np`) value of a llama-server command line. The last one wins, as in
+/// llama-server. A missing, unparsable or non-positive value counts as one slot.
+fn parallel_slots(argv: &[String]) -> u64 {
+    argv.iter()
+        .rposition(|word| word == "--parallel" || word == "-np")
+        .and_then(|at| argv.get(at + 1))
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|slots| *slots > 0)
+        .unwrap_or(1)
 }
 
 /// Undoes a start that its `acquire` future drops before the start ends. It kills the process
@@ -859,6 +875,12 @@ impl ModelEntry {
 
     fn details(&self) -> Details {
         lock(&self.details).clone()
+    }
+
+    fn llama_slots(&self) -> Option<u64> {
+        let details = self.details();
+        let row = details.row.as_ref()?;
+        (row.engine == Engine::Llama).then(|| parallel_slots(&details.argv))
     }
 
     fn update(&self, change: impl FnOnce(&mut Details)) {
@@ -1071,6 +1093,20 @@ mod tests {
     use std::sync::OnceLock;
 
     use super::*;
+
+    #[test]
+    fn parallel_slots_reads_the_last_parallel_flag() {
+        let argv = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        assert_eq!(parallel_slots(&argv(&["serve", "--parallel", "1"])), 1);
+        assert_eq!(parallel_slots(&argv(&["-np", "4"])), 4);
+        assert_eq!(
+            parallel_slots(&argv(&["--parallel", "2", "--parallel", "3"])),
+            3
+        );
+        assert_eq!(parallel_slots(&argv(&["--parallel", "-1"])), 1);
+        assert_eq!(parallel_slots(&argv(&["--parallel"])), 1);
+        assert_eq!(parallel_slots(&argv(&["serve"])), 1);
+    }
 
     const PROFILE: &str = "mac";
     const START_LINE: &str = "fake server start";

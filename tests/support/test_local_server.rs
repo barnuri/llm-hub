@@ -116,6 +116,13 @@ fn handle(mut stream: TcpStream, model: Option<&str>) {
     }
 
     if path == "/v1/chat/completions" {
+        if let Ok(body_log) = std::env::var("BODY_LOG") {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(PathBuf::from(body_log))
+                .and_then(|mut file| file.write_all(format!("{body_text}\n").as_bytes()));
+        }
         if model.is_some_and(|model| model.contains("slow")) {
             hold_slow_request();
         }

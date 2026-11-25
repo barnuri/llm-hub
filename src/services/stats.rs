@@ -517,7 +517,8 @@ const CACHE_WRITE_FIELDS: [&str; 4] = [
 ];
 
 /// Tokens written to the prompt cache in a parsed `usage` object. Reads the top level, then
-/// `prompt_tokens_details`, then the Anthropic `cache_creation` split by TTL.
+/// `prompt_tokens_details` (chat) or `input_tokens_details` (Responses), then the Anthropic
+/// `cache_creation` split by TTL.
 #[must_use]
 pub fn cache_write_in(usage: &serde_json::Value) -> u64 {
     let read = |scope: Option<&serde_json::Value>| {
@@ -530,6 +531,7 @@ pub fn cache_write_in(usage: &serde_json::Value) -> u64 {
     };
     read(Some(usage))
         .or_else(|| read(usage.get("prompt_tokens_details")))
+        .or_else(|| read(usage.get("input_tokens_details")))
         .unwrap_or_else(|| {
             let split = |field: &str| {
                 usage
@@ -543,6 +545,28 @@ pub fn cache_write_in(usage: &serde_json::Value) -> u64 {
 
 fn first_nonzero(a: u64, b: u64) -> u64 {
     if a > 0 { a } else { b }
+}
+
+/// Labels a request's cache-write count. A reported write wins. Without one, a successful request
+/// with uncached input gets that input as its estimate, labeled `UncachedInput`, so a reader never
+/// mistakes the estimate for a measured write. Returns the source and the estimate (0 unless estimated).
+#[must_use]
+pub fn cache_write_label(
+    outcome: &RequestOutcome,
+) -> (crate::schemas::cache_write_source::CacheWriteSource, u64) {
+    use crate::schemas::cache_write_source::CacheWriteSource;
+    if outcome.cache_write_tokens > 0 {
+        return (CacheWriteSource::Reported, 0);
+    }
+    if outcome.status >= crate::consts::ERROR_STATUS_MIN {
+        return (CacheWriteSource::None, 0);
+    }
+    let (uncached, _) = split_cached_input(outcome.tokens_in, outcome.cache_read_tokens, 0);
+    if uncached == 0 {
+        (CacheWriteSource::None, 0)
+    } else {
+        (CacheWriteSource::UncachedInput, uncached)
+    }
 }
 
 /// Scrapes a streamed body from its bounded head and tail. A non-zero tail field wins, and the
@@ -811,5 +835,47 @@ mod tests {
             3
         );
         assert_eq!(cache_write_in(&json!({"prompt_tokens": 1})), 0);
+    }
+
+    #[test]
+    fn cache_write_in_reads_responses_input_details() {
+        use serde_json::json;
+        assert_eq!(
+            cache_write_in(&json!({"input_tokens_details": {"cache_creation_input_tokens": 7}})),
+            7
+        );
+    }
+
+    #[test]
+    fn cache_write_label_prefers_a_reported_write_then_labels_the_uncached_fallback() {
+        use crate::schemas::cache_write_source::CacheWriteSource;
+        let with = |status: u16, tokens_in: u64, read: u64, write: u64| RequestOutcome {
+            status,
+            tokens_in,
+            cache_read_tokens: read,
+            cache_write_tokens: write,
+            ..RequestOutcome::default()
+        };
+        assert_eq!(
+            cache_write_label(&with(200, 1_000, 900, 40)),
+            (CacheWriteSource::Reported, 0)
+        );
+        assert_eq!(
+            cache_write_label(&with(200, 1_000, 900, 0)),
+            (CacheWriteSource::UncachedInput, 100)
+        );
+        // Anthropic-style rows report input without the cache reads.
+        assert_eq!(
+            cache_write_label(&with(200, 12, 900, 0)),
+            (CacheWriteSource::UncachedInput, 12)
+        );
+        assert_eq!(
+            cache_write_label(&with(200, 900, 900, 0)),
+            (CacheWriteSource::None, 0)
+        );
+        assert_eq!(
+            cache_write_label(&with(502, 1_000, 0, 0)),
+            (CacheWriteSource::None, 0)
+        );
     }
 }

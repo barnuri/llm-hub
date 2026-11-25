@@ -80,7 +80,7 @@ use crate::services::local_serving::watchdog::{StreamWatchdog, stall_event};
 use crate::services::media_fallback;
 use crate::services::model_health::FailureKind;
 use crate::services::multipart_model;
-use crate::services::prompt_cache::CacheHint;
+use crate::services::prompt_cache::{self, CacheHint};
 use crate::services::rate_limit::{CooldownHint, CooldownScope, reset_after};
 use crate::services::request_images::request_has_image;
 use crate::services::responses_chat::{self, ChatStream};
@@ -2681,6 +2681,22 @@ impl<'a> AttemptSender<'a> {
                 LocalModel::NoRoom(message) => return Ok(local_no_room(&message)),
             };
         let api_base = lease.as_ref().map(local_api_base);
+        // llama.cpp keeps one KV cache per slot, so a stream must keep its slot. mistral.rs
+        // needs no hint: its prefix cache (`prefix_cache_n`, on by default) matches any
+        // request's tokens, and its `session_id` field is an agentic-session key, not a cache key.
+        let body = match lease.as_ref() {
+            Some(lease) if bare_path(self.path.as_str()).ends_with(CHAT_ENDPOINT) => {
+                match lease.llama_slots() {
+                    Some(slots) => {
+                        let session = claude_code_session_id(self.headers);
+                        prompt_cache::llama_slot_hints(&body, session.as_deref(), slots)
+                            .map_or(body, Bytes::from)
+                    }
+                    None => body,
+                }
+            }
+            _ => body,
+        };
 
         let upstream = UpstreamRequest {
             state,

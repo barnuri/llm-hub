@@ -79,6 +79,12 @@ pub(crate) fn usage(response: &Value) -> Value {
     if cached > 0 {
         usage["cache_read_input_tokens"] = json!(cached);
     }
+    let written = response
+        .get("usage")
+        .map_or(0, crate::services::stats::cache_write_in);
+    if written > 0 {
+        usage["cache_creation_input_tokens"] = json!(written);
+    }
     usage
 }
 
@@ -179,6 +185,19 @@ mod tests {
                 "stop_sequence": null,
                 "usage": {"input_tokens": 4, "output_tokens": 4, "cache_read_input_tokens": 6},
             })
+        );
+    }
+
+    #[test]
+    fn a_reported_cache_write_becomes_cache_creation_input_tokens() {
+        let out = translate(&json!({
+            "status": "completed",
+            "output": [],
+            "usage": {"input_tokens": 40, "output_tokens": 1, "cache_creation_input_tokens": 25},
+        }));
+        assert_eq!(
+            out["usage"],
+            json!({"input_tokens": 40, "output_tokens": 1, "cache_creation_input_tokens": 25})
         );
     }
 

@@ -86,6 +86,7 @@ impl Fixture {
                 "20".to_owned(),
             ),
             ("SPAWN_LOG".to_owned(), path_str(&root.join("spawns.txt"))),
+            ("BODY_LOG".to_owned(), path_str(&root.join("bodies.txt"))),
             (
                 "SLOW_RELEASE_FILE".to_owned(),
                 path_str(&root.join("release-slow")),
@@ -274,6 +275,26 @@ async fn concurrent_requests_share_one_start() {
         "{statuses:?}"
     );
     assert_eq!(fx.spawn_count("a"), 1, "{:?}", fx.spawns());
+}
+
+#[tokio::test]
+async fn chat_to_llama_gets_cache_prompt_and_a_stable_slot() {
+    let fx = Fixture::start(&[("a", 1.0)], &[]).await;
+
+    assert!(fx.chat("a").await.is_success());
+    assert!(fx.chat("a").await.is_success());
+
+    let text = std::fs::read_to_string(fx.dir.path().join("bodies.txt")).unwrap_or_default();
+    let bodies: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(bodies.len(), 2, "{text}");
+    for body in &bodies {
+        assert_eq!(body["cache_prompt"], true, "{body}");
+        assert_eq!(body["id_slot"], 0, "one --parallel slot: {body}");
+        assert_eq!(body["messages"][0]["content"], "hi", "{body}");
+    }
 }
 
 #[tokio::test]
