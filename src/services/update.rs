@@ -9,7 +9,25 @@ use crate::services::source_install;
 #[derive(Deserialize)]
 struct Release {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
     assets: Vec<Asset>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReleaseStream {
+    Normal,
+    Mistralrs,
+}
+
+impl ReleaseStream {
+    fn system() -> Self {
+        if cfg!(feature = "mistralrs") {
+            Self::Mistralrs
+        } else {
+            Self::Normal
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -118,17 +136,25 @@ impl RepoCommands for SystemCommands {
 struct Updater<C> {
     current: PathBuf,
     latest_release_url: String,
+    release_stream: ReleaseStream,
     commands: C,
     is_supervised: fn() -> bool,
 }
 
 impl Updater<SystemCommands> {
     fn system(current: PathBuf) -> Self {
+        let release_stream = ReleaseStream::system();
         Self {
             current,
-            latest_release_url: format!(
-                "https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-            ),
+            latest_release_url: match release_stream {
+                ReleaseStream::Normal => {
+                    format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
+                }
+                ReleaseStream::Mistralrs => {
+                    format!("https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=30")
+                }
+            },
+            release_stream,
             commands: SystemCommands,
             is_supervised: crate::services::restart::is_supervised,
         }
@@ -141,22 +167,29 @@ impl<C: RepoCommands> Updater<C> {
             return self.update_from_source(&repo).await;
         }
 
-        let release = self.fetch_latest().await?;
-        let latest = release.tag_name.trim_start_matches('v').to_string();
+        let Some(release) = self.fetch_latest().await? else {
+            println!("no mistral.rs release found yet; waiting");
+            return Ok(UpdateOutcome::AlreadyUpToDate);
+        };
+        let latest = release_version_tag(&release.tag_name, self.release_stream);
         if latest == release_version() {
             println!("already up to date (v{VERSION})");
             return Ok(UpdateOutcome::AlreadyUpToDate);
         }
-        let asset = release
+        let Some(asset) = release
             .assets
             .iter()
             .find(|a| a.name == expected_asset_name())
-            .ok_or_else(|| {
-                format!(
-                    "no release asset named {} in v{latest}",
-                    expected_asset_name()
-                )
-            })?;
+        else {
+            if self.release_stream == ReleaseStream::Mistralrs {
+                println!("no mistral.rs release asset found for this platform; waiting");
+                return Ok(UpdateOutcome::AlreadyUpToDate);
+            }
+            return Err(format!(
+                "no release asset named {} in v{latest}",
+                expected_asset_name()
+            ));
+        };
 
         println!("updating v{VERSION} -> v{latest} ...");
         let bytes = http_client()?
@@ -187,14 +220,27 @@ impl<C: RepoCommands> Updater<C> {
         }
 
         let release = match self.fetch_latest().await {
-            Ok(release) => release,
+            Ok(Some(release)) => release,
+            Ok(None) => {
+                tracing::debug!("no mistral.rs release found yet; waiting");
+                return;
+            }
             Err(e) => {
                 tracing::debug!("update check failed: {e}");
                 return;
             }
         };
-        let latest = release.tag_name.trim_start_matches('v');
+        let latest = release_version_tag(&release.tag_name, self.release_stream);
         if latest == release_version() {
+            return;
+        }
+        if self.release_stream == ReleaseStream::Mistralrs
+            && !release
+                .assets
+                .iter()
+                .any(|asset| asset.name == expected_asset_name())
+        {
+            tracing::debug!("no mistral.rs release asset found for this platform; waiting");
             return;
         }
         if !auto_update_enabled {
@@ -321,17 +367,30 @@ impl<C: RepoCommands> Updater<C> {
         Ok(!stdout.trim().is_empty())
     }
 
-    async fn fetch_latest(&self) -> Result<Release, String> {
-        http_client()?
+    async fn fetch_latest(&self) -> Result<Option<Release>, String> {
+        let response = http_client()?
             .get(&self.latest_release_url)
             .send()
             .await
             .map_err(|e| e.to_string())?
             .error_for_status()
-            .map_err(|e| e.to_string())?
-            .json::<Release>()
-            .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        match self.release_stream {
+            ReleaseStream::Normal => response
+                .json::<Release>()
+                .await
+                .map(Some)
+                .map_err(|e| e.to_string()),
+            ReleaseStream::Mistralrs => response
+                .json::<Vec<Release>>()
+                .await
+                .map(|releases| {
+                    releases
+                        .into_iter()
+                        .find(|release| !release.draft && release.tag_name.ends_with("-mistralrs"))
+                })
+                .map_err(|e| e.to_string()),
+        }
     }
 }
 
@@ -534,6 +593,18 @@ fn release_version() -> &'static str {
     VERSION.split_once('+').map_or(VERSION, |(base, _)| base)
 }
 
+fn release_version_tag(tag_name: &str, release_stream: ReleaseStream) -> String {
+    let version = tag_name.trim_start_matches('v');
+    if release_stream == ReleaseStream::Mistralrs {
+        version
+            .strip_suffix("-mistralrs")
+            .unwrap_or(version)
+            .to_string()
+    } else {
+        version.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -623,12 +694,14 @@ mod tests {
     fn updater(
         current: PathBuf,
         latest_release_url: String,
+        release_stream: ReleaseStream,
         commands: FakeCommands,
         is_supervised: fn() -> bool,
     ) -> Updater<FakeCommands> {
         Updater {
             current,
             latest_release_url,
+            release_stream,
             commands,
             is_supervised,
         }
@@ -661,6 +734,7 @@ mod tests {
         updater(
             installed_binary(dir, b"old binary"),
             format!("{}/releases/latest", server.uri()),
+            ReleaseStream::Normal,
             FakeCommands::clean(),
             is_supervised,
         )
@@ -674,7 +748,22 @@ mod tests {
         updater(
             installed_binary(repo, b"old binary"),
             String::new(),
+            ReleaseStream::Normal,
             commands,
+            is_supervised,
+        )
+    }
+
+    fn mistralrs_updater(
+        dir: &Path,
+        server: &MockServer,
+        is_supervised: fn() -> bool,
+    ) -> Updater<FakeCommands> {
+        updater(
+            installed_binary(dir, b"old binary"),
+            format!("{}/releases?per_page=30", server.uri()),
+            ReleaseStream::Mistralrs,
+            FakeCommands::clean(),
             is_supervised,
         )
     }
@@ -690,6 +779,15 @@ mod tests {
                     "browser_download_url": format!("{}/download/asset", server.uri()),
                 }],
             })))
+            .mount(server)
+            .await;
+    }
+
+    async fn serve_mistralrs_releases(server: &MockServer, releases: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/releases"))
+            .and(header("user-agent", format!("llm-hub/{VERSION}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(releases))
             .mount(server)
             .await;
     }
@@ -771,6 +869,115 @@ mod tests {
                 expected_asset_name()
             ))
         );
+        assert_eq!(read(&updater.current), b"old binary");
+    }
+
+    #[tokio::test]
+    async fn a_mistralrs_stream_picks_the_newest_eligible_tag_and_asset() {
+        let server = MockServer::start().await;
+        serve_mistralrs_releases(
+            &server,
+            json!([
+                {
+                    "tag_name": "v998.0.0-mistralrs",
+                    "draft": false,
+                    "assets": [{
+                        "name": expected_asset_name(),
+                        "browser_download_url": format!("{}/download/asset", server.uri()),
+                    }],
+                },
+                {
+                    "tag_name": "v999.0.0-mistralrs",
+                    "draft": true,
+                    "assets": [],
+                },
+                {
+                    "tag_name": "v999.0.0",
+                    "draft": false,
+                    "assets": [],
+                },
+            ]),
+        )
+        .await;
+        serve_asset(
+            &server,
+            ResponseTemplate::new(200).set_body_bytes(b"mistralrs binary".to_vec()),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let updater = mistralrs_updater(dir.path(), &server, unsupervised);
+
+        let outcome = updater.self_update().await;
+
+        assert_eq!(outcome, Ok(UpdateOutcome::Applied));
+        assert_eq!(read(&updater.current), b"mistralrs binary");
+    }
+
+    #[tokio::test]
+    async fn a_mistralrs_stream_current_tag_is_already_up_to_date_after_suffix_removal() {
+        let server = MockServer::start().await;
+        serve_mistralrs_releases(
+            &server,
+            json!([{
+                "tag_name": format!("v{}-mistralrs", release_version()),
+                "draft": false,
+                "assets": [{
+                    "name": expected_asset_name(),
+                    "browser_download_url": format!("{}/download/asset", server.uri()),
+                }],
+            }]),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let updater = mistralrs_updater(dir.path(), &server, unsupervised);
+
+        let outcome = updater.self_update().await;
+
+        assert_eq!(outcome, Ok(UpdateOutcome::AlreadyUpToDate));
+        assert_eq!(read(&updater.current), b"old binary");
+    }
+
+    #[tokio::test]
+    async fn a_mistralrs_stream_with_no_eligible_release_waits() {
+        let server = MockServer::start().await;
+        serve_mistralrs_releases(
+            &server,
+            json!([
+                { "tag_name": "v999.0.0", "draft": false, "assets": [] },
+                { "tag_name": "v998.0.0-mistralrs", "draft": true, "assets": [] },
+            ]),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let updater = mistralrs_updater(dir.path(), &server, unsupervised);
+
+        let outcome = updater.self_update().await;
+
+        assert_eq!(outcome, Ok(UpdateOutcome::AlreadyUpToDate));
+        assert_eq!(read(&updater.current), b"old binary");
+    }
+
+    #[tokio::test]
+    async fn a_mistralrs_release_without_this_platform_asset_waits() {
+        let server = MockServer::start().await;
+        serve_mistralrs_releases(
+            &server,
+            json!([{
+                "tag_name": "v999.0.0-mistralrs",
+                "draft": false,
+                "assets": [{
+                    "name": "llm-hub-other-platform",
+                    "browser_download_url": format!("{}/download/asset", server.uri()),
+                }],
+            }]),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let updater = mistralrs_updater(dir.path(), &server, unsupervised);
+
+        let outcome = updater.self_update().await;
+
+        assert_eq!(outcome, Ok(UpdateOutcome::AlreadyUpToDate));
         assert_eq!(read(&updater.current), b"old binary");
     }
 
@@ -1069,7 +1276,13 @@ mod tests {
         std::fs::create_dir_all(&release).unwrap();
         let current = release.join(binary_name());
         std::fs::write(&current, b"old binary").unwrap();
-        let updater = updater(current, String::new(), FakeCommands::clean(), unsupervised);
+        let updater = updater(
+            current,
+            String::new(),
+            ReleaseStream::Normal,
+            FakeCommands::clean(),
+            unsupervised,
+        );
 
         let outcome = updater.self_update().await;
 
@@ -1177,14 +1390,35 @@ mod tests {
     }
 
     #[test]
-    fn the_system_updater_reads_the_latest_github_release() {
+    fn the_system_updater_reads_the_selected_github_release_stream() {
         let updater = Updater::system(PathBuf::from("/opt/llm-hub/llm-hub"));
 
-        assert_eq!(
-            updater.latest_release_url,
-            format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
-        );
+        if cfg!(feature = "mistralrs") {
+            assert_eq!(updater.release_stream, ReleaseStream::Mistralrs);
+            assert_eq!(
+                updater.latest_release_url,
+                format!("https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=30")
+            );
+        } else {
+            assert_eq!(updater.release_stream, ReleaseStream::Normal);
+            assert_eq!(
+                updater.latest_release_url,
+                format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
+            );
+        }
         assert_eq!(updater.current, PathBuf::from("/opt/llm-hub/llm-hub"));
+    }
+
+    #[test]
+    fn a_mistralrs_tag_drops_its_stream_suffix_for_version_comparison() {
+        assert_eq!(
+            release_version_tag("v1.2.3-mistralrs", ReleaseStream::Mistralrs),
+            "1.2.3"
+        );
+        assert_eq!(
+            release_version_tag("v1.2.3", ReleaseStream::Normal),
+            "1.2.3"
+        );
     }
 
     #[test]
