@@ -85,6 +85,7 @@ export function App() {
   const [errorsToday, setErrorsToday] = useState<number | null>(null);
   const [notificationsPending, setNotificationsPending] = useState<number | null>(null);
   const [meta, setMeta] = useState<HubMeta | null>(null);
+  const [buildSha, setBuildSha] = useState("");
   const [modelEntries, setModelEntries] = useState<readonly HubModel[]>([]);
   const models = modelEntries.map((model) => model.id);
   const enabledProfiles = (meta?.profiles ?? []).filter((profile) => profile.enabled);
@@ -115,6 +116,9 @@ export function App() {
 
   const loadAll = useCallback(() => {
     api<HubMeta>("/api/profiles").then(setMeta).catch(handleError);
+    api<{ git_sha: string }>("/api/build")
+      .then((build) => setBuildSha(build.git_sha.slice(0, 7)))
+      .catch(() => setBuildSha(""));
     api<ModelsResponse>("/v1/models")
       .then((body) => setModelEntries(body.data))
       .catch(handleError);
@@ -221,6 +225,11 @@ export function App() {
             <span className="brand-mark" aria-hidden="true" />
             llm-hub
             <span className="version">{meta ? `v${meta.version}` : ""}</span>
+            {buildSha && buildSha !== "unknow" ? (
+              <span className="version" title="Running build">
+                {buildSha}
+              </span>
+            ) : null}
           </div>
           <nav className="topnav" aria-label="Main">
             {NAV_TABS.map((navTab) => {

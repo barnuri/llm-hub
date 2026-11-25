@@ -28,6 +28,29 @@ fn main() {
         stamped
     };
     println!("cargo:rustc-env=LLM_HUB_VERSION={version}");
+    println!("cargo:rerun-if-env-changed=GIT_SHA");
+    println!("cargo:rustc-env=LLM_HUB_GIT_SHA={}", git_sha());
+    let built_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    println!("cargo:rustc-env=LLM_HUB_BUILT_AT_MS={built_ms}");
+}
+
+/// The env var `GIT_SHA`, else `git rev-parse HEAD`, else `unknown`.
+fn git_sha() -> String {
+    let from_env = std::env::var("GIT_SHA").unwrap_or_default();
+    if !from_env.trim().is_empty() {
+        return from_env.trim().to_string();
+    }
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn is_unstamped(version: &str) -> bool {

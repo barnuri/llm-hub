@@ -639,6 +639,7 @@ fn build_router_with(state: AppState, ext_routes: Option<Router>) -> Router {
 
     let (health, _) = OpenApiRouter::<AppState>::new()
         .routes(routes!(routes::admin::healthz))
+        .routes(routes!(routes::admin::build_info))
         .split_for_parts();
     let phases_state = state.clone();
     Router::new()
