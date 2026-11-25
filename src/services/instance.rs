@@ -215,6 +215,7 @@ mod tests {
         assert!(!pid_alive(0));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_successor_that_exits_before_listening_is_an_error() {
         let result = spawn_successor("127.0.0.1:3", Path::new("/usr/bin/true"), Vec::new()).await;
