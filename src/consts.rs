@@ -150,6 +150,10 @@ pub const SERVICE_BIND: &str = "0.0.0.0";
 pub const SERVICE_NAME: &str = "llm-hub";
 pub const GITHUB_REPO: &str = "barnuri/llm-hub";
 pub const VERSION: &str = env!("LLM_HUB_VERSION");
+/// Commit this binary was built from: `GIT_SHA` at build time, else `git rev-parse HEAD`, else `unknown`.
+pub const GIT_SHA: &str = env!("LLM_HUB_GIT_SHA");
+/// Unix milliseconds when `build.rs` last ran.
+pub const BUILT_AT_MS: &str = env!("LLM_HUB_BUILT_AT_MS");
 
 /// Claude Code's `[1m]` suffix / native long-context window size.
 pub const CONTEXT_TOKENS_1M: u64 = 1_000_000;

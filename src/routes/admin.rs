@@ -53,6 +53,26 @@ pub async fn healthz() -> &'static str {
     "ok"
 }
 
+/// Which build is running. Needs no key, like `/healthz`.
+#[utoipa::path(get, path = "/api/build", tag = "system", summary = "Running build", security(()),
+    responses((status = 200, description = "`git_sha`, `built_at` and `version` of the running binary", body = Object)))]
+pub async fn build_info() -> Json<Value> {
+    Json(build_info_value(
+        crate::consts::GIT_SHA,
+        crate::consts::BUILT_AT_MS,
+        VERSION,
+    ))
+}
+
+fn build_info_value(git_sha: &str, built_at_ms: &str, version: &str) -> Value {
+    let built_at = built_at_ms
+        .parse::<u64>()
+        .ok()
+        .filter(|ms| *ms > 0)
+        .map(crate::utils::time::utc_iso8601);
+    json!({"git_sha": git_sha, "built_at": built_at, "version": version})
+}
+
 #[utoipa::path(get, path = "/api/profiles", tag = "profiles", summary = "List profiles", responses((status = 200, description = "Profiles with managed and running flags, API keys masked", body = Object), (status = 401, description = "Missing or invalid hub key.", body = ErrorBody)))]
 pub async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
     let config = state.config();
@@ -2732,5 +2752,28 @@ mod tests {
 
         assert_eq!(body["models"], json!([]));
         assert!(state.model_cache().is_some());
+    }
+
+    #[test]
+    fn build_info_reports_sha_time_and_version() {
+        let value = build_info_value("abc123", "1700000000000", "1.2.3");
+
+        assert_eq!(value["git_sha"], "abc123");
+        assert_eq!(value["built_at"], "2023-11-14T22:13:20.000Z");
+        assert_eq!(value["version"], "1.2.3");
+    }
+
+    #[test]
+    fn build_info_has_null_time_when_unset_or_invalid() {
+        assert!(build_info_value("unknown", "0", "1")["built_at"].is_null());
+        assert!(build_info_value("unknown", "x", "1")["built_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn build_endpoint_returns_compiled_in_values() {
+        let Json(value) = build_info().await;
+
+        assert_eq!(value["git_sha"], crate::consts::GIT_SHA);
+        assert_eq!(value["version"], VERSION);
     }
 }

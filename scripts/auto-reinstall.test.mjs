@@ -71,3 +71,15 @@ test("failed install does not report healthy", (t) => {
   assert.match(f.log(), /service install failed/);
   assert.doesNotMatch(f.log(), /healthz 200/);
 });
+
+test("refuses when the service runs from a releases dir", (t) => {
+  const f = fixture(t, { newer: true });
+  const r = spawnSync("bash", [join(f.root, "scripts/auto-reinstall.sh")], {
+    env: { ...process.env, BASH_ENV: join(f.root, "commands.sh"), TEST_ROOT: f.root, AUTO_REINSTALL_SERVICE_EXE: "/x/releases/current/llm-hub" },
+    encoding: "utf8",
+    timeout: 10000,
+  });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /deploy-stable\.sh/);
+  assert.throws(f.calls, { code: "ENOENT" });
+});

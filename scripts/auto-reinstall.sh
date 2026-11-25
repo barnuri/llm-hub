@@ -1,5 +1,8 @@
 #!/bin/bash
-# Rebuilds llm-hub and reloads the LaunchAgent when sources are newer than the release binary.
+# DEVELOPMENT ONLY: rebuilds llm-hub from this working tree and reloads the LaunchAgent when
+# sources are newer than the release binary. The working tree can hold unmerged work, so the
+# always-on service uses scripts/deploy-stable.sh instead. This script refuses when the
+# service runs from a releases dir.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -12,6 +15,19 @@ newer_than_binary() {
   [ ! -e "$BINARY" ] && return 0
   [ -n "$(find "$@" -newer "$BINARY" -type f -print -quit 2>/dev/null)" ]
 }
+
+service_exe() {
+  case "$(uname)" in
+    Darwin) /usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$HOME/Library/LaunchAgents/"*llm-hub*.plist 2>/dev/null ;;
+    *) sed -n 's/^ExecStart="\{0,1\}\([^" ]*\).*/\1/p' "$HOME/.config/systemd/user/"*llm-hub*.service 2>/dev/null | head -n 1 ;;
+  esac
+}
+exe="${AUTO_REINSTALL_SERVICE_EXE:-$(service_exe | head -n 1)}"
+case "$exe" in
+  */releases/current/*|*/releases/*/llm-hub)
+    echo "auto-reinstall: the service runs from a releases dir ($exe); use scripts/deploy-stable.sh" >&2
+    exit 1 ;;
+esac
 
 mkdir -p "$REPO/logs" "$REPO/target"
 if ! mkdir "$LOCK" 2>/dev/null; then
