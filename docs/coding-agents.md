@@ -81,7 +81,11 @@ hub knows:
 
 - `name`: the hub's picker label, the same one Claude Code's `/model` shows (for example
   `claude-opus-5-5 · copilot · $4/$20` or `Smart Auto (Balance) (recommended)`).
-- `limit`: context and output limits.
+- `limit`: context and output limits. Set `LLM_HUB_OPENCODE_CONTEXT_CAPS` or repeat
+  `--context-cap <model id>=<tokens>` (also `--context-cap=<model id>=<tokens>`) to cap a model's
+  catalog context window. Repeatable flags win for the same model. The output limit becomes
+  `floor(capped context / 4)` only when it exceeds the capped context; the shared OpenCode service
+  uses its own provider config, so it does not receive launcher-generated limits.
 - `cost`: input, output and cache rates in USD per 1M tokens, so opencode reports the session cost.
 - `attachment: true`: when the model takes images.
 

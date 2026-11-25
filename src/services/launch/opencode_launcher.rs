@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde_json::{Map, Value, json};
 
 use super::hub_endpoint::HubEndpoint;
+use crate::configs::OpencodeContextCaps;
 use crate::schemas::launch::hub_model::HubModel;
 use crate::schemas::launch::launch_args::LaunchArgs;
 use crate::schemas::launch::launch_spec::LaunchSpec;
@@ -30,7 +31,8 @@ impl OpencodeLauncher {
     const PLUGIN_FILE: &str = "llm-hub-session.ts";
 
     /// The opencode command, with every catalog model in the `llm-hub` provider, labelled and
-    /// priced as the hub lists it. Profile and Smart Auto flags become provider headers.
+    /// priced as the hub lists it, its limits lowered by `caps`. Profile and Smart Auto flags
+    /// become provider headers.
     #[must_use]
     pub fn spec(
         endpoint: &HubEndpoint,
@@ -38,9 +40,10 @@ impl OpencodeLauncher {
         catalog: &[HubModel],
         profiles: &ProfileFilter,
         smart_auto: &SmartAutoFlags,
+        caps: &OpencodeContextCaps,
     ) -> LaunchSpec {
         let headers = Self::headers(profiles, smart_auto);
-        let config = Self::config(endpoint, args.model(), catalog, headers);
+        let config = Self::config(endpoint, args.model(), catalog, headers, caps);
         let passthrough = args.into_passthrough();
         let mut spec = LaunchSpec::new(Self::PROGRAM)
             .env(HubEndpoint::api_key_var(), endpoint.api_key())
@@ -131,10 +134,11 @@ impl OpencodeLauncher {
         model: Option<&str>,
         catalog: &[HubModel],
         headers: Map<String, Value>,
+        caps: &OpencodeContextCaps,
     ) -> Value {
         let models: Map<String, Value> = catalog
             .iter()
-            .map(|entry| (entry.id().to_string(), Self::model_entry(entry)))
+            .map(|entry| (entry.id().to_string(), Self::model_entry(entry, caps)))
             .collect();
         let mut options = json!({
             "baseURL": endpoint.v1_url(),
@@ -162,12 +166,13 @@ impl OpencodeLauncher {
         config
     }
 
-    fn model_entry(model: &HubModel) -> Value {
+    fn model_entry(model: &HubModel, caps: &OpencodeContextCaps) -> Value {
         let mut entry = json!({});
         if let Some(label) = model.picker_label() {
             entry["name"] = json!(label);
         }
         if let (Some(context), Some(output)) = (model.context_window(), model.max_output_tokens()) {
+            let (context, output) = caps.limits(model.id(), context, output);
             entry["limit"] = json!({ "context": context, "output": output });
         }
         // opencode counts a model with a zero input rate as free and sorts it first, or into a
@@ -199,6 +204,7 @@ mod tests {
             catalog,
             &ProfileFilter::default(),
             &SmartAutoFlags::default(),
+            &OpencodeContextCaps::default(),
         )
     }
 
@@ -268,6 +274,46 @@ mod tests {
             })
         );
         assert_eq!(spec.argv(), ["--standalone", "hi"]);
+    }
+
+    #[test]
+    fn a_context_cap_lowers_only_the_named_model_limit() {
+        let catalog = [
+            HubModel::new("copilot/claude-opus-5-5[1m]", Some(1_000_000))
+                .with_max_output_tokens(128_000),
+            HubModel::new("copilot/wide-output", Some(1_000_000)).with_max_output_tokens(128_000),
+            HubModel::new("copilot/other", Some(1_000_000)),
+            HubModel::new("local/small", Some(65_536)),
+        ];
+        let mut args: Vec<String> = [
+            "--context-cap=copilot/claude-opus-5-5[1m]=200000,local/small=1000000",
+            "--context-cap",
+            "copilot/wide-output=100000",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let caps = OpencodeContextCaps::take_flags(&mut args).unwrap();
+
+        let spec = OpencodeLauncher::spec(
+            &HubEndpoint::from_lookup(|_| None),
+            LaunchArgs::from_strs(&[]),
+            &catalog,
+            &ProfileFilter::default(),
+            &SmartAutoFlags::default(),
+            &caps,
+        );
+        let models = config_of(&spec)["provider"]["llm-hub"]["models"].clone();
+
+        assert_eq!(
+            models,
+            json!({
+                "copilot/claude-opus-5-5[1m]": {"limit": {"context": 200_000, "output": 128_000}},
+                "copilot/wide-output": {"limit": {"context": 100_000, "output": 25_000}},
+                "copilot/other": {"limit": {"context": 1_000_000, "output": 32_768}},
+                "local/small": {"limit": {"context": 65_536, "output": 16_384}},
+            })
+        );
     }
 
     #[test]
@@ -347,6 +393,7 @@ mod tests {
                 "--smart-auto-role",
                 "planning",
             ]),
+            &OpencodeContextCaps::default(),
         );
 
         assert_eq!(
@@ -372,6 +419,7 @@ mod tests {
                 "--smart-auto-include",
                 "openai/*",
             ]),
+            &OpencodeContextCaps::default(),
         );
 
         assert_eq!(
