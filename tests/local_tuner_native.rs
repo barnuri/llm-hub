@@ -162,7 +162,15 @@ async fn approved_stream_stall_restarts_only_its_model() {
             .unwrap();
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        assert!(status.is_success(), "{model} starts: {status} {body}");
+        let log = std::fs::read_to_string(
+            dir.path()
+                .join(format!("logs/local/{model}.log").replace("local/", "")),
+        )
+        .unwrap_or_else(|error| format!("no log: {error}"));
+        assert!(
+            status.is_success(),
+            "{model} starts: {status} {body}\nmodel log:\n{log}"
+        );
     }
     let b_before = spawns_of(&spawns, "b.gguf");
     let a_before = spawns_of(&spawns, "a.gguf");
