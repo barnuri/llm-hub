@@ -8,6 +8,7 @@ use crate::schemas::launch::launch_args::LaunchArgs;
 use crate::schemas::launch::launch_spec::LaunchSpec;
 use crate::schemas::launch::profile_filter::ProfileFilter;
 use crate::schemas::launch::smart_auto_flags::SmartAutoFlags;
+use crate::schemas::smart_auto_headers::SmartAutoHeaders;
 
 /// `llm-hub opencode`: opencode on the hub's `/v1/chat/completions`, with the
 /// provider in `OPENCODE_CONFIG_CONTENT`, merged over the user's config. Only the
@@ -16,7 +17,9 @@ use crate::schemas::launch::smart_auto_flags::SmartAutoFlags;
 pub struct OpencodeLauncher;
 
 impl OpencodeLauncher {
-    const PROGRAM: &str = "opencode";
+    pub(super) const PROGRAM: &str = "opencode";
+    /// Names the opencode binary; tests point it at a fake.
+    pub(super) const BIN_VAR: &str = "LLM_HUB_OPENCODE_BIN";
     const PROVIDER_ID: &str = "llm-hub";
     const CONFIG_VAR: &str = "OPENCODE_CONFIG_CONTENT";
     /// opencode 2 serves every TUI from one background service, which never reads this
@@ -46,6 +49,34 @@ impl OpencodeLauncher {
             spec = spec.arg(Self::STANDALONE_FLAG);
         }
         spec.args(passthrough)
+    }
+
+    /// Plain `opencode -m <provider>/<model>` on the shared service, which already serves a provider
+    /// for this hub (`shared_provider`). `None` keeps the private-server path: no such provider, a
+    /// server the user named, or a flag only a provider header carries (profiles and every Smart
+    /// Auto flag but the tier, which the `hub/smart-auto-<tier>` model id carries).
+    #[must_use]
+    pub fn shared_spec(
+        shared_provider: Option<&str>,
+        args: &LaunchArgs,
+        profiles: &ProfileFilter,
+        smart_auto: &SmartAutoFlags,
+    ) -> Option<LaunchSpec> {
+        let provider = shared_provider?;
+        let model = args.model()?;
+        let tier_only = smart_auto
+            .headers()
+            .iter()
+            .all(|(name, _)| *name == SmartAutoHeaders::TIER);
+        if !profiles.is_empty() || !tier_only || Self::names_a_server(args.passthrough()) {
+            return None;
+        }
+        Some(
+            LaunchSpec::new(Self::PROGRAM)
+                .arg("-m")
+                .arg(format!("{provider}/{model}"))
+                .args(args.passthrough().iter().cloned()),
+        )
     }
 
     fn names_a_server(args: &[String]) -> bool {
@@ -378,5 +409,67 @@ mod tests {
         let spec = spec_for(&["--continue"], &[]);
 
         assert!(config_of(&spec).get("model").is_none());
+    }
+
+    fn shared(
+        provider: Option<&str>,
+        args: &[&str],
+        profiles: &ProfileFilter,
+        flags: &SmartAutoFlags,
+    ) -> Option<LaunchSpec> {
+        OpencodeLauncher::shared_spec(provider, &LaunchArgs::from_strs(args), profiles, flags)
+    }
+
+    #[test]
+    fn the_shared_service_runs_plain_opencode_with_a_qualified_model() {
+        let spec = shared(
+            Some("hub-provider"),
+            &["hub/smart-auto-intelligence", "--continue"],
+            &ProfileFilter::default(),
+            &smart_auto(&["--smart-auto-tier", "intelligence"]),
+        )
+        .unwrap();
+
+        assert_eq!(spec.program(), "opencode");
+        assert_eq!(
+            spec.argv(),
+            [
+                "-m",
+                "hub-provider/hub/smart-auto-intelligence",
+                "--continue"
+            ]
+        );
+        assert!(spec.env_names().is_empty());
+    }
+
+    #[test]
+    fn without_a_shared_provider_the_private_server_stays() {
+        let none = shared(
+            None,
+            &["m"],
+            &ProfileFilter::default(),
+            &SmartAutoFlags::default(),
+        );
+
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn flags_only_a_header_carries_keep_the_private_server() {
+        let off = SmartAutoFlags::default();
+        let profiles = ProfileFilter::from_list("copilot");
+        let role = smart_auto(&["--smart-auto-role", "planning"]);
+
+        assert!(shared(Some("p"), &["m"], &profiles, &off).is_none());
+        assert!(shared(Some("p"), &["m"], &ProfileFilter::default(), &role).is_none());
+    }
+
+    #[test]
+    fn a_named_server_or_no_model_keeps_the_private_server() {
+        let (profiles, off) = (ProfileFilter::default(), SmartAutoFlags::default());
+
+        assert!(shared(Some("p"), &["m", "--standalone"], &profiles, &off).is_none());
+        assert!(shared(Some("p"), &["m", "--server", "http://h:1"], &profiles, &off).is_none());
+        assert!(shared(Some("p"), &["--continue"], &profiles, &off).is_none());
     }
 }

@@ -5,6 +5,7 @@ pub mod harness;
 pub mod hub_client;
 pub mod hub_endpoint;
 pub mod opencode_launcher;
+pub mod opencode_shared;
 pub mod pi_launcher;
 
 use std::collections::BTreeMap;
@@ -16,6 +17,7 @@ use self::harness::Harness;
 use self::hub_client::HubClient;
 use self::hub_endpoint::HubEndpoint;
 use self::opencode_launcher::OpencodeLauncher;
+use self::opencode_shared::OpencodeShared;
 use self::pi_launcher::PiLauncher;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::hub_model::HubModel;
@@ -150,6 +152,17 @@ async fn build_spec(
             let args = header_transport_model(args, smart_auto, None)?;
             if let Err(error) = OpencodeLauncher::write_plugin(&lookup) {
                 eprintln!("warning: could not install OpenCode session plugin: {error}");
+            }
+            let program = lookup(OpencodeLauncher::BIN_VAR).filter(|bin| !bin.is_empty());
+            let program = program.as_deref().unwrap_or(OpencodeLauncher::PROGRAM);
+            let shared = OpencodeShared::provider_for(program, &endpoint.v1_url());
+            if let Some(spec) = OpencodeLauncher::shared_spec(
+                shared.as_deref(),
+                &args,
+                client.profiles(),
+                smart_auto,
+            ) {
+                return Ok(spec);
             }
             OpencodeLauncher::spec(
                 endpoint,
@@ -694,6 +707,35 @@ mod tests {
         assert_eq!(spec.program(), "opencode");
         assert!(config.contains("copilot/m"));
         assert!(config.contains("hub/smart-auto-balance"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_uses_the_shared_service_when_it_serves_this_hub() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = hub().await;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("opencode");
+        let body = format!(
+            r#"{{"data":[{{"id":"shared-hub","activation":"enabled","settings":{{"baseURL":"{}/v1"}}}}]}}"#,
+            server.uri()
+        );
+        std::fs::write(&bin, format!("#!/bin/sh\ncat <<'EOF'\n{body}\nEOF\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = bin.to_string_lossy().to_string();
+
+        let spec = build_spec(
+            Harness::Opencode,
+            &client_for(&server),
+            LaunchArgs::from_strs(&[]),
+            &SmartAutoFlags::default(),
+            lookup_of(&[("LLM_HUB_OPENCODE_BIN", &bin)]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(spec.argv(), ["-m", "shared-hub/hub/smart-auto-balance"]);
+        assert!(spec.env_value("OPENCODE_CONFIG_CONTENT").is_none());
     }
 
     #[tokio::test]
