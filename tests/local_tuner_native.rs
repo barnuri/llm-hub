@@ -196,6 +196,19 @@ async fn approved_stream_stall_restarts_only_its_model() {
         .collect();
     assert_eq!(backups.len(), 1, "one registry backup: {backups:?}");
 
+    // The restart stops the old process; the next request starts the new one.
+    let restarted = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "local/a", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        restarted.status().is_success(),
+        "local/a restarts on demand"
+    );
     let a_after = spawns_of(&spawns, "a.gguf");
     assert_eq!(a_after.len(), 2, "a restarted once: {a_after:?}");
     assert!(
