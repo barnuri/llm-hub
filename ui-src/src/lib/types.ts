@@ -182,6 +182,8 @@ export interface UsageRow {
   readonly tokens_out: number;
   readonly cache_read_tokens: number;
   readonly cache_write_tokens: number;
+  readonly cache_write_source: "reported" | "uncached_input" | "none";
+  readonly uncached_input_tokens: number;
   readonly cost_usd: number;
   readonly error?: string | null;
   /** Caller signature: User-Agent plus harness markers. */
