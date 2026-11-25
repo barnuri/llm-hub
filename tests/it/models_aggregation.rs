@@ -14,7 +14,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::hub;
 
-use hub::{free_port, start_hub};
+use hub::{free_port, start_hub, start_process_hub};
 
 fn models_response(ids: &[&str]) -> ResponseTemplate {
     let data: Vec<serde_json::Value> = ids
@@ -50,7 +50,7 @@ async fn aggregates_partially_when_one_upstream_is_down() {
         .await;
 
     let dead_port = free_port();
-    let (hub, base) = start_hub(HashMap::from([
+    let (hub, base) = start_process_hub(HashMap::from([
         ("LLM_HUB_PROFILES".into(), "a,b,dead,disabled".into()),
         ("LLM_HUB_A_BASE_URL".into(), alive_a.uri()),
         ("LLM_HUB_B_BASE_URL".into(), alive_b.uri()),
