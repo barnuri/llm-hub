@@ -376,15 +376,11 @@ impl HubConfig {
         let managed = ManagedCommand::from_env(&upper, &base_url, home, &get)?;
         let (pricing, model_prices) =
             crate::configs::token_rates::profile_rates_from_env(name, &get)?;
-        let quota_cooldown = match get("QUOTA_COOLDOWN_SECS") {
-            Some(v) if !v.is_empty() => {
-                let secs: u64 = v.parse().map_err(|_| {
-                    format!("LLM_HUB_{upper}_QUOTA_COOLDOWN_SECS is not a number: {v}")
-                })?;
-                (secs > 0).then(|| Duration::from_secs(secs))
-            }
-            _ => global_quota_cooldown,
-        };
+        let quota_cooldown = parse_quota_cooldown(
+            get("QUOTA_COOLDOWN_SECS"),
+            &format!("LLM_HUB_{upper}_QUOTA_COOLDOWN_SECS"),
+            global_quota_cooldown,
+        )?;
         let api_key = get("API_KEY").unwrap_or_default();
         let copilot = CopilotAuth::from_env(&upper, &get)?;
         if copilot.is_some() && !api_key.is_empty() {
@@ -422,6 +418,20 @@ impl HubConfig {
             quota_cooldown,
         })
     }
+}
+
+fn parse_quota_cooldown(
+    raw: Option<String>,
+    key: &str,
+    fallback: Option<Duration>,
+) -> Result<Option<Duration>, String> {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(fallback);
+    };
+    let secs: u64 = raw
+        .parse()
+        .map_err(|_| format!("{key} is not a number: {raw}"))?;
+    Ok((secs > 0).then(|| Duration::from_secs(secs)))
 }
 
 /// A monthly budget in USD from `LLM_HUB_<key>`: a finite number above 0. Unset or empty sets none.
@@ -1060,7 +1070,7 @@ mod tests {
         let cfg = HubConfig::from_map(&vars).unwrap();
         assert_eq!(
             cfg.profile("groq").unwrap().quota_cooldown,
-            Some(Duration::from_secs(7200))
+            Some(Duration::from_hours(2))
         );
 
         vars.insert("LLM_HUB_GROQ_QUOTA_COOLDOWN_SECS".into(), "0".into());
@@ -1068,7 +1078,7 @@ mod tests {
         assert_eq!(cfg.profile("groq").unwrap().quota_cooldown, None);
         assert_eq!(
             cfg.profile("openai").unwrap().quota_cooldown,
-            Some(Duration::from_secs(7200))
+            Some(Duration::from_hours(2))
         );
     }
 
@@ -1079,7 +1089,7 @@ mod tests {
         let cfg = HubConfig::from_map(&vars).unwrap();
         assert_eq!(
             cfg.profile("groq").unwrap().quota_cooldown,
-            Some(Duration::from_secs(120))
+            Some(Duration::from_mins(2))
         );
 
         vars.insert("LLM_HUB_GROQ_QUOTA_COOLDOWN_SECS".into(), "soon".into());
