@@ -175,13 +175,13 @@ async fn a_buffered_request_is_not_cut_short() {
     let beta = listing_upstream("m2").await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ok_completion().set_delay(Duration::from_millis(1_200)))
+        .respond_with(ok_completion().set_delay(Duration::from_millis(600)))
         .mount(&alpha)
         .await;
     let (hub, base) = start_alpha_beta_hub_with(
         &alpha,
         &beta,
-        HashMap::from([("LLM_HUB_ALPHA_FIRST_BYTE_TIMEOUT_MS".into(), "300".into())]),
+        HashMap::from([("LLM_HUB_ALPHA_FIRST_BYTE_TIMEOUT_MS".into(), "150".into())]),
     )
     .await;
 

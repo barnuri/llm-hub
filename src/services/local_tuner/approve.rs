@@ -401,7 +401,7 @@ mod tests {
     async fn a_dropped_approve_still_finishes_the_apply() {
         let (dir, path) = registry_file(ROW);
         let marker = dir.path().join("done");
-        let command = format!("sh -c 'sleep 1; touch {}'", marker.display());
+        let command = format!("sh -c 'sleep 0.3; touch {}'", marker.display());
         let state = state(&[
             ("LLM_HUB_LOCAL_TUNER_REGISTRY", path.as_str()),
             ("LLM_HUB_LOCAL_TUNER_APPLY_COMMAND", command.as_str()),

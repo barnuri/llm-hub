@@ -319,13 +319,13 @@ mod tests {
                 pid_file.display()
             );
 
-            let result = run(&shell(&script), None, Duration::from_secs(1)).await;
+            let result = run(&shell(&script), None, Duration::from_millis(300)).await;
 
             assert!(!result.ok);
             assert!(
                 result
                     .tail
-                    .ends_with("sh did not finish within 1000 ms and was killed"),
+                    .ends_with("sh did not finish within 300 ms and was killed"),
                 "{}",
                 result.tail
             );

@@ -208,8 +208,9 @@ mod tests {
     }
 
     fn state() -> AppState {
+        let vars = HashMap::from([("LLM_HUB_ENV_WATCH_INTERVAL_MS".to_owned(), "20".to_owned())]);
         AppState::with_seams(
-            HubConfig::from_map(&HashMap::new()).unwrap(),
+            HubConfig::from_map(&vars).unwrap(),
             None,
             Arc::new(MemoryCredentialStore::default()),
             Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)),
