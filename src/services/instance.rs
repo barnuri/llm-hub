@@ -56,7 +56,11 @@ pub fn write_pid(bind: &str) -> std::io::Result<()> {
 
 /// The PID in the PID file of `bind`, if the file holds one.
 pub fn read_pid(bind: &str) -> Option<u32> {
-    std::fs::read_to_string(pid_file(bind)).ok()?.trim().parse().ok()
+    std::fs::read_to_string(pid_file(bind))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Whether process `pid` exists. A process owned by another user still counts as existing.
@@ -110,7 +114,11 @@ pub async fn bind_reuseport(bind: &str) -> std::io::Result<TcpListener> {
     let Ok(addr) = bind.parse::<SocketAddr>() else {
         return TcpListener::bind(bind).await;
     };
-    let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
     socket.set_reuseaddr(true)?;
     #[cfg(unix)]
     socket.set_reuseport(true)?;
@@ -142,7 +150,10 @@ pub async fn spawn_successor(bind: &str, exe: &Path, args: Vec<String>) -> Resul
         }
         if tokio::time::Instant::now() >= deadline {
             terminate(child_pid);
-            return Err(format!("the successor did not listen within {}s", READY_TIMEOUT.as_secs()));
+            return Err(format!(
+                "the successor did not listen within {}s",
+                READY_TIMEOUT.as_secs()
+            ));
         }
         tokio::time::sleep(POLL).await;
     }
@@ -208,14 +219,22 @@ mod tests {
     async fn a_successor_that_exits_before_listening_is_an_error() {
         let result = spawn_successor("127.0.0.1:3", Path::new("/usr/bin/true"), Vec::new()).await;
 
-        assert_eq!(result, Err("the successor exited before it listened".to_owned()));
+        assert_eq!(
+            result,
+            Err("the successor exited before it listened".to_owned())
+        );
     }
 
     #[tokio::test]
     async fn a_successor_that_cannot_start_is_an_error() {
-        let result = spawn_successor("127.0.0.1:4", Path::new("/no/such/llm-hub"), Vec::new()).await;
+        let result =
+            spawn_successor("127.0.0.1:4", Path::new("/no/such/llm-hub"), Vec::new()).await;
 
-        assert!(result.unwrap_err().starts_with("cannot start the successor:"));
+        assert!(
+            result
+                .unwrap_err()
+                .starts_with("cannot start the successor:")
+        );
     }
 
     #[tokio::test]
@@ -232,6 +251,9 @@ mod tests {
         let first = bind_reuseport("127.0.0.1:0").await.expect("first bind");
         let port = first.local_addr().expect("address").port();
         let second = bind_reuseport(&format!("127.0.0.1:{port}")).await;
-        assert!(second.is_ok(), "the second listener must bind the same port: {second:?}");
+        assert!(
+            second.is_ok(),
+            "the second listener must bind the same port: {second:?}"
+        );
     }
 }

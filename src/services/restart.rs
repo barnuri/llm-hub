@@ -262,10 +262,15 @@ mod tests {
         let requested: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let notify = Arc::new(Notify::new());
 
-        flag_restart(requested, Arc::clone(&notify), async { Err("no successor".to_owned()) });
+        flag_restart(requested, Arc::clone(&notify), async {
+            Err("no successor".to_owned())
+        });
         let notified = tokio::time::timeout(Duration::from_millis(800), notify.notified()).await;
 
-        assert!(notified.is_err(), "a failed handover must not stop this process");
+        assert!(
+            notified.is_err(),
+            "a failed handover must not stop this process"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!requested.load(Ordering::SeqCst));
     }
@@ -284,7 +289,9 @@ mod tests {
 
     /// Serves `app` on a loopback port and returns its base URL.
     async fn serve_app(app: axum::Router) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let url = format!("http://{}", listener.local_addr().expect("address"));
         tokio::spawn(async move { axum::serve(listener, app).await });
         url
@@ -318,9 +325,18 @@ mod tests {
         let before = active_inference();
 
         let client = reqwest::Client::new();
-        let mut response = client.post(format!("{base}/v1/chat")).send().await.expect("send");
-        tx.send(bytes::Bytes::from_static(b"first")).await.expect("chunk");
-        assert_eq!(response.chunk().await.expect("chunk").as_deref(), Some(&b"first"[..]));
+        let mut response = client
+            .post(format!("{base}/v1/chat"))
+            .send()
+            .await
+            .expect("send");
+        tx.send(bytes::Bytes::from_static(b"first"))
+            .await
+            .expect("chunk");
+        assert_eq!(
+            response.chunk().await.expect("chunk").as_deref(),
+            Some(&b"first"[..])
+        );
         assert_eq!(active_inference(), before + 1, "the open stream must count");
 
         drop(tx);
@@ -330,7 +346,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             waited += 1;
         }
-        assert_eq!(active_inference(), before, "the count must drop when the body ends");
+        assert_eq!(
+            active_inference(),
+            before,
+            "the count must drop when the body ends"
+        );
     }
 
     #[tokio::test]
@@ -345,7 +365,11 @@ mod tests {
         let before = active_inference();
 
         let client = reqwest::Client::new();
-        let response = client.post(format!("{base}/api/stats")).send().await.expect("send");
+        let response = client
+            .post(format!("{base}/api/stats"))
+            .send()
+            .await
+            .expect("send");
         assert_eq!(response.text().await.expect("body"), "ok");
         assert_eq!(active_inference(), before);
     }

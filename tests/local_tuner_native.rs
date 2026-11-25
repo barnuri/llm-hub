@@ -107,7 +107,10 @@ async fn approved_stream_stall_restarts_only_its_model() {
     let vars: Vec<(String, String)> = [
         ("LLM_HUB_PROFILES", "local".to_owned()),
         ("LLM_HUB_LOCAL_KIND", "local".to_owned()),
-        ("LLM_HUB_LOCAL_TUNER_REGISTRY", registry.display().to_string()),
+        (
+            "LLM_HUB_LOCAL_TUNER_REGISTRY",
+            registry.display().to_string(),
+        ),
         ("LLM_HUB_LOCAL_REGISTRY", registry.display().to_string()),
         ("LLM_HUB_LOCAL_MODELS_DIR", dir.path().display().to_string()),
         ("LLM_HUB_LOCAL_LLAMA_BIN", bin.display().to_string()),
