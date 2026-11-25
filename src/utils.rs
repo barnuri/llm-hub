@@ -1,4 +1,5 @@
 pub mod atomic_write;
+pub mod cli_flag;
 pub mod error_chain;
 pub mod exe;
 pub mod glob;
