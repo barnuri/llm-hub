@@ -17,6 +17,17 @@ impl PromptShape {
     const TOOL_FAMILY_OTHER: &str = "other";
     const NAMED_TOOLS: [&str; 4] = ["Read", "Bash", "Agent", "Skill"];
     const TOP_TOOL_FAMILIES: usize = 12;
+    const SUBAGENT_MARKERS: [(&str, &str); 4] = [
+        ("file search specialist", "subagent:explore"),
+        ("planning specialist", "subagent:plan"),
+        (
+            "You are an agent for Claude Code",
+            "subagent:general-purpose",
+        ),
+        ("summarizing conversations", "compaction"),
+    ];
+    const HARNESS_MARKERS: [&str; 2] = ["You are Claude Code", "You are opencode"];
+    const SPAWN_TOOLS: [&str; 3] = ["Agent", "Task", "task"];
     const HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -49,7 +60,13 @@ impl PromptShape {
                     .filter_map(|message| message.get("content")),
             )
             .flat_map(Self::text_parts);
+        let mut subagent_label: Option<&str> = None;
+        let mut harness_prompt = false;
         for text in system_texts {
+            subagent_label = subagent_label.or_else(|| Self::subagent_marker(text));
+            harness_prompt |= Self::HARNESS_MARKERS
+                .iter()
+                .any(|marker| text.contains(marker));
             shape.system_chars += Self::char_count(text);
             shape.note_text(text);
             Self::feed_hash(&mut stream_hash, text.as_bytes());
@@ -86,6 +103,11 @@ impl PromptShape {
                 }
             }
         }
+        let spawns = tool_names
+            .iter()
+            .any(|name| Self::SPAWN_TOOLS.contains(name));
+        shape.stream_label =
+            Some(Self::label_for(subagent_label, spawns, harness_prompt).to_string());
         tool_names.sort_unstable();
         for name in tool_names {
             Self::feed_hash(&mut stream_hash, name.as_bytes());
@@ -93,6 +115,25 @@ impl PromptShape {
         }
         shape.stream_key = Some(format!("{stream_hash:016x}"));
         Some(shape)
+    }
+
+    /// The subagent label of the first marker the system text holds.
+    fn subagent_marker(text: &str) -> Option<&'static str> {
+        Self::SUBAGENT_MARKERS
+            .iter()
+            .find(|(marker, _)| text.contains(marker))
+            .map(|&(_, label)| label)
+    }
+
+    /// A known subagent marker wins. Else a spawn tool means the main conversation, and a harness
+    /// prompt without one means a subagent. Anything else is `other`.
+    fn label_for(marker: Option<&'static str>, spawns: bool, harness_prompt: bool) -> &'static str {
+        match (marker, spawns, harness_prompt) {
+            (Some(label), _, _) => label,
+            (None, true, _) => "main",
+            (None, false, true) => "subagent",
+            (None, false, false) => "other",
+        }
     }
 
     /// Sizes each listing and CLAUDE.md file from its marker to the next marker or block end.
@@ -819,5 +860,49 @@ mod tests {
         assert_eq!(shape.messages, 0);
         assert_eq!(shape.tool_count, 1);
         assert!(shape.tool_result_bytes.is_empty());
+    }
+
+    #[test]
+    fn stream_label_names_main_and_each_subagent_type() {
+        let label = |system: &str, tools: &[&str]| {
+            let tools: Vec<Value> = tools.iter().map(|name| json!({"name": name})).collect();
+            shape_of(&json!({"system": system, "messages": [], "tools": tools}))
+                .stream_label
+                .unwrap()
+        };
+        let main = "You are Claude Code, Anthropic's official CLI for Claude.";
+        assert_eq!(label(main, &["Read", "Agent"]), "main");
+        assert_eq!(label("You are opencode, a CLI.", &["task"]), "main");
+        assert_eq!(label(main, &["Read"]), "subagent");
+        assert_eq!(
+            label(
+                "You are a file search specialist for Claude Code.",
+                &["Read", "Agent"]
+            ),
+            "subagent:explore"
+        );
+        assert_eq!(
+            label(
+                "You are a software planning specialist for Claude Code.",
+                &[]
+            ),
+            "subagent:plan"
+        );
+        assert_eq!(
+            label(
+                "You are an agent for Claude Code, Anthropic's CLI.",
+                &["Read"]
+            ),
+            "subagent:general-purpose"
+        );
+        assert_eq!(
+            label(
+                "You are a helpful AI assistant tasked with summarizing conversations.",
+                &[]
+            ),
+            "compaction"
+        );
+        assert_eq!(label("Be brief.", &[]), "other");
+        assert_eq!(label("Be brief.", &["Task"]), "main");
     }
 }

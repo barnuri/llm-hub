@@ -10,10 +10,12 @@ use crate::schemas::session_cache_cause::SessionCacheCause;
 use crate::schemas::session_compaction::SessionCompaction;
 use crate::schemas::session_composition::SessionComposition;
 use crate::schemas::session_detail::SessionDetail;
+use crate::schemas::session_fallback::SessionFallback;
 use crate::schemas::session_list::SessionList;
 use crate::schemas::session_prompt_point::SessionPromptPoint;
 use crate::schemas::session_routed_by_spend::SessionRoutedBySpend;
 use crate::schemas::session_skill_body::SessionSkillBody;
+use crate::schemas::session_stream_type::SessionStreamType;
 use crate::schemas::session_summary::SessionSummary;
 use crate::schemas::session_tool_result::SessionToolResult;
 use crate::services::harness::is_keep_warm;
@@ -26,6 +28,8 @@ const COMPACTION_MIN_DROP_PERCENT: u64 = 30;
 const SERIES_POINT_CAP: usize = 1_000;
 const SESSION_LIST_LIMIT: usize = 200;
 const UNKNOWN_ROUTED_BY: &str = "unknown";
+const UNKNOWN_STREAM_LABEL: &str = "unknown";
+const FALLBACK_LIST_LIMIT: usize = 50;
 const ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const SESSION_CAUSES: [CacheWriteCause; 4] = [
     CacheWriteCause::FirstInSession,
@@ -46,6 +50,7 @@ struct SessionRequest {
     client: Option<String>,
     worker: Option<String>,
     routed_by: Option<String>,
+    fallback_session: Option<String>,
     shape: Option<PromptShape>,
 }
 
@@ -71,6 +76,7 @@ struct SessionAnalysis {
     compaction_pairs: Vec<(usize, usize)>,
     causes: Vec<SessionCacheCause>,
     composition: Option<SessionComposition>,
+    stream_types: Vec<SessionStreamType>,
 }
 
 /// Sessions in the range, newest first, at most 200. The worker-less cache-write bucket is separate.
@@ -97,10 +103,18 @@ pub fn list_sessions(
     sessions.sort_by_key(|session| std::cmp::Reverse(session.last_ts_ms));
     sessions.truncate(SESSION_LIST_LIMIT);
     let priced = price_successful(&worker_less, book);
+    let all_rows: Vec<SessionRequest> = groups
+        .into_values()
+        .flatten()
+        .chain(worker_less.iter().cloned())
+        .collect();
+    let stream_types = spend_by_stream_label(&price_successful(&all_rows, book));
     Ok(SessionList {
         range: range.to_string(),
         sessions,
         no_session_id: cache_bucket(CacheWriteCause::NoSessionId, &priced),
+        fallback_sessions: fallback_sessions(&priced),
+        stream_types,
     })
 }
 
@@ -133,6 +147,7 @@ pub fn session_detail(
         compactions,
         cache_causes: analysis.causes,
         composition: analysis.composition,
+        stream_types: analysis.stream_types,
     }))
 }
 
@@ -151,7 +166,8 @@ fn load_requests(
                 s.messages, s.turn_start, s.system_chars, s.tool_count, s.tool_bytes,
                 s.mcp_tool_count, s.mcp_tool_bytes, s.deferred_listing_chars,
                 s.skills_listing_chars, s.claude_md_chars, s.image_count, s.project, s.request_id,
-                s.stream_key, r.routed_by, s.tool_result_bytes, s.skill_body_chars
+                s.stream_key, r.routed_by, s.tool_result_bytes, s.skill_body_chars,
+                r.fallback_session, s.stream_label
          FROM requests r LEFT JOIN request_shapes s ON s.request_id = r.id WHERE 1=1",
     );
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
@@ -192,6 +208,7 @@ fn read_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRequest> {
             image_count: count(row.get(19)?),
             project: row.get(20)?,
             stream_key: row.get(22)?,
+            stream_label: row.get(27)?,
             tool_result_bytes: json_counts(row.get(24)?),
             skill_body_chars: json_counts(row.get(25)?),
         })
@@ -207,6 +224,7 @@ fn read_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRequest> {
         client: row.get(7)?,
         worker: row.get(8)?,
         routed_by: row.get(23)?,
+        fallback_session: row.get(26)?,
         shape: shape.transpose()?,
     })
 }
@@ -311,6 +329,23 @@ pub fn keep_warm_summary(
     Ok(total)
 }
 
+/// The sorted distinct models and the count of distinct streams of the user rows.
+fn models_and_streams(user_rows: &[&SessionRequest]) -> (Vec<String>, u64) {
+    let models = user_rows
+        .iter()
+        .map(|row| row.model.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let streams = user_rows
+        .iter()
+        .map(|row| request_stream(row))
+        .collect::<BTreeSet<_>>()
+        .len();
+    (models, count_u64(streams))
+}
+
 fn analyze_session(
     worker: &str,
     rows: &[SessionRequest],
@@ -344,6 +379,7 @@ fn analyze_session(
             model: point.request.model.clone(),
             prompt_tokens: point.prompt_tokens,
             cost_usd: point.cost.total(),
+            tool_count: point.request.shape.as_ref().map(|shape| shape.tool_count),
         })
         .collect();
     let keyed: Vec<(&str, u64)> = measured
@@ -360,18 +396,7 @@ fn analyze_session(
         .iter()
         .filter(|row| row.shape.as_ref().is_some_and(|shape| shape.turn_start))
         .count();
-    let models: Vec<String> = user_rows
-        .iter()
-        .map(|row| row.model.as_str())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    let streams = user_rows
-        .iter()
-        .map(|row| request_stream(row))
-        .collect::<BTreeSet<_>>()
-        .len();
+    let (models, streams) = models_and_streams(&user_rows);
     let total = cost.total();
     let summary = SessionSummary {
         worker: worker.to_string(),
@@ -386,7 +411,8 @@ fn analyze_session(
         last_ts_ms: last.ts_ms,
         duration_ms: last.ts_ms.saturating_sub(first.ts_ms),
         models,
-        streams: count_u64(streams),
+        streams,
+        max_tool_count: series.iter().filter_map(|point| point.tool_count).max(),
         prompt: prompt_stats(&series),
         cost_usd: total,
         input_usd: cost.input,
@@ -415,7 +441,83 @@ fn analyze_session(
         compaction_pairs,
         causes,
         composition,
+        stream_types: spend_by_stream_label(&priced),
     })
+}
+
+/// Spend per stream label, most expensive first, ties by label. Keep-warm pings add cost but no requests.
+fn spend_by_stream_label(priced: &[Priced<'_>]) -> Vec<SessionStreamType> {
+    let mut groups: BTreeMap<&str, (u64, BTreeSet<&str>, f64, f64)> = BTreeMap::new();
+    for point in priced {
+        let label = point
+            .request
+            .shape
+            .as_ref()
+            .and_then(|shape| shape.stream_label.as_deref())
+            .unwrap_or(UNKNOWN_STREAM_LABEL);
+        let entry = groups.entry(label).or_default();
+        if !is_keep_warm(point.request.client.as_deref()) {
+            entry.0 += 1;
+        }
+        entry.1.insert(request_stream(point.request));
+        entry.2 += point.cost.total();
+        entry.3 += point.cost.cache_write;
+    }
+    let mut types: Vec<SessionStreamType> = groups
+        .into_iter()
+        .map(
+            |(label, (requests, streams, cost_usd, cache_write_usd))| SessionStreamType {
+                label: label.to_owned(),
+                requests,
+                streams: count_u64(streams.len()),
+                cost_usd,
+                cache_write_usd,
+            },
+        )
+        .collect();
+    types.sort_by(|left, right| {
+        right
+            .cost_usd
+            .total_cmp(&left.cost_usd)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    types
+}
+
+/// Worker-less requests grouped by their stored fallback key, most cache-write cost first, ties by key.
+fn fallback_sessions(priced: &[Priced<'_>]) -> Vec<SessionFallback> {
+    let mut groups: BTreeMap<&str, SessionFallback> = BTreeMap::new();
+    for point in priced {
+        let request = point.request;
+        let Some(key) = request.fallback_session.as_deref() else {
+            continue;
+        };
+        let entry = groups.entry(key).or_insert_with(|| SessionFallback {
+            key: key.to_owned(),
+            client: request.client.clone(),
+            requests: 0,
+            first_ts_ms: request.ts_ms,
+            last_ts_ms: request.ts_ms,
+            cache_write_tokens: 0,
+            cache_write_usd: 0.0,
+            cost_usd: 0.0,
+        });
+        entry.requests += 1;
+        entry.first_ts_ms = entry.first_ts_ms.min(request.ts_ms);
+        entry.last_ts_ms = entry.last_ts_ms.max(request.ts_ms);
+        entry.cache_write_tokens += request.cache_write_tokens;
+        entry.cache_write_usd += point.cost.cache_write;
+        entry.cost_usd += point.cost.total();
+    }
+    let mut sessions: Vec<SessionFallback> = groups.into_values().collect();
+    sessions.sort_by(|left, right| {
+        right
+            .cache_write_usd
+            .total_cmp(&left.cache_write_usd)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    sessions.truncate(FALLBACK_LIST_LIMIT);
+    sessions
 }
 
 /// Successful requests and cost per `routed_by`, most expensive first, ties by name.
@@ -700,6 +802,7 @@ mod tests {
             client: Some("demo-client".into()),
             worker: Some("demo-worker".into()),
             routed_by: None,
+            fallback_session: None,
             shape: None,
         }
     }
@@ -729,6 +832,7 @@ mod tests {
             image_count: 0,
             project: None,
             stream_key: None,
+            stream_label: None,
             tool_result_bytes: BTreeMap::new(),
             skill_body_chars: BTreeMap::new(),
         }
@@ -747,6 +851,7 @@ mod tests {
             model: "demo-model".into(),
             prompt_tokens,
             cost_usd: 0.0,
+            tool_count: None,
         }
     }
 
@@ -997,6 +1102,99 @@ mod tests {
         let bucket = cache_bucket(CacheWriteCause::NoSessionId, &priced);
         assert_eq!(bucket.requests, 1);
         assert_eq!(bucket.cache_write_tokens, 500);
+    }
+
+    #[test]
+    fn worker_less_requests_share_a_fallback_session_within_the_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fallback.db");
+        let store = Store::open("sqlite", Some(path.to_str().unwrap())).unwrap();
+        let minute = 60_000_u64;
+        let record = |ts_ms: u64, client: &str, key: &str, label: &str, write: u64| {
+            let id = store
+                .record(&RequestOutcome {
+                    profile: "demo".into(),
+                    model_key: "demo/demo-model".into(),
+                    status: 200,
+                    ts_ms,
+                    latency_ms: 1,
+                    ttft_ms: None,
+                    tokens_in: 1_000,
+                    tokens_out: 10,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: write,
+                    error: None,
+                    client: Some(client.into()),
+                    session_id: None,
+                    worker: None,
+                    routed_by: None,
+                    attempt: None,
+                    role: None,
+                })
+                .unwrap()
+                .unwrap();
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute(
+                    "UPDATE requests SET ts_ms = ?1 WHERE id = ?2",
+                    rusqlite::params![i64::try_from(ts_ms).unwrap(), id],
+                )
+                .unwrap();
+            let mut demo_shape = shape(true, 10);
+            demo_shape.stream_key = Some(key.into());
+            demo_shape.stream_label = Some(label.into());
+            demo_shape.tool_count = 7;
+            store.record_shape(id, &demo_shape).unwrap();
+        };
+        let start = 1_000 * minute;
+        record(start, "a", "k1", "main", 100);
+        record(start + 10 * minute, "a", "k1", "main", 100);
+        record(start + 100 * minute, "a", "k1", "main", 100);
+        record(start + 11 * minute, "a", "k2", "subagent:explore", 50);
+        record(start + 12 * minute, "b", "k1", "main", 25);
+
+        let list = list_sessions(&store, "all", None, &PricingBook::default()).unwrap();
+        let mut counts: Vec<u64> = list.fallback_sessions.iter().map(|f| f.requests).collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![1, 1, 1, 2]);
+        let pair = list
+            .fallback_sessions
+            .iter()
+            .find(|f| f.requests == 2)
+            .unwrap();
+        assert!(pair.key.starts_with("fb-"));
+        assert_eq!(pair.client.as_deref(), Some("a"));
+        assert_eq!(pair.last_ts_ms - pair.first_ts_ms, 10 * minute);
+        assert_eq!(pair.cache_write_tokens, 200);
+        let labels: Vec<&str> = list.stream_types.iter().map(|t| t.label.as_str()).collect();
+        assert!(labels.contains(&"main") && labels.contains(&"subagent:explore"));
+        let main = list
+            .stream_types
+            .iter()
+            .find(|t| t.label == "main")
+            .unwrap();
+        assert_eq!((main.requests, main.streams), (4, 1));
+    }
+
+    #[test]
+    fn workers_keep_no_fallback_key_and_report_tool_counts_and_stream_types() {
+        let mut first = with_shape(request(1, "demo-model", 200, 100), shape(true, 5));
+        first.shape.as_mut().unwrap().tool_count = 12;
+        let mut second = with_shape(request(2, "demo-model", 200, 100), shape(false, 5));
+        second.shape.as_mut().unwrap().tool_count = 30;
+        second.shape.as_mut().unwrap().stream_label = Some("main".into());
+        let rows = [first, second, request(3, "demo-model", 200, 100)];
+        let analysis = analyze_session("demo-worker", &rows, &PricingBook::default()).unwrap();
+        assert_eq!(analysis.summary.max_tool_count, Some(30));
+        assert_eq!(analysis.series[0].tool_count, Some(12));
+        assert_eq!(analysis.series[2].tool_count, None);
+        let labels: Vec<&str> = analysis
+            .stream_types
+            .iter()
+            .map(|t| t.label.as_str())
+            .collect();
+        assert_eq!(labels, ["main", "unknown"]);
+        assert!(fallback_sessions(&price_successful(&rows, &PricingBook::default())).is_empty());
     }
 
     #[test]

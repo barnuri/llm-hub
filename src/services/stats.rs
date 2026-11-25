@@ -491,13 +491,54 @@ pub fn scrape_usage(tail: &[u8]) -> ScrapedUsage {
         extract_int(after, "\"cached_tokens\""),
         extract_int(after, "\"cache_read_input_tokens\""),
     );
-    let cache_write_tokens = extract_int(after, "\"cache_creation_input_tokens\"");
+    let cache_write_tokens = CACHE_WRITE_FIELDS
+        .iter()
+        .map(|field| extract_int(after, &format!("\"{field}\"")))
+        .find(|&tokens| tokens > 0)
+        .unwrap_or_else(|| {
+            extract_int(after, "\"ephemeral_5m_input_tokens\"")
+                + extract_int(after, "\"ephemeral_1h_input_tokens\"")
+        });
     ScrapedUsage {
         tokens_in,
         tokens_out,
         cache_read_tokens,
         cache_write_tokens,
     }
+}
+
+/// Field names upstreams use for tokens written to the prompt cache, in priority order: Anthropic,
+/// then the names `OpenAI`-compatible gateways put in the usage object or its `prompt_tokens_details`.
+const CACHE_WRITE_FIELDS: [&str; 4] = [
+    "cache_creation_input_tokens",
+    "cache_write_tokens",
+    "cache_creation_tokens",
+    "cache_write_input_tokens",
+];
+
+/// Tokens written to the prompt cache in a parsed `usage` object. Reads the top level, then
+/// `prompt_tokens_details`, then the Anthropic `cache_creation` split by TTL.
+#[must_use]
+pub fn cache_write_in(usage: &serde_json::Value) -> u64 {
+    let read = |scope: Option<&serde_json::Value>| {
+        scope.and_then(|scope| {
+            CACHE_WRITE_FIELDS
+                .iter()
+                .filter_map(|field| scope.get(field).and_then(serde_json::Value::as_u64))
+                .find(|&tokens| tokens > 0)
+        })
+    };
+    read(Some(usage))
+        .or_else(|| read(usage.get("prompt_tokens_details")))
+        .unwrap_or_else(|| {
+            let split = |field: &str| {
+                usage
+                    .pointer(&format!("/cache_creation/{field}"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            };
+            split("ephemeral_5m_input_tokens") + split("ephemeral_1h_input_tokens")
+        })
 }
 
 fn first_nonzero(a: u64, b: u64) -> u64 {
@@ -732,5 +773,43 @@ mod tests {
             );
         }
         assert!(series_bucket_for_range("live").is_none());
+    }
+
+    #[test]
+    fn scrapes_cache_writes_under_every_upstream_name() {
+        for field in CACHE_WRITE_FIELDS {
+            let body = format!(
+                r#"{{"usage":{{"prompt_tokens":50,"completion_tokens":2,"prompt_tokens_details":{{"{field}":30}}}}}}"#
+            );
+            assert_eq!(
+                scrape_usage(body.as_bytes()).cache_write_tokens,
+                30,
+                "{field}"
+            );
+        }
+        let split = br#"{"usage":{"input_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":7,"ephemeral_1h_input_tokens":3}}}"#;
+        assert_eq!(scrape_usage(split).cache_write_tokens, 10);
+        let none = br#"{"usage":{"prompt_tokens":5}}"#;
+        assert_eq!(scrape_usage(none).cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn cache_write_in_reads_top_level_details_and_ttl_split() {
+        use serde_json::json;
+        assert_eq!(
+            cache_write_in(&json!({"cache_creation_input_tokens": 9})),
+            9
+        );
+        assert_eq!(
+            cache_write_in(&json!({"prompt_tokens_details": {"cache_write_tokens": 4}})),
+            4
+        );
+        assert_eq!(
+            cache_write_in(
+                &json!({"cache_creation": {"ephemeral_5m_input_tokens": 2, "ephemeral_1h_input_tokens": 1}})
+            ),
+            3
+        );
+        assert_eq!(cache_write_in(&json!({"prompt_tokens": 1})), 0);
     }
 }

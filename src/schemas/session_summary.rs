@@ -18,6 +18,8 @@ pub struct SessionSummary {
     pub models: Vec<String>,
     /// Distinct request streams (system prompt and tool set) in the session, such as the main conversation and each subagent type.
     pub streams: u64,
+    /// Most tool definitions any request of the session sent. `None` when no prompt shape was recorded.
+    pub max_tool_count: Option<u64>,
     pub prompt: Option<PromptStats>,
     pub cost_usd: f64,
     pub input_usd: f64,
