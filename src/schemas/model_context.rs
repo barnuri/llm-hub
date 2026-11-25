@@ -102,7 +102,7 @@ pub fn advertised_models(
     upstream_tokens: Option<u64>,
 ) -> Vec<(String, Option<u64>)> {
     let tokens = inferred_max_input_tokens(qualified, upstream_tokens);
-    if !tokens.is_some_and(|tokens| tokens >= CONTEXT_TOKENS_1M) {
+    if tokens.is_none_or(|tokens| tokens < CONTEXT_TOKENS_1M) {
         return vec![(qualified.to_string(), tokens)];
     }
     let bare = strip_window_suffix(qualified).0;

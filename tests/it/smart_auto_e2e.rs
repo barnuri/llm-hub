@@ -115,7 +115,7 @@ async fn shared_fixture() -> &'static SharedFixture {
                     SHARED_STORE.path().join("store.db").display().to_string(),
                 ),
             ];
-            let (hub, base) = start_pair(&alpha, &beta, 5, &extra).await;
+            let (hub, base) = start_pair(&alpha, &beta, 6, &extra).await;
             SharedFixture {
                 _hub: hub,
                 base,
@@ -686,7 +686,7 @@ async fn history_survives_a_restart() {
     let beta = &fixture.beta;
     let query = format!("worker={WORKER}&limit={HISTORY_LIMIT}");
 
-    let (hub, base) = start_pair(alpha, beta, 5, &extra).await;
+    let (hub, base) = start_pair(alpha, beta, 6, &extra).await;
     let response = post_chat(
         &base,
         &[(EXCLUDE_HEADER, "beta/*"), (WORKER_HEADER, WORKER)],
@@ -698,7 +698,7 @@ async fn history_survives_a_restart() {
     wait_for_stored_events(&store, i64::try_from(DISPATCH_STATES.len()).unwrap()).await;
     drop(hub);
 
-    let (_restarted, base) = start_pair(alpha, beta, 5, &extra).await;
+    let (_restarted, base) = start_pair(alpha, beta, 6, &extra).await;
     let events = history(&base, &query).await;
     assert_eq!(states(&events), DISPATCH_STATES);
 }
