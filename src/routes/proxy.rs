@@ -9208,7 +9208,7 @@ mod tests {
                 MESSAGES_ENDPOINT,
                 RouteKind::Anthropic,
                 &client_headers(),
-                &long_anthropic_body(&format!("{PLAIN_ID}[200k]"), 250_000),
+                &long_anthropic_body(&format!("{PLAIN_ID}[200k]"), 400_000),
             )
             .await;
 
@@ -9231,7 +9231,7 @@ mod tests {
                 MESSAGES_ENDPOINT,
                 RouteKind::Anthropic,
                 &client_headers(),
-                &long_anthropic_body(PLAIN_ID, 250_000),
+                &long_anthropic_body(PLAIN_ID, 400_000),
             )
             .await;
 

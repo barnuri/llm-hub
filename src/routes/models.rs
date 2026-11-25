@@ -1123,12 +1123,13 @@ mod tests {
         let payload = enabled_models(&restarted).await;
 
         let listed = profile_ids(&payload);
-        assert_eq!(listed.len(), 6, "unexpected list {payload}");
+        assert_eq!(listed.len(), 7, "unexpected list {payload}");
         assert!(
             listed
                 .iter()
                 .any(|id| id.starts_with("copilot/claude-opus-5-5"))
         );
+        assert!(listed.contains(&"copilot/claude-opus-5-5[1m]"));
         assert!(listed.contains(&"copilot/claude-haiku-4-5"));
         assert!(listed.contains(&"copilot/auto"));
         assert_eq!(restarted.model_cache().unwrap().payload, payload);
