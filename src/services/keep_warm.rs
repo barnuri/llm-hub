@@ -889,25 +889,34 @@ mod tests {
 
     #[test]
     fn total_bytes_stay_within_sixty_four_mib_by_evicting_the_oldest() {
+        // Streams go in directly: parsing 9 bodies of 8 MiB through `touch` takes over a second in debug.
         let registry = Arc::new(KeepWarm::default());
         let t0 = Instant::now();
-        for index in 0..9 {
-            let at = t0 + Duration::from_secs(index);
-            let body = request_body(KEEP_WARM_MAX_BODY_BYTES - 1_000);
-            registry.touch(
-                ("w".to_string(), format!("s{index}").to_string()),
-                &body,
-                &model(),
-                at,
-                4096,
-                None,
-            );
+        {
+            let mut state = registry.lock();
+            for index in 0..9 {
+                let body = Bytes::from(vec![b'x'; KEEP_WARM_MAX_BODY_BYTES - 1_000]);
+                let used = state.next_clock();
+                state.total_bytes += body.len();
+                state.streams.insert(
+                    key("w", &format!("s{index}")),
+                    Stream {
+                        body,
+                        model_id: model(),
+                        target: PingTarget::messages(None),
+                        last_user: t0 + Duration::from_secs(index),
+                        last_ping: None,
+                        ping_in_flight: false,
+                        used,
+                        cached_tokens: 4096,
+                        held: None,
+                    },
+                );
+            }
+            state.evict_to_bounds();
+            assert_eq!(state.streams.len(), 8);
+            assert!(state.total_bytes <= crate::consts::KEEP_WARM_MAX_TOTAL_BYTES);
         }
-
-        let state = registry.lock();
-        assert_eq!(state.streams.len(), 8);
-        assert!(state.total_bytes <= crate::consts::KEEP_WARM_MAX_TOTAL_BYTES);
-        drop(state);
         assert!(!keys(&registry).contains(&key("w", "s0")));
     }
 
