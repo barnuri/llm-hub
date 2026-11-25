@@ -75,6 +75,7 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml') }}
           shared-key: coverage
           cache-on-failure: true
+      - uses: oven-sh/setup-bun@v2
       - name: Tests with the coverage gate
         run: scripts/check.sh coverage
       - name: Coverage summary
