@@ -12,7 +12,6 @@ jobs:
     uses: ./.github/workflows/pr.yml
 
   tag:
-    needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
@@ -143,7 +142,7 @@ jobs:
           path: ${{ matrix.asset }}
 
   release:
-    needs: [tag, build]
+    needs: [test, tag, build]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -161,8 +160,8 @@ jobs:
           --title "$TAG" --generate-notes
 
   release-mistralrs:
-    if: ${{ !cancelled() && needs.tag.result == 'success' }}
-    needs: [tag, build-mistralrs]
+    if: ${{ !cancelled() && needs.test.result == 'success' && needs.tag.result == 'success' }}
+    needs: [test, tag, build-mistralrs]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
