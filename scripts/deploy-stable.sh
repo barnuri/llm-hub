@@ -88,10 +88,14 @@ if [ -n "$CURRENT_DIR" ] && git -C "$CLONE" cat-file -e "$PREVIOUS_SHA^{commit}"
   git -C "$CLONE" diff --quiet "$PREVIOUS_SHA" "$SHA" -- ui-src && changed_ui=false
 fi
 
+# A local service build uses thin LTO and parallel codegen: the release profile's fat LTO with one codegen unit
+# runs most of the build on one core (about 4 min against 1 on a 16-core Mac). The binary is a few MB larger.
+# CI keeps the fat profile for releases and the size check. LLM_HUB_DEPLOY_FAT_LTO=1 builds the fat profile here too.
+if [ "${LLM_HUB_DEPLOY_FAT_LTO:-}" = "1" ]; then LTO_ENV=""; else LTO_ENV="CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"; fi
 if $DRY; then
   say "would check out $SHA in $CLONE"
   $changed_ui && say "would run: npm run build:ui"
-  say "would run: GIT_SHA=$SHA cargo build --release --locked"
+  say "would run: GIT_SHA=$SHA $LTO_ENV cargo build --release --locked"
   say "would copy the binary to $RELEASES/$SHA/llm-hub"
   say "would point $RELEASES/current at $SHA and run: current/llm-hub service install"
   say "would wait up to ${HEALTH_WAIT}s for $HEALTH_URL, roll back to $PREVIOUS_SHA on failure"
@@ -104,6 +108,8 @@ cd "$CLONE" || exit 1
 if $changed_ui; then
   npm ci --silent && npm run build:ui || { say "ui build failed, keeping the running service"; exit 1; }
 fi
+# shellcheck disable=SC2086 # LTO_ENV holds NAME=value words to export
+[ -n "$LTO_ENV" ] && export $LTO_ENV
 GIT_SHA="$SHA" cargo build --release --locked || { say "cargo build failed, keeping the running service"; exit 1; }
 
 mkdir -p "$RELEASES/$SHA"

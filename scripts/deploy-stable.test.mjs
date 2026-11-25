@@ -65,7 +65,7 @@ test("dry run changes nothing and prints the plan", (t) => {
   const f = fixture(t);
   const r = f.run("--dry-run");
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /would run: GIT_SHA=.* cargo build --release --locked/);
+  assert.match(r.stdout, /would run: GIT_SHA=.* CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release --locked/);
   assert.equal(f.calls(), "");
   assert.equal(existsSync(join(f.releases, "current")), false);
 });
