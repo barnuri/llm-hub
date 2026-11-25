@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::configs::HubConfig;
-use crate::consts::{ENV_FILE, ENV_WATCH_INTERVAL};
 use crate::dependencies::state::AppState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +19,7 @@ pub enum ReloadKind {
 /// Returns whether a process restart is required for listen/store changes.
 pub fn reload(state: &AppState) -> Result<ReloadKind, String> {
     let previous = state.config();
-    let vars = crate::load_env_vars();
+    let vars = state.runtime().load_vars();
     let next = HubConfig::from_map(&vars)?;
     if requires_restart(&previous, &next) {
         return Ok(ReloadKind::NeedsRestart);
@@ -42,36 +41,38 @@ fn requires_restart(previous: &HubConfig, next: &HubConfig) -> bool {
 /// restarts us when listen/store settings change.
 pub fn spawn_env_watcher(state: AppState, restart_notify: Arc<Notify>) {
     tokio::spawn(async move {
-        let mut last_hash = env_file_hash(Path::new(ENV_FILE));
-        let mut interval = tokio::time::interval(ENV_WATCH_INTERVAL);
+        let env_file = state.runtime().env_file().to_path_buf();
+        let mut last_hash = env_file_hash(&env_file);
+        let mut interval = tokio::time::interval(state.config().timings.env_watch_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            let hash = env_file_hash(Path::new(ENV_FILE));
+            let hash = env_file_hash(&env_file);
             if hash == last_hash {
                 continue;
             }
             // Editors often write via temp+rename; give the final file a moment
             // to settle before parsing.
             tokio::time::sleep(Duration::from_millis(150)).await;
-            let settled = env_file_hash(Path::new(ENV_FILE));
+            let settled = env_file_hash(&env_file);
             if settled != hash {
                 continue;
             }
             last_hash = settled;
             match reload(&state) {
                 Ok(ReloadKind::Hot) => {
-                    tracing::info!("reloaded config from {ENV_FILE}");
+                    tracing::info!("reloaded config from {}", env_file.display());
                 }
                 Ok(ReloadKind::NeedsRestart) => {
                     tracing::info!(
-                        "{ENV_FILE} changed bind/port/store settings — restarting to apply"
+                        "{} changed bind/port/store settings — restarting to apply",
+                        env_file.display()
                     );
                     restart_notify.notify_one();
                     return;
                 }
                 Err(e) => {
-                    tracing::warn!("ignored invalid {ENV_FILE} change: {e}");
+                    tracing::warn!("ignored invalid {} change: {e}", env_file.display());
                 }
             }
         }
@@ -147,6 +148,7 @@ mod tests {
             local_tuner_enabled: false,
             notify: crate::configs::NotifyConfig::default(),
             budget_monthly_usd: None,
+            timings: crate::configs::HubTimings::default(),
         }
     }
 

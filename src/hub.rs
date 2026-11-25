@@ -86,6 +86,21 @@ impl Hub {
     pub async fn run(self) {
         crate::serve(self).await;
     }
+
+    /// Serves on `listener` until `shutdown` resolves, then stops the managed processes. The
+    /// paths and variables come from `runtime`. It installs no log subscriber, handles no signal,
+    /// reads no working-directory file and never exits the process, so one process can run many hubs.
+    ///
+    /// # Errors
+    /// The message to print when the settings are invalid or the server fails.
+    pub async fn serve_on(
+        self,
+        listener: tokio::net::TcpListener,
+        runtime: crate::HubRuntime,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), String> {
+        crate::serve_on(self, runtime, listener, shutdown).await
+    }
 }
 
 #[cfg(test)]

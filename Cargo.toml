@@ -93,6 +93,10 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# The keep_warm 64 MiB test parses and serializes 8 MiB bodies; unoptimized serde_json took 8 s for it.
+[profile.dev.package.serde_json]
+opt-level = 3
+
 
 [profile.release]
 lto = "fat"

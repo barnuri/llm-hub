@@ -15,18 +15,15 @@ use tokio::sync::Notify;
 use super::command::build_argv;
 use super::memory::{self, LoadedModel, NoRoom};
 use super::registry_rows::{self, Engine, RegistryRow};
-use crate::configs::{HubConfig, LocalServingConfig};
-use crate::consts::{MANAGED_IDLE_CHECK_INTERVAL, MANAGED_STOP_GRACE};
+use crate::configs::{HubConfig, HubTimings, LocalServingConfig};
 use crate::services::managed_process::{
-    NotReady, kill_process_group, spawn_logged, terminate, wait_ready,
+    NotReady, kill_process_group, spawn_logged, terminate_within, wait_ready,
 };
 
 const LOCAL_LOGS_SUBDIR: &str = "local";
 const PID_FILE: &str = "pids.json";
-const REGISTRY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const LOOPBACK: &str = "127.0.0.1";
 const HEALTH_PATH: &str = "/health";
-const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const BACKOFF_MIN_SECS: u64 = 5;
 const BACKOFF_MAX_SECS: u64 = 60;
 const NO_ROOM: &str = "no room to start local model";
@@ -43,6 +40,7 @@ pub struct LocalPool {
     pid_file_lock: Mutex<()>,
     health: reqwest::Client,
     budget_off_logged: Once,
+    timings: HubTimings,
 }
 
 /// Where a model process is in its life.
@@ -154,9 +152,10 @@ impl LocalPool {
             released: Arc::new(Notify::new()),
             budget_lock: Mutex::new(()),
             pid_file_lock: Mutex::new(()),
+            timings: config.timings,
             health: reqwest::Client::builder()
                 .no_proxy()
-                .timeout(HEALTH_PROBE_TIMEOUT)
+                .timeout(config.timings.health_probe_timeout)
                 .build()
                 .unwrap_or_default(),
             budget_off_logged: Once::new(),
@@ -171,7 +170,7 @@ impl LocalPool {
         self.kill_orphans();
         let pool = Arc::clone(self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(MANAGED_IDLE_CHECK_INTERVAL);
+            let mut interval = tokio::time::interval(pool.timings.idle_check_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
@@ -180,7 +179,7 @@ impl LocalPool {
         });
         let pool = Arc::clone(self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(REGISTRY_POLL_INTERVAL);
+            let mut interval = tokio::time::interval(pool.timings.registry_poll_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
@@ -219,10 +218,11 @@ impl LocalPool {
         for key in stale {
             if let Some((_, entry)) = self.entries.remove(&key) {
                 let released = Arc::clone(&self.released);
+                let grace = self.timings.managed_stop_grace;
                 tokio::spawn(async move {
                     if let Some(child) = entry.take_process().await {
                         tracing::info!(model = %entry.key, "stopping local model of a changed profile");
-                        terminate(child).await;
+                        terminate_within(child, grace).await;
                     }
                     released.notify_waiters();
                 });
@@ -235,7 +235,13 @@ impl LocalPool {
         let entries = self.all_entries();
         let children =
             futures_util::future::join_all(entries.iter().map(|entry| entry.take_process())).await;
-        futures_util::future::join_all(children.into_iter().flatten().map(terminate)).await;
+        futures_util::future::join_all(
+            children
+                .into_iter()
+                .flatten()
+                .map(|child| terminate_within(child, self.timings.managed_stop_grace)),
+        )
+        .await;
         self.write_pid_file();
         self.released.notify_waiters();
     }
@@ -282,7 +288,12 @@ impl LocalPool {
             }
         }
         changed |= !stopping.is_empty();
-        futures_util::future::join_all(stopping.into_iter().map(terminate)).await;
+        futures_util::future::join_all(
+            stopping
+                .into_iter()
+                .map(|child| terminate_within(child, self.timings.managed_stop_grace)),
+        )
+        .await;
         if changed {
             self.write_pid_file();
             self.released.notify_waiters();
@@ -350,8 +361,9 @@ impl LocalPool {
                 tracing::info!(model = %record.key, pid = record.pid, "stopping an orphaned local model process");
                 signal_orphan(record.pid);
                 let pid = record.pid;
+                let grace = self.timings.managed_stop_grace;
                 tokio::spawn(async move {
-                    tokio::time::sleep(MANAGED_STOP_GRACE).await;
+                    tokio::time::sleep(grace).await;
                     kill_orphan_group(pid);
                 });
             }
@@ -443,7 +455,7 @@ impl LocalPool {
         }
         if let Some(child) = process.take() {
             entry.set_stopped(LocalModelState::Stopped);
-            terminate(child).await;
+            terminate_within(child, self.timings.managed_stop_grace).await;
             self.write_pid_file();
         }
         if let Some(reason) = lock(&entry.backoff).reason() {
@@ -520,7 +532,7 @@ impl LocalPool {
         };
         if let Some(child) = entry.take_process().await {
             tracing::info!(model = %entry.key, "restarting local model");
-            terminate(child).await;
+            terminate_within(child, self.timings.managed_stop_grace).await;
         }
         lock(&entry.backoff).reset();
         self.write_pid_file();
@@ -560,7 +572,7 @@ impl LocalPool {
                 drop(process);
                 if let Some(child) = child {
                     tracing::info!(model = %entry.key, "restarting idle local model");
-                    terminate(child).await;
+                    terminate_within(child, self.timings.managed_stop_grace).await;
                 }
                 self.write_pid_file();
                 self.released.notify_waiters();
@@ -574,8 +586,8 @@ impl LocalPool {
                     timeout.as_secs()
                 ));
             }
-            let _ =
-                tokio::time::timeout(remaining.min(MANAGED_IDLE_CHECK_INTERVAL), released).await;
+            let _ = tokio::time::timeout(remaining.min(self.timings.idle_check_interval), released)
+                .await;
         }
     }
 
@@ -624,7 +636,12 @@ impl LocalPool {
             released.as_mut().enable();
             let (evicted, outcome) = self.try_reserve(entry, row, estimate_gb, budget_gb);
             if !evicted.is_empty() {
-                futures_util::future::join_all(evicted.into_iter().map(terminate)).await;
+                futures_util::future::join_all(
+                    evicted
+                        .into_iter()
+                        .map(|child| terminate_within(child, self.timings.managed_stop_grace)),
+                )
+                .await;
                 self.write_pid_file();
             }
             match outcome {
@@ -645,8 +662,8 @@ impl LocalPool {
                     timeout.as_secs()
                 ));
             }
-            let _ =
-                tokio::time::timeout(remaining.min(MANAGED_IDLE_CHECK_INTERVAL), released).await;
+            let _ = tokio::time::timeout(remaining.min(self.timings.idle_check_interval), released)
+                .await;
         }
     }
 

@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use crate::consts::ENV_WATCH_INTERVAL;
 use crate::dependencies::state::AppState;
 use crate::ext::builtin::builtins;
 use crate::ext::rules::{self, RulesExtension};
@@ -94,25 +93,28 @@ fn referenced_vars(text: &str) -> BTreeSet<String> {
     names
 }
 
+/// Reads the current variables, as the rules watcher does on every tick.
+pub(crate) type LoadVars = Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>;
+
 /// Polls the rules file and the variables it names. A valid change replaces the rules. An
 /// invalid one keeps the old rules and logs why.
 pub(crate) fn spawn_rules_watcher(
     state: AppState,
     sources: Arc<ExtensionSources>,
-    load_vars: fn() -> HashMap<String, String>,
+    load_vars: LoadVars,
 ) {
     tokio::spawn(async move {
-        let mut last = probe(&sources, load_vars).await.1;
-        let mut interval = tokio::time::interval(ENV_WATCH_INTERVAL);
+        let mut last = probe(&sources, &load_vars).await.1;
+        let mut interval = tokio::time::interval(state.config().timings.env_watch_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            let (_, current) = probe(&sources, load_vars).await;
+            let (_, current) = probe(&sources, &load_vars).await;
             if current == last {
                 continue;
             }
             tokio::time::sleep(RULES_SETTLE).await;
-            let (vars, settled) = probe(&sources, load_vars).await;
+            let (vars, settled) = probe(&sources, &load_vars).await;
             if settled != current {
                 continue;
             }
@@ -130,9 +132,9 @@ pub(crate) fn spawn_rules_watcher(
 /// The current variables and the rules fingerprint, read off the async runtime.
 async fn probe(
     sources: &Arc<ExtensionSources>,
-    load_vars: fn() -> HashMap<String, String>,
+    load_vars: &LoadVars,
 ) -> (HashMap<String, String>, Option<Fingerprint>) {
-    let sources = Arc::clone(sources);
+    let (sources, load_vars) = (Arc::clone(sources), Arc::clone(load_vars));
     tokio::task::spawn_blocking(move || {
         let vars = load_vars();
         let fingerprint = sources.fingerprint(&vars);
@@ -388,7 +390,7 @@ mod tests {
         let sources = Arc::new(sources(dir.path()));
         let state = state();
 
-        spawn_rules_watcher(state.clone(), Arc::clone(&sources), vars);
+        spawn_rules_watcher(state.clone(), Arc::clone(&sources), Arc::new(vars));
         tokio::time::sleep(Duration::from_millis(100)).await;
         std::fs::write(dir.path().join("extensions.yaml"), RULE).unwrap();
 
@@ -409,7 +411,7 @@ mod tests {
         reload(&state, &sources, &vars()).unwrap();
         assert_eq!(attempt_team(&state).as_deref(), Some("blue"));
 
-        spawn_rules_watcher(state.clone(), Arc::clone(&sources), vars);
+        spawn_rules_watcher(state.clone(), Arc::clone(&sources), Arc::new(vars));
         tokio::time::sleep(Duration::from_millis(100)).await;
         *TEAM.lock().unwrap() = "red".to_owned();
 

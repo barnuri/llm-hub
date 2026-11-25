@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use hub::{HubProcess, start_hub};
+use hub::{HubProcess, start_process_hub};
 
 /// The worker's feature message, as `worker.rs` prints it.
 const NOT_BUILT: &str = "this llm-hub was built without the `mistralrs` cargo feature";
@@ -82,7 +82,7 @@ impl Fixture {
         for (key, value) in extra {
             vars.insert((*key).to_owned(), (*value).to_owned());
         }
-        let (hub, base) = start_hub(vars).await;
+        let (hub, base) = start_process_hub(vars).await;
         Fixture {
             _dir: dir,
             _models: None,

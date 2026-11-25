@@ -21,7 +21,7 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use crate::hub;
 
-use hub::{BodyHas, BodyLacks, HubProcess, completion, start_hub};
+use hub::{BodyHas, BodyLacks, InProcessHub, completion, start_hub};
 
 const HUB_CHAT_ROUTE: &str = "/v1/chat/completions";
 const UPSTREAM_CHAT_ROUTE: &str = "/chat/completions";
@@ -51,7 +51,7 @@ const WORKER_STORE: &str = "run-store/node-1";
 const WORKER_RESTART: &str = "run-restart/node-1";
 
 struct SharedFixture {
-    _hub: HubProcess,
+    _hub: InProcessHub,
     base: String,
     alpha: MockServer,
     beta: MockServer,
@@ -161,7 +161,7 @@ async fn start_pair(
     beta: &MockServer,
     models: usize,
     extra: &[(&str, String)],
-) -> (HubProcess, String) {
+) -> (InProcessHub, String) {
     let mut vars: HashMap<String, String> = HashMap::from([
         ("LLM_HUB_PROFILES".to_owned(), "alpha,beta".to_owned()),
         ("LLM_HUB_ALPHA_BASE_URL".to_owned(), alpha.uri()),

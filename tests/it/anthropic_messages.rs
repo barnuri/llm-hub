@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use crate::hub::{HubProcess, start_hub};
+use crate::hub::{InProcessHub, start_hub};
 
 use wiremock::matchers::{body_partial_json, header_exists, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -559,7 +559,7 @@ async fn sent_alias(upstream: &MockServer) -> String {
         .expect("one upstream attempt")
 }
 
-async fn hub_with_echo(upstream: &MockServer, stream: bool) -> (HubProcess, String) {
+async fn hub_with_echo(upstream: &MockServer, stream: bool) -> (InProcessHub, String) {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(EchoToolName { stream })
