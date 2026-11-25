@@ -6,7 +6,7 @@ use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::directive_outcome::DirectiveOutcome;
 use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::live_signals::LiveSignals;
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_directive::ModelDirective;
 use crate::schemas::pin_miss::PinMiss;
@@ -416,16 +416,16 @@ impl SmartAutoRouter {
         live: &LiveSignals,
         limit: usize,
     ) -> Vec<String> {
-        let taken: Vec<&str> = taken.iter().map(|id| strip_1m_suffix(id)).collect();
+        let taken: Vec<&str> = taken.iter().map(|id| strip_window_suffix(id).0).collect();
         let mut ranked: Vec<&ModelDescriptor> = pool
             .iter()
             .copied()
-            .filter(|model| !taken.contains(&strip_1m_suffix(&model.qualified_id)))
+            .filter(|model| !taken.contains(&strip_window_suffix(&model.qualified_id).0))
             .collect();
         ranked.sort_by_key(|model| Reverse(Self::rank(model, tier, turn, usage, live)));
         let picked_profile = pool
             .iter()
-            .find(|model| taken.first() == Some(&strip_1m_suffix(&model.qualified_id)))
+            .find(|model| taken.first() == Some(&strip_window_suffix(&model.qualified_id).0))
             .map(|model| model.profile.as_str());
         if let Some(other) = ranked
             .iter()
@@ -478,7 +478,7 @@ impl SmartAutoRouter {
     /// 0 below 128 requests, 1 below 32,768, else 2: usage separates only near ties.
     fn usage_points(model: &ModelDescriptor, usage: &HashMap<String, u64>) -> u32 {
         let requests = usage
-            .get(strip_1m_suffix(&model.qualified_id))
+            .get(strip_window_suffix(&model.qualified_id).0)
             .copied()
             .unwrap_or(0);
         ((u64::BITS - requests.leading_zeros()) / Self::USAGE_BITS_PER_POINT)

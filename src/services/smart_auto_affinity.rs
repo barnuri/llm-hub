@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use crate::configs::TokenRates;
 use crate::schemas::affinity_key::AffinityKey;
 use crate::schemas::hub_selector::HubSelector;
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::pin_miss::PinMiss;
 use crate::schemas::turn_signals::TurnSignals;
@@ -351,7 +351,7 @@ impl SmartAutoAffinity {
     }
 
     fn is_pinnable(model: &str) -> bool {
-        let Some((profile, bare_id)) = strip_1m_suffix(model).split_once(Self::PROFILE_SEPARATOR)
+        let Some((profile, bare_id)) = strip_window_suffix(model).0.split_once(Self::PROFILE_SEPARATOR)
         else {
             return false;
         };

@@ -157,6 +157,8 @@ pub const BUILT_AT_MS: &str = env!("LLM_HUB_BUILT_AT_MS");
 
 /// Claude Code's `[1m]` suffix / native long-context window size.
 pub const CONTEXT_TOKENS_1M: u64 = 1_000_000;
+/// The window a bare id of a 1M model lists: the 200k a client gets without `[1m]`.
+pub const CONTEXT_TOKENS_200K: u64 = 200_000;
 /// Suffix Claude Code appends to treat a gateway model id as 1M context.
 pub const CONTEXT_1M_SUFFIX: &str = "[1m]";
 

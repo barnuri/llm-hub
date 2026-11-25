@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 
 /// Every concrete model's descriptor from the last model refresh, keyed by qualified id.
@@ -24,14 +24,14 @@ impl ModelDescriptorSnapshot {
     #[allow(dead_code, reason = "Consumed by Smart Auto eligibility and admission")]
     #[must_use]
     pub fn get(&self, qualified_id: &str) -> Option<&ModelDescriptor> {
-        self.by_qualified_id.get(strip_1m_suffix(qualified_id))
+        self.by_qualified_id.get(strip_window_suffix(qualified_id).0)
     }
 
     /// `model` is the bare id the hub advertises, e.g. `claude-opus-5-5`; a `[1m]` alias is ignored.
     #[allow(dead_code, reason = "Consumed by Smart Auto eligibility and admission")]
     #[must_use]
     pub fn for_model(&self, profile: &str, model: &str) -> Option<&ModelDescriptor> {
-        self.get(&format!("{profile}/{}", strip_1m_suffix(model)))
+        self.get(&format!("{profile}/{}", strip_window_suffix(model).0))
     }
 
     /// Every descriptor in the snapshot, in no fixed order.

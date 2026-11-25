@@ -72,7 +72,7 @@ The steps:
 4. **Eligible pool.** The pool is the set of models allowed for this request. A model must pass each check, in order:
    1. It is a concrete chat model. Speech models, `hub/*` ids and Copilot Auto aliases (`auto`, `auto-fast`, ...) never count.
    2. It serves the client route, such as `/v1/messages`. A model that lists no routes serves all of them.
-   3. The rules allow it. The order is: global exclude, profile exclude, profile include, global include. A deny always wins. `[1m]` on a glob is ignored for matching.
+   3. The rules allow it. The order is: global exclude, profile exclude, profile include, global include. A deny always wins. A window suffix such as `[1m]` or `[200k]` on a glob is ignored for matching.
    4. Its known total context, prompt size and output size meet the minimums. An unknown or conflicting value fails any minimum set for it. The local runtime cap applies to prompt and total context.
    5. The estimated prompt, about one token per four request bytes, fits any known prompt or context limit. A lower-bound observation is never a limit.
    6. The caller's `x-llm-hub-profiles` filter allows its profile. A filter that names only `hub` leaves the pool open.

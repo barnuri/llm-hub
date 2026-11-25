@@ -1,4 +1,4 @@
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 use crate::schemas::model_directive::ModelDirective;
 
 /// Finds a model directive in the visible user text: "use opus" at the start of a clause,
@@ -38,7 +38,7 @@ impl SmartAutoDirective {
     /// model id, or a run of its `-` separated parts, such as `opus` in `claude-opus-5-5`.
     #[must_use]
     pub fn names_model(name: &str, qualified_id: &str) -> bool {
-        let id = Self::normalize(strip_1m_suffix(qualified_id));
+        let id = Self::normalize(strip_window_suffix(qualified_id).0);
         let name = Self::normalize(name);
         if name.contains(Self::PATH_SEPARATOR) {
             return id == name || id.ends_with(&format!("{}{name}", Self::PATH_SEPARATOR));

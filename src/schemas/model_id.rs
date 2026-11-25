@@ -1,4 +1,4 @@
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 
 /// A fully-qualified hub model id: `<profile>/<upstream model id>`.
 /// Split happens on the FIRST slash only — upstream ids legitimately
@@ -7,11 +7,13 @@ use crate::schemas::model_context::strip_1m_suffix;
 pub struct ModelId {
     pub profile: String,
     pub model: String,
+    /// The window the client declared with a `[<n>k]` or `[<n>m]` suffix, in tokens.
+    pub window: Option<u64>,
 }
 
 impl ModelId {
     pub fn parse(raw: &str) -> Option<ModelId> {
-        let raw = strip_1m_suffix(raw);
+        let (raw, window) = strip_window_suffix(raw);
         let (profile, model) = raw.split_once('/')?;
         if profile.is_empty() || model.is_empty() {
             return None;
@@ -19,6 +21,7 @@ impl ModelId {
         Some(ModelId {
             profile: profile.to_string(),
             model: model.to_string(),
+            window,
         })
     }
 
@@ -70,6 +73,19 @@ mod tests {
         assert_eq!(id.profile, "llmgw");
         assert_eq!(id.model, "bedrock/anthropic.claude-opus-5");
         assert_eq!(id.qualified(), "llmgw/bedrock/anthropic.claude-opus-5");
+        assert_eq!(id.window, Some(1_000_000));
+    }
+
+    #[test]
+    fn window_suffix_is_kept_as_the_declared_window() {
+        let id = ModelId::parse("copilot/claude-sonnet-5-5[200k]").unwrap();
+        assert_eq!(id.model, "claude-sonnet-5-5");
+        assert_eq!(id.window, Some(200_000));
+    }
+
+    #[test]
+    fn bare_id_declares_no_window() {
+        assert_eq!(ModelId::parse("copilot/claude-sonnet-5-5").unwrap().window, None);
     }
 
     #[test]

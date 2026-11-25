@@ -55,8 +55,9 @@ How the `/model` picker fills:
   while hub auth is off. With [hub auth](http-api.md#hub-authentication) on, set
   `LLM_HUB_API_KEY` to a real hub key.
 - A discovered model can merge into its built-in alias row, for example `opus`.
-- The hub adds `[1m]` to the id of a model whose known window is 1M tokens or more, so Claude
-  Code does not assume a 200k window.
+- A model whose known window is 1M tokens or more is listed twice: the bare id at 200k, and the id
+  with `[1m]` at 1M. Pick the `[1m]` id for the 1M window. Requests accept `[<n>k]` and `[<n>m]`
+  suffixes (for example `[200k]`) to declare a window; the bare id is held to 200k.
 
 ## llm-hub codex
 
