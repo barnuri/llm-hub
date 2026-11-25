@@ -245,6 +245,7 @@ fn upsert_profile_apply(
         tuner: existing.map(|p| p.tuner.clone()).unwrap_or_default(),
         local: existing.and_then(|p| p.local.clone()),
         budget_monthly_usd: existing.and_then(|p| p.budget_monthly_usd),
+        quota_cooldown: existing.and_then(|p| p.quota_cooldown),
     };
     if !profile.base_url.starts_with("http://") && !profile.base_url.starts_with("https://") {
         return Err(AppError::BadRequest(
