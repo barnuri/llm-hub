@@ -6,6 +6,7 @@ pub mod bifrost_usage;
 pub mod body_transform;
 pub mod bounded_ring;
 pub mod buffered_reply_stream;
+pub mod cache_stats;
 pub mod config_reload;
 pub mod copilot_auto;
 pub mod copilot_auto_decisions;

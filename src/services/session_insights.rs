@@ -346,6 +346,27 @@ fn models_and_streams(user_rows: &[&SessionRequest]) -> (Vec<String>, u64) {
     (models, count_u64(streams))
 }
 
+fn cache_session_totals(user_rows: &[&SessionRequest]) -> (f64, u64) {
+    let successful: Vec<&SessionRequest> = user_rows
+        .iter()
+        .copied()
+        .filter(|row| row.status < 400)
+        .collect();
+    let cache_total_in: u64 = successful.iter().map(|row| row.tokens_in).sum();
+    let cache_read: u64 = successful.iter().map(|row| row.cache_read_tokens).sum();
+    let big_misses = successful
+        .iter()
+        .filter(|row| row.tokens_in >= 100_000 && row.cache_read_tokens * 2 < row.tokens_in)
+        .count();
+    let hit_rate_pct = if cache_total_in == 0 {
+        0.0
+    } else {
+        f64::from(u32::try_from(cache_read).unwrap_or(u32::MAX)) * 100.0
+            / f64::from(u32::try_from(cache_total_in).unwrap_or(u32::MAX))
+    };
+    (hit_rate_pct, count_u64(big_misses))
+}
+
 fn analyze_session(
     worker: &str,
     rows: &[SessionRequest],
@@ -397,6 +418,7 @@ fn analyze_session(
         .filter(|row| row.shape.as_ref().is_some_and(|shape| shape.turn_start))
         .count();
     let (models, streams) = models_and_streams(&user_rows);
+    let (cache_hit_rate_pct, big_misses) = cache_session_totals(&user_rows);
     let total = cost.total();
     let summary = SessionSummary {
         worker: worker.to_string(),
@@ -427,6 +449,8 @@ fn analyze_session(
         },
         compactions: count_u64(compaction_pairs.len()),
         idle_cache_write_usd,
+        cache_hit_rate_pct,
+        big_misses,
         routed_by_spend,
         keep_warm,
     };

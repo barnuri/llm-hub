@@ -25,6 +25,7 @@ import { useFreshKeys, useLive } from "../lib/live";
 import { navigate, setQueryParam } from "../lib/router";
 import { formatBucket, type SeriesBucket, stackByUpstream, type UpstreamStacks } from "../lib/series";
 import type {
+  CacheStats,
   CopilotQuota,
   CopilotUsageReport,
   ErrorsReport,
@@ -69,6 +70,13 @@ interface DailyTotals {
   readonly tokensIn: number[];
   readonly tokensOut: number[];
   readonly cost: number[];
+  readonly cacheHit: number[];
+}
+
+export function cacheHitTone(hitRatePct: number): KpiTone {
+  if (hitRatePct < 60) return "danger";
+  if (hitRatePct < 80) return "warn";
+  return "default";
 }
 
 function periodUsable(snapshot: StatsSnapshot | null, range: string): snapshot is StatsSnapshot {
@@ -76,13 +84,14 @@ function periodUsable(snapshot: StatsSnapshot | null, range: string): snapshot i
 }
 
 function dailyTotals(series: readonly SeriesPoint[]): DailyTotals {
-  const byDay = new Map<number, { requests: number; tokensIn: number; tokensOut: number; cost: number }>();
+  const byDay = new Map<number, { requests: number; tokensIn: number; tokensOut: number; cost: number; cacheRead: number }>();
   for (const point of series) {
-    const day = byDay.get(point.ts_ms) ?? { requests: 0, tokensIn: 0, tokensOut: 0, cost: 0 };
+    const day = byDay.get(point.ts_ms) ?? { requests: 0, tokensIn: 0, tokensOut: 0, cost: 0, cacheRead: 0 };
     day.requests += point.requests;
     day.tokensIn += point.tokens_in;
     day.tokensOut += point.tokens_out;
     day.cost += point.cost_usd;
+    day.cacheRead += point.cache_read_tokens;
     byDay.set(point.ts_ms, day);
   }
   const days = [...byDay.entries()].sort(([left], [right]) => left - right).slice(-SPARK_DAYS);
@@ -92,6 +101,7 @@ function dailyTotals(series: readonly SeriesPoint[]): DailyTotals {
     tokensIn: days.map(([, totals]) => totals.tokensIn),
     tokensOut: days.map(([, totals]) => totals.tokensOut),
     cost: days.map(([, totals]) => totals.cost),
+    cacheHit: days.map(([, totals]) => totals.tokensIn > 0 ? (totals.cacheRead / totals.tokensIn) * 100 : 0),
   };
 }
 
@@ -379,6 +389,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
   const [gateways, setGateways] = useState<readonly GatewayQuota[]>([]);
   const [quotaHistory, setQuotaHistory] = useState<QuotaHistory | null>(null);
   const [weekErrors, setWeekErrors] = useState<readonly UsageRow[] | null>(null);
+  const [cacheToday, setCacheToday] = useState<CacheStats | null>(null);
   const [loadedAt, setLoadedAt] = useState<Date | null>(null);
   const [historyOff, setHistoryOff] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -395,7 +406,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
     let cancelled = false;
 
     const load = async () => {
-      const [todayResult, weekResult, usageResult, copilotResult, errorsResult, quotaResult, gatewayResult] =
+      const [todayResult, weekResult, usageResult, copilotResult, errorsResult, quotaResult, gatewayResult, cacheTodayResult] =
         await Promise.allSettled([
           api<StatsSnapshot>("/api/stats?range=1d"),
           api<StatsSnapshot>("/api/stats?range=7d"),
@@ -404,6 +415,7 @@ export function UsageScreen({ period }: UsageScreenProps) {
           api<ErrorsReport>("/api/errors?range=7d"),
           api<QuotaHistory>("/api/copilot/usage/history?range=7d"),
           loadGatewayQuotas(),
+          api<CacheStats>("/api/cache?range=1d"),
         ]);
       if (cancelled) {
         return;
@@ -430,6 +442,9 @@ export function UsageScreen({ period }: UsageScreenProps) {
       }
       if (gatewayResult.status === "fulfilled") {
         setGateways(gatewayResult.value);
+      }
+      if (cacheTodayResult.status === "fulfilled") {
+        setCacheToday(cacheTodayResult.value);
       }
       setLoadedAt(new Date());
       setLoading(false);
@@ -491,6 +506,9 @@ export function UsageScreen({ period }: UsageScreenProps) {
   };
 
   const daily = dailyTotals(weekReady ? (week.series ?? []) : []);
+  const weekCacheRead = (week?.series ?? []).reduce((sum, point) => sum + point.cache_read_tokens, 0);
+  const weekCacheInput = (week?.series ?? []).reduce((sum, point) => sum + point.tokens_in, 0);
+  const weekCacheHitPct = weekCacheInput > 0 ? (weekCacheRead / weekCacheInput) * 100 : 0;
   const errorSeries = weekErrors ? dailyErrors(daily.days, weekErrors) : [];
   const weekSub = (values: readonly number[], format: (value: number) => string): string | undefined => {
     if (values.length === 0) {
@@ -588,6 +606,14 @@ export function UsageScreen({ period }: UsageScreenProps) {
           )}
         </div>
         <div className="kpi-strip">
+          <KpiCard
+            label="Cache hit"
+            value={formatPct(snapshot.overview.cache_hit_rate_pct)}
+            sub={`${formatNumber(cacheToday?.big_misses ?? 0)} big misses today · ${formatPct(weekCacheHitPct)} in 7 days`}
+            series={daily.cacheHit}
+            seriesLabel="Cache hit rate, last 7 days"
+            tone={cacheHitTone(snapshot.overview.cache_hit_rate_pct)}
+          />
           <KpiCard
             label="Keep-warm pings"
             value={formatNumber(snapshot.overview.keepwarm_pings)}

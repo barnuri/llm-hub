@@ -5,7 +5,7 @@ use super::managed_command::ManagedCommand;
 use crate::schemas::notification::{MuteMatch, NotificationSeverity};
 
 /// Notification settings from the `LLM_HUB_NOTIFICATIONS` and `LLM_HUB_NOTIFY_*` keys.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NotifyConfig {
     /// `LLM_HUB_NOTIFICATIONS`, on by default. `false` stops inbox writes and every sink.
     pub enabled: bool,
@@ -23,6 +23,16 @@ pub struct NotifyConfig {
     pub mutes: Vec<MuteMatch>,
     /// `LLM_HUB_NOTIFY_BUDGET_STEPS`: the budget percents that raise a notification, sorted and unique.
     pub budget_steps: Vec<u32>,
+    /// `LLM_HUB_NOTIFY_CACHE`, on by default.
+    pub cache_enabled: bool,
+    /// `LLM_HUB_CACHE_MISS_BURST_COUNT`, the big-miss count that raises a burst alert.
+    pub cache_miss_burst_count: u64,
+    /// `LLM_HUB_CACHE_MISS_BURST_USD`, the miss-cost threshold that raises a burst alert.
+    pub cache_miss_burst_usd: f64,
+    /// `LLM_HUB_CACHE_HIT_LOW_PCT`, the hit-rate percentage below which the hub alerts.
+    pub cache_hit_low_pct: f64,
+    /// `LLM_HUB_CACHE_HIT_MIN_REQUESTS`, the successful-request minimum for a hit-rate alert.
+    pub cache_hit_min_requests: u64,
 }
 
 impl Default for NotifyConfig {
@@ -36,6 +46,11 @@ impl Default for NotifyConfig {
             timeout: Self::DEFAULT_TIMEOUT,
             mutes: Vec::new(),
             budget_steps: Self::DEFAULT_BUDGET_STEPS.to_vec(),
+            cache_enabled: true,
+            cache_miss_burst_count: 3,
+            cache_miss_burst_usd: 5.0,
+            cache_hit_low_pct: 80.0,
+            cache_hit_min_requests: 20,
         }
     }
 }
@@ -83,6 +98,19 @@ impl NotifyConfig {
                 || Ok(Self::DEFAULT_BUDGET_STEPS.to_vec()),
                 |raw| Self::parse_budget_steps(&raw),
             )?,
+            cache_enabled: get("NOTIFY_CACHE").is_none_or(|v| !is_falsy(&v)),
+            cache_miss_burst_count: present("CACHE_MISS_BURST_COUNT").map_or(Ok(3), |raw| {
+                Self::parse_u64(&raw, "LLM_HUB_CACHE_MISS_BURST_COUNT", 1, u64::MAX)
+            })?,
+            cache_miss_burst_usd: present("CACHE_MISS_BURST_USD").map_or(Ok(5.0), |raw| {
+                Self::parse_f64(&raw, "LLM_HUB_CACHE_MISS_BURST_USD", 0.0, 1_000_000.0)
+            })?,
+            cache_hit_low_pct: present("CACHE_HIT_LOW_PCT").map_or(Ok(80.0), |raw| {
+                Self::parse_f64(&raw, "LLM_HUB_CACHE_HIT_LOW_PCT", 0.0, 100.0)
+            })?,
+            cache_hit_min_requests: present("CACHE_HIT_MIN_REQUESTS").map_or(Ok(20), |raw| {
+                Self::parse_u64(&raw, "LLM_HUB_CACHE_HIT_MIN_REQUESTS", 1, u64::MAX)
+            })?,
         })
     }
 
@@ -136,6 +164,22 @@ impl NotifyConfig {
         })
     }
 
+    fn parse_u64(raw: &str, key: &str, min: u64, max: u64) -> Result<u64, String> {
+        match raw.parse::<u64>() {
+            Ok(value) if value >= min && value <= max => Ok(value),
+            _ => Err(format!(
+                "{key} must be a whole number from {min} to {max}: {raw}"
+            )),
+        }
+    }
+
+    fn parse_f64(raw: &str, key: &str, min: f64, max: f64) -> Result<f64, String> {
+        match raw.parse::<f64>() {
+            Ok(value) if value.is_finite() && value >= min && value <= max => Ok(value),
+            _ => Err(format!("{key} must be a number from {min} to {max}: {raw}")),
+        }
+    }
+
     fn parse_timeout(raw: &str) -> Result<Duration, String> {
         match raw.parse::<u64>() {
             Ok(ms) if ms > 0 => Ok(Duration::from_millis(ms)),
@@ -187,6 +231,11 @@ mod tests {
             "NOTIFY_TIMEOUT_MS",
             "NOTIFY_MUTE",
             "NOTIFY_BUDGET_STEPS",
+            "NOTIFY_CACHE",
+            "CACHE_MISS_BURST_COUNT",
+            "CACHE_MISS_BURST_USD",
+            "CACHE_HIT_LOW_PCT",
+            "CACHE_HIT_MIN_REQUESTS",
         ];
         let pairs: Vec<(&str, &str)> = keys.iter().map(|key| (*key, "")).collect();
         assert_eq!(parse(&pairs).unwrap(), NotifyConfig::default());
@@ -203,6 +252,11 @@ mod tests {
             ("NOTIFY_TIMEOUT_MS", "2500"),
             ("NOTIFY_MUTE", "source=errors;model=*/gemma-*"),
             ("NOTIFY_BUDGET_STEPS", "90, 50,50 ,1000,1"),
+            ("NOTIFY_CACHE", "false"),
+            ("CACHE_MISS_BURST_COUNT", "4"),
+            ("CACHE_MISS_BURST_USD", "6.5"),
+            ("CACHE_HIT_LOW_PCT", "75"),
+            ("CACHE_HIT_MIN_REQUESTS", "25"),
         ])
         .unwrap();
         assert!(!config.enabled);
@@ -220,6 +274,11 @@ mod tests {
         assert_eq!(config.mutes.len(), 2);
         assert_eq!(config.mutes[1].model.as_deref(), Some("*/gemma-*"));
         assert_eq!(config.budget_steps, vec![1, 50, 90, 1000]);
+        assert!(!config.cache_enabled);
+        assert_eq!(config.cache_miss_burst_count, 4);
+        assert!((config.cache_miss_burst_usd - 6.5).abs() < f64::EPSILON);
+        assert!((config.cache_hit_low_pct - 75.0).abs() < f64::EPSILON);
+        assert_eq!(config.cache_hit_min_requests, 25);
     }
 
     #[test]

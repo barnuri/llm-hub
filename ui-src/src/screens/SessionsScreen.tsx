@@ -27,7 +27,7 @@ const RANGE_OPTIONS: readonly SegmentedOption<SessionsRange>[] = [
   { value: "all", label: "All time" },
 ];
 
-const LIST_COLUMN_COUNT = 15;
+const LIST_COLUMN_COUNT = 17;
 
 export function SessionsScreen() {
   const route = useRoute();
@@ -110,6 +110,8 @@ function SessionsList({ range }: { readonly range: SessionsRange }) {
                   <th className="num">Prompt peak</th>
                   <th className="num">Cost</th>
                   <th className="num">Cache read</th>
+                  <th className="num">Cache-hit %</th>
+                  <th className="num">Big misses</th>
                   <th className="num">Cache write</th>
                   <th className="num" title="Cache writes after the cache expired">
                     Idle cache write
@@ -181,6 +183,8 @@ function SessionRow({ session, range }: { readonly session: SessionSummary; read
       </td>
       <td className="num nowrap">{formatUsd(session.cost_usd)}</td>
       <td className="num nowrap">{formatUsd(session.cache_read_usd)}</td>
+      <td className="num">{formatPct(session.cache_hit_rate_pct)}</td>
+      <td className="num">{formatNumber(session.big_misses)}</td>
       <td className="num nowrap">{formatUsd(session.cache_write_usd)}</td>
       <td className="num nowrap">{formatUsd(session.idle_cache_write_usd)}</td>
       <td className="num">{formatPct(session.long_tier_share * 100)}</td>
