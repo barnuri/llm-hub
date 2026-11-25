@@ -28,7 +28,7 @@ platform = { host = "cfg(windows)" }
 setup = "test-roots-windows"
 
 [profile.ci]
-test-threads = 8
+test-threads = "num-cpus"
 fail-fast = false
 
 [profile.ci.junit]
