@@ -3,6 +3,9 @@
 //! of tools, system or messages, so the cached prefix stays the same.
 
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+
+use crate::schemas::prompt_shape::PromptShape;
 
 /// Anthropic allows at most four breakpoints per request.
 const MAX_BREAKPOINTS: usize = 4;
@@ -36,6 +39,44 @@ impl CacheHint {
 
 fn ephemeral() -> Value {
     json!({"type": "ephemeral"})
+}
+
+/// Adds llama.cpp's `cache_prompt` and a stream-scoped `id_slot` to a chat body that the client
+/// did not set. The slot is picked from the caller's session and the body's stream key (system
+/// prompt and tool names), so one conversation stream keeps its slot and its cached prefix. The
+/// body's text is never changed. `None` when the body is not a JSON object or has both fields.
+pub fn llama_slot_hints(body: &[u8], session: Option<&str>, slots: u64) -> Option<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(body).ok()?;
+    let object = value.as_object_mut()?;
+    let unset = |object: &Map<String, Value>, key: &str| object.get(key).is_none_or(Value::is_null);
+    let (set_prompt, set_slot) = (unset(object, "cache_prompt"), unset(object, "id_slot"));
+    if !set_prompt && !set_slot {
+        return None;
+    }
+    let stream = PromptShape::from_body(body)
+        .and_then(|shape| shape.stream_key)
+        .unwrap_or_default();
+    if set_prompt {
+        object.insert("cache_prompt".into(), Value::Bool(true));
+    }
+    if set_slot {
+        let slot = stream_slot(session, &stream, slots);
+        object.insert("id_slot".into(), json!(slot));
+    }
+    serde_json::to_vec(&value).ok()
+}
+
+/// The slot of one stream: a SHA-256 over the session and the stream key, taken modulo `slots`.
+/// Zero slots count as one.
+pub fn stream_slot(session: Option<&str>, stream: &str, slots: u64) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(session.unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(stream.as_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut first = [0; 8];
+    first.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(first) % slots.max(1)
 }
 
 fn set_prompt_key(body: &mut Value, key: &str) {
@@ -308,6 +349,45 @@ mod tests {
         let mut odd = json!({"messages": ["x", {"role": "user", "content": "q"}]});
         CacheHint::CopilotChat.apply(&mut odd);
         assert_eq!(marks(&odd), 1);
+    }
+
+    #[test]
+    fn llama_hints_set_cache_prompt_and_a_stream_slot() {
+        let body =
+            br#"{"model":"m","system":"be terse","messages":[{"role":"user","content":"hi"}]}"#;
+        let out: Value =
+            serde_json::from_slice(&llama_slot_hints(body, Some("ses-1"), 4).unwrap()).unwrap();
+        assert_eq!(out["cache_prompt"], true);
+        let slot = out["id_slot"].as_u64().unwrap();
+        assert!(slot < 4);
+        let again: Value =
+            serde_json::from_slice(&llama_slot_hints(body, Some("ses-1"), 4).unwrap()).unwrap();
+        assert_eq!(again["id_slot"], slot, "the same stream keeps its slot");
+        assert_eq!(out["messages"], json!([{"role":"user","content":"hi"}]));
+    }
+
+    #[test]
+    fn llama_hints_keep_the_clients_fields_and_skip_full_bodies() {
+        let body = br#"{"model":"m","messages":[],"cache_prompt":false,"id_slot":2}"#;
+        assert!(llama_slot_hints(body, None, 4).is_none());
+        let partial = br#"{"model":"m","messages":[],"id_slot":1}"#;
+        let out: Value =
+            serde_json::from_slice(&llama_slot_hints(partial, None, 4).unwrap()).unwrap();
+        assert_eq!(out["cache_prompt"], true);
+        assert_eq!(out["id_slot"], 1);
+        assert!(llama_slot_hints(b"not json", None, 4).is_none());
+        assert!(llama_slot_hints(b"[1]", None, 4).is_none());
+    }
+
+    #[test]
+    fn stream_slot_stays_inside_the_slot_count() {
+        assert_eq!(stream_slot(Some("a"), "k", 1), 0);
+        assert_eq!(stream_slot(Some("a"), "k", 0), 0);
+        assert!((0..16).all(|n| stream_slot(Some("a"), &format!("k{n}"), 3) < 3));
+        assert_ne!(
+            stream_slot(Some("ses-main"), "main", 8),
+            stream_slot(Some("ses-other"), "main", 8)
+        );
     }
 
     #[test]

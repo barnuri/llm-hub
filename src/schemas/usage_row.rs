@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::schemas::cache_write_source::CacheWriteSource;
+
 #[derive(Debug, Serialize, Clone)]
 pub struct UsageRow {
     pub ts_ms: u64,
@@ -12,6 +14,10 @@ pub struct UsageRow {
     pub tokens_out: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// Labels whether `cache_write_tokens` was reported or only `uncached_input_tokens` is known.
+    pub cache_write_source: CacheWriteSource,
+    /// Upper-bound estimate when the upstream reports no cache-write count.
+    pub uncached_input_tokens: u64,
     /// Estimated USD at read time. Not persisted; old JSON store files load as `$0`.
     pub cost_usd: f64,
     /// Failure reason captured for `status >= 400` rows.
@@ -43,6 +49,10 @@ impl<'de> Deserialize<'de> for UsageRow {
             #[serde(default)]
             cache_write_tokens: u64,
             #[serde(default)]
+            cache_write_source: CacheWriteSource,
+            #[serde(default)]
+            uncached_input_tokens: u64,
+            #[serde(default)]
             cost_usd: f64,
             #[serde(default)]
             error: Option<String>,
@@ -65,6 +75,8 @@ impl<'de> Deserialize<'de> for UsageRow {
             tokens_out: raw.tokens_out,
             cache_read_tokens: raw.cache_read_tokens,
             cache_write_tokens: raw.cache_write_tokens,
+            cache_write_source: raw.cache_write_source,
+            uncached_input_tokens: raw.uncached_input_tokens,
             cost_usd: raw.cost_usd,
             error: raw.error,
             client: raw.client,

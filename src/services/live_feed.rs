@@ -37,6 +37,8 @@ impl LiveFeed {
             outcome.cache_read_tokens,
             outcome.cache_write_tokens,
         );
+        let (cache_write_source, uncached_input_tokens) =
+            crate::services::stats::cache_write_label(outcome);
         let row = UsageRow {
             ts_ms: now_ms(),
             model: outcome.model_key.clone(),
@@ -48,6 +50,8 @@ impl LiveFeed {
             tokens_out: outcome.tokens_out,
             cache_read_tokens: outcome.cache_read_tokens,
             cache_write_tokens: outcome.cache_write_tokens,
+            cache_write_source,
+            uncached_input_tokens,
             cost_usd,
             error: outcome.error.clone(),
             session_id: None,

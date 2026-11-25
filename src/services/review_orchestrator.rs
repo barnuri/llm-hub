@@ -539,7 +539,9 @@ impl ReviewOrchestrator {
             tokens_in: count("/usage/prompt_tokens"),
             tokens_out: count("/usage/completion_tokens"),
             cache_read: count("/usage/prompt_tokens_details/cached_tokens"),
-            cache_write: 0,
+            cache_write: completion
+                .get("usage")
+                .map_or(0, crate::services::stats::cache_write_in),
         }
     }
 
@@ -1194,6 +1196,19 @@ mod usage_tests {
                 cache_write: 0,
             }
         );
+    }
+
+    #[test]
+    fn usage_reads_a_reported_cache_write() {
+        let completion = json!({
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 80,
+                "prompt_tokens_details": { "cached_tokens": 900 },
+                "cache_creation_input_tokens": 250
+            }
+        });
+        assert_eq!(ReviewOrchestrator::usage_of(&completion).cache_write, 250);
     }
 
     #[test]
