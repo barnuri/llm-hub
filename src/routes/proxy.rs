@@ -457,10 +457,11 @@ pub(crate) async fn attempt_loop(
         if media_fallback && !text_only {
             sent = resend_as_text(state, model_id, &sender, &mut attempt, sent).await;
         }
-        // A newly refused endpoint is learned, and the same model is routed again on another endpoint.
+        // A newly refused endpoint is learned. The same model is routed again only when another
+        // endpoint remains, otherwise its 400 moves on to the next model or to the client.
         let (sent, refused) =
             learn_refused_endpoint(state, model_id, sent, attempt.path.as_str()).await;
-        if refused {
+        if refused && routes_elsewhere(&bodies, state, model_id, &attempt) {
             if let Some(event) = &selection {
                 record_transition(state, event, SelectionState::Rejected, None);
             }
@@ -1484,8 +1485,20 @@ pub(crate) fn upstream_key(state: &AppState, model_id: &ModelId) -> String {
         .map_or_else(|| model_id.model.clone(), |entry| entry.upstream_id)
 }
 
+/// True when `model_id`, after an endpoint refusal, now routes to another endpoint than `sent`.
+fn routes_elsewhere(
+    bodies: &AttemptBodies<'_>,
+    state: &AppState,
+    model_id: &ModelId,
+    sent: &Attempt<'_>,
+) -> bool {
+    bodies
+        .for_model(state, model_id)
+        .is_ok_and(|next| next.path.as_str() != sent.path.as_str())
+}
+
 /// When `sent` is a Copilot 400 that refuses the chat-completions or messages endpoint, learns the
-/// refusal and reports it as new (`true`). Any other reply comes back unchanged, with `false`.
+/// refusal and reports it as new (`true`). The reply always comes back, rebuilt when it was read.
 async fn learn_refused_endpoint(
     state: &AppState,
     model_id: &ModelId,
@@ -1515,13 +1528,13 @@ async fn learn_refused_endpoint(
         usize::try_from(MAX_REJECTION_BYTES).unwrap_or(usize::MAX),
     )
     .await;
-    if String::from_utf8_lossy(&raw).contains(NO_ENDPOINT_REFUSAL)
-        && state.learn_endpoint_refused(&model_id.profile, &model_id.model, endpoint)
-    {
-        return (Err(NO_ENDPOINT_REFUSAL.to_string()), true);
-    }
+    let refused = String::from_utf8_lossy(&raw).contains(NO_ENDPOINT_REFUSAL)
+        && state.learn_endpoint_refused(&model_id.profile, &model_id.model, endpoint);
     let body = reqwest::Body::from(raw);
-    (Ok(rebuilt_response(status, version, headers, body)), false)
+    (
+        Ok(rebuilt_response(status, version, headers, body)),
+        refused,
+    )
 }
 
 /// When `sent` is a 500 that refuses image input, learns the refusal and sends the attempt once
@@ -7644,6 +7657,39 @@ mod tests {
                 "a learned refusal is not sent to chat-completions again"
             );
             assert_eq!(requests_to(&copilot, RESPONSES_ENDPOINT).await.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn refused_only_endpoint_returns_the_400_without_a_resend() {
+            let copilot = copilot().await;
+            copilot.state.set_copilot_catalog(
+                PROFILE,
+                vec![json!({"id": MIXED_ID, "supported_endpoints": ["/chat/completions"]})],
+            );
+            Mock::given(method("POST"))
+                .and(path(UPSTREAM_CHAT_PATH))
+                .respond_with(
+                    ResponseTemplate::new(400).set_body_raw(NO_ENDPOINT_BODY, "application/json"),
+                )
+                .mount(&copilot.upstream)
+                .await;
+
+            let (status, bytes) = send(
+                &copilot,
+                &client_headers(),
+                &chat_body(MIXED_ID, false),
+                RouteKind::OpenAi,
+            )
+            .await;
+
+            assert_eq!(status, 400);
+            assert!(String::from_utf8_lossy(&bytes).contains(NO_ENDPOINT_REFUSAL));
+            assert_eq!(copilot.upstream.received_requests().await.unwrap().len(), 1);
+            assert!(
+                copilot
+                    .state
+                    .endpoint_refused(PROFILE, MIXED_ID, CHAT_ENDPOINT)
+            );
         }
 
         #[tokio::test]
