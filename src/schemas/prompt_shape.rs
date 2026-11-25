@@ -31,6 +31,9 @@ pub struct PromptShape {
     /// Hex hash of the system text and the sorted tool names. Requests with the same key come from
     /// the same conversation or subagent type.
     pub stream_key: Option<String>,
+    /// Which stream this is: `main`, `subagent:explore`, `subagent:plan`, `subagent:general-purpose`,
+    /// `subagent` (a harness request with no spawn tool), `compaction`, or `other`.
+    pub stream_label: Option<String>,
     /// Text bytes of the tool results (chat `tool` messages) by tool family: `mcp__<server>`, `Read`, `Bash`, `Agent`, `Skill`, or `other`.
     /// At most 12 named families; the rest are summed into `other`.
     pub tool_result_bytes: BTreeMap<String, u64>,

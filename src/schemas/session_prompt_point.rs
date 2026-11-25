@@ -7,4 +7,6 @@ pub struct SessionPromptPoint {
     pub model: String,
     pub prompt_tokens: u64,
     pub cost_usd: f64,
+    /// Tool definitions the request sent. `None` when no prompt shape was recorded.
+    pub tool_count: Option<u64>,
 }

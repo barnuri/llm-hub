@@ -507,8 +507,8 @@ impl Store {
                     request_id, system_chars, messages, turn_start, tool_count, tool_bytes,
                     mcp_tool_count, mcp_tool_bytes, deferred_listing_chars, skills_listing_chars,
                     claude_md_chars, image_count, project, stream_key, tool_result_bytes,
-                    skill_body_chars
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    skill_body_chars, stream_label
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     request_id,
                     db_i64(shape.system_chars),
@@ -525,10 +525,64 @@ impl Store {
                     shape.project.as_deref(),
                     shape.stream_key.as_deref(),
                     Self::json_text(&shape.tool_result_bytes),
-                    Self::json_text(&shape.skill_body_chars)
+                    Self::json_text(&shape.skill_body_chars),
+                    shape.stream_label.as_deref()
                 ],
             )
             .map_err(|e| e.to_string())?;
+        Self::assign_fallback_session(&guard, request_id, shape.stream_key.as_deref())
+    }
+
+    /// Gives a request with no worker a fallback session key. It reuses the key of the newest
+    /// request with the same client and stream key within `FALLBACK_SESSION_GAP_MS`, else starts one.
+    fn assign_fallback_session(
+        conn: &Connection,
+        request_id: i64,
+        stream_key: Option<&str>,
+    ) -> Result<(), String> {
+        let row = conn
+            .query_row(
+                "SELECT ts_ms, client, worker FROM requests WHERE id = ?1",
+                [request_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((ts_ms, client, None)) = row else {
+            return Ok(());
+        };
+        let earliest = ts_ms.saturating_sub(db_i64(FALLBACK_SESSION_GAP_MS));
+        let reused = conn
+            .query_row(
+                "SELECT r.fallback_session FROM requests r
+                 JOIN request_shapes s ON s.request_id = r.id
+                 WHERE r.worker IS NULL AND r.fallback_session IS NOT NULL AND r.id <> ?1
+                   AND r.client IS ?2 AND s.stream_key IS ?3 AND r.ts_ms >= ?4
+                 ORDER BY r.ts_ms DESC, r.id DESC LIMIT 1",
+                rusqlite::params![request_id, client, stream_key, earliest],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let key = reused.unwrap_or_else(|| {
+            let seed = format!(
+                "{}|{}|{ts_ms}",
+                client.as_deref().unwrap_or(""),
+                stream_key.unwrap_or("")
+            );
+            format!("fb-{}", &hash_key(&seed)[..16])
+        });
+        conn.execute(
+            "UPDATE requests SET fallback_session = ?1 WHERE id = ?2",
+            rusqlite::params![key, request_id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -2424,6 +2478,10 @@ impl JsonStore {
     }
 }
 
+/// Requests with no worker, the same client and the same stream key join one fallback session
+/// while each follows the previous within this gap.
+const FALLBACK_SESSION_GAP_MS: u64 = 30 * 60 * 1000;
+
 pub fn hash_key(key: &str) -> String {
     crate::utils::hex::to_hex(&Sha256::digest(key.as_bytes()))
 }
@@ -2498,6 +2556,10 @@ fn migrate_requests_columns(conn: &Connection) -> Result<(), String> {
         "resolved_ms",
         "ALTER TABLE requests ADD COLUMN resolved_ms INTEGER",
     )?;
+    add(
+        "fallback_session",
+        "ALTER TABLE requests ADD COLUMN fallback_session TEXT",
+    )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_requests_worker ON requests(worker)",
         [],
@@ -2525,6 +2587,10 @@ fn migrate_request_shapes_columns(conn: &Connection) -> Result<(), String> {
     add(
         "skill_body_chars",
         "ALTER TABLE request_shapes ADD COLUMN skill_body_chars TEXT",
+    )?;
+    add(
+        "stream_label",
+        "ALTER TABLE request_shapes ADD COLUMN stream_label TEXT",
     )?;
     Ok(())
 }
@@ -3181,6 +3247,7 @@ mod tests {
             image_count: 2,
             project: Some("sample-project".into()),
             stream_key: Some("0123456789abcdef".into()),
+            stream_label: Some("subagent:explore".into()),
             tool_result_bytes: std::collections::BTreeMap::from([("Read".into(), 480_u64)]),
             skill_body_chars: std::collections::BTreeMap::from([("pdf".into(), 800_u64)]),
         };
@@ -3191,7 +3258,7 @@ mod tests {
                 "SELECT system_chars, messages, turn_start, tool_count, tool_bytes,
                         mcp_tool_count, mcp_tool_bytes, deferred_listing_chars,
                         skills_listing_chars, claude_md_chars, image_count, project, stream_key,
-                        tool_result_bytes, skill_body_chars
+                        tool_result_bytes, skill_body_chars, stream_label
                  FROM request_shapes WHERE request_id = ?1",
                 [id],
                 |r| {
@@ -3211,6 +3278,7 @@ mod tests {
                         stream_key: r.get(12)?,
                         tool_result_bytes: serde_json::from_str(&r.get::<_, String>(13)?).unwrap(),
                         skill_body_chars: serde_json::from_str(&r.get::<_, String>(14)?).unwrap(),
+                        stream_label: r.get(15)?,
                     })
                 },
             )

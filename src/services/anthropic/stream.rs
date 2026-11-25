@@ -229,7 +229,7 @@ impl AnthropicStream {
             tokens_in: field("prompt_tokens"),
             tokens_out: field("completion_tokens"),
             cache_read_tokens: cached_details.max(field("cache_read_input_tokens")),
-            cache_write_tokens: field("cache_creation_input_tokens"),
+            cache_write_tokens: crate::services::stats::cache_write_in(usage),
         });
     }
 

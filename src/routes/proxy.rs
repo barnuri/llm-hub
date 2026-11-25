@@ -2372,7 +2372,7 @@ async fn review_deliver(
         tokens_in: count("/prompt_tokens"),
         tokens_out: count("/completion_tokens"),
         cache_read_tokens: count("/prompt_tokens_details/cached_tokens"),
-        cache_write_tokens: 0,
+        cache_write_tokens: usage.map_or(0, crate::services::stats::cache_write_in),
         error: None,
         client,
         session_id,

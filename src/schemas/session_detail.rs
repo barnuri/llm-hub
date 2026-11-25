@@ -4,6 +4,7 @@ use crate::schemas::session_cache_cause::SessionCacheCause;
 use crate::schemas::session_compaction::SessionCompaction;
 use crate::schemas::session_composition::SessionComposition;
 use crate::schemas::session_prompt_point::SessionPromptPoint;
+use crate::schemas::session_stream_type::SessionStreamType;
 use crate::schemas::session_summary::SessionSummary;
 
 /// One session with its prompt-size series, compaction points, cache-write causes and composition.
@@ -15,4 +16,6 @@ pub struct SessionDetail {
     pub compactions: Vec<SessionCompaction>,
     pub cache_causes: Vec<SessionCacheCause>,
     pub composition: Option<SessionComposition>,
+    /// Spend of this session by stream label, most expensive first.
+    pub stream_types: Vec<SessionStreamType>,
 }
