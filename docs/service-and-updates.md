@@ -76,6 +76,23 @@ the binary for your OS and architecture, and swaps it in one step. Set
 llm-hub update   # update once
 ```
 
+### Release streams
+
+Normal llm-hub binaries use the normal release stream. Binaries built with Cargo feature
+`mistralrs` use a separate prerelease stream tagged `vX-mistralrs`. The mistral.rs stream has
+assets for Linux x86_64 and AArch64, macOS x86_64 and AArch64, and Windows x86_64. macOS builds
+use Metal acceleration. Linux and Windows builds run CPU-only and do not include CUDA support.
+
+The mistral.rs build is slower than the normal build. A mistral.rs binary waits for its matching
+`vX-mistralrs` release instead of falling back to a normal release. If a platform asset is missing,
+the build for that platform is still running or failed. The binary reports that it waits and
+continues without an update.
+
+To install the first mistral.rs binary, download `llm-hub-macos-aarch64` from the matching
+`vX-mistralrs` release on macOS arm64. Download the matching asset name for another supported
+platform. The prerelease tag keeps the normal `releases/latest` page and normal binary-size check
+from selecting the mistral.rs stream.
+
 ### Source installs
 
 The updater resolves symlinks first. A binary counts as a source install when its real path is
