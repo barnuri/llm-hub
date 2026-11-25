@@ -1,7 +1,7 @@
 //! Integration coverage for the native tuner: a seeded `stream_stall` proposal is approved over HTTP,
 //! the registry row gains `--reasoning off`, a backup is written, only that model restarts, and the
-//! other running model keeps its process.
-#![cfg(unix)]
+//! other running model keeps its process. Linux only: the fake model server never listens on the macOS runner.
+#![cfg(target_os = "linux")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
