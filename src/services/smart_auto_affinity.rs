@@ -351,7 +351,9 @@ impl SmartAutoAffinity {
     }
 
     fn is_pinnable(model: &str) -> bool {
-        let Some((profile, bare_id)) = strip_window_suffix(model).0.split_once(Self::PROFILE_SEPARATOR)
+        let Some((profile, bare_id)) = strip_window_suffix(model)
+            .0
+            .split_once(Self::PROFILE_SEPARATOR)
         else {
             return false;
         };

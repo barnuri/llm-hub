@@ -24,7 +24,8 @@ impl ModelDescriptorSnapshot {
     #[allow(dead_code, reason = "Consumed by Smart Auto eligibility and admission")]
     #[must_use]
     pub fn get(&self, qualified_id: &str) -> Option<&ModelDescriptor> {
-        self.by_qualified_id.get(strip_window_suffix(qualified_id).0)
+        self.by_qualified_id
+            .get(strip_window_suffix(qualified_id).0)
     }
 
     /// `model` is the bare id the hub advertises, e.g. `claude-opus-5-5`; a `[1m]` alias is ignored.

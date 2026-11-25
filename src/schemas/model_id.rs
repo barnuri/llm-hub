@@ -85,7 +85,10 @@ mod tests {
 
     #[test]
     fn bare_id_declares_no_window() {
-        assert_eq!(ModelId::parse("copilot/claude-sonnet-5-5").unwrap().window, None);
+        assert_eq!(
+            ModelId::parse("copilot/claude-sonnet-5-5").unwrap().window,
+            None
+        );
     }
 
     #[test]

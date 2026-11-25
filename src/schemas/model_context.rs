@@ -108,7 +108,10 @@ pub fn advertised_models(
     let bare = strip_window_suffix(qualified).0;
     vec![
         (bare.to_string(), Some(CONTEXT_TOKENS_200K)),
-        (format!("{bare}{CONTEXT_1M_SUFFIX}"), Some(CONTEXT_TOKENS_1M)),
+        (
+            format!("{bare}{CONTEXT_1M_SUFFIX}"),
+            Some(CONTEXT_TOKENS_1M),
+        ),
     ]
 }
 
@@ -199,7 +202,10 @@ mod tests {
         assert_eq!(
             advertised_models("llmgw/bedrock/anthropic.claude-opus-5", Some(1_000_000)),
             vec![
-                ("llmgw/bedrock/anthropic.claude-opus-5".to_string(), Some(200_000)),
+                (
+                    "llmgw/bedrock/anthropic.claude-opus-5".to_string(),
+                    Some(200_000)
+                ),
                 (
                     "llmgw/bedrock/anthropic.claude-opus-5[1m]".to_string(),
                     Some(1_000_000)
@@ -257,7 +263,10 @@ mod tests {
                 .iter()
                 .map(|(id, _)| id.as_str())
                 .collect::<Vec<_>>(),
-            ["llmgw/bedrock/claude-opus-5", "llmgw/bedrock/claude-opus-5[1m]"]
+            [
+                "llmgw/bedrock/claude-opus-5",
+                "llmgw/bedrock/claude-opus-5[1m]"
+            ]
         );
     }
 

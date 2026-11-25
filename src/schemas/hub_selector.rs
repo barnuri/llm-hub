@@ -38,7 +38,8 @@ impl HubSelector {
         model_id: &str,
         operator_presets: &BTreeMap<String, SmartAutoPolicy>,
     ) -> Result<Option<HubSelector>, AppError> {
-        let Some(name) = strip_window_suffix(model_id).0
+        let Some(name) = strip_window_suffix(model_id)
+            .0
             .strip_prefix(Self::NAMESPACE)
             .and_then(|rest| rest.strip_prefix(Self::NAMESPACE_SEPARATOR))
         else {

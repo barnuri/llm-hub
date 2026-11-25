@@ -209,7 +209,8 @@ impl SmartAutoSuitability {
     }
 
     fn family(model_id: &str) -> Option<&'static FamilySeed> {
-        let name = strip_window_suffix(model_id).0
+        let name = strip_window_suffix(model_id)
+            .0
             .rsplit(Self::PATH_SEPARATOR)
             .next()
             .unwrap_or_default()

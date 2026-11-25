@@ -289,7 +289,10 @@ mod tests {
         let config = config_of(&spec);
         let models = &config["provider"]["llm-hub"]["models"];
 
-        assert_eq!(models["copilot/claude-sonnet-5-5"]["limit"]["context"], 200_000);
+        assert_eq!(
+            models["copilot/claude-sonnet-5-5"]["limit"]["context"],
+            200_000
+        );
         assert_eq!(
             models["copilot/claude-sonnet-5-5[1m]"]["limit"]["context"],
             1_000_000
