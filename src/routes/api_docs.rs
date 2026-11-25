@@ -175,7 +175,7 @@ mod tests {
     fn committed_spec_passes_openapi_parser_if_available() {
         let Ok(bunx) = which_bunx() else { return };
         let out = std::process::Command::new(bunx)
-            .args(["--bun", "@readme/openapi-parser", "validate", SPEC_FILE])
+            .args(["--bun", "@apidevtools/swagger-cli", "validate", SPEC_FILE])
             .output();
         let Ok(out) = out else { return };
         let text = String::from_utf8_lossy(&out.stdout).to_string()
