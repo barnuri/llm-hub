@@ -31,6 +31,12 @@ impl LaunchArgs {
         self.model.as_deref()
     }
 
+    /// The arguments the harness receives unchanged, borrowed.
+    #[must_use]
+    pub fn passthrough(&self) -> &[String] {
+        &self.passthrough
+    }
+
     /// The arguments the harness receives unchanged.
     #[must_use]
     pub fn into_passthrough(self) -> Vec<String> {
