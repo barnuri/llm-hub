@@ -64,6 +64,8 @@ struct Inner {
     model_health: ModelHealth,
     /// Cost score (0 to 10) of each model from the price book, rebuilt with the model list.
     model_costs: ArcSwap<HashMap<String, u8>>,
+    /// Price card of each model, rebuilt with the model list, so routing never rebuilds the book.
+    model_prices: ArcSwap<HashMap<String, crate::configs::PriceCard>>,
     /// profile name -> reachable, updated on every models fan-out.
     upstream_health: DashMap<String, bool>,
     /// Managed profiles stopped on purpose at the last models fan-out.
@@ -193,6 +195,7 @@ impl AppState {
             model_usage: ArcSwap::from_pointee(HashMap::new()),
             model_health: ModelHealth::default(),
             model_costs: ArcSwap::from_pointee(HashMap::new()),
+            model_prices: ArcSwap::from_pointee(HashMap::new()),
             upstream_health: DashMap::new(),
             idle_upstreams: dashmap::DashSet::new(),
             upstream_models: DashMap::new(),
@@ -422,13 +425,16 @@ impl AppState {
     /// Swaps in the descriptors a model refresh built, and the cost scores they price to.
     /// Readers keep the snapshot they loaded.
     pub fn set_model_descriptors(&self, descriptors: Vec<ModelDescriptor>) {
-        let costs = SmartAutoLive::cost_scores(
-            &self.pricing_book(),
+        let book = self.pricing_book();
+        let ids = || {
             descriptors
                 .iter()
-                .map(|descriptor| descriptor.qualified_id.as_str()),
-        );
+                .map(|descriptor| descriptor.qualified_id.as_str())
+        };
+        let costs = SmartAutoLive::cost_scores(&book, ids());
         self.0.model_costs.store(Arc::new(costs));
+        let prices = SmartAutoLive::price_cards(&book, ids());
+        self.0.model_prices.store(Arc::new(prices));
         self.0
             .model_descriptors
             .store(Arc::new(ModelDescriptorSnapshot::new(descriptors)));
@@ -437,6 +443,11 @@ impl AppState {
     /// Cost score (0 dearest, 10 free) of each priced model.
     pub fn model_costs(&self) -> Arc<HashMap<String, u8>> {
         self.0.model_costs.load_full()
+    }
+
+    /// Price card of each model in the last model list.
+    pub fn model_prices(&self) -> Arc<HashMap<String, crate::configs::PriceCard>> {
+        self.0.model_prices.load_full()
     }
 
     /// Failures, error rates and speed measured on the request path.

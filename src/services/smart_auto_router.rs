@@ -20,9 +20,10 @@ use crate::schemas::smart_auto_policy::SmartAutoPolicy;
 use crate::schemas::smart_auto_tier::SmartAutoTier;
 use crate::schemas::turn_signals::TurnSignals;
 use crate::schemas::work_role::WorkRole;
-use crate::services::smart_auto_affinity::SmartAutoAffinity;
+use crate::services::smart_auto_affinity::{SmartAutoAffinity, StepDownCost};
 use crate::services::smart_auto_directive::SmartAutoDirective;
 use crate::services::smart_auto_effort::SmartAutoEffort;
+use crate::services::smart_auto_live::SmartAutoLive;
 use crate::services::smart_auto_roles::SmartAutoRoles;
 use crate::services::smart_auto_suitability::SmartAutoSuitability;
 
@@ -272,7 +273,9 @@ impl SmartAutoRouter {
                 ..Choice::routed(pinned, turn, RouteReason::UserPinned, None)
             });
         }
-        let step_down_allowed = affinity.step_down_allowed(key, signals.user_turns, now);
+        let cheap = Self::best(pool, tier, Self::CHEAP_WORK, usage, live)?;
+        let cost = Self::step_down_cost(pinned, cheap, live, signals.estimated_prompt_tokens);
+        let step_down_allowed = affinity.step_down_allowed(key, signals.user_turns, cost, now);
         if Self::steps_down(
             pinned_role,
             pinned_plan_backed,
@@ -280,7 +283,7 @@ impl SmartAutoRouter {
             signals,
             step_down_allowed,
         ) {
-            let model = Self::best(pool, tier, Self::CHEAP_WORK, usage, live)?;
+            let model = cheap;
             let reason = if std::ptr::eq(model, pinned) {
                 RouteReason::Pinned
             } else {
@@ -316,6 +319,24 @@ impl SmartAutoRouter {
             reason
         };
         Some(Choice::routed(model, turn, reason, None))
+    }
+
+    /// The prices a step-down from `pinned` to `cheap` weighs, when both models have known rates.
+    fn step_down_cost(
+        pinned: &ModelDescriptor,
+        cheap: &ModelDescriptor,
+        live: &LiveSignals,
+        turn_tokens: u64,
+    ) -> Option<StepDownCost> {
+        let pinned = live.get(&pinned.qualified_id).rates?;
+        let cheap = live.get(&cheap.qualified_id).rates?;
+        Some(StepDownCost {
+            pinned,
+            cheap,
+            pinned_blended: SmartAutoLive::blended_usd_per_1m(&pinned),
+            cheap_blended: SmartAutoLive::blended_usd_per_1m(&cheap),
+            turn_tokens,
+        })
     }
 
     /// Whether a heavy pin steps down to the cheap pick at the start of a user turn. Only
@@ -721,6 +742,84 @@ mod tests {
         let decision = route_pinned(&pool, &affinity, &signals(SCOPED_TEXT, 4, false), now);
         assert_eq!(decision.model.qualified_id, OPUS);
         assert_eq!(decision.reason, RouteReason::Pinned);
+    }
+
+    fn priced(input: f64, output: f64, read: f64, write: f64) -> ModelSignal {
+        ModelSignal {
+            rates: Some(crate::configs::TokenRates {
+                input_per_1m: input,
+                output_per_1m: output,
+                cache_read_per_1m: read,
+                cache_write_per_1m: write,
+            }),
+            ..ModelSignal::default()
+        }
+    }
+
+    fn route_priced<'a>(
+        pool: &[&'a ModelDescriptor],
+        affinity: &SmartAutoAffinity,
+        turn: &TurnSignals,
+        now: Instant,
+    ) -> RouteDecision<'a> {
+        let policy = policy(SmartAutoTier::Balance);
+        let key = key(&policy);
+        // The cheap model writes cache dearly, so a big warm prefix outweighs a small turn.
+        let live = live(&[
+            (OPUS, priced(4.0, 20.0, 0.2, 5.0)),
+            (HAIKU, priced(1.0, 5.0, 0.1, 10.0)),
+        ]);
+        SmartAutoRouter::route(
+            pool,
+            &policy,
+            turn,
+            Some((affinity, &key)),
+            &HashMap::new(),
+            &live,
+            None,
+            now,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_warm_prefix_dearer_to_rewrite_than_the_turn_saves_blocks_the_step_down() {
+        let now = Instant::now();
+        let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
+        affinity.record_prefix(&key(&policy(SmartAutoTier::Balance)), 150_000);
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let small = TurnSignals {
+            estimated_prompt_tokens: 1_000,
+            ..signals(SCOPED_TEXT, 2, false)
+        };
+        let kept = route_priced(&pool, &affinity, &small, now);
+        assert_eq!(kept.model.qualified_id, OPUS);
+        assert_eq!(kept.reason, RouteReason::Pinned);
+
+        let large = TurnSignals {
+            estimated_prompt_tokens: 2_000_000,
+            ..small
+        };
+        let moved = route_priced(&pool, &affinity, &large, now);
+        assert_eq!(moved.model.qualified_id, HAIKU);
+        assert_eq!(moved.reason, RouteReason::RoleSwitch);
+    }
+
+    #[test]
+    fn a_cold_prefix_never_blocks_the_step_down() {
+        let now = Instant::now();
+        let cold = now + SmartAutoAffinity::CACHE_WARM_WINDOW + Duration::from_secs(1);
+        let affinity = pinned_store(OPUS, WorkRole::Planning, false, now);
+        affinity.record_prefix(&key(&policy(SmartAutoTier::Balance)), 150_000);
+        let owned = models(&[HAIKU, OPUS, SONNET]);
+        let pool: Vec<&ModelDescriptor> = owned.iter().collect();
+        let small = TurnSignals {
+            estimated_prompt_tokens: 1_000,
+            ..signals(SCOPED_TEXT, 2, false)
+        };
+        let decision = route_priced(&pool, &affinity, &small, cold);
+        assert_eq!(decision.model.qualified_id, HAIKU);
     }
 
     #[test]

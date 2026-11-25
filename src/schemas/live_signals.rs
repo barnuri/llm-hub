@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::configs::TokenRates;
 use crate::schemas::model_context::strip_1m_suffix;
 
 /// What the hub measured about one model right now. A field is `None` when nothing is known,
@@ -14,6 +15,8 @@ pub struct ModelSignal {
     pub error_rate: Option<f64>,
     /// Quota left on the model's profile, 0 to 100.
     pub quota_remaining_pct: Option<f64>,
+    /// Price-book rates for this request's prompt size, long-context tier included.
+    pub rates: Option<TokenRates>,
 }
 
 /// The live signals of every model in one request's pool, keyed by qualified id.
