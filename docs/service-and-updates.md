@@ -50,6 +50,32 @@ Logs go to `logs/llm-hub.log` in that directory. Managed processes log to `logs/
 Run `service install` again after an update to pick up changes to the service definition. It is
 safe to run on an installed service.
 
+### Deploy without dropping requests
+
+`service install` restarts the service, so requests sent during the restart can fail. To deploy a
+new binary to a running service, run the new binary from the install directory instead:
+
+```sh
+cd ~/llm-hub
+/path/to/new/llm-hub service handover
+```
+
+1. The new binary starts a second hub on the service port, beside the running one
+   (`SO_REUSEPORT`), with the service environment, and logs to `logs/llm-hub.log`.
+2. When the new hub writes its PID file and answers `/healthz`, the old hub gets SIGTERM. It stops
+   accepting connections, finishes its open requests and exits.
+3. When the new hub exits, does not listen within 60 seconds, or fails 30 `/healthz` probes
+   (500 ms apart), handover stops it, gives the PID file back to the old hub and exits with an
+   error. The old hub keeps serving.
+
+When no healthy hub serves the port, `service handover` runs `service install`. It does not
+rewrite the service definition, so run `service install` after a change to the definition.
+
+The new hub runs outside the service manager. The service manager's own process waits while it
+serves and takes over the port when it exits. Local model processes start in the new hub after the
+old hub has exited, so a local model is unavailable while the old hub drains. Windows has no
+handover: there `service handover` always runs `service install`.
+
 ### Service PATH
 
 launchd and systemd start the service with a minimal `PATH` that does not include Homebrew. Any

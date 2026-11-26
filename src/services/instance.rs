@@ -3,7 +3,7 @@
 //! A restart starts a successor that binds the same address with `SO_REUSEPORT`. The successor
 //! writes its PID file once it listens; the old process then drains and exits. The successor waits
 //! for the old process to exit before it starts local model processes, so the old process stops
-//! only its own children.
+//! only its own children. `llm-hub service handover` uses the same steps for a deploy.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -51,7 +51,15 @@ pub fn pid_file(bind: &str) -> PathBuf {
 /// # Errors
 /// Fails when the file cannot be written.
 pub fn write_pid(bind: &str) -> std::io::Result<()> {
-    std::fs::write(pid_file(bind), format!("{}\n", std::process::id()))
+    record_pid(bind, std::process::id())
+}
+
+/// Writes `pid` to the PID file of `bind`, for example to give it back after a failed handover.
+///
+/// # Errors
+/// Fails when the file cannot be written.
+pub fn record_pid(bind: &str, pid: u32) -> std::io::Result<()> {
+    std::fs::write(pid_file(bind), format!("{pid}\n"))
 }
 
 /// The PID in the PID file of `bind`, if the file holds one.
@@ -132,17 +140,31 @@ pub async fn bind_reuseport(bind: &str) -> std::io::Result<TcpListener> {
 /// Fails when the successor cannot start, exits first, or is not ready within the timeout. The
 /// successor is terminated on timeout.
 pub async fn spawn_successor(bind: &str, exe: &Path, args: Vec<String>) -> Result<u32, String> {
-    let me = std::process::id();
-    let mut child = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .args(args)
-        .env(HANDOVER_VAR, me.to_string())
+        .env(HANDOVER_VAR, std::process::id().to_string());
+    start_successor(bind, command).await.map(|child| child.id())
+}
+
+/// Runs `command` as a successor and waits until it writes its PID to the PID file of `bind`.
+/// Returns the running child, so the caller can tell when it exits.
+///
+/// # Errors
+/// Fails when the successor cannot start, exits first, or is not ready within the timeout. The
+/// successor is terminated on timeout.
+pub async fn start_successor(
+    bind: &str,
+    mut command: std::process::Command,
+) -> Result<std::process::Child, String> {
+    let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start the successor: {e}"))?;
     let child_pid = child.id();
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     loop {
         if read_pid(bind) == Some(child_pid) {
-            return Ok(child_pid);
+            return Ok(child);
         }
         // try_wait reaps an exited successor; a zombie would still look alive to pid_alive.
         if let Ok(Some(_)) = child.try_wait() {
@@ -159,16 +181,22 @@ pub async fn spawn_successor(bind: &str, exe: &Path, args: Vec<String>) -> Resul
     }
 }
 
+/// Sends SIGTERM to `pid`. A hub drains its open requests on SIGTERM, then exits.
 #[cfg(unix)]
-fn terminate(pid: u32) {
+pub fn terminate(pid: u32) {
+    // Pid 0 names the caller's process group, so it never reaches kill.
+    if pid == 0 {
+        return;
+    }
     if let Ok(pid) = libc::pid_t::try_from(pid) {
-        // SAFETY: sends SIGTERM to the successor this process started, nothing else.
+        // SAFETY: sends SIGTERM to one process id; the callers pass a hub or a successor they own.
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
 }
 
+/// Windows has no SIGTERM, so this does nothing there.
 #[cfg(not(unix))]
-fn terminate(_pid: u32) {}
+pub fn terminate(_pid: u32) {}
 
 /// Parent-exit watch for the server. A successor skips it: its parent is the process it replaces,
 /// which exits on purpose after the handover.
@@ -236,6 +264,40 @@ mod tests {
                 .unwrap_err()
                 .starts_with("cannot start the successor:")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_successor_that_writes_its_pid_is_returned_running() {
+        let bind = "127.0.0.1:6";
+        let file = pid_file(bind);
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("echo $$ > '{}'; exec sleep 30", file.display()));
+
+        let mut child = start_successor(bind, command).await.expect("ready");
+
+        assert_eq!(read_pid(bind), Some(child.id()));
+        assert!(child.try_wait().expect("status").is_none());
+        terminate(child.id());
+        assert!(child.wait().is_ok());
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn a_recorded_pid_is_read_back() {
+        let bind = "127.0.0.1:7";
+        record_pid(bind, 4242).expect("write the pid file");
+        assert_eq!(read_pid(bind), Some(4242));
+        let _ = std::fs::remove_file(pid_file(bind));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminating_pid_zero_signals_nothing() {
+        terminate(0);
+        assert!(pid_alive(std::process::id()));
     }
 
     #[tokio::test]

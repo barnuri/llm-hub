@@ -9,6 +9,7 @@
 | `llm-hub version`, `--version`, `-V` | Print `llm-hub v<version>`. |
 | `llm-hub update` | Update the binary once. See [Updates](service-and-updates.md#updates). |
 | `llm-hub service install` | Install and start the background service, or reload it. See [Service](service-and-updates.md#service). |
+| `llm-hub service handover` | Replace the running service with this binary without dropping a request. See [Deploy without dropping requests](service-and-updates.md#deploy-without-dropping-requests). |
 | `llm-hub service uninstall` | Remove the background service. |
 | `llm-hub service status` | Show the service status. |
 | `llm-hub extensions check [FILE]` | Validate a rules file the way the server loads it, and print how many rules and hooks it has. Exits 1 with the file, rule and reason when it is invalid. See [Extensions](extensions.md#rules). |
