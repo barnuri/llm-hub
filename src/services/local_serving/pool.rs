@@ -155,6 +155,7 @@ impl LocalPool {
             timings: config.timings,
             health: reqwest::Client::builder()
                 .no_proxy()
+                .tls_built_in_root_certs(false)
                 .timeout(config.timings.health_probe_timeout)
                 .build()
                 .unwrap_or_default(),
