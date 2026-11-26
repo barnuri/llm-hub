@@ -752,6 +752,57 @@ fn open_store(config: &HubConfig) -> Result<Option<Store>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zz_profile_startup_costs() {
+        use std::time::Instant;
+        let mut out = String::new();
+        let n = 20;
+        macro_rules! t {
+            ($name:expr, $body:expr) => {{
+                let start = Instant::now();
+                for _ in 0..n {
+                    let _ = std::hint::black_box($body);
+                }
+                out.push_str(&format!("{}: {:.1} ms\n", $name, start.elapsed().as_secs_f64() * 1000.0 / f64::from(n)));
+            }};
+        }
+        let vars: HashMap<String, String> = [
+            ("LLM_HUB_PROFILES", "alpha,beta"),
+            ("LLM_HUB_ALPHA_BASE_URL", "http://127.0.0.1:9"),
+            ("LLM_HUB_BETA_BASE_URL", "http://127.0.0.1:9"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        t!("tempdir", tempfile::tempdir().unwrap());
+        t!("Client::new", reqwest::Client::new());
+        t!("Client::builder.build", reqwest::Client::builder().build().unwrap());
+        t!("HubConfig::from_map", HubConfig::from_map(&vars).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let mut k = 0;
+        t!("Store::open sqlite", {
+            k += 1;
+            let p = dir.path().join(format!("s{k}.db"));
+            Store::open("sqlite", Some(p.to_str().unwrap())).unwrap()
+        });
+        t!("AppState::with_seams nostore", AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            None,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::Token("t".to_string()))),
+        ).unwrap());
+        let state = AppState::with_seams(
+            HubConfig::from_map(&vars).unwrap(),
+            None,
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(FakeGhCli::new(GhOutcome::Token("t".to_string()))),
+        ).unwrap();
+        t!("build_router_with", build_router_with(state.clone(), None));
+        t!("ExtensionSet builtins", crate::ext::ExtensionSet::new(crate::ext::builtin::builtins()));
+        t!("ModelLimits::load", crate::services::model_limits::ModelLimits::load(None, std::iter::empty::<&str>(), 0));
+        panic!("PROFILE\n{out}");
+    }
+
     use std::sync::Arc;
 
     use serde_json::{Value, json};
