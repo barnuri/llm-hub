@@ -23,6 +23,7 @@ impl OpencodeLauncher {
     pub(super) const BIN_VAR: &str = "LLM_HUB_OPENCODE_BIN";
     const PROVIDER_ID: &str = "llm-hub";
     const CONFIG_VAR: &str = "OPENCODE_CONFIG_CONTENT";
+    const SMALL_MODEL: &str = "llm-hub/hub/smart-auto-fast";
     /// opencode 2 serves every TUI from one background service, which never reads this
     /// process's `OPENCODE_CONFIG_CONTENT`; a private server does.
     const STANDALONE_FLAG: &str = "--standalone";
@@ -52,6 +53,21 @@ impl OpencodeLauncher {
             spec = spec.arg(Self::STANDALONE_FLAG);
         }
         spec.args(passthrough)
+    }
+
+    /// The config `llm-hub setup opencode` stores in the user's opencode config: the `llm-hub`
+    /// provider with the catalog and the literal hub key, as the shared service never reads
+    /// `OPENCODE_CONFIG_CONTENT`. Smart Auto Fast is the small model.
+    #[must_use]
+    pub fn persistent_config(
+        endpoint: &HubEndpoint,
+        catalog: &[HubModel],
+        caps: &OpencodeContextCaps,
+    ) -> Value {
+        let mut config = Self::config(endpoint, None, catalog, Map::new(), caps);
+        config["provider"][Self::PROVIDER_ID]["options"]["apiKey"] = json!(endpoint.api_key());
+        config["small_model"] = json!(Self::SMALL_MODEL);
+        config
     }
 
     /// Plain `opencode -m <provider>/<model>` on the shared service, which already serves a provider
@@ -106,7 +122,7 @@ impl OpencodeLauncher {
         Ok(path)
     }
 
-    fn config_dir(lookup: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    pub(crate) fn config_dir(lookup: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
         let read = |name: &str| lookup(name).filter(|value| !value.is_empty());
         if let Some(xdg) = read("XDG_CONFIG_HOME") {
             return Some(PathBuf::from(xdg).join("opencode"));
@@ -448,6 +464,31 @@ mod tests {
         assert_eq!(
             config_of(&spec)["provider"]["llm-hub"]["options"]["headers"],
             json!({"x-llm-hub-smart-auto-include": "copilot/*,openai/*"})
+        );
+    }
+
+    #[test]
+    fn persistent_config_holds_the_literal_key_and_the_small_model() {
+        let catalog = [HubModel::new("copilot/auto", None)];
+
+        let config = OpencodeLauncher::persistent_config(
+            &HubEndpoint::from_lookup(|name| (name == "LLM_HUB_API_KEY").then(|| "k".to_string())),
+            &catalog,
+            &OpencodeContextCaps::default(),
+        );
+
+        assert_eq!(
+            config,
+            json!({
+                "enabled_providers": ["llm-hub"],
+                "provider": {"llm-hub": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "llm-hub",
+                    "options": {"baseURL": "http://localhost:8888/v1", "apiKey": "k"},
+                    "models": {"copilot/auto": {}},
+                }},
+                "small_model": "llm-hub/hub/smart-auto-fast",
+            })
         );
     }
 

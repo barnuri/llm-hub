@@ -34,6 +34,7 @@ use crate::consts::{LOGS_DIR, VERSION};
 use crate::dependencies::state::AppState;
 use crate::services::extension_loader::{self, EXTENSIONS_FILE_VAR, ExtensionSources};
 use crate::services::launch;
+use crate::services::setup;
 use crate::services::store::Store;
 
 /// Env-file pairs merged with process env (process env wins). Reads via
@@ -63,6 +64,9 @@ async fn serve(hub: Hub) {
         return;
     }
     if run_local_worker_command().await {
+        return;
+    }
+    if run_setup_command().await {
         return;
     }
     if run_launch_command().await {
@@ -422,6 +426,8 @@ Coding agents on the hub ([model] is optional, e.g. copilot/claude-opus-5-5):
                                       after the agent name (also --profiles=a,b), e.g.
                                       llm-hub --profiles copilot,ivrit claude
 
+  llm-hub setup <agent> [--dry-run]   write the agent's user config so plain `<agent>` uses the hub
+
 Extensions:
   llm-hub extensions check [FILE]  validate a rules file (default: LLM_HUB_EXTENSIONS_FILE or extensions.yaml)
 
@@ -532,6 +538,26 @@ async fn run_launch_command() -> bool {
     let harness = command.harness;
     if let Err(e) = launch::run(command).await {
         eprintln!("llm-hub {}: {e}", harness.command());
+        std::process::exit(1);
+    }
+    true
+}
+
+/// `llm-hub setup <harness> [--dry-run]` writes the harness's user config so it uses the hub.
+/// It runs before tracing starts, for the same reason as the launch commands.
+async fn run_setup_command() -> bool {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let command = match setup::SetupCommand::parse(&args) {
+        Ok(Some(command)) => command,
+        Ok(None) => return false,
+        Err(e) => {
+            eprintln!("llm-hub: {e}");
+            std::process::exit(2);
+        }
+    };
+    let harness = command.harness;
+    if let Err(e) = setup::run(command).await {
+        eprintln!("llm-hub setup {}: {e}", harness.command());
         std::process::exit(1);
     }
     true

@@ -126,6 +126,26 @@ The extension reads `/v1/models` and registers an `llm-hub` provider. The comman
 `LLM_HUB_URL` and `LLM_HUB_API_KEY`, then runs
 `pi -e <extension> [--model llm-hub/<model>] <args>`.
 
+## Persistent setup: llm-hub setup
+
+`llm-hub setup <claude|codex|opencode|copilot-cli|pi> [--dry-run]` writes the harness's user
+config, so the plain command talks to the hub with no `llm-hub` in front. It reads the hub at
+`LLM_HUB_URL` and `LLM_HUB_API_KEY`, like the launch commands, and stops when the hub does not
+answer. It merges into an existing file and keeps keys it does not own, writes through a temp file
+and a rename, and prints the path. A second run with the same hub changes nothing. `--dry-run`
+prints the content and writes nothing. The files hold the hub key in plain text.
+
+| Harness | File | What it writes |
+|---|---|---|
+| `claude` | `$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json` | The hub's `/api/claude-code/settings` body, and `env` with `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and the other variables `llm-hub claude` sets. |
+| `codex` | `$CODEX_HOME/config.toml`, else `~/.codex/config.toml` | `model_provider = "llm_hub"` and a `[model_providers.llm_hub]` table (`wire_api = "responses"`), each in a block marked `# >>> llm-hub`. A rerun replaces only those blocks and any top-level `model_provider` key. |
+| `opencode` | `$XDG_CONFIG_HOME/opencode/opencode.json`, else `~/.config/opencode/opencode.json` | The `llm-hub` provider with every hub model (name, limit, cost, attachment, as `llm-hub opencode` lists them), `enabled_providers: ["llm-hub"]` and `small_model`. The shared opencode service reads this file and ignores `OPENCODE_CONFIG_CONTENT`. Run it again after the hub catalog changes. |
+| `copilot-cli` | none | Copilot CLI takes its provider from the environment only. The command prints the `export` lines and writes nothing. |
+| `pi` | `$PI_CODING_AGENT_DIR/models.json`, else `~/.pi/agent/models.json` | The `llm-hub` provider with every hub model, with the limits the launcher extension uses. |
+
+Profile and Smart Auto flags do not apply: the files hold no per-run headers. `opencode.json`
+must be plain JSON; a file with comments is refused and left untouched.
+
 ## A shell wrapper
 
 A shell function can add your usual flags to every `llm-hub claude` run. This zsh or bash example keeps the
