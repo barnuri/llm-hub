@@ -353,7 +353,14 @@ impl KeepWarm {
             tokens: cached_tokens,
             card: PriceCard::default(),
         };
-        self.touch_with(key, body, model_id, started, prompt, PingTarget::messages(beta));
+        self.touch_with(
+            key,
+            body,
+            model_id,
+            started,
+            prompt,
+            PingTarget::messages(beta),
+        );
     }
 
     /// The prompt a completed response cached, billed at `card`. Copilot reports no cache write, so
@@ -526,7 +533,12 @@ impl KeepWarm {
             })
             .collect();
         for (key, economics) in &unprofitable {
-            state.drop_with(key, SkipReason::DroppedUnlikelyReturn, Some(now), Some(*economics));
+            state.drop_with(
+                key,
+                SkipReason::DroppedUnlikelyReturn,
+                Some(now),
+                Some(*economics),
+            );
         }
         let mut due: Vec<(Instant, StreamKey)> = state
             .streams
@@ -984,6 +996,7 @@ mod tests {
                         ping_in_flight: false,
                         used,
                         cached_tokens: 4096,
+                        card: PriceCard::default(),
                         held: None,
                     },
                 );
@@ -1050,7 +1063,10 @@ mod tests {
             tokens_in: 130_000,
             ..RequestOutcome::default()
         };
-        assert_eq!(KeepWarm::cached_prompt(&outcome, PriceCard::default()).tokens, 0);
+        assert_eq!(
+            KeepWarm::cached_prompt(&outcome, PriceCard::default()).tokens,
+            0
+        );
     }
 
     /// Haiku-style prices: the base is 1.0 input, and above 100K prompt tokens the tier is 5x.

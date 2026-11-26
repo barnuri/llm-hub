@@ -49,6 +49,7 @@ mod tests {
             est_write_saved_usd: 1.25,
             persisted: true,
             keepwarm_skips: BTreeMap::from([("expired_idle_cap".to_owned(), 2)]),
+            keepwarm_skips_scope: None,
         };
         let other = KeepWarmSummary {
             keepwarm_pings: 3,
@@ -60,6 +61,7 @@ mod tests {
                 ("expired_idle_cap".to_owned(), 3),
                 ("held_busy_worker".to_owned(), 1),
             ]),
+            keepwarm_skips_scope: None,
         };
 
         total.absorb(&other);
@@ -76,6 +78,7 @@ mod tests {
                     ("expired_idle_cap".to_owned(), 5),
                     ("held_busy_worker".to_owned(), 1),
                 ]),
+                keepwarm_skips_scope: None,
             }
         );
     }
