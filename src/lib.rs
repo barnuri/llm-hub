@@ -411,6 +411,7 @@ Server:
   llm-hub                         ensure the installed service is up, or run in the foreground
   llm-hub serve                   run the hub in the foreground
   llm-hub service install         install or reload the background service (macOS LaunchAgent)
+  llm-hub service handover        replace the running service with this binary, dropping no request
   llm-hub service uninstall       remove the background service
   llm-hub service status          show the background service status
   llm-hub update                  update to the latest version (git pull + build for a source checkout)
@@ -468,7 +469,7 @@ async fn run_cli_command() -> bool {
             true
         }
         Some("service") => {
-            run_service_command();
+            run_service_command().await;
             true
         }
         Some("extensions") => {
@@ -637,14 +638,15 @@ async fn run_copilot_command() -> Result<(), String> {
     Ok(())
 }
 
-fn run_service_command() {
+async fn run_service_command() {
     let action = std::env::args().nth(2).unwrap_or_default();
     let result = match action.as_str() {
         "install" => services::service_manager::install(),
+        "handover" => services::handover::handover().await,
         "uninstall" => services::service_manager::uninstall(),
         "status" => services::service_manager::status(),
         _ => {
-            eprintln!("usage: llm-hub service <install|uninstall|status>");
+            eprintln!("usage: llm-hub service <install|handover|uninstall|status>");
             std::process::exit(1);
         }
     };

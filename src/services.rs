@@ -29,6 +29,7 @@ pub mod fallback;
 pub mod first_event;
 pub mod gh_cli;
 pub mod github_token_resolver;
+pub mod handover;
 pub mod harness;
 pub mod history_exporter;
 pub mod http_client;

@@ -31,11 +31,7 @@ pub async fn ensure_installed_service() -> Result<bool, String> {
     if !platform::installed()? {
         return Ok(false);
     }
-    let client = crate::services::http_client::builder()
-        .timeout(std::time::Duration::from_secs(1))
-        .no_proxy()
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = health_client()?;
     let url = format!("http://127.0.0.1:{SERVICE_PORT}/healthz");
     ensure_healthy(
         || async { platform::running() && endpoint_healthy(&client, &url).await },
@@ -48,7 +44,20 @@ pub async fn ensure_installed_service() -> Result<bool, String> {
     Ok(true)
 }
 
-async fn endpoint_healthy(client: &reqwest::Client, url: &str) -> bool {
+/// A client for `/healthz` probes: a one-second timeout and no proxy.
+///
+/// # Errors
+/// Fails when the HTTP client cannot be built.
+pub(crate) fn health_client() -> Result<reqwest::Client, String> {
+    crate::services::http_client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .no_proxy()
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+/// Whether `url` answers 200 with the body `ok`.
+pub(crate) async fn endpoint_healthy(client: &reqwest::Client, url: &str) -> bool {
     match client.get(url).send().await {
         Ok(response) if response.status().is_success() => {
             response.text().await.is_ok_and(|body| body == "ok")
