@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::configs::HubConfig;
 use crate::consts::{CONNECT_TIMEOUT, POOL_IDLE_TIMEOUT, POOL_MAX_IDLE_PER_HOST};
 
-/// One pooled client per profile. Pool sizing is the main latency lever:
+/// One pooled client handle per profile. Pool sizing is the main latency lever:
 /// default reqwest keeps only 2 idle connections per host, which forces a
 /// fresh TCP+TLS handshake on nearly every concurrent request.
 /// Deliberately NO whole-request `Client::timeout` — it would sever
@@ -18,18 +18,28 @@ fn build_clients_with(
     new_builder: fn() -> reqwest::ClientBuilder,
 ) -> Result<HashMap<String, reqwest::Client>, String> {
     let mut clients = HashMap::with_capacity(config.profiles.len());
+    // Every profile's client has the same settings, and building one loads the system root
+    // certificates. A `Client` is a cheap handle, so one build serves all profiles.
+    let mut shared: Option<reqwest::Client> = None;
     for profile in &config.profiles {
-        let client = new_builder()
-            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
-            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|e| {
-                format!(
-                    "failed to build http client for profile {}: {e}",
-                    profile.name
-                )
-            })?;
+        let client = match &shared {
+            Some(client) => client.clone(),
+            None => {
+                let built = new_builder()
+                    .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+                    .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .build()
+                    .map_err(|e| {
+                        format!(
+                            "failed to build http client for profile {}: {e}",
+                            profile.name
+                        )
+                    })?;
+                shared = Some(built.clone());
+                built
+            }
+        };
         clients.insert(profile.name.clone(), client);
     }
     Ok(clients)

@@ -33,6 +33,8 @@ Every change to `src/` comes with unit tests in the same change. The `coverage` 
 
 Run `scripts/check.sh` before you report a change as done, and fix every failure. It runs what CI runs: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and the tests with the 80% per-file coverage gate. `scripts/check.sh fast` runs only format and lint. There are no git hooks: the GitHub checks on the PR are the gate.
 
+Never raise, loosen or suggest raising a CI gate (`TEST_TOTAL_MAX_S`, the 1000 ms slowest-test limit, `COVERAGE_MIN`, in `scripts/test-speed.ts` or the workflows). Each gate exists for a reason. When one fails, fix the tests or code that cause it. A re-run of a flaky gate is a diagnosis step, not a fix. Do not offer "raise the gate" as an option.
+
 Clippy enforces these rules, so do not spend review on them. The `[lints]` table in `Cargo.toml` and `clippy.toml` hold the full list:
 
 - No `unwrap`, `expect`, `panic!`, `todo!` or `dbg!` outside tests. Return a `Result` or an `Option`.
