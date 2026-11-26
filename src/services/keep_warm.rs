@@ -43,7 +43,7 @@ const PER_MILLION: f64 = 1_000_000.0;
 type StreamKey = (String, String);
 
 /// The prompt a completed response cached, and the price card it is billed at.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct CachedPrompt {
     pub(crate) tokens: u64,
     pub(crate) card: PriceCard,
