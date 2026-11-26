@@ -30,7 +30,7 @@ pub use crate::services::local_serving::watchdog::{StreamWatchdog, stall_event};
 pub use {axum, serde_json};
 
 use crate::configs::HubConfig;
-use crate::consts::{LOGS_DIR, VERSION};
+use crate::consts::{LOGS_DIR, SUCCESSOR_WARM_UP_LIMIT, VERSION};
 use crate::dependencies::state::AppState;
 use crate::services::extension_loader::{self, EXTENSIONS_FILE_VAR, ExtensionSources};
 use crate::services::launch;
@@ -80,16 +80,18 @@ async fn serve(hub: Hub) {
 
     if let Some(bind) = configured_bind(&HubRuntime::process()) {
         services::instance::set_bind(&bind);
-        if services::instance::handover_from().is_none()
-            && let Some(pid) = services::instance::live_server(&bind)
-        {
-            if services::restart::is_supervised() {
+        match services::instance::startup(&bind) {
+            services::instance::Startup::Serve => {}
+            services::instance::Startup::TakeOver(bridge) => services::instance::take_over(bridge),
+            services::instance::Startup::Wait => {
                 // The supervisor restarts this process after the live one exits.
                 services::instance::wait_while_served(&bind).await;
                 return;
             }
-            eprintln!("llm-hub is already running (pid {pid}) on {bind}");
-            std::process::exit(1);
+            services::instance::Startup::Refuse(pid) => {
+                eprintln!("llm-hub is already running (pid {pid}) on {bind}");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -102,12 +104,17 @@ async fn serve(hub: Hub) {
     };
     let Built {
         app,
+        state,
         bind,
         vars,
         managed,
         local_pool,
         restart_notify,
     } = built;
+    if services::instance::handover_from().is_some() {
+        // A successor takes traffic only with a warm model cache, so no request waits on the fan-out.
+        routes::models::warm_up(&state, SUCCESSOR_WARM_UP_LIMIT).await;
+    }
 
     let listener = match services::instance::bind_reuseport(&bind).await {
         Ok(listener) => listener,
@@ -116,10 +123,20 @@ async fn serve(hub: Hub) {
             std::process::exit(1);
         }
     };
+    if let Err(e) = services::instance::mark_bridge(&bind) {
+        eprintln!("cannot write the bridge marker for {bind}: {e}");
+    }
     if let Err(e) = services::instance::write_pid(&bind) {
         eprintln!("cannot write the pid file for {bind}: {e}");
     }
     tracing::info!("llm-hub v{VERSION} listening on http://{bind}");
+    if let Some(bridge) = services::instance::taking_over() {
+        tracing::info!(
+            bridge,
+            "took the service port over from the handover bridge"
+        );
+        services::instance::finish_take_over(&bind, bridge).await;
+    }
     if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             tokio::select! {
@@ -149,6 +166,7 @@ async fn serve(hub: Hub) {
 /// stop its processes.
 struct Built {
     app: Router,
+    state: AppState,
     bind: String,
     vars: HashMap<String, String>,
     managed: std::sync::Arc<services::managed_process::ProcessManager>,
@@ -201,12 +219,13 @@ fn build_server(hub: Hub, runtime: HubRuntime) -> Result<Built, String> {
     );
     install_extensions(&state, hub.extensions, &vars)?;
 
-    let mut app = build_router_with(state, hub.routes);
+    let mut app = build_router_with(state.clone(), hub.routes);
     for change in hub.router_changes {
         app = change(app);
     }
     Ok(Built {
         app,
+        state,
         bind,
         vars,
         managed,
