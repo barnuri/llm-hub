@@ -68,7 +68,7 @@ mod tests {
 
     use super::*;
 
-    fn object(value: Value) -> Map<String, Value> {
+    fn object(value: &Value) -> Map<String, Value> {
         value.as_object().cloned().unwrap()
     }
 
@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn object_entry_replaces_a_non_object() {
-        let mut map = object(json!({"a": 1, "b": {"keep": true}}));
+        let mut map = object(&json!({"a": 1, "b": {"keep": true}}));
 
         JsonConfig::object_entry(&mut map, "a")
             .unwrap()
@@ -114,11 +114,11 @@ mod tests {
 
     #[test]
     fn merge_recurses_into_objects_and_replaces_the_rest() {
-        let mut target = object(json!({"env": {"A": "1", "B": "2"}, "list": [1], "k": "old"}));
+        let mut target = object(&json!({"env": {"A": "1", "B": "2"}, "list": [1], "k": "old"}));
 
         JsonConfig::merge(
             &mut target,
-            object(json!({"env": {"B": "3"}, "list": [2], "k": {"n": 1}, "new": 1})),
+            object(&json!({"env": {"B": "3"}, "list": [2], "k": {"n": 1}, "new": 1})),
         );
 
         assert_eq!(
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn render_ends_with_a_newline() {
-        let text = JsonConfig::render(object(json!({"a": 1}))).unwrap();
+        let text = JsonConfig::render(object(&json!({"a": 1}))).unwrap();
 
         assert_eq!(text, "{\n  \"a\": 1\n}\n");
     }

@@ -1,4 +1,4 @@
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::config_paths::ConfigPaths;
 use super::json_config::JsonConfig;
@@ -56,6 +56,8 @@ impl ClaudeSetup {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use super::*;
 
     fn endpoint() -> HubEndpoint {
