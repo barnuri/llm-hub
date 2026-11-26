@@ -2711,7 +2711,7 @@ impl<'a> AttemptSender<'a> {
             return Err(format!("profile disabled: {}", profile.name));
         }
         let client = state.client(&profile.name).ok_or("no client for profile")?;
-        state.managed().ensure_running(profile).await?;
+        let active = state.managed().ensure_running_active(profile).await?;
         let lease =
             match LocalModel::acquire(state.local_pool(), profile, &self.model_id.model).await? {
                 LocalModel::NotLocal => None,
@@ -2766,9 +2766,9 @@ impl<'a> AttemptSender<'a> {
         } else {
             response
         };
-        Ok(match lease {
-            Some(lease) => hold_lease(response, lease),
-            None => response,
+        Ok(match (lease, active) {
+            (None, None) => response,
+            (lease, active) => hold_lease(response, (lease, active)),
         })
     }
 }
@@ -2812,7 +2812,10 @@ fn local_api_base(lease: &Lease) -> String {
 
 /// `response` with a body that holds `lease` until the body ends or its reader drops it, so
 /// the pool never stops a model that still streams.
-fn hold_lease(mut response: reqwest::Response, lease: Lease) -> reqwest::Response {
+fn hold_lease<L: Send + Sync + 'static>(
+    mut response: reqwest::Response,
+    lease: L,
+) -> reqwest::Response {
     let (status, version) = (response.status(), response.version());
     let headers = std::mem::take(response.headers_mut());
     let chunks = Box::pin(response.bytes_stream());
