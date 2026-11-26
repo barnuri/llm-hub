@@ -29,7 +29,7 @@ use crate::schemas::insights::model_cost::ModelCost;
 use crate::schemas::insights::pick_by::PickBy;
 use crate::schemas::insights_analysis_input::InsightsAnalysisInput;
 use crate::schemas::keep_warm_input::KeepWarmInput;
-use crate::schemas::keep_warm_summary::KeepWarmSummary;
+use crate::schemas::keep_warm_summary::{KeepWarmSummary, SKIPS_SINCE_START};
 use crate::schemas::media_fallback_input::MediaFallbackInput;
 use crate::schemas::model_id::ModelId;
 use crate::schemas::profile_input::ProfileInput;
@@ -676,6 +676,7 @@ fn in_memory_keep_warm(state: &AppState, persisted: bool) -> KeepWarmSummary {
         keepwarm_pings: pings,
         keepwarm_cost_usd: cost_usd,
         keepwarm_skips: state.keep_warm().skip_counts(),
+        keepwarm_skips_scope: Some(SKIPS_SINCE_START),
         persisted,
         ..KeepWarmSummary::default()
     }
@@ -690,7 +691,8 @@ async fn stored_keep_warm(
     tokio::task::spawn_blocking(move || {
         let store = state.store().ok_or("persistence is off")?;
         let mut summary = session_insights::keep_warm_summary(store, since_ms, &book)?;
-        summary.keepwarm_skips.clear();
+        summary.keepwarm_skips = state.keep_warm().skip_counts();
+        summary.keepwarm_skips_scope = Some(SKIPS_SINCE_START);
         Ok(summary)
     })
     .await
