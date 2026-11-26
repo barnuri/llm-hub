@@ -109,7 +109,14 @@ impl ProcessManager {
             return Ok(());
         }
         let log_path = self.log_path(&profile.name);
-        match start(&profile.name, command, &log_path, self.timings.ready_poll_interval).await {
+        match start(
+            &profile.name,
+            command,
+            &log_path,
+            self.timings.ready_poll_interval,
+        )
+        .await
+        {
             Ok(started) => {
                 *child = Some(started);
                 entry.reset_backoff();
@@ -771,13 +778,18 @@ mod tests {
             let child =
                 spawn_logged(&argv(&["sleep", "30"]), &dir.path().join("a.log"), "test").unwrap();
 
-            let mut ready = wait_ready(child, Duration::from_secs(5), Duration::from_millis(10), || async {
-                client
-                    .get(&url)
-                    .send()
-                    .await
-                    .is_ok_and(|response| response.status().is_success())
-            })
+            let mut ready = wait_ready(
+                child,
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+                || async {
+                    client
+                        .get(&url)
+                        .send()
+                        .await
+                        .is_ok_and(|response| response.status().is_success())
+                },
+            )
             .await
             .unwrap();
 
@@ -792,7 +804,10 @@ mod tests {
                 spawn_logged(&argv(&["sleep", "30"]), &dir.path().join("a.log"), "test").unwrap();
             let pgid = pgid_of(&child);
 
-            let result = wait_ready(child, Duration::ZERO, Duration::from_millis(10), || async { false }).await;
+            let result = wait_ready(child, Duration::ZERO, Duration::from_millis(10), || async {
+                false
+            })
+            .await;
 
             assert!(matches!(result, Err(NotReady::TimedOut)), "{result:?}");
             assert!(wait_until_group_gone(pgid).await);
@@ -808,7 +823,13 @@ mod tests {
             )
             .unwrap();
 
-            let result = wait_ready(child, Duration::from_secs(5), Duration::from_millis(10), || async { false }).await;
+            let result = wait_ready(
+                child,
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+                || async { false },
+            )
+            .await;
 
             let Err(NotReady::Exited(status)) = result else {
                 panic!("expected an early exit, got {result:?}");

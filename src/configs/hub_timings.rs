@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::consts::{
-    ENV_WATCH_INTERVAL, MANAGED_IDLE_CHECK_INTERVAL, MANAGED_READY_POLL_INTERVAL, MANAGED_STOP_GRACE,
+    ENV_WATCH_INTERVAL, MANAGED_IDLE_CHECK_INTERVAL, MANAGED_READY_POLL_INTERVAL,
+    MANAGED_STOP_GRACE,
 };
 
 /// How often the local model registries are re-read for edits.

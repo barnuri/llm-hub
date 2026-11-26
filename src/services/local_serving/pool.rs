@@ -737,15 +737,15 @@ impl LocalPool {
         wait_ready(child, timeout, self.timings.ready_poll_interval, || {
             health_ok(&self.health, &url)
         })
-            .await
-            .map_err(|error| match error {
-                NotReady::Exited(status) => {
-                    format!("the process exited with {status} before /health answered")
-                }
-                NotReady::TimedOut => {
-                    format!("{url} did not answer 200 within {} ms", timeout.as_millis())
-                }
-            })
+        .await
+        .map_err(|error| match error {
+            NotReady::Exited(status) => {
+                format!("the process exited with {status} before /health answered")
+            }
+            NotReady::TimedOut => {
+                format!("{url} did not answer 200 within {} ms", timeout.as_millis())
+            }
+        })
     }
 
     fn lease(&self, entry: &Arc<ModelEntry>) -> Lease {
