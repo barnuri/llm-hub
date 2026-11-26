@@ -631,9 +631,8 @@ mod tests {
             start_timeout: Duration::from_secs(1),
         };
         let entry = Arc::new(ManagedEntry::new("p", &command, Duration::from_secs(1)));
-        *entry.last_used.lock().unwrap() = Instant::now()
-            .checked_sub(Duration::from_secs(60))
-            .unwrap();
+        *entry.last_used.lock().unwrap() =
+            Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
         entry
     }
 
