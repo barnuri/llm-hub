@@ -54,7 +54,11 @@ mod tests {
     use crate::services::notifications::desktop::test_notification;
 
     fn sink(url: String) -> WebhookSink {
-        WebhookSink::new(reqwest::Client::new(), url, Duration::from_secs(5))
+        WebhookSink::new(
+            crate::services::http_client::client(),
+            url,
+            Duration::from_secs(5),
+        )
     }
 
     #[tokio::test]
@@ -101,7 +105,7 @@ mod tests {
             .mount(&server)
             .await;
         let sink = WebhookSink::new(
-            reqwest::Client::new(),
+            crate::services::http_client::client(),
             server.uri(),
             Duration::from_millis(50),
         );

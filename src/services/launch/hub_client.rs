@@ -33,7 +33,7 @@ impl HubClient {
     /// # Errors
     /// Returns a message when the HTTP client cannot be built.
     pub fn new(endpoint: HubEndpoint) -> Result<Self, String> {
-        let http = reqwest::Client::builder()
+        let http = crate::services::http_client::builder()
             .user_agent(format!("llm-hub/{VERSION}"))
             .build()
             .map_err(|e| e.to_string())?;

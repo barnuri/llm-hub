@@ -635,7 +635,7 @@ mod tests {
             .mount(&server)
             .await;
         let (state, auth) = vscode_state(&server);
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let ttl_ms = u64::try_from(COPILOT_USAGE_TTL.as_millis()).unwrap();
 
         let first = usage_at(&state, &client, PROFILE, &auth, NOW_MS).await;
@@ -667,7 +667,7 @@ mod tests {
             .mount(&server)
             .await;
         let (state, auth) = vscode_state(&server);
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let stale_at = NOW_MS + u64::try_from(COPILOT_USAGE_TTL.as_millis()).unwrap();
 
         usage_at(&state, &client, PROFILE, &auth, NOW_MS).await;
@@ -693,7 +693,7 @@ mod tests {
         .await;
         mount_user_once(&server, ResponseTemplate::new(500)).await;
         let (state, auth) = vscode_state(&server);
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let stale_at = NOW_MS + u64::try_from(COPILOT_USAGE_TTL.as_millis()).unwrap();
 
         usage_at(&state, &client, PROFILE, &auth, NOW_MS).await;
@@ -711,7 +711,14 @@ mod tests {
         mount_user_once(&server, ResponseTemplate::new(500)).await;
         let (state, auth) = vscode_state(&server);
 
-        let usage = usage_at(&state, &reqwest::Client::new(), PROFILE, &auth, NOW_MS).await;
+        let usage = usage_at(
+            &state,
+            &crate::services::http_client::client(),
+            PROFILE,
+            &auth,
+            NOW_MS,
+        )
+        .await;
 
         assert_eq!(usage, None);
     }
@@ -732,7 +739,14 @@ mod tests {
         // One call acquires the session, the other reads the quota.
         let (state, auth) = state_with("github-copilot", &server.uri());
 
-        let usage = usage_at(&state, &reqwest::Client::new(), PROFILE, &auth, NOW_MS).await;
+        let usage = usage_at(
+            &state,
+            &crate::services::http_client::client(),
+            PROFILE,
+            &auth,
+            NOW_MS,
+        )
+        .await;
 
         assert_eq!(used(&usage.unwrap()), json!(12626.0));
     }

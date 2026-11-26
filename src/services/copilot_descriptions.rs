@@ -242,7 +242,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE))
             .mount(&server)
             .await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let url = server.uri();
         assert!(
             CopilotDescriptions::fetch(&client, &url)

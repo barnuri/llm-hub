@@ -230,7 +230,7 @@ mod tests {
         let base_url = format!("{}/v1", server.uri());
 
         let usage = fetch(
-            &reqwest::Client::new(),
+            &crate::services::http_client::client(),
             "llmgw",
             &base_url,
             "sk-bf-secret",
@@ -253,7 +253,7 @@ mod tests {
             .await;
 
         let usage = fetch(
-            &reqwest::Client::new(),
+            &crate::services::http_client::client(),
             "llmgw",
             &server.uri(),
             "sk-bf-bad",

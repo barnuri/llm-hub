@@ -31,7 +31,7 @@ pub async fn ensure_installed_service() -> Result<bool, String> {
     if !platform::installed()? {
         return Ok(false);
     }
-    let client = reqwest::Client::builder()
+    let client = crate::services::http_client::builder()
         .timeout(std::time::Duration::from_secs(1))
         .no_proxy()
         .build()
@@ -692,7 +692,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
             .mount(&server)
             .await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         assert!(endpoint_healthy(&client, &server.uri()).await);
     }
 
@@ -709,7 +709,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(503).set_body_string("ok"))
             .mount(&server)
             .await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         assert!(!endpoint_healthy(&client, &format!("{}/wrong", server.uri())).await);
         assert!(!endpoint_healthy(&client, &format!("{}/error", server.uri())).await);
     }

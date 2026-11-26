@@ -399,7 +399,7 @@ mod tests {
 
     async fn device_flow(server: &MockServer, client_id: &str) -> Result<String, String> {
         run_device_flow(
-            &reqwest::Client::new(),
+            &crate::services::http_client::client(),
             &server.uri(),
             client_id,
             Duration::ZERO,
@@ -413,7 +413,7 @@ mod tests {
         store: &Arc<MemoryCredentialStore>,
     ) -> Result<(), String> {
         login_at(
-            &reqwest::Client::new(),
+            &crate::services::http_client::client(),
             PROFILE,
             auth,
             &server.uri(),

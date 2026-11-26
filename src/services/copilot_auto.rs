@@ -1215,7 +1215,7 @@ mod tests {
         catalog: &[Value],
         now: u64,
     ) -> AutoRoute {
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let uri = server.uri();
         let upstream = AutoUpstream {
             client: &client,
@@ -1974,7 +1974,7 @@ mod tests {
         tier: AutoTier,
         body: &Value,
     ) -> AutoRoute {
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let uri = server.uri();
         let upstream = AutoUpstream {
             client: &client,

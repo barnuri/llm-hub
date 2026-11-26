@@ -666,7 +666,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let url = format!("{}/health", server.uri());
-            let client = reqwest::Client::new();
+            let client = crate::services::http_client::client();
             let dir = tempfile::tempdir().unwrap();
             let child =
                 spawn_logged(&argv(&["sleep", "30"]), &dir.path().join("a.log"), "test").unwrap();
