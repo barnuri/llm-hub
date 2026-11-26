@@ -19,6 +19,7 @@
 | `llm-hub opencode [model] [args...]` | Start opencode against the hub. |
 | `llm-hub copilot-cli [model] [args...]` | Start GitHub Copilot CLI against the hub. |
 | `llm-hub pi [model] [args...]` | Start pi against the hub. |
+| `llm-hub setup <harness> [--dry-run]` | Write the harness's user config so the plain command uses the hub. See [Persistent setup](coding-agents.md#persistent-setup-llm-hub-setup). |
 
 The five harness commands are in [Coding agents](coding-agents.md).
 

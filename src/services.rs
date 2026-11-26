@@ -71,6 +71,7 @@ pub mod review_prompts;
 pub mod selection_log;
 pub mod service_manager;
 pub mod session_insights;
+pub mod setup;
 pub mod smart_auto_affinity;
 pub mod smart_auto_decisions;
 pub mod smart_auto_directive;
