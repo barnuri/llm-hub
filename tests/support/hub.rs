@@ -60,6 +60,7 @@ pub fn hub_command(dir: &std::path::Path, port: u16) -> Command {
         .env("LLM_HUB_ENV_WATCH_INTERVAL_MS", "100")
         .env("LLM_HUB_REGISTRY_POLL_INTERVAL_MS", "50")
         .env("LLM_HUB_MANAGED_STOP_GRACE_MS", "300")
+        .env("LLM_HUB_READY_POLL_INTERVAL_MS", "20")
         .env("LLM_HUB_COPILOT_PRICES_REFRESH_SECS", "0")
         .stdin(Stdio::piped());
     // A developer's own hub settings must not leak into a test hub.
@@ -107,6 +108,7 @@ pub async fn start_hub_with_dir(
         ("LLM_HUB_ENV_WATCH_INTERVAL_MS", "100"),
         ("LLM_HUB_REGISTRY_POLL_INTERVAL_MS", "50"),
         ("LLM_HUB_MANAGED_STOP_GRACE_MS", "300"),
+        ("LLM_HUB_READY_POLL_INTERVAL_MS", "20"),
         ("LLM_HUB_COPILOT_PRICES_REFRESH_SECS", "0"),
     ] {
         vars.entry(key.to_owned())

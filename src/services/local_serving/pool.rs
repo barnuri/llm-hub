@@ -734,16 +734,18 @@ impl LocalPool {
         tracing::info!(model = %entry.key, pid, port, "started local model, waiting for /health");
         let url = format!("http://{LOOPBACK}:{port}{HEALTH_PATH}");
         let timeout = local.config.start_timeout;
-        wait_ready(child, timeout, || health_ok(&self.health, &url))
-            .await
-            .map_err(|error| match error {
-                NotReady::Exited(status) => {
-                    format!("the process exited with {status} before /health answered")
-                }
-                NotReady::TimedOut => {
-                    format!("{url} did not answer 200 within {} ms", timeout.as_millis())
-                }
-            })
+        wait_ready(child, timeout, self.timings.ready_poll_interval, || {
+            health_ok(&self.health, &url)
+        })
+        .await
+        .map_err(|error| match error {
+            NotReady::Exited(status) => {
+                format!("the process exited with {status} before /health answered")
+            }
+            NotReady::TimedOut => {
+                format!("{url} did not answer 200 within {} ms", timeout.as_millis())
+            }
+        })
     }
 
     fn lease(&self, entry: &Arc<ModelEntry>) -> Lease {
@@ -1129,6 +1131,7 @@ mod tests {
                 "https://api.openai.com/v1".into(),
             ),
             ("LLM_HUB_OPENAI_API_KEY".into(), "sk-test".into()),
+            ("LLM_HUB_READY_POLL_INTERVAL_MS".into(), "10".into()),
         ]))
         .unwrap()
     }

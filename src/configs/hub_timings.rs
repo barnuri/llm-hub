@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::consts::{ENV_WATCH_INTERVAL, MANAGED_IDLE_CHECK_INTERVAL, MANAGED_STOP_GRACE};
+use crate::consts::{
+    ENV_WATCH_INTERVAL, MANAGED_IDLE_CHECK_INTERVAL, MANAGED_READY_POLL_INTERVAL,
+    MANAGED_STOP_GRACE,
+};
 
 /// How often the local model registries are re-read for edits.
 const DEFAULT_REGISTRY_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -22,6 +25,8 @@ pub struct HubTimings {
     pub health_probe_timeout: Duration,
     /// `LLM_HUB_MANAGED_STOP_GRACE_MS`: how long a process gets to exit after SIGTERM before it is killed.
     pub managed_stop_grace: Duration,
+    /// `LLM_HUB_READY_POLL_INTERVAL_MS`: how often a starting process is probed until it answers.
+    pub ready_poll_interval: Duration,
 }
 
 impl Default for HubTimings {
@@ -32,6 +37,7 @@ impl Default for HubTimings {
             registry_poll_interval: DEFAULT_REGISTRY_POLL_INTERVAL,
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
             managed_stop_grace: MANAGED_STOP_GRACE,
+            ready_poll_interval: MANAGED_READY_POLL_INTERVAL,
         }
     }
 }
@@ -64,6 +70,7 @@ impl HubTimings {
             )?,
             health_probe_timeout: read("HEALTH_PROBE_TIMEOUT", defaults.health_probe_timeout)?,
             managed_stop_grace: read("MANAGED_STOP_GRACE", defaults.managed_stop_grace)?,
+            ready_poll_interval: read("READY_POLL_INTERVAL", defaults.ready_poll_interval)?,
         })
     }
 }
@@ -97,6 +104,7 @@ mod tests {
             ("LLM_HUB_REGISTRY_POLL_INTERVAL_MS", "40"),
             ("LLM_HUB_HEALTH_PROBE_TIMEOUT_MS", "50"),
             ("LLM_HUB_MANAGED_STOP_GRACE_MS", " 60 "),
+            ("LLM_HUB_READY_POLL_INTERVAL_MS", "70"),
         ]))
         .unwrap();
         assert_eq!(timings.idle_check_interval, Duration::from_millis(20));
@@ -104,6 +112,7 @@ mod tests {
         assert_eq!(timings.registry_poll_interval, Duration::from_millis(40));
         assert_eq!(timings.health_probe_timeout, Duration::from_millis(50));
         assert_eq!(timings.managed_stop_grace, Duration::from_millis(60));
+        assert_eq!(timings.ready_poll_interval, Duration::from_millis(70));
     }
 
     #[test]

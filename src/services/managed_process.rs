@@ -109,7 +109,14 @@ impl ProcessManager {
             return Ok(());
         }
         let log_path = self.log_path(&profile.name);
-        match start(&profile.name, command, &log_path).await {
+        match start(
+            &profile.name,
+            command,
+            &log_path,
+            self.timings.ready_poll_interval,
+        )
+        .await
+        {
             Ok(started) => {
                 *child = Some(started);
                 entry.reset_backoff();
@@ -347,7 +354,12 @@ impl ManagedEntry {
     }
 }
 
-async fn start(profile: &str, command: &ManagedCommand, log_path: &Path) -> Result<Child, String> {
+async fn start(
+    profile: &str,
+    command: &ManagedCommand,
+    log_path: &Path,
+    poll: Duration,
+) -> Result<Child, String> {
     let child = spawn_logged(&command.argv, log_path, profile)?;
     tracing::info!(
         profile,
@@ -355,7 +367,7 @@ async fn start(profile: &str, command: &ManagedCommand, log_path: &Path) -> Resu
         "started managed process, waiting for {}",
         command.address
     );
-    wait_ready(child, command.start_timeout, || {
+    wait_ready(child, command.start_timeout, poll, || {
         accepts_connections(&command.address)
     })
     .await
@@ -421,6 +433,7 @@ pub(crate) fn spawn_logged(
 pub(crate) async fn wait_ready<F, Fut>(
     mut child: Child,
     timeout: Duration,
+    poll: Duration,
     mut probe: F,
 ) -> Result<Child, NotReady>
 where
@@ -439,7 +452,7 @@ where
             terminate(child).await;
             return Err(NotReady::TimedOut);
         }
-        tokio::time::sleep(MANAGED_READY_POLL_INTERVAL).await;
+        tokio::time::sleep(poll).await;
     }
 }
 
@@ -765,13 +778,18 @@ mod tests {
             let child =
                 spawn_logged(&argv(&["sleep", "30"]), &dir.path().join("a.log"), "test").unwrap();
 
-            let mut ready = wait_ready(child, Duration::from_secs(5), || async {
-                client
-                    .get(&url)
-                    .send()
-                    .await
-                    .is_ok_and(|response| response.status().is_success())
-            })
+            let mut ready = wait_ready(
+                child,
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+                || async {
+                    client
+                        .get(&url)
+                        .send()
+                        .await
+                        .is_ok_and(|response| response.status().is_success())
+                },
+            )
             .await
             .unwrap();
 
@@ -786,7 +804,10 @@ mod tests {
                 spawn_logged(&argv(&["sleep", "30"]), &dir.path().join("a.log"), "test").unwrap();
             let pgid = pgid_of(&child);
 
-            let result = wait_ready(child, Duration::ZERO, || async { false }).await;
+            let result = wait_ready(child, Duration::ZERO, Duration::from_millis(10), || async {
+                false
+            })
+            .await;
 
             assert!(matches!(result, Err(NotReady::TimedOut)), "{result:?}");
             assert!(wait_until_group_gone(pgid).await);
@@ -802,7 +823,13 @@ mod tests {
             )
             .unwrap();
 
-            let result = wait_ready(child, Duration::from_secs(5), || async { false }).await;
+            let result = wait_ready(
+                child,
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+                || async { false },
+            )
+            .await;
 
             let Err(NotReady::Exited(status)) = result else {
                 panic!("expected an early exit, got {result:?}");
