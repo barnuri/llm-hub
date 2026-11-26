@@ -4011,7 +4011,10 @@ fn build_response(
                 );
                 let cached = outcome.cache_read_tokens + outcome.cache_write_tokens;
                 if pays {
-                    lease.complete(cached);
+                    let card = state_for_stats
+                        .pricing_book()
+                        .price_card_for(&outcome.model_key);
+                    lease.complete(KeepWarm::cached_prompt(&outcome, card));
                 } else {
                     lease.complete_unpaid(cached);
                 }
