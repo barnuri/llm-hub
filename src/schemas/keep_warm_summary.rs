@@ -16,7 +16,13 @@ pub struct KeepWarmSummary {
     /// Streams not kept, dropped or held back, by stable reason name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub keepwarm_skips: BTreeMap<String, u64>,
+    /// What `keepwarm_skips` counts. `since_start` marks in-memory counters that reset at restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keepwarm_skips_scope: Option<&'static str>,
 }
+
+/// The `keepwarm_skips_scope` of counters kept in memory since the last start.
+pub const SKIPS_SINCE_START: &str = "since_start";
 
 impl KeepWarmSummary {
     pub fn absorb(&mut self, other: &KeepWarmSummary) {
@@ -85,6 +91,19 @@ mod tests {
         })
         .unwrap();
         assert_eq!(non_empty["keepwarm_skips"]["expired_idle_cap"], 3);
+    }
+
+    #[test]
+    fn keepwarm_skips_scope_is_omitted_when_unset_and_named_when_set() {
+        let unset = serde_json::to_value(KeepWarmSummary::default()).unwrap();
+        assert!(unset.get("keepwarm_skips_scope").is_none());
+
+        let since_start = serde_json::to_value(KeepWarmSummary {
+            keepwarm_skips_scope: Some(SKIPS_SINCE_START),
+            ..KeepWarmSummary::default()
+        })
+        .unwrap();
+        assert_eq!(since_start["keepwarm_skips_scope"], "since_start");
     }
 
     #[test]

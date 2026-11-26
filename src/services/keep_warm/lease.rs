@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use super::{KeepWarm, PingTarget, SkipEvent, SkipReason};
+use super::{CachedPrompt, KeepWarm, PingTarget, SkipEvent, SkipReason};
 use crate::schemas::model_id::ModelId;
 
 /// One user request in flight for a worker. Dropping it ends the request.
@@ -48,8 +48,8 @@ impl KeepWarmLease {
 
     /// Keeps the recorded stream when the response cached enough prompt tokens. The stream key is
     /// read on a blocking thread, so the response path does no parsing.
-    pub(crate) fn complete(mut self, cached_tokens: u64) {
-        self.settle(Settle::Keep(cached_tokens));
+    pub(crate) fn complete(mut self, prompt: CachedPrompt) {
+        self.settle(Settle::Keep(prompt));
     }
 
     /// Drops the recorded stream, as a completion with no cached tokens did, and logs it as
@@ -88,13 +88,13 @@ impl KeepWarmLease {
                 SkipEvent::new(reason, &worker, Some(&stream_key), &model_id).bytes(body.len())
             };
             match settle {
-                Settle::Keep(cached_tokens) => {
+                Settle::Keep(prompt) => {
                     registry.touch_with(
                         (worker.clone(), stream_key.clone()),
                         &body,
                         &model_id,
                         started,
-                        cached_tokens,
+                        prompt,
                         target,
                     );
                 }
@@ -111,7 +111,7 @@ impl KeepWarmLease {
 /// What happens to a recorded stream when its response ends.
 enum Settle {
     /// Keep it, or drop it when it cached too few tokens.
-    Keep(u64),
+    Keep(CachedPrompt),
     /// Drop it: pings cannot pay for themselves.
     Unpaid(u64),
     /// Leave any kept stream as it is and log the reason.

@@ -69,6 +69,17 @@ impl SkipReason {
     }
 }
 
+/// The prices and the return odds behind a drop, in USD and as a probability.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Economics {
+    /// Cost of one ping at the prompt's tier rate: the cache reads of the prompt.
+    pub(crate) ping_usd: f64,
+    /// Cost of one miss at the prompt's tier rate: the rewrite of the prompt.
+    pub(crate) miss_usd: f64,
+    /// Chance the user returns before the next ping, from the model's past gaps.
+    pub(crate) odds: f64,
+}
+
 /// One skip, or the release of a held stream, ready to log once the registry lock is free.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SkipEvent {
@@ -79,6 +90,8 @@ pub(crate) struct SkipEvent {
     pub(crate) tokens: Option<u64>,
     pub(crate) bytes: Option<usize>,
     pub(crate) idle: Option<Duration>,
+    /// Set when a stream is dropped as unlikely to return: the prices and odds that decided it.
+    pub(crate) economics: Option<Economics>,
     /// Set when a held stream is released: how long it was held.
     pub(crate) released_after: Option<Duration>,
 }
@@ -98,8 +111,14 @@ impl SkipEvent {
             tokens: None,
             bytes: None,
             idle: None,
+            economics: None,
             released_after: None,
         }
+    }
+
+    pub(crate) fn economics(mut self, economics: Economics) -> Self {
+        self.economics = Some(economics);
+        self
     }
 
     pub(crate) fn tokens(mut self, tokens: u64) -> Self {
@@ -127,6 +146,9 @@ impl SkipEvent {
         let reason = self.reason.as_str();
         let stream = self.stream.as_deref().unwrap_or("-");
         let idle_secs = self.idle.map(|idle| idle.as_secs());
+        let ping_usd = self.economics.map(|e| e.ping_usd);
+        let miss_usd = self.economics.map(|e| e.miss_usd);
+        let return_odds = self.economics.map(|e| e.odds);
         if let Some(held) = self.released_after {
             tracing::info!(
                 worker = %self.worker, stream, model = %self.model, reason,
@@ -137,7 +159,8 @@ impl SkipEvent {
         } else {
             tracing::info!(
                 worker = %self.worker, stream, model = %self.model, reason,
-                tokens = self.tokens, bytes = self.bytes, idle_secs, "keep-warm stream skipped"
+                tokens = self.tokens, bytes = self.bytes, idle_secs, ping_usd, miss_usd,
+                return_odds, "keep-warm stream skipped"
             );
         }
     }
@@ -286,6 +309,23 @@ mod tests {
         assert!(output.contains("tokens=4096"), "{output}");
         assert!(output.contains("bytes=512"), "{output}");
         assert!(output.contains("idle_secs=1800"), "{output}");
+    }
+
+    #[test]
+    fn a_drop_for_an_unlikely_return_logs_the_prices_and_the_odds() {
+        let event = SkipEvent::new(SkipReason::DroppedUnlikelyReturn, "w", Some("s"), &model())
+            .tokens(130_000)
+            .economics(Economics {
+                ping_usd: 0.065,
+                miss_usd: 0.8125,
+                odds: 0.25,
+            });
+
+        let output = logged(&event);
+
+        assert!(output.contains("ping_usd=0.065"), "{output}");
+        assert!(output.contains("miss_usd=0.8125"), "{output}");
+        assert!(output.contains("return_odds=0.25"), "{output}");
     }
 
     #[test]

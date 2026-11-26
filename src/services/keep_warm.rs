@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use crate::configs::{KeepWarmConfig, TokenRates};
+use crate::configs::{KeepWarmConfig, PriceCard, TokenRates};
 use crate::consts::{
     KEEP_WARM_MAX_BODY_BYTES, KEEP_WARM_MAX_STREAMS, KEEP_WARM_MAX_TOTAL_BYTES,
     KEEP_WARM_MIN_CACHED_TOKENS, KEEP_WARM_PING_INTERVAL, KEEP_WARM_PINGS_PER_MINUTE,
@@ -15,6 +15,7 @@ use crate::consts::{
 use crate::dependencies::state::AppState;
 use crate::schemas::keep_warm_summary::KeepWarmSummary;
 use crate::schemas::model_id::ModelId;
+use crate::services::stats::{RequestOutcome, cache_write_label};
 
 mod api_shape;
 mod lease;
@@ -27,17 +28,34 @@ pub(crate) use api_shape::{ApiShape, PingTarget};
 pub(crate) use lease::KeepWarmLease;
 pub(crate) use ping_plan::PingPlan;
 use skip::SkipLog;
-pub(crate) use skip::{SkipEvent, SkipReason};
+pub(crate) use skip::{Economics, SkipEvent, SkipReason};
 pub(crate) use warm_request::WarmRequest;
 
 /// Idle gaps kept per model for the stop rule.
 const KEEP_WARM_MAX_GAPS: usize = 64;
 /// Gaps a model needs before the stop rule applies.
 const KEEP_WARM_MIN_GAPS: usize = 8;
-/// A cache miss costs about nine reads: input at 1.0 against a read at 0.1.
+/// A cache miss costs about nine reads when no price is known: input at 1.0 against a read at 0.1.
 const KEEP_WARM_MISS_TO_PING_RATIO: f64 = 9.0;
+/// Token prices are per this many tokens.
+const PER_MILLION: f64 = 1_000_000.0;
 
 type StreamKey = (String, String);
+
+/// The prompt a completed response cached, and the price card it is billed at.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedPrompt {
+    pub(crate) tokens: u64,
+    pub(crate) card: PriceCard,
+}
+
+/// Whether a ping pays, with the prices and the return odds it was decided on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PingCheck {
+    pays: bool,
+    /// The odds stay 0 when the model has too few gaps to judge.
+    economics: Economics,
+}
 
 /// Keeps the last request body of each idle stream on a profile that caches prompts, so a ping
 /// can replay it and refresh the cache. Everything here is in memory and bounded.
@@ -74,6 +92,8 @@ struct Stream {
     used: u64,
     /// Prompt tokens the last user response cached, for the skip log.
     cached_tokens: u64,
+    /// The price card the last user response was billed at. The ping cost uses its tier for the prompt size.
+    card: PriceCard,
     /// Why a due ping is held back, and since when. Only the change is logged.
     held: Option<(SkipReason, Instant)>,
 }
@@ -162,29 +182,58 @@ impl State {
 
     /// Whether the next ping is worth it. After `idle` quiet time, a ping pays when the chance
     /// that the user returns before the following ping, times the miss cost, beats the ping cost.
-    /// A model with too few recorded gaps always pays.
-    fn ping_pays(&self, model: &str, idle: Duration) -> bool {
+    /// Both costs use the stream's tier rate for its prompt size. Without a known price the miss
+    /// costs `KEEP_WARM_MISS_TO_PING_RATIO` pings. A model with too few recorded gaps always pays.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "Prompt and gap counts stay far below 2^53"
+    )]
+    fn ping_pays(&self, stream: &Stream, idle: Duration) -> PingCheck {
+        let rates = stream
+            .card
+            .rates_for_prompt(stream.cached_tokens)
+            .with_cache_defaults();
+        let prompt = stream.cached_tokens as f64;
+        let ping_usd = prompt * rates.cache_read_per_1m / PER_MILLION;
+        let miss_usd = prompt * rates.cache_write_per_1m / PER_MILLION;
+        let ratio = if ping_usd > 0.0 {
+            miss_usd / ping_usd
+        } else {
+            KEEP_WARM_MISS_TO_PING_RATIO
+        };
         let Some(gaps) = self
             .gaps
-            .get(model)
+            .get(&stream.model_id.qualified())
             .filter(|g| g.len() >= KEEP_WARM_MIN_GAPS)
         else {
-            return true;
+            let economics = Economics {
+                ping_usd,
+                miss_usd,
+                odds: 0.0,
+            };
+            return PingCheck {
+                pays: true,
+                economics,
+            };
         };
         let later = gaps.iter().filter(|gap| **gap > idle).count();
-        if later == 0 {
-            return false;
-        }
         let soon = gaps
             .iter()
             .filter(|gap| **gap > idle && **gap <= idle + KEEP_WARM_PING_INTERVAL)
             .count();
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "Gap counts stay below the ring size"
-        )]
-        let chance = soon as f64 / later as f64;
-        chance * KEEP_WARM_MISS_TO_PING_RATIO > 1.0
+        let odds = if later == 0 {
+            0.0
+        } else {
+            soon as f64 / later as f64
+        };
+        PingCheck {
+            pays: later > 0 && odds * ratio > 1.0,
+            economics: Economics {
+                ping_usd,
+                miss_usd,
+                odds,
+            },
+        }
     }
 
     fn take(&mut self, key: &StreamKey) -> Option<Stream> {
@@ -200,12 +249,26 @@ impl State {
 
     /// Drops a kept stream and logs why. `now` adds its idle time since the last user request.
     fn drop_stream(&mut self, key: &StreamKey, reason: SkipReason, now: Option<Instant>) {
+        self.drop_with(key, reason, now, None);
+    }
+
+    /// Drops a kept stream and logs why, with the `economics` that decided it when a price did.
+    fn drop_with(
+        &mut self,
+        key: &StreamKey,
+        reason: SkipReason,
+        now: Option<Instant>,
+        economics: Option<Economics>,
+    ) {
         let Some(stream) = self.take(key) else {
             return;
         };
         let mut event = stream.skip_event(reason, key);
         if let Some(now) = now {
             event = event.idle(now.saturating_duration_since(stream.last_user));
+        }
+        if let Some(economics) = economics {
+            event = event.economics(economics);
         }
         self.skips.note(event);
     }
@@ -286,14 +349,26 @@ impl KeepWarm {
         cached_tokens: u64,
         beta: Option<HeaderValue>,
     ) {
-        self.touch_with(
-            key,
-            body,
-            model_id,
-            started,
-            cached_tokens,
-            PingTarget::messages(beta),
-        );
+        let prompt = CachedPrompt {
+            tokens: cached_tokens,
+            card: PriceCard::default(),
+        };
+        self.touch_with(key, body, model_id, started, prompt, PingTarget::messages(beta));
+    }
+
+    /// The prompt a completed response cached, billed at `card`. Copilot reports no cache write, so
+    /// its uncached input counts as the prompt it just wrote.
+    #[must_use]
+    pub(crate) fn cached_prompt(outcome: &RequestOutcome, card: PriceCard) -> CachedPrompt {
+        let written = if outcome.model_key.starts_with("copilot/") {
+            cache_write_label(outcome).1
+        } else {
+            0
+        };
+        CachedPrompt {
+            tokens: outcome.cache_read_tokens + outcome.cache_write_tokens + written,
+            card,
+        }
     }
 
     /// Keeps the stream for the next ping. A response that cached too few prompt tokens, or a body
@@ -304,9 +379,10 @@ impl KeepWarm {
         body: &[u8],
         model_id: &ModelId,
         started: Instant,
-        cached_tokens: u64,
+        prompt: CachedPrompt,
         target: PingTarget,
     ) {
+        let cached_tokens = prompt.tokens;
         let refused = if cached_tokens < KEEP_WARM_MIN_CACHED_TOKENS {
             Some(SkipReason::NotKeptLowCache)
         } else if body.len() > KEEP_WARM_MAX_BODY_BYTES {
@@ -357,6 +433,7 @@ impl KeepWarm {
                 ping_in_flight,
                 used,
                 cached_tokens,
+                card: prompt.card,
                 held,
             },
         );
@@ -438,20 +515,18 @@ impl KeepWarm {
         for key in &expired {
             state.drop_stream(key, SkipReason::ExpiredIdleCap, Some(now));
         }
-        let unprofitable: Vec<StreamKey> = state
+        let unprofitable: Vec<(StreamKey, Economics)> = state
             .streams
             .iter()
-            .filter(|(key, stream)| {
-                stream.is_due(now, state.is_busy(&key.0))
-                    && !state.ping_pays(
-                        &stream.model_id.qualified(),
-                        now.saturating_duration_since(stream.last_user),
-                    )
+            .filter(|(key, stream)| stream.is_due(now, state.is_busy(&key.0)))
+            .filter_map(|(key, stream)| {
+                let idle = now.saturating_duration_since(stream.last_user);
+                let check = state.ping_pays(stream, idle);
+                (!check.pays).then(|| (key.clone(), check.economics))
             })
-            .map(|(key, _)| key.clone())
             .collect();
-        for key in &unprofitable {
-            state.drop_stream(key, SkipReason::DroppedUnlikelyReturn, Some(now));
+        for (key, economics) in &unprofitable {
+            state.drop_with(key, SkipReason::DroppedUnlikelyReturn, Some(now), Some(*economics));
         }
         let mut due: Vec<(Instant, StreamKey)> = state
             .streams
@@ -945,6 +1020,94 @@ mod tests {
     }
 
     #[test]
+    fn a_copilot_response_with_no_reported_write_keeps_its_prompt_as_cached() {
+        let outcome = RequestOutcome {
+            model_key: "copilot/claude-haiku-5-5".to_owned(),
+            status: 200,
+            tokens_in: 130_000,
+            ..RequestOutcome::default()
+        };
+        let prompt = KeepWarm::cached_prompt(&outcome, PriceCard::default());
+        assert_eq!(prompt.tokens, 130_000);
+
+        let registry = Arc::new(KeepWarm::default());
+        registry.touch_with(
+            key("w", "s"),
+            &request_body(10),
+            &model(),
+            Instant::now(),
+            prompt,
+            PingTarget::messages(None),
+        );
+        assert_eq!(keys(&registry), vec![key("w", "s")]);
+    }
+
+    #[test]
+    fn a_response_from_another_provider_with_no_reported_write_is_not_counted_as_cached() {
+        let outcome = RequestOutcome {
+            model_key: "groq/llama-3".to_owned(),
+            status: 200,
+            tokens_in: 130_000,
+            ..RequestOutcome::default()
+        };
+        assert_eq!(KeepWarm::cached_prompt(&outcome, PriceCard::default()).tokens, 0);
+    }
+
+    /// Haiku-style prices: the base is 1.0 input, and above 100K prompt tokens the tier is 5x.
+    fn haiku_card() -> PriceCard {
+        PriceCard {
+            base: rates(1.0, 0.1, 1.25),
+            long_context: Some(crate::configs::LongContextTier {
+                threshold_tokens: 100_000,
+                rates: rates(5.0, 0.5, 6.25),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_haiku_stream_above_the_tier_pings_at_the_tier_price_and_the_ping_pays() {
+        let registry = Arc::new(KeepWarm::default());
+        let model = model();
+        let prompt = || CachedPrompt {
+            tokens: 130_000,
+            card: haiku_card(),
+        };
+        // Eight 5-minute gaps: the user always returned within the next ping interval.
+        let mut at = Instant::now();
+        registry.touch_with(
+            key("w", "s"),
+            &request_body(10),
+            &model,
+            at,
+            prompt(),
+            PingTarget::messages(None),
+        );
+        for _ in 0..8 {
+            at += Duration::from_mins(5);
+            registry.touch_with(
+                key("w", "s"),
+                &request_body(10),
+                &model,
+                at,
+                prompt(),
+                PingTarget::messages(None),
+            );
+        }
+        {
+            let state = registry.lock();
+            let stream = state.streams.get(&key("w", "s")).unwrap();
+            let check = state.ping_pays(stream, Duration::from_mins(4));
+            // 130K tokens at the tier: 0.5 per 1M for a read, 6.25 per 1M for a rewrite.
+            assert!((check.economics.ping_usd - 0.065).abs() < 1e-9);
+            assert!((check.economics.miss_usd - 0.8125).abs() < 1e-9);
+            assert!((check.economics.odds - 1.0).abs() < 1e-9);
+            assert!(check.pays);
+        }
+        let plans = registry.take_due(at + Duration::from_mins(4), IDLE_CAP);
+        assert_eq!(plans.len(), 1);
+    }
+
+    #[test]
     fn failed_ping_drops_the_stream_and_counts_the_ping() {
         let registry = Arc::new(KeepWarm::default());
         let t0 = Instant::now();
@@ -978,7 +1141,10 @@ mod tests {
             Instant::now(),
             PingTarget::messages(None),
         );
-        lease.complete(4096);
+        lease.complete(CachedPrompt {
+            tokens: 4096,
+            card: PriceCard::default(),
+        });
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while keys(&registry).is_empty() && Instant::now() < deadline {
