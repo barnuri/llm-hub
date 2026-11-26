@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,12 +25,26 @@ struct ManagedEntry {
     command: ManagedCommand,
     child: tokio::sync::Mutex<Option<Child>>,
     last_used: Mutex<Instant>,
+    /// Requests between `ensure_running_active` and the end of their response. The idle reaper
+    /// never stops a process while this is above zero.
+    in_flight: AtomicUsize,
     // Backoff state to avoid rapid respawn attempts when a process repeatedly fails.
     backoff_until: Mutex<Option<Instant>>,
     backoff_secs: Mutex<u64>,
     // Last observed exit reason (if any) to help operators diagnose failures.
     last_exit_reason: Mutex<Option<String>>,
     stop_grace: Duration,
+}
+
+/// Marks one request as using a managed process. Dropping it ends the use and restarts the
+/// idle clock.
+pub struct ActiveRequest(Arc<ManagedEntry>);
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.0.touch();
+    }
 }
 
 impl ProcessManager {
@@ -51,11 +66,36 @@ impl ProcessManager {
     /// After a failed start, requests fail fast with the last reason until a
     /// backoff (5s doubling to 60s) passes, so a broken command is not respawned per request.
     pub async fn ensure_running(&self, profile: &ProfileConfig) -> Result<(), String> {
+        self.ensure_running_active(profile).await.map(drop)
+    }
+
+    /// [`Self::ensure_running`], and the returned guard keeps the idle reaper from stopping the
+    /// process until it drops. Hold it until the response ends: the idle clock restarts at each
+    /// request, so a request that outlasts the idle timeout would otherwise lose its server.
+    ///
+    /// # Errors
+    /// The `ensure_running` message when the process cannot start.
+    pub async fn ensure_running_active(
+        &self,
+        profile: &ProfileConfig,
+    ) -> Result<Option<ActiveRequest>, String> {
         let Some(command) = &profile.managed else {
-            return Ok(());
+            return Ok(None);
         };
         let entry = self.entry_for(&profile.name, command);
+        entry.in_flight.fetch_add(1, Ordering::AcqRel);
+        let active = ActiveRequest(Arc::clone(&entry));
         entry.touch();
+        self.start_if_needed(profile, command, &entry).await?;
+        Ok(Some(active))
+    }
+
+    async fn start_if_needed(
+        &self,
+        profile: &ProfileConfig,
+        command: &ManagedCommand,
+        entry: &ManagedEntry,
+    ) -> Result<(), String> {
         let mut child = entry.child.lock().await;
         if child.as_mut().is_some_and(is_alive) {
             return Ok(());
@@ -232,6 +272,7 @@ impl ManagedEntry {
             command: command.clone(),
             child: tokio::sync::Mutex::new(None),
             last_used: Mutex::new(Instant::now()),
+            in_flight: AtomicUsize::new(0),
             backoff_until: Mutex::new(None),
             backoff_secs: Mutex::new(5),
             last_exit_reason: Mutex::new(None),
@@ -249,6 +290,9 @@ impl ManagedEntry {
         let Some(idle_timeout) = self.command.idle_timeout else {
             return false;
         };
+        if self.in_flight.load(Ordering::Acquire) > 0 {
+            return false;
+        }
         self.last_used
             .lock()
             .is_ok_and(|last_used| last_used.elapsed() >= idle_timeout)
@@ -578,6 +622,56 @@ mod windows_job {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn idle_entry() -> Arc<ManagedEntry> {
+        let command = ManagedCommand {
+            argv: vec!["server".to_owned()],
+            address: "127.0.0.1:1".to_owned(),
+            idle_timeout: Some(Duration::from_secs(5)),
+            start_timeout: Duration::from_secs(1),
+        };
+        let entry = Arc::new(ManagedEntry::new("p", &command, Duration::from_secs(1)));
+        *entry.last_used.lock().unwrap() =
+            Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+        entry
+    }
+
+    #[test]
+    fn an_active_request_keeps_its_process_from_counting_as_idle() {
+        let entry = idle_entry();
+        assert!(entry.is_idle());
+
+        entry.in_flight.fetch_add(1, Ordering::AcqRel);
+        let active = ActiveRequest(Arc::clone(&entry));
+        assert!(!entry.is_idle(), "a request in flight is not idle");
+
+        drop(active);
+        assert_eq!(entry.in_flight.load(Ordering::Acquire), 0);
+        assert!(
+            !entry.is_idle(),
+            "the idle clock restarts when the request ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_profile_without_a_command_needs_no_guard() {
+        let manager = ProcessManager::new(std::env::temp_dir(), HubTimings::default());
+        let vars = std::collections::HashMap::from([
+            ("LLM_HUB_PROFILES".to_owned(), "plain".to_owned()),
+            (
+                "LLM_HUB_PLAIN_BASE_URL".to_owned(),
+                "http://127.0.0.1:9/v1".to_owned(),
+            ),
+        ]);
+        let config = HubConfig::from_map(&vars).unwrap();
+
+        let guard = manager
+            .ensure_running_active(config.profile("plain").unwrap())
+            .await
+            .unwrap();
+
+        assert!(guard.is_none());
+    }
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(ToString::to_string).collect()
