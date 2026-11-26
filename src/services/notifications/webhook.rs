@@ -54,7 +54,11 @@ mod tests {
     use crate::services::notifications::desktop::test_notification;
 
     fn sink(url: String) -> WebhookSink {
-        WebhookSink::new(crate::services::http_client::client(), url, Duration::from_secs(5))
+        WebhookSink::new(
+            crate::services::http_client::client(),
+            url,
+            Duration::from_secs(5),
+        )
     }
 
     #[tokio::test]

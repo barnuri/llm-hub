@@ -400,7 +400,9 @@ mod tests {
         .await;
         let root = format!("{}/", server.uri());
 
-        let found = props(&crate::services::http_client::client(), &root, None).await.unwrap();
+        let found = props(&crate::services::http_client::client(), &root, None)
+            .await
+            .unwrap();
 
         assert_eq!(found, ModelProps::default());
     }
@@ -428,9 +430,13 @@ mod tests {
         .await;
         let url = endpoint(&server.uri(), &["running"]).unwrap();
 
-        let err = fetch(&crate::services::http_client::client(), url, Duration::from_millis(50))
-            .await
-            .unwrap_err();
+        let err = fetch(
+            &crate::services::http_client::client(),
+            url,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
 
         let LlamaSwapError::Http(inner) = &err else {
             panic!("expected an http error, got {err:?}");
@@ -446,7 +452,9 @@ mod tests {
         let root = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
 
-        let err = running(&crate::services::http_client::client(), &root).await.unwrap_err();
+        let err = running(&crate::services::http_client::client(), &root)
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, LlamaSwapError::Http(_)));
     }
@@ -454,7 +462,9 @@ mod tests {
     #[tokio::test]
     async fn invalid_root_is_a_url_error() {
         for root in ["not a url", "mailto:someone@example.com"] {
-            let err = running(&crate::services::http_client::client(), root).await.unwrap_err();
+            let err = running(&crate::services::http_client::client(), root)
+                .await
+                .unwrap_err();
 
             assert!(matches!(err, LlamaSwapError::Url(_)), "{root}");
             assert!(err.to_string().starts_with("invalid llama-swap url"));

@@ -344,7 +344,13 @@ mod tests {
             None,
         );
         let key = UsageKey::for_profile(&state.config(), "copilot").unwrap();
-        let fetched = profile_usage::usage(&state, &crate::services::http_client::client(), "copilot", &key).await;
+        let fetched = profile_usage::usage(
+            &state,
+            &crate::services::http_client::client(),
+            "copilot",
+            &key,
+        )
+        .await;
         assert!(fetched.is_some());
 
         let notes = run_once(&state, now_ms()).await;

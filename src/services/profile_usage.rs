@@ -711,7 +711,14 @@ mod tests {
         mount_user_once(&server, ResponseTemplate::new(500)).await;
         let (state, auth) = vscode_state(&server);
 
-        let usage = usage_at(&state, &crate::services::http_client::client(), PROFILE, &auth, NOW_MS).await;
+        let usage = usage_at(
+            &state,
+            &crate::services::http_client::client(),
+            PROFILE,
+            &auth,
+            NOW_MS,
+        )
+        .await;
 
         assert_eq!(usage, None);
     }
@@ -732,7 +739,14 @@ mod tests {
         // One call acquires the session, the other reads the quota.
         let (state, auth) = state_with("github-copilot", &server.uri());
 
-        let usage = usage_at(&state, &crate::services::http_client::client(), PROFILE, &auth, NOW_MS).await;
+        let usage = usage_at(
+            &state,
+            &crate::services::http_client::client(),
+            PROFILE,
+            &auth,
+            NOW_MS,
+        )
+        .await;
 
         assert_eq!(used(&usage.unwrap()), json!(12626.0));
     }

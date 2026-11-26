@@ -146,9 +146,12 @@ mod tests {
             probe(&crate::services::http_client::client(), &model).await,
             NativeEvidence::default()
         );
-        let error = get::<Props>(&crate::services::http_client::client(), &format!("{}/props", server.uri()))
-            .await
-            .unwrap_err();
+        let error = get::<Props>(
+            &crate::services::http_client::client(),
+            &format!("{}/props", server.uri()),
+        )
+        .await
+        .unwrap_err();
         assert!(error.contains("404"));
     }
 
@@ -202,9 +205,12 @@ mod tests {
         )
         .await;
 
-        let slots = get::<Vec<Slot>>(&crate::services::http_client::client(), &format!("{}/slots", server.uri()))
-            .await
-            .unwrap();
+        let slots = get::<Vec<Slot>>(
+            &crate::services::http_client::client(),
+            &format!("{}/slots", server.uri()),
+        )
+        .await
+        .unwrap();
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].id, 7);
     }

@@ -1190,7 +1190,11 @@ mod tests {
         );
         let url = serve_mapping_probe(state).await;
 
-        let response = crate::services::http_client::client().post(&url).send().await.unwrap();
+        let response = crate::services::http_client::client()
+            .post(&url)
+            .send()
+            .await
+            .unwrap();
 
         assert_eq!(response.text().await.unwrap(), "claude-opus-5.5");
     }
