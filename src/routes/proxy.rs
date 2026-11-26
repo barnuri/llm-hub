@@ -83,7 +83,7 @@ use crate::services::media_fallback;
 use crate::services::model_health::FailureKind;
 use crate::services::multipart_model;
 use crate::services::prompt_cache::{self, CacheHint};
-use crate::services::rate_limit::{CooldownHint, CooldownScope, reset_after};
+use crate::services::rate_limit::{CooldownHint, CooldownScope, HINT_CAP, reset_after};
 use crate::services::request_images::request_has_image;
 use crate::services::responses_chat::{self, ChatStream};
 use crate::services::responses_item_ids::ResponsesItemIds;
@@ -751,8 +751,8 @@ fn deadline_exceeded(limit: Duration, tried: &[String], skipped: &[ModelId]) -> 
     AppError::DeadlineExceeded(message)
 }
 
-/// Applies a cooldown a built-in read from an error body. A profile-wide one without its own
-/// wait uses `LLM_HUB_QUOTA_COOLDOWN_SECS`.
+/// Applies a cooldown a built-in read from an error body. A profile-wide one uses an upstream
+/// reset first, then the profile setting, then the global setting.
 fn apply_cooldown_hint(
     state: &AppState,
     config: &HubConfig,
@@ -763,7 +763,10 @@ fn apply_cooldown_hint(
     let (health, now) = (state.model_health(), Instant::now());
     match hint.scope {
         CooldownScope::Profile => {
-            if let Some(wait) = hint.wait.or(config.quota_cooldown) {
+            let profile_wait = config
+                .profile(&model_id.profile)
+                .map_or(config.quota_cooldown, |profile| profile.quota_cooldown);
+            if let Some(wait) = hint.wait.map(|wait| wait.min(HINT_CAP)).or(profile_wait) {
                 tracing::warn!(profile = %model_id.profile, wait_s = wait.as_secs(), reason = %hint.reason, "profile cooled");
                 health.cool_profile(&model_id.profile, wait, hint.reason, now);
             }

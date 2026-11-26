@@ -187,7 +187,7 @@ The seed table cannot know that a model is down, slow today, dear on this accoun
 
 One further rule keeps a broken model out of the pool, not just lower in the ranking:
 
-- **Cooldown.** A failed attempt cools the model on that route for 30 seconds. Each failure in a row doubles the wait, up to 10 minutes. A rate limit that names its reset cools the model until then instead, up to 6 hours. An out-of-credits reply cools every model of the profile for `LLM_HUB_QUOTA_COOLDOWN_SECS`. An answer clears it. The model rejoins the pool when the wait ends, so the next request tests it. See [Fallbacks](fallbacks-and-transforms.md#fallbacks).
+- **Cooldown.** A failed attempt cools the model on that route for 30 seconds. Each failure in a row doubles the wait, up to 10 minutes. A rate limit that names its reset cools the model until then instead, up to 6 hours. An out-of-credits reply cools every model of the profile until the upstream reset time, the profile `LLM_HUB_<NAME>_QUOTA_COOLDOWN_SECS`, or the global `LLM_HUB_QUOTA_COOLDOWN_SECS` (24 hours by default), in that order. An answer clears it. The model rejoins the pool when the wait ends, so the next request tests it. See [Fallbacks](fallbacks-and-transforms.md#fallbacks).
 
 A quota only costs points. It applies to every model of the profile, because the hub cannot tell which models a quota meters. A metered model that the upstream refuses is cooled by its own error.
 

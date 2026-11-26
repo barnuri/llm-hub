@@ -121,6 +121,9 @@ mod tests {
                 tuner: crate::configs::LocalTunerConfig::default(),
                 local: None,
                 budget_monthly_usd: None,
+                quota_cooldown: Some(Duration::from_secs(
+                    crate::consts::DEFAULT_QUOTA_COOLDOWN_SECS,
+                )),
             }],
             master_key: None,
             smart_auto_presets: std::collections::BTreeMap::new(),
@@ -139,7 +142,9 @@ mod tests {
             copilot_strip_sampling_models: vec![],
             sse_keepalive: None,
             first_byte_timeout: None,
-            quota_cooldown: None,
+            quota_cooldown: Some(Duration::from_secs(
+                crate::consts::DEFAULT_QUOTA_COOLDOWN_SECS,
+            )),
             deadline: None,
             copilot_prices_refresh: None,
             keep_warm: KeepWarmConfig::default(),

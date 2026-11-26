@@ -1673,6 +1673,7 @@ mod tests {
             keep_warm: true,
             first_byte_timeout_ms: None,
             budget_monthly_usd: None,
+            quota_cooldown: None,
             local: None,
             tuner: crate::configs::local_tuner_config::LocalTunerConfig::default(),
         }

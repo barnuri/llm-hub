@@ -214,6 +214,7 @@ mod tests {
             tuner: crate::configs::LocalTunerConfig::default(),
             local: None,
             budget_monthly_usd: None,
+            quota_cooldown: None,
         }
     }
 
