@@ -151,6 +151,14 @@ impl HubConfig {
             // No index var: discover profiles from LLM_HUB_<NAME>_BASE_URL or _KIND keys.
             _ => discover_profile_names(vars),
         };
+        let quota_cooldown_secs: u64 = match get("QUOTA_COOLDOWN_SECS") {
+            Some(v) if !v.is_empty() => v
+                .parse()
+                .map_err(|_| format!("LLM_HUB_QUOTA_COOLDOWN_SECS is not a number: {v}"))?,
+            _ => DEFAULT_QUOTA_COOLDOWN_SECS,
+        };
+        let quota_cooldown =
+            (quota_cooldown_secs > 0).then(|| Duration::from_secs(quota_cooldown_secs));
 
         let mut profiles = Vec::with_capacity(profile_names.len());
         #[allow(
@@ -160,7 +168,7 @@ impl HubConfig {
         let mut usage_sources = HashMap::new();
         let mut profile_errors = Vec::new();
         for name in &profile_names {
-            let parsed = Self::parse_profile(name, vars).and_then(|profile| {
+            let parsed = Self::parse_profile(name, vars, quota_cooldown).and_then(|profile| {
                 let sources = usage_sources_from_map(std::slice::from_ref(&profile), vars)?;
                 Ok((profile, sources))
             });
@@ -214,12 +222,6 @@ impl HubConfig {
             _ => DEFAULT_FIRST_BYTE_TIMEOUT_MS,
         };
 
-        let quota_cooldown_secs: u64 = match get("QUOTA_COOLDOWN_SECS") {
-            Some(v) if !v.is_empty() => v
-                .parse()
-                .map_err(|_| format!("LLM_HUB_QUOTA_COOLDOWN_SECS is not a number: {v}"))?,
-            _ => DEFAULT_QUOTA_COOLDOWN_SECS,
-        };
         let deadline_ms: u64 = match get("DEADLINE_MS") {
             Some(v) if !v.is_empty() => v
                 .parse()
@@ -292,8 +294,7 @@ impl HubConfig {
             sse_keepalive: (sse_keepalive_ms > 0).then(|| Duration::from_millis(sse_keepalive_ms)),
             first_byte_timeout: (first_byte_timeout_ms > 0)
                 .then(|| Duration::from_millis(first_byte_timeout_ms)),
-            quota_cooldown: (quota_cooldown_secs > 0)
-                .then(|| Duration::from_secs(quota_cooldown_secs)),
+            quota_cooldown,
             deadline: (deadline_ms > 0).then(|| Duration::from_millis(deadline_ms)),
             copilot_prices_refresh: (copilot_prices_refresh_secs > 0)
                 .then(|| Duration::from_secs(copilot_prices_refresh_secs)),
@@ -308,7 +309,11 @@ impl HubConfig {
         Ok((config, profile_errors))
     }
 
-    fn parse_profile(name: &str, vars: &HashMap<String, String>) -> Result<ProfileConfig, String> {
+    fn parse_profile(
+        name: &str,
+        vars: &HashMap<String, String>,
+        global_quota_cooldown: Option<Duration>,
+    ) -> Result<ProfileConfig, String> {
         if name.contains('/') {
             return Err(format!("profile name may not contain '/': {name}"));
         }
@@ -371,6 +376,11 @@ impl HubConfig {
         let managed = ManagedCommand::from_env(&upper, &base_url, home, &get)?;
         let (pricing, model_prices) =
             crate::configs::token_rates::profile_rates_from_env(name, &get)?;
+        let quota_cooldown = parse_quota_cooldown(
+            get("QUOTA_COOLDOWN_SECS"),
+            &format!("LLM_HUB_{upper}_QUOTA_COOLDOWN_SECS"),
+            global_quota_cooldown,
+        )?;
         let api_key = get("API_KEY").unwrap_or_default();
         let copilot = CopilotAuth::from_env(&upper, &get)?;
         if copilot.is_some() && !api_key.is_empty() {
@@ -405,8 +415,23 @@ impl HubConfig {
                 get("BUDGET_MONTHLY_USD"),
                 &format!("{upper}_BUDGET_MONTHLY_USD"),
             )?,
+            quota_cooldown,
         })
     }
+}
+
+fn parse_quota_cooldown(
+    raw: Option<String>,
+    key: &str,
+    fallback: Option<Duration>,
+) -> Result<Option<Duration>, String> {
+    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(fallback);
+    };
+    let secs: u64 = raw
+        .parse()
+        .map_err(|_| format!("{key} is not a number: {raw}"))?;
+    Ok((secs > 0).then(|| Duration::from_secs(secs)))
 }
 
 /// A monthly budget in USD from `LLM_HUB_<key>`: a finite number above 0. Unset or empty sets none.
@@ -1036,6 +1061,43 @@ mod tests {
             let err = HubConfig::from_map(&vars).unwrap_err();
             assert!(err.contains(key), "{err}");
         }
+    }
+
+    #[test]
+    fn profile_quota_cooldown_defaults_to_global_and_supports_zero() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_QUOTA_COOLDOWN_SECS".into(), "7200".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert_eq!(
+            cfg.profile("groq").unwrap().quota_cooldown,
+            Some(Duration::from_hours(2))
+        );
+
+        vars.insert("LLM_HUB_GROQ_QUOTA_COOLDOWN_SECS".into(), "0".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert_eq!(cfg.profile("groq").unwrap().quota_cooldown, None);
+        assert_eq!(
+            cfg.profile("openai").unwrap().quota_cooldown,
+            Some(Duration::from_hours(2))
+        );
+    }
+
+    #[test]
+    fn profile_quota_cooldown_override_parses_and_rejects_text() {
+        let mut vars = base_vars();
+        vars.insert("LLM_HUB_GROQ_QUOTA_COOLDOWN_SECS".into(), "120".into());
+        let cfg = HubConfig::from_map(&vars).unwrap();
+        assert_eq!(
+            cfg.profile("groq").unwrap().quota_cooldown,
+            Some(Duration::from_mins(2))
+        );
+
+        vars.insert("LLM_HUB_GROQ_QUOTA_COOLDOWN_SECS".into(), "soon".into());
+        let err = HubConfig::from_map(&vars).unwrap_err();
+        assert_eq!(
+            err,
+            "LLM_HUB_GROQ_QUOTA_COOLDOWN_SECS is not a number: soon"
+        );
     }
 
     #[test]

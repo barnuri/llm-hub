@@ -69,7 +69,7 @@ pub const DEFAULT_SSE_KEEPALIVE_MS: u64 = 15_000;
 /// before the hub marks the model and tries the next one.
 pub const DEFAULT_FIRST_BYTE_TIMEOUT_MS: u64 = 20_000;
 /// How long the hub skips a profile whose upstream says it is out of credits.
-pub const DEFAULT_QUOTA_COOLDOWN_SECS: u64 = 3_600;
+pub const DEFAULT_QUOTA_COOLDOWN_SECS: u64 = 86_400;
 /// The keepalive itself. A line starting with `:` is a comment in the SSE
 /// grammar, so every conformant parser drops it before it reaches the message
 /// stream — it is inert in both the `OpenAI` and Anthropic dialects.

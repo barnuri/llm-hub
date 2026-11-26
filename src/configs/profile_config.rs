@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProfileConfig {
     pub name: String,
@@ -32,6 +34,9 @@ pub struct ProfileConfig {
     pub local: Option<crate::configs::LocalServingConfig>,
     /// `LLM_HUB_<NAME>_BUDGET_MONTHLY_USD`, env-only: this profile's monthly spend budget in USD.
     pub budget_monthly_usd: Option<f64>,
+    /// How long an out-of-credits response cools this profile. `None` means this profile does not
+    /// cool itself. An unset `LLM_HUB_<NAME>_QUOTA_COOLDOWN_SECS` uses the global value.
+    pub quota_cooldown: Option<Duration>,
 }
 
 impl ProfileConfig {
@@ -86,6 +91,7 @@ mod tests {
             tuner: crate::configs::LocalTunerConfig::default(),
             local: None,
             budget_monthly_usd: None,
+            quota_cooldown: None,
         }
     }
 

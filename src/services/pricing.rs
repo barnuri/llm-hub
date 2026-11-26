@@ -653,6 +653,7 @@ mod tests {
             tuner: crate::configs::LocalTunerConfig::default(),
             local: None,
             budget_monthly_usd: None,
+            quota_cooldown: None,
         };
         let shared = TokenRates {
             input_per_1m: 5.0,
