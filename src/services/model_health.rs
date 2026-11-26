@@ -206,12 +206,12 @@ impl ModelHealth {
         entry.cooled_reason = Some(reason);
     }
 
-    /// Cools every model of `profile` for `wait`, at most six hours.
+    /// Cools every model of `profile` for `wait`.
     pub fn cool_profile(&self, profile: &str, wait: Duration, reason: String, now: Instant) {
         self.lock_profiles().insert(
             profile.to_owned(),
             ProfileCooldown {
-                until: now + wait.min(HINT_CAP),
+                until: now + wait,
                 reason,
             },
         );

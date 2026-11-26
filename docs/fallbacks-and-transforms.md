@@ -19,7 +19,8 @@ fail the same way on every upstream. Three cases are exceptions, because they de
   over the context, still stops the chain.
 - **Out of credits.** A 402, or a 400, 403 or 429 whose body says the account has no credit
   (`insufficient_quota`, "credit balance is too low", and similar), moves on and cools the whole
-  profile for `LLM_HUB_QUOTA_COOLDOWN_SECS` (1 hour by default).
+  profile. The upstream reset time wins, then `LLM_HUB_<NAME>_QUOTA_COOLDOWN_SECS`, then the global
+  `LLM_HUB_QUOTA_COOLDOWN_SECS` (24 hours by default). Set either value to `0` to cool nothing.
 
 A rate limit cools the model until the reset the upstream names: `retry-after-ms`, `Retry-After`
 (seconds or an HTTP date), `x-ratelimit-reset-requests` and `-tokens` (`6m0s`),
