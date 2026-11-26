@@ -60,12 +60,12 @@ async fn start_hub(dir: &Path, vars: &[(String, String)], base: &str) -> Child {
     }
     let mut hub = command.spawn().unwrap();
     let client = reqwest::Client::new();
-    for _ in 0..200 {
+    for _ in 0..1000 {
         assert!(hub.try_wait().unwrap().is_none(), "hub exited during start");
         if client.get(format!("{base}/healthz")).send().await.is_ok() {
             return hub;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("hub did not answer /healthz");
 }
@@ -128,11 +128,35 @@ async fn approved_stream_stall_restarts_only_its_model() {
     .map(|(k, v)| (k.to_owned(), v))
     .collect();
 
-    // The first start creates hub.db with the real schema. The proposal is seeded while the hub is
-    // stopped, because the notifications load once at boot.
-    stop_hub(start_hub(dir.path(), &vars, &base).await);
+    // The proposal is seeded before the hub starts, because the notifications load once at boot.
+    // The hub creates every other table itself with `CREATE TABLE IF NOT EXISTS`.
     {
         let conn = rusqlite::Connection::open(&store).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS notifications (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                profile TEXT,
+                model TEXT,
+                rule TEXT,
+                diff TEXT,
+                actions TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL,
+                result TEXT,
+                muted INTEGER NOT NULL DEFAULT 0,
+                CONSTRAINT ck_notifications_kind CHECK (kind IN ('proposal', 'guard', 'advisory', 'custom')),
+                CONSTRAINT ck_notifications_severity CHECK (severity IN ('info', 'warning', 'critical')),
+                CONSTRAINT ck_notifications_status CHECK (status IN ('pending', 'approved', 'dismissed', 'applied', 'failed'))
+            )",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO notifications (id, kind, source, severity, title, body, profile, model, rule,
                 diff, actions, status, created_ms, updated_ms, result, muted)
