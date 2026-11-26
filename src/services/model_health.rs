@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 use crate::services::rate_limit::HINT_CAP;
 
 /// Why an attempt counts against a model.
@@ -379,7 +379,7 @@ impl ModelHealth {
     }
 
     fn key(model: &str, endpoint: &str) -> (String, String) {
-        (strip_1m_suffix(model).to_owned(), endpoint.to_owned())
+        (strip_window_suffix(model).0.to_owned(), endpoint.to_owned())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), Entry>> {

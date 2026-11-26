@@ -24,7 +24,7 @@ use crate::schemas::error_body::ErrorBody;
 use crate::schemas::history_query::HistoryQuery;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::profile_filter::ProfileFilter;
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::role_decision::RoleDecision;
 use crate::schemas::role_reason::RoleReason;
@@ -560,7 +560,7 @@ fn resolve_dry_run(state: &AppState, mut body: ResolveBody) -> Result<ResolveRep
     let live = SmartAutoLive::collect(state, endpoint, &pool, 0, now);
     let sits_out = |descriptor: &&ModelDescriptor| {
         live.unavailable
-            .contains(strip_1m_suffix(&descriptor.qualified_id))
+            .contains(strip_window_suffix(&descriptor.qualified_id).0)
     };
     if pool.iter().any(|descriptor| !sits_out(descriptor)) {
         pool.retain(|descriptor| !sits_out(descriptor));

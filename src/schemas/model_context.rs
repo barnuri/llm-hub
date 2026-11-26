@@ -1,26 +1,38 @@
-use crate::consts::{CONTEXT_1M_SUFFIX, CONTEXT_TOKENS_1M};
+use crate::consts::{CONTEXT_1M_SUFFIX, CONTEXT_TOKENS_1M, CONTEXT_TOKENS_200K};
 use crate::schemas::evidence_source::EvidenceSource;
 use crate::schemas::limit_evidence::LimitEvidence;
 use serde_json::Value;
 
-/// Drops a trailing `[1m]` / `[1M]` that Claude Code adds to declare a 1M window.
-pub fn strip_1m_suffix(raw: &str) -> &str {
+/// Splits a trailing window suffix, `[<n>k]` or `[<n>m]` (case-insensitive), off a model id.
+/// `[200k]` is 200,000 tokens and `[1m]` is 1,000,000. Returns the bare id and the window.
+/// Text that is not a window suffix stays in the id, so `[abc]` or `[0m]` leave it unchanged.
+pub fn strip_window_suffix(raw: &str) -> (&str, Option<u64>) {
     let trimmed = raw.trim();
-    let suffix_len = CONTEXT_1M_SUFFIX.len();
-    let Some(prefix) = trimmed.get(..trimmed.len().saturating_sub(suffix_len)) else {
-        return trimmed;
+    let Some((bare, inner)) = trimmed
+        .strip_suffix(']')
+        .and_then(|rest| rest.rsplit_once('['))
+    else {
+        return (trimmed, None);
     };
-    let suffix = &trimmed[prefix.len()..];
-    if suffix.eq_ignore_ascii_case(CONTEXT_1M_SUFFIX) {
-        prefix
-    } else {
-        trimmed
+    match parse_window(inner) {
+        Some(tokens) => (bare, Some(tokens)),
+        None => (trimmed, None),
     }
 }
 
-/// True when `raw` already ends with Claude Code's 1M-window suffix.
-pub fn has_1m_suffix(raw: &str) -> bool {
-    strip_1m_suffix(raw) != raw.trim()
+/// The token count of a window such as `200k` or `1M`. Digits only, then `k` or `m`.
+fn parse_window(raw: &str) -> Option<u64> {
+    let (&unit, digits) = raw.as_bytes().split_last()?;
+    let scale = match unit.to_ascii_lowercase() {
+        b'k' => 1_000,
+        b'm' => 1_000_000,
+        _ => return None,
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let count: u64 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    count.checked_mul(scale).filter(|tokens| *tokens > 0)
 }
 
 /// Read a context window from an upstream `/v1/models` entry. llama-swap
@@ -83,19 +95,24 @@ pub fn inferred_max_input_tokens(_model_id: &str, upstream_tokens: Option<u64>) 
     upstream_tokens.filter(|t| *t > 0)
 }
 
-/// Hub `/v1/models` id Claude Code should see. Models with a 1M+ window get
-/// `[1m]` so the client does not default gateway ids to 200k.
-pub fn advertised_model_id(qualified: &str, upstream_tokens: Option<u64>) -> String {
-    if should_advertise_1m(qualified, upstream_tokens) && !has_1m_suffix(qualified) {
-        format!("{qualified}{CONTEXT_1M_SUFFIX}")
-    } else {
-        qualified.to_string()
+/// The `/v1/models` entries for a qualified id, each with the window it declares. A model with a
+/// 1M+ window lists its bare id at 200k and its `[1m]` id at 1M. Any other model lists one entry.
+pub fn advertised_models(
+    qualified: &str,
+    upstream_tokens: Option<u64>,
+) -> Vec<(String, Option<u64>)> {
+    let tokens = inferred_max_input_tokens(qualified, upstream_tokens);
+    if tokens.is_none_or(|tokens| tokens < CONTEXT_TOKENS_1M) {
+        return vec![(qualified.to_string(), tokens)];
     }
-}
-
-fn should_advertise_1m(model_id: &str, upstream_tokens: Option<u64>) -> bool {
-    inferred_max_input_tokens(model_id, upstream_tokens)
-        .is_some_and(|tokens| tokens >= CONTEXT_TOKENS_1M)
+    let bare = strip_window_suffix(qualified).0;
+    vec![
+        (bare.to_string(), Some(CONTEXT_TOKENS_200K)),
+        (
+            format!("{bare}{CONTEXT_1M_SUFFIX}"),
+            Some(CONTEXT_TOKENS_1M),
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -139,55 +156,91 @@ mod tests {
     }
 
     #[test]
-    fn trailing_1m_suffix_stripped() {
+    fn trailing_window_suffix_stripped() {
         assert_eq!(
-            strip_1m_suffix("llmgw/bedrock/claude-opus-5[1m]"),
-            "llmgw/bedrock/claude-opus-5"
+            strip_window_suffix("llmgw/bedrock/claude-opus-5[1m]"),
+            ("llmgw/bedrock/claude-opus-5", Some(1_000_000))
         );
         assert_eq!(
-            strip_1m_suffix("llmgw/bedrock/claude-opus-5[1M]"),
-            "llmgw/bedrock/claude-opus-5"
+            strip_window_suffix("llmgw/bedrock/claude-opus-5[1M]"),
+            ("llmgw/bedrock/claude-opus-5", Some(1_000_000))
+        );
+        assert_eq!(
+            strip_window_suffix("copilot/claude-sonnet-5-5[200k]"),
+            ("copilot/claude-sonnet-5-5", Some(200_000))
+        );
+        assert_eq!(
+            strip_window_suffix("copilot/claude-sonnet-5-5[400K]"),
+            ("copilot/claude-sonnet-5-5", Some(400_000))
         );
     }
 
     #[test]
-    fn id_without_suffix_unchanged() {
-        assert_eq!(
-            strip_1m_suffix("llama_swap/meta/muse-glimmer"),
-            "llama_swap/meta/muse-glimmer"
-        );
-        assert!(!has_1m_suffix("llama_swap/meta/muse-glimmer"));
+    fn text_that_is_not_a_window_suffix_stays() {
+        for raw in [
+            "llama_swap/meta/muse-glimmer",
+            "local/model[abc]",
+            "local/model[0m]",
+            "local/model[k]",
+            "local/model[1.5m]",
+            "local/model[ 1m]",
+            "local/model[1000000]",
+            "local/model[1m]x",
+        ] {
+            assert_eq!(strip_window_suffix(raw), (raw, None), "{raw}");
+        }
     }
 
     #[test]
-    fn upstream_1m_advertises_suffix() {
+    fn window_suffix_of_a_huge_count_does_not_overflow() {
+        let raw = format!("local/model[{}m]", u64::MAX);
+        assert_eq!(strip_window_suffix(&raw), (raw.as_str(), None));
+    }
+
+    #[test]
+    fn upstream_1m_lists_bare_at_200k_and_suffixed_at_1m() {
         assert_eq!(
-            advertised_model_id("llmgw/bedrock/anthropic.claude-opus-5", Some(1_000_000)),
-            "llmgw/bedrock/anthropic.claude-opus-5[1m]"
+            advertised_models("llmgw/bedrock/anthropic.claude-opus-5", Some(1_000_000)),
+            vec![
+                (
+                    "llmgw/bedrock/anthropic.claude-opus-5".to_string(),
+                    Some(200_000)
+                ),
+                (
+                    "llmgw/bedrock/anthropic.claude-opus-5[1m]".to_string(),
+                    Some(1_000_000)
+                ),
+            ]
         );
         assert_eq!(
-            advertised_model_id("llmgw/bedrock/anthropic.claude-sonnet-5", Some(1_000_000)),
+            advertised_models("llmgw/bedrock/anthropic.claude-sonnet-5", Some(1_000_000))[1].0,
             "llmgw/bedrock/anthropic.claude-sonnet-5[1m]"
         );
     }
 
     #[test]
-    fn upstream_200k_does_not_advertise_1m_even_for_sonnet_5_name() {
+    fn upstream_200k_lists_one_plain_entry_even_for_sonnet_5_name() {
         assert_eq!(
-            advertised_model_id("llmgw/bedrock/anthropic.claude-sonnet-5", Some(200_000)),
-            "llmgw/bedrock/anthropic.claude-sonnet-5"
+            advertised_models("llmgw/bedrock/anthropic.claude-sonnet-5", Some(200_000)),
+            vec![(
+                "llmgw/bedrock/anthropic.claude-sonnet-5".to_string(),
+                Some(200_000)
+            )]
         );
         assert_eq!(
-            advertised_model_id("llmgw/bedrock/anthropic.claude-opus-5", Some(200_000)),
-            "llmgw/bedrock/anthropic.claude-opus-5"
+            advertised_models("llmgw/bedrock/anthropic.claude-opus-5", Some(200_000)),
+            vec![(
+                "llmgw/bedrock/anthropic.claude-opus-5".to_string(),
+                Some(200_000)
+            )]
         );
     }
 
     #[test]
-    fn missing_upstream_tokens_does_not_advertise_1m() {
+    fn missing_upstream_tokens_lists_one_plain_entry() {
         assert_eq!(
-            advertised_model_id("llmgw/bedrock/anthropic.claude-sonnet-5", None),
-            "llmgw/bedrock/anthropic.claude-sonnet-5"
+            advertised_models("llmgw/bedrock/anthropic.claude-sonnet-5", None),
+            vec![("llmgw/bedrock/anthropic.claude-sonnet-5".to_string(), None)]
         );
         assert_eq!(
             inferred_max_input_tokens("llmgw/bedrock/anthropic.claude-opus-5", None),
@@ -206,8 +259,14 @@ mod tests {
     #[test]
     fn already_suffixed_id_not_double_suffixed() {
         assert_eq!(
-            advertised_model_id("llmgw/bedrock/claude-opus-5[1m]", Some(1_000_000)),
-            "llmgw/bedrock/claude-opus-5[1m]"
+            advertised_models("llmgw/bedrock/claude-opus-5[1m]", Some(1_000_000))
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "llmgw/bedrock/claude-opus-5",
+                "llmgw/bedrock/claude-opus-5[1m]"
+            ]
         );
     }
 
@@ -218,20 +277,23 @@ mod tests {
             None
         );
         assert_eq!(
-            advertised_model_id("llama_swap/meta/muse-glimmer", None),
-            "llama_swap/meta/muse-glimmer"
+            advertised_models("llama_swap/meta/muse-glimmer", None),
+            vec![("llama_swap/meta/muse-glimmer".to_string(), None)]
         );
     }
 
     #[test]
-    fn claude_haiku_upstream_200k_no_1m_suffix() {
+    fn claude_haiku_upstream_200k_lists_plain_id_at_200k() {
         assert_eq!(
             inferred_max_input_tokens("llmgw/anthropic.claude-haiku-4-5", Some(200_000)),
             Some(200_000)
         );
         assert_eq!(
-            advertised_model_id("llmgw/anthropic.claude-haiku-4-5", Some(200_000)),
-            "llmgw/anthropic.claude-haiku-4-5"
+            advertised_models("llmgw/anthropic.claude-haiku-4-5", Some(200_000)),
+            vec![(
+                "llmgw/anthropic.claude-haiku-4-5".to_string(),
+                Some(200_000)
+            )]
         );
     }
 }

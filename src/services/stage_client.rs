@@ -41,6 +41,7 @@ impl StageClient {
                 .state
                 .upstream_model(&model.profile, &model.model)
                 .map_or_else(|| model.model.clone(), |catalog| catalog.upstream_id),
+            window: None,
         };
         if let Some(object) = body.as_object_mut() {
             object.insert("model".to_owned(), Value::String(sent_id.model.clone()));

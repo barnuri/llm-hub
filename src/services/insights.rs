@@ -23,7 +23,7 @@ use crate::schemas::insights::pick_candidate::PickCandidate;
 use crate::schemas::insights::sessions_insight::SessionsInsight;
 use crate::schemas::insights::solver_verdict::SolverVerdict;
 use crate::schemas::insights::use_case_pick::UseCasePick;
-use crate::schemas::model_context::{max_input_tokens_from_item, strip_1m_suffix};
+use crate::schemas::model_context::{max_input_tokens_from_item, strip_window_suffix};
 use crate::schemas::work_role::WorkRole;
 use crate::services::harness::{classify, is_keep_warm};
 use crate::services::pricing::split_cached_input;
@@ -189,7 +189,7 @@ pub fn catalog_from_models(payload: &Value) -> HashMap<String, ModelCatalogEntry
                 use_cases,
                 summary,
             };
-            Some((strip_1m_suffix(id).to_string(), entry))
+            Some((strip_window_suffix(id).0.to_string(), entry))
         })
         .collect()
 }
