@@ -44,6 +44,31 @@ pub async fn ensure_installed_service() -> Result<bool, String> {
     Ok(true)
 }
 
+/// The PID of the hub process the service manager runs now, if it runs one.
+pub(crate) fn service_pid() -> Option<u32> {
+    platform::service_pid()
+}
+
+/// The `pid = N` line of `launchctl print`, which a job shows while its process runs.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "Only the macOS service manager uses it")
+)]
+fn parse_launchd_pid(print: &str) -> Option<u32> {
+    print
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pid = ")?.trim().parse().ok())
+}
+
+/// The value of `systemctl show --property=MainPID --value`, which is 0 when nothing runs.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "Only the Linux service manager uses it")
+)]
+fn parse_systemd_main_pid(value: &str) -> Option<u32> {
+    value.trim().parse().ok().filter(|pid| *pid != 0)
+}
+
 /// A client for `/healthz` probes: a one-second timeout and no proxy.
 ///
 /// # Errors
@@ -494,6 +519,18 @@ mod platform {
         }
     }
 
+    pub fn service_pid() -> Option<u32> {
+        let target = format!("gui/{}/{SERVICE_LABEL}", uid().ok()?);
+        let out = std::process::Command::new("launchctl")
+            .args(["print", &target])
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| super::parse_launchd_pid(&String::from_utf8_lossy(&out.stdout)))
+            .flatten()
+    }
+
     fn is_loaded(target: &str) -> bool {
         std::process::Command::new("launchctl")
             .args(["print", target])
@@ -557,6 +594,20 @@ mod platform {
 
     pub fn start() -> Result<(), String> {
         run("systemctl", &["--user", "start", SERVICE_NAME])
+    }
+
+    pub fn service_pid() -> Option<u32> {
+        let out = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=MainPID",
+                "--value",
+                SERVICE_NAME,
+            ])
+            .output()
+            .ok()?;
+        super::parse_systemd_main_pid(&String::from_utf8_lossy(&out.stdout))
     }
 
     pub(super) fn unit_path() -> Result<PathBuf, String> {
@@ -641,6 +692,11 @@ mod platform {
         run("schtasks", &["/Run", "/TN", SERVICE_NAME])
     }
 
+    /// The task runs the hub under a `cmd` loop, and a handover sends no signal on Windows.
+    pub fn service_pid() -> Option<u32> {
+        None
+    }
+
     fn launcher_path() -> Result<PathBuf, String> {
         let local_app_data = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is not set")?;
         Ok(PathBuf::from(local_app_data)
@@ -686,11 +742,31 @@ mod platform {
     pub fn start() -> Result<(), String> {
         Err(UNSUPPORTED.to_string())
     }
+
+    pub fn service_pid() -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_launchd_job_pid_is_read_from_launchctl_print() {
+        let print =
+            "gui/501/com.example.hub = {\n\tstate = running\n\tpid = 90835\n\tprogram = /x\n}";
+
+        assert_eq!(parse_launchd_pid(print), Some(90835));
+        assert_eq!(parse_launchd_pid("\tstate = not running\n"), None);
+    }
+
+    #[test]
+    fn a_systemd_main_pid_of_zero_means_no_process() {
+        assert_eq!(parse_systemd_main_pid("4242\n"), Some(4242));
+        assert_eq!(parse_systemd_main_pid("0\n"), None);
+        assert_eq!(parse_systemd_main_pid(""), None);
+    }
 
     #[tokio::test]
     async fn health_endpoint_requires_ok_response() {

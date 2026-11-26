@@ -2,6 +2,9 @@ use std::time::Duration;
 
 pub const MODELS_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MODELS_CACHE_TTL: Duration = Duration::from_mins(1);
+/// How long a handover successor waits for its first model fan-out before it listens. It stays
+/// well under the minute the old process waits for the successor to listen.
+pub const SUCCESSOR_WARM_UP_LIMIT: Duration = Duration::from_secs(15);
 pub const DEFAULT_MAX_REPLAY_BYTES: usize = 256 * 1024 * 1024;
 /// Largest request body the proxy accepts, judged by `Content-Length` before it is buffered.
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;

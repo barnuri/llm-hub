@@ -404,6 +404,17 @@ async fn first_refresh(state: &AppState) {
         .await;
 }
 
+/// Runs the first fan-out before a successor listens, so its first requests answer from the
+/// model cache. After `limit` it returns and the fan-out goes on in the background.
+pub async fn warm_up(state: &AppState, limit: std::time::Duration) {
+    if tokio::time::timeout(limit, first_refresh(state))
+        .await
+        .is_err()
+    {
+        tracing::warn!("the first model refresh is still running; listening anyway");
+    }
+}
+
 fn copilot_auto_model(profile: &ProfileConfig, bare_id: &str, tier: AutoTier) -> Value {
     json!({
         "id": format!("{}/{bare_id}", profile.name),
@@ -1937,5 +1948,36 @@ mod tests {
                 "data": [{"id": "enabled/model", "owned_by": "enabled"}]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn warm_up_fills_the_model_cache_before_it_returns() {
+        let (github, _copilot) = copilot_upstream(opus_catalog(), Duration::ZERO, Some(1)).await;
+        let state = copilot_state(&github.uri());
+        assert!(state.model_cache().is_none());
+
+        warm_up(&state, Duration::from_secs(5)).await;
+
+        let cached = state.model_cache().expect("the warm-up fills the cache");
+        assert!(cached.payload["data"].as_array().unwrap().iter().any(|m| {
+            m["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("copilot/claude-opus-5-5"))
+        }));
+        assert!(state.first_refresh().initialized());
+    }
+
+    #[tokio::test]
+    async fn warm_up_returns_at_its_limit_while_the_fan_out_runs() {
+        let (github, _copilot) =
+            copilot_upstream(opus_catalog(), Duration::from_secs(3), None).await;
+        let state = copilot_state(&github.uri());
+        let started = tokio::time::Instant::now();
+
+        warm_up(&state, Duration::from_millis(50)).await;
+
+        assert!(started.elapsed() < Duration::from_millis(900));
+        assert!(state.model_cache().is_none());
+        assert!(!state.first_refresh().initialized());
     }
 }

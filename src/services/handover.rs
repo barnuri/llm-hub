@@ -2,6 +2,9 @@
 //! no request. The new process binds the service port beside the old one (`SO_REUSEPORT`) and
 //! must pass `/healthz`. Only then does the old process get SIGTERM: it stops accepting, finishes
 //! its open requests and exits. A new process that fails leaves the old one serving.
+//!
+//! The new process is a bridge: the supervisor did not start it. When the old process exits, the
+//! supervisor starts its own process, which takes the port over from the bridge the same way.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -10,7 +13,7 @@ use std::time::Duration;
 
 use crate::consts::{SERVICE_BIND, SERVICE_PORT};
 use crate::services::instance;
-use crate::services::service_manager::{endpoint_healthy, health_client};
+use crate::services::service_manager::{endpoint_healthy, health_client, service_pid};
 
 /// How many `/healthz` probes the new process gets before the handover is cancelled.
 const HEALTH_CHECKS: usize = 30;
@@ -35,8 +38,13 @@ struct Target {
 enum Outcome {
     /// No healthy hub served the port, so the service was installed (a plain restart).
     Installed,
-    /// `new` serves the port; `old` drains its open requests and exits.
-    HandedOver { old: u32, new: u32 },
+    /// `new` serves the port; `old` drains its open requests and exits. `waiter` is a service
+    /// process that waited beside a hub; it got SIGTERM so the supervisor starts a fresh one.
+    HandedOver {
+        old: u32,
+        new: u32,
+        waiter: Option<u32>,
+    },
 }
 
 /// Hands the service port over from the running hub to this binary.
@@ -49,7 +57,7 @@ pub async fn handover() -> Result<(), String> {
     let exe = crate::utils::exe::stable_service_exe(&resolved);
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let install = crate::services::service_manager::install;
-    let outcome = handover_to(&service_target(), &exe, &cwd, install).await?;
+    let outcome = handover_to(&service_target(), &exe, &cwd, install, service_pid).await?;
     println!("{}", report(&outcome));
     Ok(())
 }
@@ -67,8 +75,13 @@ fn service_target() -> Target {
 fn report(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Installed => "no healthy llm-hub served the port; installed the service".into(),
-        Outcome::HandedOver { old, new } => {
-            format!("handed over to pid {new}; pid {old} finishes its open requests and exits")
+        Outcome::HandedOver { old, new, waiter } => {
+            let stopped = waiter.map_or_else(String::new, |pid| {
+                format!("; stopped the waiting service process {pid}")
+            });
+            format!(
+                "handed over to pid {new}; pid {old} finishes its open requests and exits{stopped}"
+            )
         }
     }
 }
@@ -78,6 +91,7 @@ async fn handover_to(
     exe: &Path,
     cwd: &Path,
     install: impl FnOnce() -> Result<(), String>,
+    service_pid: impl FnOnce() -> Option<u32>,
 ) -> Result<Outcome, String> {
     let client = health_client()?;
     // A hub that answers /healthz wrote the PID file, so the PID names that hub.
@@ -97,8 +111,23 @@ async fn handover_to(
             "the new llm-hub (pid {new}) did not pass /healthz; pid {old} keeps serving"
         ));
     }
+    // Connections in the old hub's accept queue are served before its listener closes.
+    tokio::time::sleep(instance::SETTLE).await;
     instance::terminate(old);
-    Ok(Outcome::HandedOver { old, new })
+    let waiter = stale_waiter(service_pid(), old, new);
+    if let Some(waiter) = waiter {
+        // The waiter only exits on a signal. Once the old hub is gone, the supervisor's fresh
+        // process takes the port over from the new hub, which is a bridge.
+        instance::wait_gone(old).await;
+        instance::terminate(waiter);
+    }
+    Ok(Outcome::HandedOver { old, new, waiter })
+}
+
+/// The supervisor's process when it is neither hub: an earlier copy that waits beside a hub that
+/// the supervisor did not start, and would wait for as long as any hub serves.
+fn stale_waiter(service: Option<u32>, old: u32, new: u32) -> Option<u32> {
+    service.filter(|pid| *pid != old && *pid != new && instance::pid_alive(*pid))
 }
 
 /// True when `/healthz` answers while the new process still runs.
@@ -115,8 +144,8 @@ async fn passes_health(target: &Target, client: &reqwest::Client, child: &mut Ch
     false
 }
 
-/// The new service process: the service environment, the log file and its own process group, so
-/// the old process's supervisor does not stop it when the old process exits.
+/// The new service process: the service environment, the log file, the bridge flag and its own
+/// process group, so the old process's supervisor does not stop it when the old process exits.
 fn successor_command(
     exe: &Path,
     cwd: &Path,
@@ -144,6 +173,7 @@ fn successor_command(
         .env("LLM_HUB_PORT", SERVICE_PORT.to_string())
         .env("LLM_HUB_BIND", SERVICE_BIND)
         .env(instance::HANDOVER_VAR, old.to_string())
+        .env(instance::BRIDGE_VAR, "1")
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(log_err);
@@ -209,20 +239,87 @@ mod tests {
         let exe = fake_hub(dir.path(), &target.bind);
         let mut old = old_hub(&target.bind);
 
-        let outcome = handover_to(&target, &exe, dir.path(), || Err("no install".into()))
-            .await
-            .unwrap();
+        let outcome = handover_to(
+            &target,
+            &exe,
+            dir.path(),
+            || Err("no install".into()),
+            || None,
+        )
+        .await
+        .unwrap();
 
-        let Outcome::HandedOver { old: old_pid, new } = outcome else {
+        let Outcome::HandedOver {
+            old: old_pid,
+            new,
+            waiter,
+        } = outcome
+        else {
             panic!("expected a handover, got {outcome:?}");
         };
         assert_eq!(old_pid, old.id());
+        assert_eq!(waiter, None);
         assert_eq!(instance::read_pid(&target.bind), Some(new));
         let status = old.wait().unwrap();
         assert!(!status.success(), "the old hub must stop on SIGTERM");
         instance::terminate(new);
         assert!(dir.path().join("logs/llm-hub.log").exists());
         let _ = std::fs::remove_file(instance::pid_file(&target.bind));
+    }
+
+    #[tokio::test]
+    async fn a_service_process_that_waits_beside_the_hub_is_stopped_after_the_old_hub_exits() {
+        let server = healthy_server().await;
+        let target = target(&server, 3);
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_hub(dir.path(), &target.bind);
+        let old = old_hub(&target.bind);
+        let old_pid = old.id();
+        // A reaper thread collects the old hub, so it does not linger as a zombie.
+        let reaper = std::thread::spawn(move || {
+            let mut old = old;
+            old.wait()
+        });
+        let mut waiter = Command::new("sleep").arg("30").spawn().unwrap();
+        let waiter_pid = waiter.id();
+
+        let outcome = handover_to(
+            &target,
+            &exe,
+            dir.path(),
+            || Err("no install".into()),
+            || Some(waiter_pid),
+        )
+        .await
+        .unwrap();
+
+        let Outcome::HandedOver {
+            old,
+            new,
+            waiter: stopped,
+        } = outcome
+        else {
+            panic!("expected a handover, got {outcome:?}");
+        };
+        assert_eq!((old, stopped), (old_pid, Some(waiter_pid)));
+        assert!(!reaper.join().unwrap().unwrap().success());
+        assert!(
+            !waiter.wait().unwrap().success(),
+            "the waiter must stop on SIGTERM"
+        );
+        instance::terminate(new);
+        let _ = std::fs::remove_file(instance::pid_file(&target.bind));
+    }
+
+    #[test]
+    fn only_a_live_service_process_that_is_neither_hub_is_a_stale_waiter() {
+        let me = std::process::id();
+
+        assert_eq!(stale_waiter(None, 1, 2), None);
+        assert_eq!(stale_waiter(Some(me), me, 2), None);
+        assert_eq!(stale_waiter(Some(me), 1, me), None);
+        assert_eq!(stale_waiter(Some(999_999_999), 1, 2), None);
+        assert_eq!(stale_waiter(Some(me), 1, 2), Some(me));
     }
 
     #[tokio::test]
@@ -243,9 +340,15 @@ mod tests {
         let exe = fake_hub(dir.path(), &target.bind);
         let mut old = old_hub(&target.bind);
 
-        let error = handover_to(&target, &exe, dir.path(), || Err("no install".into()))
-            .await
-            .unwrap_err();
+        let error = handover_to(
+            &target,
+            &exe,
+            dir.path(),
+            || Err("no install".into()),
+            || None,
+        )
+        .await
+        .unwrap_err();
 
         assert!(error.contains("did not pass /healthz"), "{error}");
         assert_eq!(instance::read_pid(&target.bind), Some(old.id()));
@@ -276,10 +379,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut installs = 0;
 
-        let outcome = handover_to(&target, Path::new("/no/such/hub"), dir.path(), || {
+        let install = || -> Result<(), String> {
             installs += 1;
             Ok(())
-        })
+        };
+
+        let outcome = handover_to(
+            &target,
+            Path::new("/no/such/hub"),
+            dir.path(),
+            install,
+            || None,
+        )
         .await;
 
         assert_eq!(outcome, Ok(Outcome::Installed));
@@ -292,9 +403,16 @@ mod tests {
         let target = target(&server, 1);
         let dir = tempfile::tempdir().unwrap();
 
-        let outcome = handover_to(&target, Path::new("/no/such/hub"), dir.path(), || {
-            Err("launchctl exited with exit status: 5".into())
-        })
+        let install =
+            || -> Result<(), String> { Err("launchctl exited with exit status: 5".into()) };
+
+        let outcome = handover_to(
+            &target,
+            Path::new("/no/such/hub"),
+            dir.path(),
+            install,
+            || None,
+        )
         .await;
 
         assert_eq!(outcome, Err("launchctl exited with exit status: 5".into()));
@@ -325,6 +443,7 @@ mod tests {
         );
         assert_eq!(value("LLM_HUB_BIND"), Some(OsStr::new(SERVICE_BIND)));
         assert_eq!(value(instance::HANDOVER_VAR), Some(OsStr::new("77")));
+        assert_eq!(value(instance::BRIDGE_VAR), Some(OsStr::new("1")));
         assert!(dir.path().join("logs/llm-hub.log").exists());
     }
 
@@ -344,8 +463,20 @@ mod tests {
     #[test]
     fn the_report_names_both_processes_or_the_install() {
         assert_eq!(
-            report(&Outcome::HandedOver { old: 1, new: 2 }),
+            report(&Outcome::HandedOver {
+                old: 1,
+                new: 2,
+                waiter: None
+            }),
             "handed over to pid 2; pid 1 finishes its open requests and exits"
+        );
+        assert!(
+            report(&Outcome::HandedOver {
+                old: 1,
+                new: 2,
+                waiter: Some(3)
+            })
+            .ends_with("; stopped the waiting service process 3")
         );
         assert!(report(&Outcome::Installed).contains("installed the service"));
     }
