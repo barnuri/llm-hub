@@ -493,7 +493,7 @@ fn is_same_file(a: &Path, b: &Path) -> bool {
 }
 
 fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    crate::services::http_client::builder()
         .user_agent(format!("llm-hub/{VERSION}"))
         .build()
         .map_err(|e| e.to_string())

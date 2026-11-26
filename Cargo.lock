@@ -3274,6 +3274,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rusqlite",
  "rust-embed",
+ "rustls-native-certs",
  "serde",
  "serde-saphyr 2.2.0",
  "serde_json",

@@ -38,7 +38,7 @@ impl HookSet {
         if specs.is_empty() {
             return Ok(None);
         }
-        let client = reqwest::Client::builder()
+        let client = crate::services::http_client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("the hook client could not start: {e}"))?;

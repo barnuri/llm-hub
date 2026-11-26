@@ -31,6 +31,7 @@ pub mod gh_cli;
 pub mod github_token_resolver;
 pub mod harness;
 pub mod history_exporter;
+pub mod http_client;
 pub mod insights;
 pub mod insights_analysis;
 pub mod keep_warm;

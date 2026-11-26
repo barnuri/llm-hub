@@ -1168,7 +1168,7 @@ mod tests {
         let delay = Duration::from_millis(200);
         let (github, _copilot) = copilot_upstream(opus_catalog(), delay, Some(1)).await;
         let url = serve_mapping_probe(copilot_state(&github.uri())).await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         let (first, second) = tokio::join!(client.post(&url).send(), client.post(&url).send());
 
@@ -1190,7 +1190,7 @@ mod tests {
         );
         let url = serve_mapping_probe(state).await;
 
-        let response = reqwest::Client::new().post(&url).send().await.unwrap();
+        let response = crate::services::http_client::client().post(&url).send().await.unwrap();
 
         assert_eq!(response.text().await.unwrap(), "claude-opus-5.5");
     }

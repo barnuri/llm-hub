@@ -419,7 +419,7 @@ mod tests {
     }
 
     async fn post(base: &str, path: &str, body: Value) -> (StatusCode, Value) {
-        let response = reqwest::Client::new()
+        let response = crate::services::http_client::client()
             .post(format!("{base}{path}"))
             .json(&body)
             .send()
@@ -573,7 +573,7 @@ mod tests {
     #[tokio::test]
     async fn mutes_add_list_and_delete() {
         let base = serve(state("true", "source=env-src")).await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         let (status, rule) = post(
             &base,

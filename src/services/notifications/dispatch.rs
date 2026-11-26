@@ -1024,7 +1024,7 @@ mod tests {
     fn concrete_sinks_name_themselves() {
         let desktop = DesktopSink::new(false, Duration::from_secs(1));
         let webhook = WebhookSink::new(
-            reqwest::Client::new(),
+            crate::services::http_client::client(),
             "http://127.0.0.1:9/x".into(),
             Duration::from_millis(50),
         );
@@ -1071,7 +1071,7 @@ mod tests {
             .mount(&server)
             .await;
         let webhook = WebhookSink::new(
-            reqwest::Client::new(),
+            crate::services::http_client::client(),
             format!("{}/hook", server.uri()),
             Duration::from_secs(5),
         );

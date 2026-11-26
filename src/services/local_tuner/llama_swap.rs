@@ -296,7 +296,7 @@ mod tests {
         ]});
         let server = serve("/running", ResponseTemplate::new(200).set_body_json(body)).await;
 
-        let models = running(&reqwest::Client::new(), &server.uri())
+        let models = running(&crate::services::http_client::client(), &server.uri())
             .await
             .unwrap();
 
@@ -315,7 +315,7 @@ mod tests {
         )
         .await;
 
-        let models = running(&reqwest::Client::new(), &server.uri())
+        let models = running(&crate::services::http_client::client(), &server.uri())
             .await
             .unwrap();
 
@@ -326,7 +326,7 @@ mod tests {
     async fn running_on_plain_llama_server_is_not_found() {
         let server = MockServer::start().await;
 
-        let err = running(&reqwest::Client::new(), &server.uri())
+        let err = running(&crate::services::http_client::client(), &server.uri())
             .await
             .unwrap_err();
 
@@ -342,7 +342,7 @@ mod tests {
         )
         .await;
 
-        let err = running(&reqwest::Client::new(), &server.uri())
+        let err = running(&crate::services::http_client::client(), &server.uri())
             .await
             .unwrap_err();
 
@@ -359,7 +359,7 @@ mod tests {
         );
         let server = serve("/running", ResponseTemplate::new(200).set_body_string(huge)).await;
 
-        let err = running(&reqwest::Client::new(), &server.uri())
+        let err = running(&crate::services::http_client::client(), &server.uri())
             .await
             .unwrap_err();
 
@@ -381,7 +381,7 @@ mod tests {
         .await;
 
         let found = props(
-            &reqwest::Client::new(),
+            &crate::services::http_client::client(),
             &server.uri(),
             Some("ornith-1.5-9b"),
         )
@@ -400,7 +400,7 @@ mod tests {
         .await;
         let root = format!("{}/", server.uri());
 
-        let found = props(&reqwest::Client::new(), &root, None).await.unwrap();
+        let found = props(&crate::services::http_client::client(), &root, None).await.unwrap();
 
         assert_eq!(found, ModelProps::default());
     }
@@ -409,7 +409,7 @@ mod tests {
     async fn props_error_status_is_reported() {
         let server = serve("/props", ResponseTemplate::new(503)).await;
 
-        let err = props(&reqwest::Client::new(), &server.uri(), None)
+        let err = props(&crate::services::http_client::client(), &server.uri(), None)
             .await
             .unwrap_err();
 
@@ -428,7 +428,7 @@ mod tests {
         .await;
         let url = endpoint(&server.uri(), &["running"]).unwrap();
 
-        let err = fetch(&reqwest::Client::new(), url, Duration::from_millis(50))
+        let err = fetch(&crate::services::http_client::client(), url, Duration::from_millis(50))
             .await
             .unwrap_err();
 
@@ -446,7 +446,7 @@ mod tests {
         let root = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
 
-        let err = running(&reqwest::Client::new(), &root).await.unwrap_err();
+        let err = running(&crate::services::http_client::client(), &root).await.unwrap_err();
 
         assert!(matches!(err, LlamaSwapError::Http(_)));
     }
@@ -454,7 +454,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_root_is_a_url_error() {
         for root in ["not a url", "mailto:someone@example.com"] {
-            let err = running(&reqwest::Client::new(), root).await.unwrap_err();
+            let err = running(&crate::services::http_client::client(), root).await.unwrap_err();
 
             assert!(matches!(err, LlamaSwapError::Url(_)), "{root}");
             assert!(err.to_string().starts_with("invalid llama-swap url"));
@@ -466,7 +466,7 @@ mod tests {
     async fn log_mentions_finds_the_needle() {
         let logs = "[INFO] ornith-1.5-9b ready\nW srv    load_model: cache_reuse is not supported by this context, it will be disabled\n";
         let server = serve("/logs", ResponseTemplate::new(200).set_body_string(logs)).await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         assert!(
             log_mentions(&client, &server.uri(), "cache_reuse is not supported")
@@ -486,7 +486,7 @@ mod tests {
         logs.push_str(&"x".repeat(2 * MAX_BODY_BYTES));
         logs.push_str("late needle\n");
         let server = serve("/logs", ResponseTemplate::new(200).set_body_string(logs)).await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         assert!(log_mentions(&client, &server.uri(), "early").await.unwrap());
         assert!(!log_mentions(&client, &server.uri(), "late").await.unwrap());
@@ -496,7 +496,7 @@ mod tests {
     async fn log_mentions_reports_error_status() {
         let server = serve("/logs", ResponseTemplate::new(500)).await;
 
-        let err = log_mentions(&reqwest::Client::new(), &server.uri(), "x")
+        let err = log_mentions(&crate::services::http_client::client(), &server.uri(), "x")
             .await
             .unwrap_err();
 

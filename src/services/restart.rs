@@ -324,7 +324,7 @@ mod tests {
         let base = serve_app(app).await;
         let before = active_inference();
 
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let mut response = client
             .post(format!("{base}/v1/chat"))
             .send()
@@ -364,7 +364,7 @@ mod tests {
         let base = serve_app(app).await;
         let before = active_inference();
 
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let response = client
             .post(format!("{base}/api/stats"))
             .send()

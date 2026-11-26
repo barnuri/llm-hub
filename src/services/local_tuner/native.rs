@@ -100,7 +100,7 @@ mod tests {
         let model = model(None, LocalModelState::Stopped);
 
         assert_eq!(
-            probe(&reqwest::Client::new(), &model).await,
+            probe(&crate::services::http_client::client(), &model).await,
             NativeEvidence::default()
         );
         assert_eq!(model.state, LocalModelState::Stopped);
@@ -116,7 +116,7 @@ mod tests {
         let model = model(Some(port_of(&server)), LocalModelState::Running);
 
         assert_eq!(
-            probe(&reqwest::Client::new(), &model).await,
+            probe(&crate::services::http_client::client(), &model).await,
             NativeEvidence { ctx: Some(65536) }
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
@@ -132,7 +132,7 @@ mod tests {
         let model = model(Some(port_of(&server)), LocalModelState::Running);
 
         assert_eq!(
-            probe(&reqwest::Client::new(), &model).await,
+            probe(&crate::services::http_client::client(), &model).await,
             NativeEvidence::default()
         );
     }
@@ -143,10 +143,10 @@ mod tests {
         let model = model(Some(port_of(&server)), LocalModelState::Running);
 
         assert_eq!(
-            probe(&reqwest::Client::new(), &model).await,
+            probe(&crate::services::http_client::client(), &model).await,
             NativeEvidence::default()
         );
-        let error = get::<Props>(&reqwest::Client::new(), &format!("{}/props", server.uri()))
+        let error = get::<Props>(&crate::services::http_client::client(), &format!("{}/props", server.uri()))
             .await
             .unwrap_err();
         assert!(error.contains("404"));
@@ -162,7 +162,7 @@ mod tests {
         let model = model(Some(port_of(&server)), LocalModelState::Running);
 
         assert_eq!(
-            probe(&reqwest::Client::new(), &model).await,
+            probe(&crate::services::http_client::client(), &model).await,
             NativeEvidence::default()
         );
     }
@@ -186,7 +186,7 @@ mod tests {
         .await;
 
         let metrics = get::<Metrics>(
-            &reqwest::Client::new(),
+            &crate::services::http_client::client(),
             &format!("{}/metrics", server.uri()),
         )
         .await
@@ -202,7 +202,7 @@ mod tests {
         )
         .await;
 
-        let slots = get::<Vec<Slot>>(&reqwest::Client::new(), &format!("{}/slots", server.uri()))
+        let slots = get::<Vec<Slot>>(&crate::services::http_client::client(), &format!("{}/slots", server.uri()))
             .await
             .unwrap();
         assert_eq!(slots.len(), 1);
@@ -219,7 +219,7 @@ mod tests {
         let model = model(Some(port_of(&server)), LocalModelState::Stopped);
 
         assert_eq!(
-            probe(&reqwest::Client::new(), &model).await,
+            probe(&crate::services::http_client::client(), &model).await,
             NativeEvidence { ctx: Some(8192) }
         );
         let requests = server.received_requests().await.unwrap();
@@ -237,7 +237,7 @@ mod tests {
         ] {
             let model = model(None, state);
             assert_eq!(
-                probe(&reqwest::Client::new(), &model).await,
+                probe(&crate::services::http_client::client(), &model).await,
                 NativeEvidence::default()
             );
             assert_eq!(model.port, None);
@@ -252,7 +252,7 @@ mod tests {
         let model = model(Some(port), LocalModelState::Running);
 
         assert_eq!(
-            probe(&reqwest::Client::new(), &model).await,
+            probe(&crate::services::http_client::client(), &model).await,
             NativeEvidence::default()
         );
     }

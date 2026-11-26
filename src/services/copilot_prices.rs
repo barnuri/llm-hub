@@ -99,7 +99,7 @@ impl CopilotPrices {
     /// [`COPILOT_PRICES_MIN_GAP`] apart, while a Copilot profile is enabled and the refresh is on.
     pub fn spawn_refresh_loop(state: AppState) {
         tokio::spawn(async move {
-            let client = match reqwest::Client::builder()
+            let client = match crate::services::http_client::builder()
                 .timeout(COPILOT_PRICES_TIMEOUT)
                 .build()
             {
@@ -435,7 +435,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE))
             .mount(&server)
             .await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let url = server.uri();
         assert!(
             CopilotPrices::fetch(&client, &url)
@@ -502,7 +502,7 @@ mod tests {
         let state = state_with_a_dead_copilot_upstream();
         CopilotPrices::refresh_once(
             &state,
-            &reqwest::Client::new(),
+            &crate::services::http_client::client(),
             &format!("{}/prices", server.uri()),
             &format!("{}/descriptions", server.uri()),
         )
@@ -520,7 +520,7 @@ mod tests {
         let state = state_with_a_dead_copilot_upstream();
         CopilotPrices::refresh_once(
             &state,
-            &reqwest::Client::new(),
+            &crate::services::http_client::client(),
             &format!("{}/prices", server.uri()),
             &format!("{}/descriptions", server.uri()),
         )

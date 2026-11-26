@@ -276,7 +276,7 @@ fn spawn_notifications(state: &AppState) {
         .set_desktop(std::sync::Arc::clone(&desktop));
     let mut sinks: Vec<Box<dyn services::notifications::dispatch::Sink>> = vec![Box::new(desktop)];
     if let Some(url) = notify.webhook_url.clone() {
-        match reqwest::Client::builder().build() {
+        match crate::services::http_client::builder().build() {
             Ok(client) => sinks.push(Box::new(
                 services::notifications::webhook::WebhookSink::new(client, url, notify.timeout),
             )),
@@ -600,7 +600,7 @@ async fn run_copilot_command() -> Result<(), String> {
         }
         return Ok(());
     }
-    let client = reqwest::Client::builder()
+    let client = crate::services::http_client::builder()
         .user_agent(format!("llm-hub/{VERSION}"))
         .build()
         .map_err(|e| e.to_string())?;
@@ -825,7 +825,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let router = build_router(state.clone());
         tokio::spawn(async move { axum::serve(listener, router).await });
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         let put = client
             .put(format!("{base}/api/local/models/local/m/engine"))
@@ -864,7 +864,7 @@ mod tests {
         let mut all = crate::ext::builtin::builtins();
         all.push(Arc::new(rules));
         state.set_extensions(crate::ext::ExtensionSet::new(all));
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         let health = client.get(format!("{base}/healthz")).send().await.unwrap();
         assert_eq!(health.status(), 202);
@@ -913,7 +913,7 @@ mod tests {
     #[tokio::test]
     async fn claude_code_discovery_request_accepts_either_credential_header() {
         let base = serve_hub_with_auth().await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let url = format!("{base}{DISCOVERY_PATH}");
 
         let with_api_key = client
@@ -941,7 +941,7 @@ mod tests {
     #[tokio::test]
     async fn openapi_and_docs_ui_follow_the_master_key_rule() {
         let base = serve_hub_with_auth().await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         for path in ["/openapi.json", "/api-docs/"] {
             let denied = client.get(format!("{base}{path}")).send().await.unwrap();
             assert_eq!(denied.status(), 401, "{path} without a key");
@@ -970,7 +970,7 @@ mod tests {
     #[tokio::test]
     async fn claude_code_settings_route_is_protected() {
         let base = serve_hub_with_auth().await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let url = format!("{base}/api/claude-code/settings");
 
         let with_key = client
@@ -993,7 +993,7 @@ mod tests {
     #[tokio::test]
     async fn sessions_routes_require_master_key() {
         let base = serve_hub_with_auth().await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         for url in [
             format!("{base}/api/sessions?range=7d"),
             format!("{base}/api/sessions/some-worker"),
@@ -1014,7 +1014,7 @@ mod tests {
     #[tokio::test]
     async fn live_route_requires_master_key() {
         let base = serve_hub_with_auth().await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let url = format!("{base}/api/live");
 
         let with_key = client
@@ -1038,7 +1038,7 @@ mod tests {
     #[tokio::test]
     async fn live_route_streams_each_finished_request() {
         let (base, state) = serve_hub_with_auth_state().await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let mut response = client
             .get(format!("{base}/api/live"))
             .bearer_auth(MASTER_KEY)
@@ -1080,7 +1080,7 @@ mod tests {
     #[tokio::test]
     async fn copilot_usage_route_is_protected() {
         let base = serve_hub_with_auth().await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let url = format!("{base}/api/copilot/usage?profile=copilot");
 
         let with_key = client
@@ -1098,7 +1098,7 @@ mod tests {
     #[tokio::test]
     async fn copilot_usage_history_route_is_protected() {
         let base = serve_hub_with_auth().await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let url = format!("{base}/api/copilot/usage/history?range=7d");
 
         let with_key = client
@@ -1116,7 +1116,7 @@ mod tests {
     #[tokio::test]
     async fn keep_warm_route_is_protected() {
         let base = serve_hub_with_auth().await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let url = format!("{base}/api/keep-warm");
 
         let with_key = client
@@ -1164,7 +1164,7 @@ mod tests {
     async fn copilot_auto_decisions_route_is_protected() {
         let (base, state) = serve_hub_with_auth_state().await;
         state.copilot_auto().decisions().record(auto_decision(1));
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let url = format!("{base}/api/copilot/auto/decisions?session=session-1&limit=1");
 
         let with_key = client
@@ -1191,7 +1191,7 @@ mod tests {
                 .decisions()
                 .record(auto_decision(ts_ms));
         }
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let url = |query: &str| format!("{base}/api/copilot/auto/decisions{query}");
 
         assert_eq!(decision_count(&client, &url("")).await, 50);
@@ -1218,7 +1218,7 @@ mod tests {
                 "copilot/claude-opus-4-5",
             )
         });
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let current = format!("{base}/api/smart-auto/current?session=session-1");
 
         let with_key = client
@@ -1263,7 +1263,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = serve_hub_with_rules(dir.path(), None).await;
         let url = format!("{base}/api/smart-auto/resolve");
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let body = serde_json::json!({"tier": "fast"});
 
         let without_key = client.post(&url).json(&body).send().await.unwrap();
@@ -1360,7 +1360,7 @@ mod tests {
             )
         });
         state.attempt_tracker().note_completed(&worker, "attempt-1");
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let outcome_url = format!("{base}/api/smart-auto/outcome");
 
         let missing = client
@@ -1414,7 +1414,7 @@ mod tests {
     async fn smart_auto_rules_save_to_the_file_and_env_locks_them() {
         let dir = tempfile::tempdir().unwrap();
         let base = serve_hub_with_rules(dir.path(), None).await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let url = format!("{base}/api/smart-auto/rules");
 
         let empty: serde_json::Value = client
@@ -1496,7 +1496,7 @@ mod tests {
     #[tokio::test]
     async fn smart_auto_current_needs_a_worker_or_session() {
         let base = serve_hub_with_auth().await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         let response = client
             .get(format!("{base}/api/smart-auto/current"))

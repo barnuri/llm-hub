@@ -471,7 +471,7 @@ mod tests {
             .await;
         let auth = vscode_auth(&server);
         let cache = vscode_cache(&auth);
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         let first = cache.get_at(&client, PROFILE, &auth, NOW).await.unwrap();
         let second = cache
@@ -491,7 +491,7 @@ mod tests {
         let auth = vscode_auth(&server);
         let cache = vscode_cache(&auth);
         cache
-            .get_at(&reqwest::Client::new(), PROFILE, &auth, NOW)
+            .get_at(&crate::services::http_client::client(), PROFILE, &auth, NOW)
             .await
             .unwrap();
 
@@ -508,7 +508,7 @@ mod tests {
         mount_exchange(&server, token_body(NOW + 1800, 1500), 1).await;
         let auth = vscode_auth(&server);
         let cache = vscode_cache(&auth);
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         let (first, second) = tokio::join!(
             cache.get_at(&client, PROFILE, &auth, NOW),
@@ -524,7 +524,7 @@ mod tests {
         mount_exchange(&server, token_body(NOW + 3600, 1500), 2).await;
         let auth = vscode_auth(&server);
         let cache = vscode_cache(&auth);
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         for now in [NOW, NOW + 1499, NOW + 1500] {
             cache.get_at(&client, PROFILE, &auth, now).await.unwrap();
@@ -561,7 +561,7 @@ mod tests {
         mount_exchange(&server, token_body(NOW + 1800, 1500), 2).await;
         let auth = vscode_auth(&server);
         let cache = vscode_cache(&auth);
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         cache.get_at(&client, PROFILE, &auth, NOW).await.unwrap();
         cache.invalidate(PROFILE, COPILOT_TOKEN).await;
@@ -574,7 +574,7 @@ mod tests {
         mount_exchange(&server, token_body(NOW + 1800, 1500), 1).await;
         let auth = vscode_auth(&server);
         let cache = vscode_cache(&auth);
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         cache.get_at(&client, PROFILE, &auth, NOW).await.unwrap();
         cache.invalidate(PROFILE, "an_older_bearer").await;
@@ -593,7 +593,7 @@ mod tests {
         let cache = vscode_cache(&auth);
 
         let err = cache
-            .get_at(&reqwest::Client::new(), PROFILE, &auth, NOW)
+            .get_at(&crate::services::http_client::client(), PROFILE, &auth, NOW)
             .await
             .unwrap_err();
 
@@ -617,7 +617,7 @@ mod tests {
         let cache = vscode_cache(&auth);
 
         let err = cache
-            .get_at(&reqwest::Client::new(), PROFILE, &auth, NOW)
+            .get_at(&crate::services::http_client::client(), PROFILE, &auth, NOW)
             .await
             .unwrap_err();
 
@@ -642,7 +642,7 @@ mod tests {
         let auth = opencode_auth(&server);
         let gh = Arc::new(FakeGhCli::new(GhOutcome::Token(GH_TOKEN.to_string())));
         let cache = cache_with(&auth, Arc::clone(&gh));
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let ttl = COPILOT_USER_TTL.as_secs();
 
         let first = cache.get_at(&client, PROFILE, &auth, NOW).await.unwrap();
@@ -674,7 +674,7 @@ mod tests {
         let cache = cache_with(&auth, Arc::new(FakeGhCli::new(GhOutcome::NotInstalled)));
 
         let (bearer, _) = cache
-            .get_at(&reqwest::Client::new(), PROFILE, &auth, NOW)
+            .get_at(&crate::services::http_client::client(), PROFILE, &auth, NOW)
             .await
             .unwrap();
 
@@ -693,7 +693,7 @@ mod tests {
         );
 
         let err = cache
-            .get_at(&reqwest::Client::new(), PROFILE, &auth, NOW)
+            .get_at(&crate::services::http_client::client(), PROFILE, &auth, NOW)
             .await
             .unwrap_err();
 
@@ -711,7 +711,7 @@ mod tests {
         );
 
         let err = cache
-            .get_at(&reqwest::Client::new(), PROFILE, &auth, NOW)
+            .get_at(&crate::services::http_client::client(), PROFILE, &auth, NOW)
             .await
             .unwrap_err();
 
@@ -728,7 +728,7 @@ mod tests {
             &auth,
             Arc::new(FakeGhCli::new(GhOutcome::Token(GH_TOKEN.to_string()))),
         );
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         let retry = COPILOT_USER_RETRY.as_secs();
 
         let first = cache.get_at(&client, PROFILE, &auth, NOW).await.unwrap();
@@ -751,7 +751,7 @@ mod tests {
         let auth = opencode_auth(&server);
         let gh = Arc::new(FakeGhCli::new(GhOutcome::Token(GH_TOKEN.to_string())));
         let cache = cache_with(&auth, Arc::clone(&gh));
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         cache.get_at(&client, PROFILE, &auth, NOW).await.unwrap();
         cache.invalidate(PROFILE, GH_TOKEN).await;
@@ -773,7 +773,7 @@ mod tests {
         let user = ResponseTemplate::new(200)
             .set_body_json(json!({"chat_enabled": true, "endpoints": {"api": insecure}}));
         mount_user(&server, user, 1).await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         for auth in [vscode_auth(&server), opencode_auth(&server)] {
             let cache = cache_with(
@@ -895,7 +895,7 @@ mod tests {
         let user = ResponseTemplate::new(200)
             .set_body_json(json!({"chat_enabled": true, "endpoints": {"api": foreign}}));
         mount_user(&server, user, 1).await;
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
 
         for auth in [vscode_auth(&server), opencode_auth(&server)] {
             let cache = cache_with(
@@ -923,7 +923,7 @@ mod tests {
             &auth,
             Arc::new(FakeGhCli::new(GhOutcome::Token(GH_TOKEN.to_string()))),
         );
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::client();
         for profile in ["kept", "changed", "removed"] {
             cache.get_at(&client, profile, &auth, NOW).await.unwrap();
         }

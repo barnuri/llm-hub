@@ -9,7 +9,7 @@ use crate::consts::{CONNECT_TIMEOUT, POOL_IDLE_TIMEOUT, POOL_MAX_IDLE_PER_HOST};
 /// Deliberately NO whole-request `Client::timeout` — it would sever
 /// long-lived SSE streams; per-attempt deadlines wrap `execute` instead.
 pub fn build_clients(config: &HubConfig) -> Result<HashMap<String, reqwest::Client>, String> {
-    build_clients_with(config, reqwest::Client::builder)
+    build_clients_with(config, crate::services::http_client::builder)
 }
 
 /// [`build_clients`] with each profile's builder made by `new_builder`.
