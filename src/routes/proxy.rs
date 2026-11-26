@@ -12,11 +12,11 @@ use serde_json::Value;
 
 use crate::configs::{HubConfig, ProfileConfig};
 use crate::consts::{
-    ANTHROPIC_UPSTREAM_PATH, AUTO_REASON_HEADER_MAX_CHARS, ERROR_REASON_MAX_CHARS,
-    ERROR_STATUS_MIN, HEADER_ATTEMPTS, HEADER_AUTO_PICK, HEADER_AUTO_REASON, HEADER_SERVED_MODEL,
-    HEADER_TRANSFORMS, KEEP_WARM_CLIENT, MAX_MULTIPART_BYTES, MAX_TRANSFORM_BUFFER_BYTES,
-    MEDIA_FALLBACK_CLIENT, PROMPT_REFUSAL_MARGIN_PERCENT, SSE_KEEPALIVE_FRAME,
-    USAGE_SCRAPE_TAIL_BYTES,
+    ANTHROPIC_UPSTREAM_PATH, AUTO_REASON_HEADER_MAX_CHARS, CONTEXT_TOKENS_1M, CONTEXT_TOKENS_200K,
+    ERROR_REASON_MAX_CHARS, ERROR_STATUS_MIN, HEADER_ATTEMPTS, HEADER_AUTO_PICK,
+    HEADER_AUTO_REASON, HEADER_SERVED_MODEL, HEADER_TRANSFORMS, KEEP_WARM_CLIENT,
+    MAX_MULTIPART_BYTES, MAX_TRANSFORM_BUFFER_BYTES, MEDIA_FALLBACK_CLIENT,
+    PROMPT_REFUSAL_MARGIN_PERCENT, SSE_KEEPALIVE_FRAME, USAGE_SCRAPE_TAIL_BYTES,
 };
 use crate::dependencies::state::AppState;
 use crate::ext::builtin::AttemptNote;
@@ -29,7 +29,7 @@ use crate::schemas::effort_level::EffortLevel;
 use crate::schemas::error_body::ErrorBody;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::profile_filter::ProfileFilter;
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_id::ModelId;
 use crate::schemas::notification::{
@@ -289,7 +289,11 @@ pub(crate) async fn attempt_loop(
                 fallbacks,
                 plan,
             } => (primary, fallbacks, Some(plan)),
-            HubResolution::NotHub(fallbacks) => (requested_id, fallbacks, None),
+            HubResolution::NotHub(fallbacks) => (
+                declared_window(state, &config, requested_id),
+                fallbacks,
+                None,
+            ),
         };
 
     let mut chain: Vec<ModelId> = vec![primary_id];
@@ -1011,7 +1015,7 @@ fn resolve_hub(
     );
     let sits_out = |descriptor: &&ModelDescriptor| {
         live.unavailable
-            .contains(strip_1m_suffix(&descriptor.qualified_id))
+            .contains(strip_window_suffix(&descriptor.qualified_id).0)
     };
     if pool.iter().any(|descriptor| !sits_out(descriptor)) {
         pool.retain(|descriptor| !sits_out(descriptor));
@@ -1112,7 +1116,7 @@ fn resolve_hub(
             evidence_tokens: signals.estimated_prompt_tokens,
             admits: &|id: &str| {
                 profiles.as_ref().is_none_or(|filter| filter.allows(id))
-                    && !live.unavailable.contains(strip_1m_suffix(id))
+                    && !live.unavailable.contains(strip_window_suffix(id).0)
             },
         },
         &|profile: &str| {
@@ -1368,15 +1372,17 @@ fn refusal(
     if let Some(reason) = prefill_guard_refusal(state, config, model_id, &qualified, needs) {
         return Some(Refusal::Guarded(reason));
     }
-    let limit = known_prompt_limit(state, model_id, is_copilot, &upstream, descriptor)?;
-    (needs.prompt_tokens.saturating_mul(100) > limit.saturating_mul(PROMPT_REFUSAL_MARGIN_PERCENT)).then(|| {
-        Refusal::Estimated {
-            reason: format!(
-                "{qualified}: a prompt of about {} tokens is over the known limit of {limit} tokens",
-                needs.prompt_tokens
-            ),
-            limit,
-        }
+    // The declared window caps the known limit: `[200k]` gates a 1M model at 200k.
+    let known = known_prompt_limit(state, model_id, is_copilot, &upstream, descriptor);
+    let limit = [model_id.window, known].into_iter().flatten().min()?;
+    let over_limit = needs.prompt_tokens.saturating_mul(100)
+        > limit.saturating_mul(PROMPT_REFUSAL_MARGIN_PERCENT);
+    over_limit.then(|| Refusal::Estimated {
+        reason: format!(
+            "{qualified}: a prompt of about {} tokens is over the known limit of {limit} tokens",
+            needs.prompt_tokens
+        ),
+        limit,
     })
 }
 
@@ -1444,6 +1450,26 @@ fn prefill_guard_notification(model_id: &ModelId, reason: &str) -> Notification 
 
 /// The smallest prompt size `model_id` is known to accept: a Copilot model's seeded or learned limit,
 /// else the ceiling its descriptor reports, and any limit an upstream rejection named. `None` when none is known.
+/// A bare id of a model whose known window is 1M+ lists 200k, so the hub holds it to 200k. An id
+/// that carries its own window keeps it.
+fn declared_window(state: &AppState, config: &HubConfig, mut id: ModelId) -> ModelId {
+    if id.window.is_some() {
+        return id;
+    }
+    let is_copilot = config
+        .profile(&id.profile)
+        .is_some_and(|found| found.copilot.is_some());
+    let snapshot = state.model_descriptors();
+    let descriptor = snapshot.for_model(&id.profile, &id.model);
+    let upstream = upstream_key(state, &id);
+    let known = known_prompt_limit(state, &id, is_copilot, &upstream, descriptor);
+    if known.is_some_and(|limit| limit >= CONTEXT_TOKENS_1M) {
+        id.window = Some(CONTEXT_TOKENS_200K);
+    }
+    id
+}
+
+/// The known prompt limit of `model_id`, when one is known.
 fn known_prompt_limit(
     state: &AppState,
     model_id: &ModelId,
@@ -1779,6 +1805,7 @@ impl<'a> AttemptBodies<'a> {
             model: catalog
                 .as_ref()
                 .map_or_else(|| model_id.model.clone(), |m| m.upstream_id.clone()),
+            window: None,
         };
         let native = self.native.as_ref().filter(|_| {
             catalog.as_ref().is_some_and(|m| m.native_messages)
@@ -2027,10 +2054,12 @@ async fn resolve_auto(
     let model_id = ModelId {
         profile: profile.name.clone(),
         model: advertised_bare_id(profile, &route.model),
+        window: None,
     };
     let auto_pick = ModelId {
         profile: profile.name.clone(),
         model: advertised_bare_id(profile, &route.auto_pick),
+        window: None,
     }
     .qualified();
     let reason = route
@@ -5025,6 +5054,7 @@ mod tests {
         let served = ModelId {
             profile: "alpha".to_owned(),
             model: "m1".to_owned(),
+            window: None,
         };
 
         assert!(plan.commit(500, &served).is_none());
@@ -5070,10 +5100,12 @@ mod tests {
         let directed = ModelId {
             profile: "alpha".to_owned(),
             model: "m1".to_owned(),
+            window: None,
         };
         let fallback = ModelId {
             profile: "beta".to_owned(),
             model: "m2".to_owned(),
+            window: None,
         };
 
         assert_eq!(
@@ -9167,6 +9199,86 @@ mod tests {
                 message.ends_with("is over the known limit of 500 tokens"),
                 "{message}"
             );
+        }
+
+        #[tokio::test]
+        async fn a_window_suffix_caps_the_known_limit_it_declares() {
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 1_000_000, 1);
+
+            let message = refused_message(
+                &copilot,
+                MESSAGES_ENDPOINT,
+                RouteKind::Anthropic,
+                &client_headers(),
+                &long_anthropic_body(&format!("{PLAIN_ID}[200k]"), 400_000),
+            )
+            .await;
+
+            assert!(
+                message.ends_with("is over the known limit of 200000 tokens"),
+                "{message}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_bare_id_of_a_1m_model_is_refused_above_200k() {
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 1_000_000, 1);
+
+            let message = refused_message(
+                &copilot,
+                MESSAGES_ENDPOINT,
+                RouteKind::Anthropic,
+                &client_headers(),
+                &long_anthropic_body(PLAIN_ID, 400_000),
+            )
+            .await;
+
+            assert!(
+                message.ends_with("is over the known limit of 200000 tokens"),
+                "{message}"
+            );
+        }
+
+        #[tokio::test]
+        async fn declared_window_holds_only_a_bare_1m_id_to_200k() {
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 1_000_000, 1);
+            let config = copilot.state.config();
+            let bare = ModelId::parse(&format!("{PROFILE}/{PLAIN_ID}")).unwrap();
+            let wide = ModelId::parse(&format!("{PROFILE}/{PLAIN_ID}[1m]")).unwrap();
+
+            assert_eq!(
+                declared_window(&copilot.state, &config, bare).window,
+                Some(200_000)
+            );
+            assert_eq!(
+                declared_window(&copilot.state, &config, wide).window,
+                Some(1_000_000)
+            );
+        }
+
+        #[tokio::test]
+        async fn declared_window_leaves_a_bare_id_under_1m_alone() {
+            let copilot = copilot().await;
+            copilot
+                .state
+                .model_limits()
+                .learn(PROFILE, PLAIN_ID, 200_000, 1);
+            let config = copilot.state.config();
+            let bare = ModelId::parse(&format!("{PROFILE}/{PLAIN_ID}")).unwrap();
+
+            assert_eq!(declared_window(&copilot.state, &config, bare).window, None);
         }
 
         #[tokio::test]

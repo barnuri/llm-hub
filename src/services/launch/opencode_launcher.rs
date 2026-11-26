@@ -277,6 +277,29 @@ mod tests {
     }
 
     #[test]
+    fn a_1m_model_lists_its_bare_id_at_200k_and_its_suffixed_id_at_1m() {
+        let catalog = [
+            HubModel::new("copilot/claude-sonnet-5-5", Some(200_000))
+                .with_max_output_tokens(64_000),
+            HubModel::new("copilot/claude-sonnet-5-5[1m]", Some(1_000_000))
+                .with_max_output_tokens(64_000),
+        ];
+
+        let spec = spec_for(&["copilot/claude-sonnet-5-5[1m]"], &catalog);
+        let config = config_of(&spec);
+        let models = &config["provider"]["llm-hub"]["models"];
+
+        assert_eq!(
+            models["copilot/claude-sonnet-5-5"]["limit"]["context"],
+            200_000
+        );
+        assert_eq!(
+            models["copilot/claude-sonnet-5-5[1m]"]["limit"]["context"],
+            1_000_000
+        );
+    }
+
+    #[test]
     fn a_context_cap_lowers_only_the_named_model_limit() {
         let catalog = [
             HubModel::new("copilot/claude-opus-5-5[1m]", Some(1_000_000))

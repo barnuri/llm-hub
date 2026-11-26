@@ -8,7 +8,7 @@ use crate::consts::{
     HEADER_DEADLINE_MS, HEADER_FALLBACKS, HEADER_FALLBACKS_ALIAS, HEADER_RETRY_ON,
     HEADER_TIMEOUT_MS,
 };
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 
 /// Statuses that describe the request itself — identical on every upstream,
@@ -86,10 +86,10 @@ pub fn retain_eligible(chain: Vec<String>, eligible: Option<&[&ModelDescriptor]>
     chain
         .into_iter()
         .filter(|entry| {
-            let entry = strip_1m_suffix(entry);
+            let entry = strip_window_suffix(entry).0;
             eligible
                 .iter()
-                .any(|descriptor| strip_1m_suffix(&descriptor.qualified_id) == entry)
+                .any(|descriptor| strip_window_suffix(&descriptor.qualified_id).0 == entry)
         })
         .collect()
 }

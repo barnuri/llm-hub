@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::configs::TokenRates;
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 
 /// What the hub measured about one model right now. A field is `None` when nothing is known,
 /// and the score then falls back to the built-in seed or adds no penalty.
@@ -35,7 +35,7 @@ impl LiveSignals {
     #[must_use]
     pub fn get(&self, qualified_id: &str) -> ModelSignal {
         self.by_model
-            .get(strip_1m_suffix(qualified_id))
+            .get(strip_window_suffix(qualified_id).0)
             .copied()
             .unwrap_or_default()
     }
