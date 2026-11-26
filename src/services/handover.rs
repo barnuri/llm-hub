@@ -152,7 +152,8 @@ fn successor_command(
     Ok(command)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::collections::HashMap;
     use std::ffi::OsStr;
