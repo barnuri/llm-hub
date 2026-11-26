@@ -43,6 +43,7 @@ lopdf = { version = "0.47.0", default-features = false, optional = true }
 mime_guess = "2.0.5"
 rand = "0.10.2"
 rustls-native-certs = "0.8"
+rustls-native-certs = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust-embed = "8.12.0"

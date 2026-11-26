@@ -774,6 +774,11 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect();
+        t!("load_native_certs", rustls_native_certs::load_native_certs());
+        t!("build no builtin roots", reqwest::Client::builder().tls_built_in_root_certs(false).build().unwrap());
+        let certs: Vec<reqwest::Certificate> = rustls_native_certs::load_native_certs().certs.iter().filter_map(|c| reqwest::Certificate::from_der(c.as_ref()).ok()).collect();
+        out.push_str(&format!("certs: {}\n", certs.len()));
+        t!("build with cached certs", { let mut b = reqwest::Client::builder().tls_built_in_root_certs(false); for c in &certs { b = b.add_root_certificate(c.clone()); } b.build().unwrap() });
         t!("tempdir", tempfile::tempdir().unwrap());
         t!("Client::new", reqwest::Client::new());
         t!("Client::builder.build", reqwest::Client::builder().build().unwrap());

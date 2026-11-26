@@ -3272,6 +3272,7 @@ dependencies = [
  "mistralrs-server-core",
  "rand 0.10.2",
  "reqwest 0.12.28",
+ "rustls-native-certs",
  "rusqlite",
  "rust-embed",
  "serde",
