@@ -632,7 +632,7 @@ mod tests {
         };
         let entry = Arc::new(ManagedEntry::new("p", &command, Duration::from_secs(1)));
         *entry.last_used.lock().unwrap() =
-            Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+            Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
         entry
     }
 
