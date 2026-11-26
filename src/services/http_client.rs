@@ -20,12 +20,10 @@ pub fn builder() -> reqwest::ClientBuilder {
     )
 }
 
-/// A client with the default settings and the cached system roots.
-///
-/// # Panics
-/// When the TLS backend cannot start, as `reqwest::Client::new` does.
+/// A client with the default settings and the cached system roots, for tests.
+#[cfg(test)]
 pub fn client() -> reqwest::Client {
-    builder().build().expect("http client builds")
+    builder().build().unwrap()
 }
 
 #[cfg(test)]
