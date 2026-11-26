@@ -56,7 +56,9 @@ of OpenAI-compatible APIs into one `/v1/models` and routes each request by its p
 | `llm-hub copilot-cli` | GitHub Copilot CLI (`copilot`) | OpenAI chat completions | `llm-hub copilot-cli copilot/gpt-4.1` |
 | `llm-hub pi` | pi (`pi`) | OpenAI chat completions | `llm-hub pi copilot/claude-sonnet-4-5` |
 
-See [Coding agents](docs/coding-agents.md) for what each command sets.
+See [Coding agents](docs/coding-agents.md) for what each command sets. `llm-hub setup <harness>`
+writes the same hub settings into the harness's own user config, so the plain command (for example
+`opencode`) uses the hub without `llm-hub` in front of it.
 
 ## API docs
 
