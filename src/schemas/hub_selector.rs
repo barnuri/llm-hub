@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::consts::CONTEXT_TOKENS_1M;
 use crate::schemas::app_error::AppError;
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 use crate::schemas::smart_auto_policy::SmartAutoPolicy;
 use crate::schemas::smart_auto_tier::SmartAutoTier;
 
@@ -38,7 +38,8 @@ impl HubSelector {
         model_id: &str,
         operator_presets: &BTreeMap<String, SmartAutoPolicy>,
     ) -> Result<Option<HubSelector>, AppError> {
-        let Some(name) = strip_1m_suffix(model_id)
+        let Some(name) = strip_window_suffix(model_id)
+            .0
             .strip_prefix(Self::NAMESPACE)
             .and_then(|rest| rest.strip_prefix(Self::NAMESPACE_SEPARATOR))
         else {

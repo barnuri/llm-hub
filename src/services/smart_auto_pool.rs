@@ -1,6 +1,6 @@
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::limit_evidence::LimitEvidence;
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
 use crate::schemas::pool_limits::PoolLimits;
@@ -94,7 +94,7 @@ impl SmartAutoPool {
     }
 
     fn bare_id(qualified_id: &str) -> &str {
-        let id = strip_1m_suffix(qualified_id);
+        let id = strip_window_suffix(qualified_id).0;
         id.split_once(Self::PROFILE_SEPARATOR)
             .map_or(id, |(_, model)| model)
     }
@@ -127,7 +127,7 @@ impl SmartAutoPool {
         if Self::is_hub(descriptor) {
             return RuleDecision::HubNamespace;
         }
-        let qualified_id = strip_1m_suffix(&descriptor.qualified_id);
+        let qualified_id = strip_window_suffix(&descriptor.qualified_id).0;
         if let Some(glob) = Self::first_match(&policy.allow, qualified_id) {
             return RuleDecision::AllowedOverride(glob);
         }
@@ -166,7 +166,7 @@ impl SmartAutoPool {
     ) -> Option<&'a String> {
         let bare_id = Self::bare_id(qualified_id);
         globs.into_iter().find(|glob| {
-            let glob = strip_1m_suffix(glob);
+            let glob = strip_window_suffix(glob).0;
             glob_matches(glob, qualified_id) || glob_matches(glob, bare_id)
         })
     }

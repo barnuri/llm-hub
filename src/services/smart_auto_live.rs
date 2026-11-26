@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::configs::{PriceCard, TokenRates};
 use crate::dependencies::state::AppState;
 use crate::schemas::live_signals::{LiveSignals, ModelSignal};
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::services::pricing::PricingBook;
 use crate::services::store::now_ms;
@@ -51,7 +51,7 @@ impl SmartAutoLive {
         let mut by_model = HashMap::with_capacity(pool.len());
         let mut unavailable = health.cooled;
         for descriptor in pool {
-            let id = strip_1m_suffix(&descriptor.qualified_id);
+            let id = strip_window_suffix(&descriptor.qualified_id).0;
             if health.cooled_profiles.contains(&descriptor.profile) {
                 unavailable.insert(id.to_owned());
             }
@@ -85,7 +85,7 @@ impl SmartAutoLive {
     ) -> HashMap<String, u8> {
         let mut scores = HashMap::new();
         for raw in model_ids {
-            let id = strip_1m_suffix(raw);
+            let id = strip_window_suffix(raw).0;
             let rates = book.rates_for(id);
             let score = if rates.is_zero() {
                 let profile = id.split_once('/').map_or("", |(profile, _)| profile);
@@ -110,7 +110,7 @@ impl SmartAutoLive {
     ) -> HashMap<String, PriceCard> {
         model_ids
             .map(|raw| {
-                let id = strip_1m_suffix(raw);
+                let id = strip_window_suffix(raw).0;
                 (id.to_owned(), book.price_card_for(id))
             })
             .collect()

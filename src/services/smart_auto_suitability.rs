@@ -1,5 +1,5 @@
 use crate::schemas::live_signals::ModelSignal;
-use crate::schemas::model_context::strip_1m_suffix;
+use crate::schemas::model_context::strip_window_suffix;
 use crate::schemas::score_parts::ScoreParts;
 use crate::schemas::smart_auto_tier::SmartAutoTier;
 use crate::schemas::work_role::WorkRole;
@@ -209,7 +209,8 @@ impl SmartAutoSuitability {
     }
 
     fn family(model_id: &str) -> Option<&'static FamilySeed> {
-        let name = strip_1m_suffix(model_id)
+        let name = strip_window_suffix(model_id)
+            .0
             .rsplit(Self::PATH_SEPARATOR)
             .next()
             .unwrap_or_default()

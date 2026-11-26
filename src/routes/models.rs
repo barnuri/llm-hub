@@ -18,9 +18,7 @@ use crate::schemas::error_body::ErrorBody;
 use crate::schemas::hub_selector::HubSelector;
 use crate::schemas::launch::profile_filter::ProfileFilter;
 use crate::schemas::limit_evidence::LimitEvidence;
-use crate::schemas::model_context::{
-    advertised_model_id, inferred_max_input_tokens, max_input_tokens_from_item,
-};
+use crate::schemas::model_context::{advertised_models, max_input_tokens_from_item};
 use crate::schemas::model_descriptor::ModelDescriptor;
 use crate::schemas::model_descriptor_snapshot::ModelDescriptorSnapshot;
 use crate::schemas::smart_auto_headers::SmartAutoHeaders;
@@ -315,7 +313,7 @@ fn describe_and_rewrite(
     let mut descriptors = Vec::with_capacity(items.len());
     for item in items {
         let descriptor = ModelDescriptors::describe(profile, item, limits);
-        models.push(rewrite_model(profile, item, limits, descriptor.as_ref()));
+        models.extend(rewrite_model(profile, item, limits, descriptor.as_ref()));
         descriptors.extend(descriptor);
     }
     ProfileListing {
@@ -507,29 +505,33 @@ fn is_copilot_model_usable(item: &Value) -> bool {
 }
 
 /// `limits` holds a Copilot profile's learned and seeded prompt limits; see
-/// [`advertised_prompt_limit`] for which source wins.
+/// [`advertised_prompt_limit`] for which source wins. Returns one entry, or two for a 1M model.
 fn rewrite_model(
     profile: &ProfileConfig,
     item: &Value,
     limits: Option<&HashMap<String, ModelLimit>>,
     descriptor: Option<&ModelDescriptor>,
-) -> Value {
-    let mut model = item.clone();
+) -> Vec<Value> {
     let raw_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
     let upstream_tokens = advertised_prompt_limit(raw_id, item, limits);
     let bare = advertised_bare_id(profile, raw_id);
     let qualified = format!("{}/{}", profile.name, bare);
-    let advertised = advertised_model_id(&qualified, upstream_tokens);
-    if let Some(obj) = model.as_object_mut() {
-        obj.insert("id".into(), json!(advertised.clone()));
-        obj.insert("owned_by".into(), json!(profile.name));
-        annotate_labels(obj, profile, &bare);
-        annotate_context(obj, &advertised, upstream_tokens);
-        if let Some(descriptor) = descriptor {
-            annotate_limits(obj, descriptor);
-        }
-    }
-    model
+    advertised_models(&qualified, upstream_tokens)
+        .into_iter()
+        .map(|(advertised, tokens)| {
+            let mut model = item.clone();
+            if let Some(obj) = model.as_object_mut() {
+                obj.insert("id".into(), json!(advertised));
+                obj.insert("owned_by".into(), json!(profile.name));
+                annotate_labels(obj, profile, &bare);
+                annotate_context(obj, tokens);
+                if let Some(descriptor) = descriptor {
+                    annotate_limits(obj, descriptor);
+                }
+            }
+            model
+        })
+        .collect()
 }
 
 /// Prompt limit to advertise: learned from a Copilot rejection, then the measured seed, then the
@@ -549,19 +551,22 @@ fn static_models(profile: &ProfileConfig) -> Vec<Value> {
     profile
         .static_models
         .iter()
-        .map(|id| {
+        .flat_map(|id| {
             let qualified = format!("{}/{}", profile.name, id);
-            let advertised = advertised_model_id(&qualified, None);
-            let mut model = json!({
-                "id": advertised.clone(),
-                "object": "model",
-                "owned_by": profile.name,
-            });
-            if let Some(obj) = model.as_object_mut() {
-                annotate_labels(obj, profile, id);
-                annotate_context(obj, &advertised, None);
-            }
-            model
+            advertised_models(&qualified, None)
+                .into_iter()
+                .map(move |(advertised, tokens)| {
+                    let mut model = json!({
+                        "id": advertised,
+                        "object": "model",
+                        "owned_by": profile.name,
+                    });
+                    if let Some(obj) = model.as_object_mut() {
+                        annotate_labels(obj, profile, id);
+                        annotate_context(obj, tokens);
+                    }
+                    model
+                })
         })
         .collect()
 }
@@ -592,12 +597,8 @@ fn annotate_labels(obj: &mut serde_json::Map<String, Value>, profile: &ProfileCo
     );
 }
 
-fn annotate_context(
-    obj: &mut serde_json::Map<String, Value>,
-    advertised_id: &str,
-    upstream_tokens: Option<u64>,
-) {
-    let Some(tokens) = inferred_max_input_tokens(advertised_id, upstream_tokens) else {
+fn annotate_context(obj: &mut serde_json::Map<String, Value>, tokens: Option<u64>) {
+    let Some(tokens) = tokens else {
         return;
     };
     obj.insert("max_input_tokens".into(), json!(tokens));
@@ -910,6 +911,7 @@ mod tests {
             model["max_input_tokens"].as_u64()
         };
         assert_eq!(window("copilot/claude-opus-5-5[1m]"), Some(1_000_000));
+        assert_eq!(window("copilot/claude-opus-5-5"), Some(200_000));
         assert_eq!(window("copilot/claude-haiku-4-5"), Some(180_000));
         assert_eq!(window("copilot/gpt-9"), Some(136_000));
     }
@@ -977,7 +979,7 @@ mod tests {
         let local = profile("llama_swap", &[]);
         let descriptor = ModelDescriptors::describe(&local, &item, None);
 
-        let out = rewrite_model(&local, &item, None, descriptor.as_ref());
+        let out = rewrite_model(&local, &item, None, descriptor.as_ref()).remove(0);
 
         assert!(out.get(LIMITS_FIELD).is_none(), "{out}");
         assert!(out.get("max_output_tokens").is_none(), "{out}");
@@ -1121,12 +1123,13 @@ mod tests {
         let payload = enabled_models(&restarted).await;
 
         let listed = profile_ids(&payload);
-        assert_eq!(listed.len(), 6, "unexpected list {payload}");
+        assert_eq!(listed.len(), 7, "unexpected list {payload}");
         assert!(
             listed
                 .iter()
                 .any(|id| id.starts_with("copilot/claude-opus-5-5"))
         );
+        assert!(listed.contains(&"copilot/claude-opus-5-5[1m]"));
         assert!(listed.contains(&"copilot/claude-haiku-4-5"));
         assert!(listed.contains(&"copilot/auto"));
         assert_eq!(restarted.model_cache().unwrap().payload, payload);
@@ -1443,7 +1446,7 @@ mod tests {
     fn rewrite_model_adds_display_name_and_description() {
         let mut labelled = profile("llmgw", &[]);
         labelled.display_name = Some("Gateway".to_string());
-        let out = rewrite_model(&labelled, &json!({"id": "gpt-4.1"}), None, None);
+        let out = rewrite_model(&labelled, &json!({"id": "gpt-4.1"}), None, None).remove(0);
         assert_eq!(out["display_name"], "gpt-4.1 · Gateway");
         assert_eq!(out["description"], "via llm-hub profile Gateway");
     }
@@ -1862,7 +1865,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_claude_opus_advertises_1m_id_and_tokens() {
+    fn rewrite_claude_opus_advertises_bare_at_200k_and_1m_id_at_1m() {
         let item = json!({
             "id": "bedrock/anthropic.claude-opus-5",
             "object": "model",
@@ -1870,9 +1873,13 @@ mod tests {
             "context_length": CONTEXT_TOKENS_1M,
         });
         let out = rewrite_model(&profile("llmgw", &[]), &item, None, None);
-        assert_eq!(out["id"], "llmgw/bedrock/anthropic.claude-opus-5[1m]");
-        assert_eq!(out["max_input_tokens"], CONTEXT_TOKENS_1M);
-        assert_eq!(out["context_window"], CONTEXT_TOKENS_1M);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0]["id"], "llmgw/bedrock/anthropic.claude-opus-5");
+        assert_eq!(out[0]["max_input_tokens"], 200_000);
+        assert_eq!(out[0]["context_window"], 200_000);
+        assert_eq!(out[1]["id"], "llmgw/bedrock/anthropic.claude-opus-5[1m]");
+        assert_eq!(out[1]["max_input_tokens"], CONTEXT_TOKENS_1M);
+        assert_eq!(out[1]["context_window"], CONTEXT_TOKENS_1M);
     }
 
     #[test]
@@ -1882,7 +1889,7 @@ mod tests {
             "object": "model",
             "max_input_tokens": 200_000,
         });
-        let out = rewrite_model(&profile("llmgw", &[]), &item, None, None);
+        let out = rewrite_model(&profile("llmgw", &[]), &item, None, None).remove(0);
         assert_eq!(out["id"], "llmgw/bedrock/anthropic.claude-opus-5");
         assert_eq!(out["max_input_tokens"], 200_000);
     }
@@ -1890,7 +1897,7 @@ mod tests {
     #[test]
     fn rewrite_local_model_keeps_plain_id() {
         let item = json!({"id": "meta/muse-glimmer", "object": "model"});
-        let out = rewrite_model(&profile("llama_swap", &[]), &item, None, None);
+        let out = rewrite_model(&profile("llama_swap", &[]), &item, None, None).remove(0);
         assert_eq!(out["id"], "llama_swap/meta/muse-glimmer");
         assert!(out.get("max_input_tokens").is_none());
     }
