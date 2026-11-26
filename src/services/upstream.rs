@@ -28,7 +28,12 @@ fn build_clients_with(
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
-        .map_err(|e| format!("failed to build http client for profile {}: {e}", first.name))?;
+        .map_err(|e| {
+            format!(
+                "failed to build http client for profile {}: {e}",
+                first.name
+            )
+        })?;
     for profile in &config.profiles {
         clients.insert(profile.name.clone(), shared.clone());
     }
